@@ -24,6 +24,7 @@ pub(crate) struct Cli {
 #[argh(
     help_triggers("-h", "--help"),
     description = "Landlock sandbox runner",
+    usage = "[OPTIONS] <COMMAND> [ARG...]",
     example = "{command_name} -p policy.json cargo test"
 )]
 struct CliOptions {
@@ -39,9 +40,9 @@ struct CliOptions {
     #[argh(option, short = 'p', from_str_fn(parse_policy_path))]
     policy: Vec<PathBuf>,
 
-    /// command and arguments
-    #[argh(positional, greedy)]
-    command: Vec<String>,
+    /// command to run inside the sandbox, followed by its arguments
+    #[argh(positional)]
+    command: Option<String>,
 }
 
 #[derive(Debug)]
@@ -84,8 +85,12 @@ fn parse_cli_action(
         )));
     }
 
+    if command_tail.is_empty() {
+        return Err(Error::usage(command_required_usage(&program_name)));
+    }
+
     let policy_base =
-        env::current_dir().map_err(|source| Error::with_source("cli: cwd", source))?;
+        env::current_dir().map_err(|source| Error::with_source("current directory", source))?;
 
     cli_from_options(options, policy_base, command_tail).map(CliAction::Run)
 }
@@ -125,12 +130,12 @@ fn cli_from_options(
     policy_base: PathBuf,
     command_tail: Vec<OsString>,
 ) -> Result<Cli> {
-    debug_assert!(options.command.is_empty());
+    debug_assert!(options.command.is_none());
 
     let mut command_tail = command_tail.into_iter();
     let command = command_tail
         .next()
-        .ok_or_else(|| Error::usage("cli: command required"))?;
+        .ok_or_else(|| Error::usage(command_required_usage(PROGRAM_NAME)))?;
 
     Ok(Cli {
         policy_paths: options.policy,
@@ -143,7 +148,7 @@ fn cli_from_options(
 
 fn parse_policy_path(path: &str) -> std::result::Result<PathBuf, String> {
     if path.is_empty() {
-        return Err("cli: policy path empty".to_owned());
+        return Err("policy path empty".to_owned());
     }
 
     Ok(PathBuf::from(path))
@@ -173,7 +178,7 @@ fn option_args_to_strings(args: impl IntoIterator<Item = OsString>) -> Result<Ve
 
     for arg in args {
         let string = arg.into_string().map_err(|arg| {
-            Error::message(format!("cli: arg encoding: {}", arg.to_string_lossy()))
+            Error::message(format!("argument encoding: {}", arg.to_string_lossy()))
         })?;
 
         strings.push(string);
@@ -193,7 +198,11 @@ fn handle_cli_options_early_exit(early_exit: &argh::EarlyExit) -> Result<ParsedO
         .next()
         .filter(|line| !line.is_empty())
         .unwrap_or("arguments invalid");
-    Err(Error::usage(format!("cli: {message}")))
+    Err(Error::usage(message.to_owned()))
+}
+
+fn command_required_usage(program_name: &str) -> String {
+    format!("Usage: {program_name} [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.")
 }
 
 fn program_name(program: &OsStr) -> String {
