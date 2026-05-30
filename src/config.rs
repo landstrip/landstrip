@@ -9,14 +9,14 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct Settings {
     pub(crate) filesystem: SandboxFilesystem,
     pub(crate) network: SandboxNetwork,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct SandboxFilesystem {
     pub(crate) allow_write: Vec<String>,
     pub(crate) deny_write: Vec<String>,
@@ -25,7 +25,7 @@ pub(crate) struct SandboxFilesystem {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct SandboxNetwork {
     pub(crate) allow_local_binding: bool,
     pub(crate) http_proxy_port: Option<u16>,

@@ -21,10 +21,10 @@ allowlist, applies that ruleset to itself, and then executes
 If no policy file is specified, the policy document is read from standard
 input.
 .Pp
-The accepted policy format is a strict subset of Anthropic Sandbox Runtime
-settings for the fields that
+The accepted policy format is the subset of Anthropic Sandbox Runtime
+settings that
 .Nm
-uses. Unknown JSON fields are rejected.
+uses. Unknown JSON fields are ignored.
 .Sh OPTIONS
 .Bl -tag -width Ds
 .It Fl -debug
