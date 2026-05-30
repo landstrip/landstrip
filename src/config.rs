@@ -21,6 +21,7 @@ pub(crate) struct Sandbox {
     pub(crate) enabled: bool,
     pub(crate) fail_if_unavailable: bool,
     pub(crate) filesystem: Option<SandboxFilesystem>,
+    pub(crate) network: Option<SandboxNetwork>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -31,6 +32,17 @@ pub(crate) struct SandboxFilesystem {
     pub(crate) deny_write: Vec<String>,
     pub(crate) allow_read: Vec<String>,
     pub(crate) deny_read: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SandboxNetwork {
+    pub(crate) allow_local_binding: bool,
+    pub(crate) http_proxy_port: Option<u16>,
+    pub(crate) socks_proxy_port: Option<u16>,
+    pub(crate) allowed_domains: Vec<String>,
+    pub(crate) denied_domains: Vec<String>,
 }
 
 pub(crate) fn load_settings(policy_paths: &[PathBuf]) -> Result<Settings> {

@@ -5,6 +5,8 @@ parametrized and there are no pre-defined policy file or directory locations.
 
 ## Sandbox model
 
+### Files
+
 `landstrip` defines sandbox configuration as a Landlock allowlist. Deny rules
 are handled by traversing the directory tree and allowing only the roots that
 remain after subtracting denied paths.
@@ -19,6 +21,16 @@ when an allowed ancestor rule covers it.
 
 Directories created outside the sandbox after policy setup are not exposed
 merely because their paths match a previous traversal result.
+
+### Network
+
+`landstrip` uses Landlock TCP port rules to define network policy. When
+`sandbox.network` is present, direct TCP connections are denied by default.
+`httpProxyPort` and `socksProxyPort` are also fully supported.
+
+`allowLocalBinding` leaves TCP binding unrestricted because Landlock cannot
+process local addresses. `landstrip` neither provides domain, UDP, nor
+address-based network filtering for the time being.
 
 ## Documenting errors
 

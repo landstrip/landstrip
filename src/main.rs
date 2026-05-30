@@ -16,7 +16,7 @@ use crate::cli::parse_cli;
 use crate::config::{SandboxFilesystem, load_settings};
 use crate::error::{Error, Result};
 use crate::landlock::enforce_access_policy;
-use crate::policy::lower_filesystem_policy;
+use crate::policy::lower_sandbox_policy;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -58,7 +58,7 @@ fn apply_sandbox(settings: &config::Settings, policy_base: &Path) -> Result<()> 
 
     let default_filesystem = SandboxFilesystem::default();
     let filesystem = sandbox.filesystem.as_ref().unwrap_or(&default_filesystem);
-    let policy = lower_filesystem_policy(filesystem, policy_base)?;
+    let policy = lower_sandbox_policy(filesystem, sandbox.network.as_ref(), policy_base)?;
 
     enforce_access_policy(&policy, sandbox.fail_if_unavailable)
 }

@@ -3,7 +3,7 @@
 .Os
 .Sh NAME
 .Nm landstrip
-.Nd run a command inside a Landlock filesystem sandbox
+.Nd run a command inside a Landlock sandbox
 .Sh SYNOPSIS
 .Nm
 .Op Fl -debug
@@ -51,6 +51,12 @@ The relevant policy shape is:
       "denyWrite": [".git/hooks"],
       "denyRead": ["~/.ssh"],
       "allowRead": ["~/.ssh/config"]
+    },
+    "network": {
+      "httpProxyPort": 8080,
+      "socksProxyPort": 8081,
+      "allowLocalBinding": false,
+      "allowedDomains": ["api.anthropic.com"]
     }
   }
 }
@@ -80,6 +86,18 @@ contains entries, read access is lowered to an allowlist by traversing from
 and subtracting denied paths. Entries in
 .Va allowRead
 are then added back to the read allowlist.
+.Pp
+When
+.Va network
+is present, direct TCP connections are denied by default. The
+.Va httpProxyPort
+and
+.Va socksProxyPort
+settings are fully supported.
+.Va allowLocalBinding
+leaves TCP binding unrestricted because Landlock cannot process local addresses.
+.Nm
+neither does not currently provide domain, UDP, nor address-based network filtering.
 .Sh SANDBOX MODEL
 Landlock rules are tied to filesystem objects opened while the sandbox is
 created, not to path strings. If an allowed directory is removed and the same

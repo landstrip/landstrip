@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::config::SandboxFilesystem;
+use crate::config::{SandboxFilesystem, SandboxNetwork};
 use crate::error::{Error, Result};
 use crate::paths::{normalize_path, normalize_roots};
 use crate::traversal::subtract_denied_roots;
@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
     pub(crate) read_access: ReadAccess,
+    pub(crate) network_access: NetworkAccess,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -20,21 +21,29 @@ pub(crate) enum ReadAccess {
     AllowRoots(Vec<PathBuf>),
 }
 
-pub(crate) fn lower_filesystem_policy(
-    source: &SandboxFilesystem,
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct NetworkAccess {
+    pub(crate) restrict_connect_tcp: bool,
+    pub(crate) connect_tcp_ports: Vec<u16>,
+    pub(crate) restrict_bind_tcp: bool,
+}
+
+pub(crate) fn lower_sandbox_policy(
+    filesystem: &SandboxFilesystem,
+    network: Option<&SandboxNetwork>,
     policy_base: &Path,
 ) -> Result<AccessPolicy> {
     let home_dir = dirs::home_dir();
     let home = home_dir.as_deref();
     let policy_base = absolute_policy_base(policy_base)?;
 
-    let write_allow = resolve_write_roots(source, &policy_base, home)?;
-    let write_deny = resolve_paths(&source.deny_write, &policy_base, home)?;
+    let write_allow = resolve_write_roots(filesystem, &policy_base, home)?;
+    let write_deny = resolve_paths(&filesystem.deny_write, &policy_base, home)?;
     let write_roots = subtract_denied_roots(write_allow, &write_deny)
         .map_err(|source| Error::with_source("policy: write traversal", source))?;
 
-    let read_allow = resolve_paths(&source.allow_read, &policy_base, home)?;
-    let read_deny = resolve_paths(&source.deny_read, &policy_base, home)?;
+    let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
+    let read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
     let read_access = if read_deny.is_empty() {
         ReadAccess::Unrestricted
     } else {
@@ -48,7 +57,61 @@ pub(crate) fn lower_filesystem_policy(
     Ok(AccessPolicy {
         write_roots,
         read_access,
+        network_access: lower_network_policy(network)?,
     })
+}
+
+fn lower_network_policy(source: Option<&SandboxNetwork>) -> Result<NetworkAccess> {
+    let Some(source) = source else {
+        return Ok(NetworkAccess::default());
+    };
+
+    let mut connect_tcp_ports = Vec::new();
+    push_proxy_port(
+        &mut connect_tcp_ports,
+        source.http_proxy_port,
+        "httpProxyPort",
+    )?;
+    push_proxy_port(
+        &mut connect_tcp_ports,
+        source.socks_proxy_port,
+        "socksProxyPort",
+    )?;
+    connect_tcp_ports.sort_unstable();
+    connect_tcp_ports.dedup();
+
+    if (!source.allowed_domains.is_empty() || !source.denied_domains.is_empty())
+        && connect_tcp_ports.is_empty()
+    {
+        return Err(Error::message(
+            "policy: network domains require httpProxyPort or socksProxyPort",
+        ));
+    }
+
+    if !source.allowed_domains.is_empty() || !source.denied_domains.is_empty() {
+        log::warn!("network domain filtering is delegated to the configured proxy port");
+    }
+
+    Ok(NetworkAccess {
+        restrict_connect_tcp: true,
+        connect_tcp_ports,
+        restrict_bind_tcp: !source.allow_local_binding,
+    })
+}
+
+fn push_proxy_port(ports: &mut Vec<u16>, port: Option<u16>, label: &str) -> Result<()> {
+    let Some(port) = port else {
+        return Ok(());
+    };
+
+    if port == 0 {
+        return Err(Error::message(format!(
+            "policy: network {label} must be in range 1..=65535"
+        )));
+    }
+
+    ports.push(port);
+    Ok(())
 }
 
 fn resolve_write_roots(
