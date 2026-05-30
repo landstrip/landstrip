@@ -19,7 +19,7 @@ pub(crate) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
 
     let ruleset = Ruleset::default()
         .handle_access(handled_access)
-        .map_err(|source| Error::with_source("landlock: filesystem rights", source))?;
+        .map_err(|source| Error::with_source("landlock: fs rights", source))?;
     let mut ruleset = handle_network_access(ruleset, policy)?
         .create()
         .map_err(|source| Error::with_source("landlock: ruleset", source))?;
@@ -34,12 +34,12 @@ pub(crate) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
 
     let status = ruleset
         .restrict_self()
-        .map_err(|source| Error::with_source("landlock", source))?;
+        .map_err(|source| Error::with_source("landlock: restrict", source))?;
 
     match status.ruleset {
         RulesetStatus::FullyEnforced => Ok(()),
-        RulesetStatus::PartiallyEnforced => Err(Error::message("landlock: partially enforced")),
-        RulesetStatus::NotEnforced => Err(Error::message("landlock: not enforced")),
+        RulesetStatus::PartiallyEnforced => Err(Error::message("landlock: enforcement partial")),
+        RulesetStatus::NotEnforced => Err(Error::message("landlock: enforcement none")),
     }
 }
 
@@ -60,7 +60,7 @@ fn handle_network_access(ruleset: Ruleset, policy: &AccessPolicy) -> Result<Rule
 
     ruleset
         .handle_access(access)
-        .map_err(|source| Error::with_source("landlock: network rights", source))
+        .map_err(|source| Error::with_source("landlock: net rights", source))
 }
 
 fn add_path_rules(
@@ -71,11 +71,17 @@ fn add_path_rules(
 ) -> Result<RulesetCreated> {
     for path in paths {
         let fd = PathFd::new(path).map_err(|source| {
-            Error::with_source(format!("landlock: {label} root {}", path.display()), source)
+            Error::with_source(
+                format!("landlock: fs {label} root {}", path.display()),
+                source,
+            )
         })?;
         let rule = PathBeneath::new(fd, access_for_path(path, access));
         ruleset = ruleset.add_rule(rule).map_err(|source| {
-            Error::with_source(format!("landlock: {label} rule {}", path.display()), source)
+            Error::with_source(
+                format!("landlock: fs {label} rule {}", path.display()),
+                source,
+            )
         })?;
     }
 
@@ -90,7 +96,7 @@ fn add_network_rules(mut ruleset: RulesetCreated, policy: &AccessPolicy) -> Resu
     for port in &policy.network_access.connect_tcp_ports {
         let rule = NetPort::new(*port, AccessNet::ConnectTcp);
         ruleset = ruleset.add_rule(rule).map_err(|source| {
-            Error::with_source(format!("landlock: connect TCP {port}"), source)
+            Error::with_source(format!("landlock: net connect {port}"), source)
         })?;
     }
 

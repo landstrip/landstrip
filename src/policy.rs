@@ -40,7 +40,7 @@ pub(crate) fn lower_sandbox_policy(
     let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
     let write_deny = resolve_paths(&filesystem.deny_write, &policy_base, home)?;
     let write_roots = subtract_denied_roots(write_allow, &write_deny)
-        .map_err(|source| Error::with_source("policy: write traversal", source))?;
+        .map_err(|source| Error::with_source("policy: fs write", source))?;
 
     let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
     let read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
@@ -48,7 +48,7 @@ pub(crate) fn lower_sandbox_policy(
         ReadAccess::Unrestricted
     } else {
         let mut read_roots = subtract_denied_roots(vec![PathBuf::from("/")], &read_deny)
-            .map_err(|source| Error::with_source("policy: read traversal", source))?;
+            .map_err(|source| Error::with_source("policy: fs read", source))?;
         read_roots.extend(read_allow);
         normalize_roots(&mut read_roots);
         ReadAccess::AllowRoots(read_roots)
@@ -79,7 +79,7 @@ fn lower_network_policy(network: &SandboxNetwork) -> Result<NetworkAccess> {
     let has_domain_policy =
         !network.allowed_domains.is_empty() || !network.denied_domains.is_empty();
     if has_domain_policy {
-        return Err(Error::message("policy: network domain filters unsupported"));
+        return Err(Error::message("policy: net domain unsupported"));
     }
 
     Ok(NetworkAccess {
@@ -96,7 +96,7 @@ fn push_proxy_port(ports: &mut Vec<u16>, port: Option<u16>, label: &str) -> Resu
 
     if port == 0 {
         return Err(Error::message(format!(
-            "policy: network {label} must be in range 1..=65535"
+            "policy: net {label} range 1..=65535"
         )));
     }
 
@@ -125,7 +125,7 @@ fn absolute_policy_base(policy_base: &Path) -> Result<PathBuf> {
         policy_base.to_path_buf()
     } else {
         env::current_dir()
-            .map_err(|source| Error::with_source("current directory", source))?
+            .map_err(|source| Error::with_source("policy: cwd", source))?
             .join(policy_base)
     };
 
@@ -134,7 +134,7 @@ fn absolute_policy_base(policy_base: &Path) -> Result<PathBuf> {
 
 fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<PathBuf> {
     if path.is_empty() {
-        return Err(Error::message("empty sandbox path"));
+        return Err(Error::message("policy: path empty"));
     }
 
     let raw = Path::new(path);
@@ -142,12 +142,12 @@ fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<
         raw.to_path_buf()
     } else if path == "~" {
         home.map(Path::to_path_buf)
-            .ok_or_else(|| Error::message("~: home directory unavailable"))?
+            .ok_or_else(|| Error::message("policy: home unavailable"))?
     } else if let Some(rest) = path.strip_prefix("~/") {
         home.map(|home| home.join(rest))
-            .ok_or_else(|| Error::message("~/: home directory unavailable"))?
+            .ok_or_else(|| Error::message("policy: home unavailable"))?
     } else if path.starts_with('~') {
-        return Err(Error::message("unsupported ~user path"));
+        return Err(Error::message("policy: path ~user unsupported"));
     } else {
         base.join(raw)
     };

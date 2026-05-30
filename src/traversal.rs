@@ -46,7 +46,12 @@ fn scan_allowed_root(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(vec![root.to_path_buf()]);
         }
-        Err(source) => return Err(Error::with_source(root.display().to_string(), source)),
+        Err(source) => {
+            return Err(Error::with_source(
+                format!("traversal: {}", root.display()),
+                source,
+            ));
+        }
     };
     let file_type = metadata.file_type();
     if file_type.is_symlink() && !is_explicit_root {
@@ -61,11 +66,12 @@ fn scan_allowed_root(
 
     let mut roots = Vec::new();
     let entries = fs::read_dir(root)
-        .map_err(|source| Error::with_source(root.display().to_string(), source))?;
+        .map_err(|source| Error::with_source(format!("traversal: {}", root.display()), source))?;
 
     for entry in entries {
-        let entry =
-            entry.map_err(|source| Error::with_source(root.display().to_string(), source))?;
+        let entry = entry.map_err(|source| {
+            Error::with_source(format!("traversal: {}", root.display()), source)
+        })?;
         let child = entry.path();
         roots.extend(scan_allowed_root(&child, denied, false)?);
     }

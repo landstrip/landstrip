@@ -33,7 +33,7 @@ fn run() -> Result<()> {
     let cli = parse_cli()?;
     init_logger(cli.debug);
 
-    log::debug!("policy base: {}", cli.policy_base.display());
+    log::debug!("policy: base {}", cli.policy_base.display());
     let settings = load_settings(&cli.policy_paths)?;
     apply_sandbox(&settings, &cli.policy_base)?;
     exec_command(&cli.command, &cli.command_args)
@@ -56,7 +56,7 @@ fn apply_sandbox(settings: &config::Settings, policy_base: &Path) -> Result<()> 
 fn exec_command(command: &OsStr, args: &[OsString]) -> Result<()> {
     let error = Command::new(command).args(args).exec();
     Err(Error::with_source(
-        command.to_string_lossy().to_string(),
+        format!("exec: {}", command.to_string_lossy()),
         error,
     ))
 }
