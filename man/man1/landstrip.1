@@ -1,4 +1,4 @@
-.Dd May 31, 2026
+.Dd June 1, 2026
 .Dt LANDSTRIP 1
 .Os
 .Sh NAME
@@ -95,8 +95,9 @@ addresses, this mode uses a seccomp user-notification broker for
 .Xr bind 2
 and fails closed if that facility is unavailable.
 .Nm
-does not currently provide domain, UDP, or general address-based network
-filtering.
+parses domain allow and deny lists but skips them.
+.Nm
+does not currently provide UDP or general address-based network filtering.
 .Sh SANDBOX MODEL
 Landlock rules are tied to filesystem objects opened while the sandbox is
 created, not to path strings. If an allowed directory is removed and the same

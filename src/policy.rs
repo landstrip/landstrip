@@ -77,10 +77,17 @@ fn lower_network_policy(network: &SandboxNetwork) -> Result<NetworkAccess> {
     connect_tcp_ports.sort_unstable();
     connect_tcp_ports.dedup();
 
-    let has_domain_policy =
-        !network.allowed_domains.is_empty() || !network.denied_domains.is_empty();
-    if has_domain_policy {
-        return Err(Error::message("policy: net domain unsupported"));
+    if !network.allowed_domains.is_empty() {
+        log::debug!(
+            "network.allowed_domains: {} (skipped)",
+            serde_json::to_string(&network.allowed_domains).unwrap_or_else(|_| "[]".to_owned())
+        );
+    }
+    if !network.denied_domains.is_empty() {
+        log::debug!(
+            "network.denied_domains: {} (skipped)",
+            serde_json::to_string(&network.denied_domains).unwrap_or_else(|_| "[]".to_owned())
+        );
     }
 
     Ok(NetworkAccess {

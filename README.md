@@ -32,8 +32,9 @@ proxy ports.
 `allowLocalBinding` allows TCP binding to loopback addresses. Because Landlock
 cannot process local addresses, this mode uses a seccomp user-notification
 broker for `bind(2)` and fails closed if that facility is unavailable.
-`landstrip` does not currently provide domain, UDP, or general address-based
-network filtering for the time being.
+Domain allow and deny lists are parsed but skipped. `landstrip` does not
+currently provide UDP or general address-based network filtering for the time
+being.
 
 ## Documenting errors
 
