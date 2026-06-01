@@ -565,9 +565,54 @@ pub(crate) enum UnixSocketFilter {
 }
 
 fn add_socket_family_filter(filter: &mut ScmpFilterContext, socket: ScmpSyscall) -> Result<()> {
+    let stream = u64::try_from(libc::SOCK_STREAM).map_err(|_| Error::InvalidAddress)?;
+    let tcp = u64::try_from(libc::IPPROTO_TCP).map_err(|_| Error::InvalidAddress)?;
+
     for domain in [libc::AF_INET, libc::AF_INET6] {
-        add_socket_type_filter(filter, socket, domain, libc::SOCK_DGRAM)?;
-        add_socket_type_filter(filter, socket, domain, libc::SOCK_RAW)?;
+        let domain = u64::try_from(domain).map_err(|_| Error::InvalidAddress)?;
+
+        for ty in 0..=SOCK_TYPE_MASK {
+            if ty == stream {
+                continue;
+            }
+
+            filter
+                .add_rule_conditional(
+                    ScmpAction::Errno(libc::EAFNOSUPPORT),
+                    socket,
+                    &[
+                        ScmpArgCompare::new(0, ScmpCompareOp::Equal, domain),
+                        ScmpArgCompare::new(1, ScmpCompareOp::MaskedEqual(SOCK_TYPE_MASK), ty),
+                    ],
+                )
+                .map_err(Error::Seccomp)?;
+        }
+
+        for proto in 1..tcp {
+            filter
+                .add_rule_conditional(
+                    ScmpAction::Errno(libc::EAFNOSUPPORT),
+                    socket,
+                    &[
+                        ScmpArgCompare::new(0, ScmpCompareOp::Equal, domain),
+                        ScmpArgCompare::new(1, ScmpCompareOp::MaskedEqual(SOCK_TYPE_MASK), stream),
+                        ScmpArgCompare::new(2, ScmpCompareOp::Equal, proto),
+                    ],
+                )
+                .map_err(Error::Seccomp)?;
+        }
+
+        filter
+            .add_rule_conditional(
+                ScmpAction::Errno(libc::EAFNOSUPPORT),
+                socket,
+                &[
+                    ScmpArgCompare::new(0, ScmpCompareOp::Equal, domain),
+                    ScmpArgCompare::new(1, ScmpCompareOp::MaskedEqual(SOCK_TYPE_MASK), stream),
+                    ScmpArgCompare::new(2, ScmpCompareOp::Greater, tcp),
+                ],
+            )
+            .map_err(Error::Seccomp)?;
     }
 
     for domain in [libc::AF_PACKET, libc::AF_NETLINK] {
@@ -589,28 +634,6 @@ fn add_socket_domain_filter(
             ScmpAction::Errno(libc::EAFNOSUPPORT),
             socket,
             &[ScmpArgCompare::new(0, ScmpCompareOp::Equal, domain)],
-        )
-        .map(|_| ())
-        .map_err(Error::Seccomp)
-}
-
-fn add_socket_type_filter(
-    filter: &mut ScmpFilterContext,
-    socket: ScmpSyscall,
-    domain: i32,
-    ty: i32,
-) -> Result<()> {
-    let domain = u64::try_from(domain).map_err(|_| Error::InvalidAddress)?;
-    let ty = u64::try_from(ty).map_err(|_| Error::InvalidAddress)?;
-
-    filter
-        .add_rule_conditional(
-            ScmpAction::Errno(libc::EAFNOSUPPORT),
-            socket,
-            &[
-                ScmpArgCompare::new(0, ScmpCompareOp::Equal, domain),
-                ScmpArgCompare::new(1, ScmpCompareOp::MaskedEqual(SOCK_TYPE_MASK), ty),
-            ],
         )
         .map(|_| ())
         .map_err(Error::Seccomp)
