@@ -4,9 +4,13 @@
 use crate::error::{Error, Result};
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use std::env;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
+
+const HTTP_PROXY: &str = "HTTP_PROXY";
+const SOCKS_PROXY: &str = "SOCKS_PROXY";
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -58,6 +62,8 @@ pub(crate) fn load_settings(policy_paths: &[PathBuf]) -> Result<Settings> {
         }
     }
 
+    apply_proxy_env_defaults(&mut merged, |name| env::var(name).ok())?;
+
     serde_json::from_value(merged).map_err(|source| Error::with_source("policy: decode", source))
 }
 
@@ -78,5 +84,204 @@ fn merge_json(base: &mut Value, overlay: Value) {
         (base, overlay) => {
             *base = overlay;
         }
+    }
+}
+
+fn apply_proxy_env_defaults(
+    settings: &mut Value,
+    env_var: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
+    let Some(settings) = settings.as_object_mut() else {
+        return Ok(());
+    };
+
+    if settings
+        .get("network")
+        .is_some_and(|network| !network.is_object())
+    {
+        return Ok(());
+    }
+
+    let http_proxy_port = env_var(HTTP_PROXY)
+        .map(|value| proxy_port(HTTP_PROXY, &value, 80))
+        .transpose()?;
+    let socks_proxy_port = env_var(SOCKS_PROXY)
+        .map(|value| proxy_port(SOCKS_PROXY, &value, 1080))
+        .transpose()?;
+    if http_proxy_port.is_none() && socks_proxy_port.is_none() {
+        return Ok(());
+    }
+
+    let network = settings
+        .entry("network")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .expect("network object created above");
+
+    if !network.contains_key("httpProxyPort") {
+        if let Some(port) = http_proxy_port {
+            network.insert("httpProxyPort".to_owned(), Value::from(port));
+        }
+    }
+
+    if !network.contains_key("socksProxyPort") {
+        if let Some(port) = socks_proxy_port {
+            network.insert("socksProxyPort".to_owned(), Value::from(port));
+        }
+    }
+
+    Ok(())
+}
+
+fn proxy_port(name: &str, value: &str, default_port: u16) -> Result<Option<u16>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    let authority = value
+        .split_once("://")
+        .map_or(value, |(_, authority)| authority);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
+    if authority.is_empty() {
+        return Ok(None);
+    }
+
+    let port = authority_port(name, authority)?.unwrap_or(default_port);
+
+    if port == 0 {
+        return Err(Error::message(format!(
+            "policy: net {name} range 1..=65535",
+        )));
+    }
+
+    Ok(Some(port))
+}
+
+fn authority_port(name: &str, authority: &str) -> Result<Option<u16>> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let Some((_, rest)) = rest.split_once(']') else {
+            return Ok(None);
+        };
+        let Some(port) = rest.strip_prefix(':') else {
+            return Ok(None);
+        };
+
+        return parse_port(name, port).map(Some);
+    }
+
+    let Some((_, port)) = authority.rsplit_once(':') else {
+        return Ok(None);
+    };
+
+    parse_port(name, port).map(Some)
+}
+
+fn parse_port(name: &str, port: &str) -> Result<u16> {
+    if port.is_empty() {
+        return Err(Error::message(format!("policy: net {name} port empty")));
+    }
+
+    port.parse::<u16>()
+        .map_err(|source| Error::with_source(format!("policy: net {name} port"), source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn proxy_env_fills_missing_network_ports() {
+        let mut settings = json!({});
+
+        apply_proxy_env_defaults(&mut settings, |name| match name {
+            HTTP_PROXY => Some("http://127.0.0.1:8080".to_owned()),
+            SOCKS_PROXY => Some("socks5h://127.0.0.1:1080".to_owned()),
+            _ => None,
+        })
+        .expect("proxy env defaults");
+
+        assert_eq!(
+            settings,
+            json!({
+                "network": {
+                    "httpProxyPort": 8080,
+                    "socksProxyPort": 1080,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn json_proxy_ports_override_env() {
+        let mut settings = json!({
+            "network": {
+                "httpProxyPort": 9000,
+                "socksProxyPort": 9001,
+            },
+        });
+
+        apply_proxy_env_defaults(&mut settings, |_| Some("http://127.0.0.1:8080".to_owned()))
+            .expect("proxy env defaults");
+
+        assert_eq!(
+            settings,
+            json!({
+                "network": {
+                    "httpProxyPort": 9000,
+                    "socksProxyPort": 9001,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_null_proxy_port_overrides_env() {
+        let mut settings = json!({
+            "network": {
+                "httpProxyPort": null,
+            },
+        });
+
+        apply_proxy_env_defaults(&mut settings, |name| match name {
+            HTTP_PROXY => Some("http://127.0.0.1:8080".to_owned()),
+            SOCKS_PROXY => Some("socks5h://127.0.0.1:1080".to_owned()),
+            _ => None,
+        })
+        .expect("proxy env defaults");
+
+        assert_eq!(
+            settings,
+            json!({
+                "network": {
+                    "httpProxyPort": null,
+                    "socksProxyPort": 1080,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn proxy_env_uses_default_ports() {
+        let mut settings = json!({});
+
+        apply_proxy_env_defaults(&mut settings, |name| match name {
+            HTTP_PROXY => Some("127.0.0.1".to_owned()),
+            SOCKS_PROXY => Some("socks5://[::1]".to_owned()),
+            _ => None,
+        })
+        .expect("proxy env defaults");
+
+        assert_eq!(
+            settings,
+            json!({
+                "network": {
+                    "httpProxyPort": 80,
+                    "socksProxyPort": 1080,
+                },
+            })
+        );
     }
 }

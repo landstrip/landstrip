@@ -37,12 +37,16 @@ fn run() -> Result<()> {
     let settings = load_settings(&cli.policy_paths)?;
     let policy = lower_sandbox_policy(&settings.filesystem, &settings.network, &cli.policy_base)?;
 
-    if policy.network_access.local_tcp_bind {
-        let status = seccomp::run_local_bind(&policy, &cli.command, &cli.command_args)?;
+    if policy.network_access.local_tcp_bind || !policy.network_access.connect_tcp_ports.is_empty() {
+        let status = seccomp::run_network_broker(&policy, &cli.command, &cli.command_args)?;
         process::exit(status);
     }
 
     enforce_access_policy(&policy)?;
+    let filter = seccomp::network_filter(false, false)?;
+    filter
+        .load()
+        .map_err(|source| Error::with_source("seccomp: load", source))?;
     exec_command(&cli.command, &cli.command_args)
 }
 

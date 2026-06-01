@@ -84,20 +84,23 @@ and subtracting denied paths. Entries in
 .Va allowRead
 are then added back to the read allowlist.
 .Pp
-Direct TCP connections and binding are denied by default. The
+For TCP port rules,
+.Nm
+uses Landlock TCP port rules and a seccomp user-notification broker for
+address-level decisions. When the sandbox is applied, direct TCP connections are
+denied by default.
+.Pp
 .Va httpProxyPort
 and
 .Va socksProxyPort
-settings allow direct connections to configured proxy ports.
-.Va allowLocalBinding
-allows TCP binding to loopback addresses. Because Landlock cannot process local
-addresses, this mode uses a seccomp user-notification broker for
-.Xr bind 2
-and fails closed if that facility is unavailable.
-.Nm
-parses domain allow and deny lists but skips them.
-.Nm
-does not currently provide UDP or general address-based network filtering.
+allow connecting to proxy ports only on loopback addresses. Implicit default
+values can be provided via
+.Ev HTTP_PROXY
+and
+.Ev SOCKS_PROXY
+environment variables, which the corresponding JSON attributes override.
+.Pp
+Domain allow and deny lists are for the time being skipped.
 .Sh SANDBOX MODEL
 Landlock rules are tied to filesystem objects opened while the sandbox is
 created, not to path strings. If an allowed directory is removed and the same
