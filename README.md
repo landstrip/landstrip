@@ -8,16 +8,12 @@ macOS Seatbelt backend.
 
 ## Seatbelt and Landstrip comparison
 
-| Area      | Seatbelt backend         | Landstrip backend          |
-| --------- | ------------------------ | -------------------------- |
-| Kernel    | sandbox-exec / Seatbelt  | Landlock + seccomp         |
-| FS view   | host view + path rules   | host view + object rules   |
-| Timing    | dynamic path checks      | launch-time snapshot       |
-| Globs     | profile regex/path match | expanded at launch         |
-| TCP net   | localhost proxy ports    | loopback proxy ports       |
-| Proxies   | supplied by runtime      | supplied by caller/runtime |
-| Unix sock | path allowlist           | path allowlist via broker  |
-| Runtime   | unknown settings ignored | unknown settings ignored   |
+| Area         | Seatbelt                 | Landstrip                    |
+| ------------ | ------------------------ | -----------------------------|
+| Policy       | path based rules         | file based rules             |
+| Timing       | dynamic subset of paths  | file scan at launch          |
+| TCP          | localhost proxy ports    | loopback proxy ports         |
+| Unix sockets | allowlist                | allowlist via seccomp broker |
 
 ## Licensing
 
