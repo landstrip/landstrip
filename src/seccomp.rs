@@ -231,6 +231,9 @@ fn handle_bind(policy: &AccessPolicy, request: &ScmpNotifReq) -> SysResult<Notif
 
     match socket.kind() {
         SocketKind::Tcp => {
+            if !policy.network_access.local_tcp_bind {
+                return Err(Error::PolicyDenied);
+            }
             let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
             if !endpoint.loopback {
                 return Err(Error::PolicyDenied);
