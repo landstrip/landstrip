@@ -28,12 +28,15 @@ For TCP port rules `landstrip` uses Landlock TCP port rules and a seccomp
 user-notification broker for address-level decisions. When the sandbox is
 applied, direct TCP connections are denied by default.
 
-`httpProxyPort` and `socksProxyPort` allow connecting to proxy ports only on
-loopback addresses. Implicit default values can be provided via `HTTP_PROXY` and
-`SOCKS_PROXY` environment variables, which can get then overriden by the
-corresponding JSON attributes.
+`httpProxyPort` and `socksProxyPort` select local HTTP and SOCKS proxy ports.
+Connections to these ports are allowed only on loopback addresses. If domain
+filters are configured, `landstrip` starts the corresponding proxies and exports
+proxy environment variables to the child. `HTTP_PROXY` and `SOCKS_PROXY` provide
+defaults that the JSON attributes override.
 
-Domain allow and deny lists are for the time being skipped.
+`allowUnixSockets` lists Unix domain socket paths the policy permits.
+`allowAllUnixSockets` disables Unix domain socket path restriction. The default
+is to permit no Unix domain socket paths once Unix socket enforcement is active.
 
 ## Documenting errors
 

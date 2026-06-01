@@ -32,6 +32,8 @@ pub(crate) struct SandboxFilesystem {
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct SandboxNetwork {
     pub(crate) allow_local_binding: bool,
+    pub(crate) allow_all_unix_sockets: bool,
+    pub(crate) allow_unix_sockets: Vec<String>,
     pub(crate) http_proxy_port: Option<u16>,
     pub(crate) socks_proxy_port: Option<u16>,
     pub(crate) allowed_domains: Vec<String>,

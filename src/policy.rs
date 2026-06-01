@@ -30,7 +30,14 @@ pub(crate) struct NetworkAccess {
     pub(crate) connect_tcp_ports: Vec<u16>,
     pub(crate) restrict_bind_tcp: bool,
     pub(crate) local_tcp_bind: bool,
+    pub(crate) unix_socket_access: UnixSocketAccess,
     pub(crate) domain_policy: DomainPolicy,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UnixSocketAccess {
+    Unrestricted,
+    AllowPaths(Vec<PathBuf>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -68,11 +75,15 @@ pub(crate) fn lower_sandbox_policy(
     Ok(AccessPolicy {
         write_roots,
         read_access,
-        network_access: lower_network_policy(network)?,
+        network_access: lower_network_policy(network, &policy_base, home)?,
     })
 }
 
-fn lower_network_policy(network: &SandboxNetwork) -> Result<NetworkAccess> {
+fn lower_network_policy(
+    network: &SandboxNetwork,
+    policy_base: &Path,
+    home: Option<&Path>,
+) -> Result<NetworkAccess> {
     let mut connect_tcp_ports = Vec::new();
     push_proxy_port(
         &mut connect_tcp_ports,
@@ -88,12 +99,19 @@ fn lower_network_policy(network: &SandboxNetwork) -> Result<NetworkAccess> {
     connect_tcp_ports.dedup();
 
     let domain_policy = DomainPolicy::try_from(network)?;
+    let unix_socket_paths = resolve_paths(&network.allow_unix_sockets, policy_base, home)?;
+    let unix_socket_access = if network.allow_all_unix_sockets {
+        UnixSocketAccess::Unrestricted
+    } else {
+        UnixSocketAccess::AllowPaths(unix_socket_paths)
+    };
 
     Ok(NetworkAccess {
         restrict_connect_tcp: true,
         connect_tcp_ports,
         restrict_bind_tcp: !network.allow_local_binding,
         local_tcp_bind: network.allow_local_binding,
+        unix_socket_access,
         domain_policy,
     })
 }
