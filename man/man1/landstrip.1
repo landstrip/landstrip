@@ -106,10 +106,17 @@ and
 provide defaults that the JSON attributes override.
 .Pp
 .Va allowUnixSockets
-lists Unix domain socket paths the policy permits.
+permits pathname Unix socket
+.Xr connect 2
+and
+.Xr bind 2
+operations under listed paths. Relative paths are resolved against the
+sandboxed process current directory. Abstract and unnamed sockets,
+.Xr socketpair 2 ,
+and inherited descriptors are not path-mediated.
 .Va allowAllUnixSockets
-disables Unix domain socket path restriction. The default is to permit no Unix
-domain socket paths once Unix socket enforcement is active.
+permits new Unix sockets without path checks. By default, new Unix sockets are
+denied.
 .Sh SANDBOX MODEL
 Landlock rules are tied to filesystem objects opened while the sandbox is
 created, not to path strings. If an allowed directory is removed and the same

@@ -18,7 +18,7 @@ use crate::cli::parse_cli;
 use crate::config::load_settings;
 use crate::error::{Error, Result};
 use crate::landlock::enforce_access_policy;
-use crate::policy::lower_sandbox_policy;
+use crate::policy::{UnixSocketAccess, lower_sandbox_policy};
 use crate::proxy::NetworkProxies;
 use std::ffi::{OsStr, OsString};
 use std::net::{Ipv4Addr, TcpListener};
@@ -79,14 +79,21 @@ fn run() -> Result<()> {
         policy.network_access.connect_tcp_ports.dedup();
     }
 
-    if policy.network_access.local_tcp_bind || !policy.network_access.connect_tcp_ports.is_empty() {
+    if policy.network_access.local_tcp_bind
+        || !policy.network_access.connect_tcp_ports.is_empty()
+        || needs_unix_socket_broker(&policy.network_access.unix_socket_access)
+    {
         let status =
             seccomp::run_network_broker(&policy, &cli.command, &cli.command_args, proxies)?;
         process::exit(status);
     }
 
     enforce_access_policy(&policy)?;
-    let filter = seccomp::network_filter(false, false)?;
+    let filter = seccomp::network_filter(seccomp::NetworkFilter {
+        notify_bind: false,
+        notify_connect: false,
+        unix_sockets: unix_socket_filter(&policy.network_access.unix_socket_access),
+    })?;
     filter
         .load()
         .map_err(|source| Error::with_source("seccomp: load", source))?;
@@ -99,6 +106,20 @@ fn init_logger(debug: bool) {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
         .format_timestamp(None)
         .init();
+}
+
+fn needs_unix_socket_broker(access: &UnixSocketAccess) -> bool {
+    matches!(access, UnixSocketAccess::AllowPaths(paths) if !paths.is_empty())
+}
+
+fn unix_socket_filter(access: &UnixSocketAccess) -> seccomp::UnixSocketFilter {
+    match access {
+        UnixSocketAccess::Unrestricted => seccomp::UnixSocketFilter::Unrestricted,
+        UnixSocketAccess::AllowPaths(paths) if paths.is_empty() => {
+            seccomp::UnixSocketFilter::DenyAll
+        }
+        UnixSocketAccess::AllowPaths(_) => seccomp::UnixSocketFilter::PathMediated,
+    }
 }
 
 fn exec_command(command: &OsStr, args: &[OsString]) -> Result<()> {

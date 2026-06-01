@@ -34,9 +34,11 @@ filters are configured, `landstrip` starts the corresponding proxies and exports
 proxy environment variables to the child. `HTTP_PROXY` and `SOCKS_PROXY` provide
 defaults that the JSON attributes override.
 
-`allowUnixSockets` lists Unix domain socket paths the policy permits.
-`allowAllUnixSockets` disables Unix domain socket path restriction. The default
-is to permit no Unix domain socket paths once Unix socket enforcement is active.
+Unix domain sockets are denied by default. `allowUnixSockets` permits pathname
+socket `connect` and `bind` operations under listed paths, with relative paths
+resolved against the sandboxed process current directory. Abstract and unnamed
+sockets, `socketpair`, and inherited descriptors are not path-mediated;
+`allowAllUnixSockets` permits new Unix sockets without path checks.
 
 ## Documenting errors
 

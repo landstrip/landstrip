@@ -4,7 +4,7 @@
 use crate::error::{Error, Result};
 use crate::landlock::enforce_access_policy;
 use crate::paths::normalize_path;
-use crate::policy::AccessPolicy;
+use crate::policy::{AccessPolicy, UnixSocketAccess};
 use crate::proxy::{NetworkProxies, ProxyProtocol, accept_proxy};
 use libseccomp::{
     ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpNotifReq, ScmpNotifResp,
@@ -58,9 +58,15 @@ pub(crate) fn run_network_broker(
         )));
     }
 
-    let notify_bind = policy.network_access.local_tcp_bind;
-    let notify_connect = !policy.network_access.connect_tcp_ports.is_empty();
-    let _filter = network_filter(notify_bind, notify_connect)?;
+    let notify_unix_sockets = needs_unix_socket_broker(&policy.network_access.unix_socket_access);
+    let notify_bind = policy.network_access.local_tcp_bind || notify_unix_sockets;
+    let notify_connect = !policy.network_access.connect_tcp_ports.is_empty() || notify_unix_sockets;
+    let unix_sockets = unix_socket_filter(&policy.network_access.unix_socket_access);
+    let _filter = network_filter(NetworkFilter {
+        notify_bind,
+        notify_connect,
+        unix_sockets,
+    })?;
     let syscalls = NotificationSyscalls::new()?;
     let (parent, child_sock) =
         UnixStream::pair().map_err(|source| Error::with_source("seccomp: socketpair", source))?;
@@ -73,7 +79,11 @@ pub(crate) fn run_network_broker(
             let result = (|| -> Result<()> {
                 enforce_access_policy(policy)?;
 
-                let filter = network_filter(notify_bind, notify_connect)?;
+                let filter = network_filter(NetworkFilter {
+                    notify_bind,
+                    notify_connect,
+                    unix_sockets,
+                })?;
                 filter
                     .load()
                     .map_err(|source| Error::with_source("seccomp: load", source))?;
@@ -264,9 +274,28 @@ fn handle_connect(policy: &AccessPolicy, request: &ScmpNotifReq) -> SysResult<No
             broker_addr_call(socket.sock.as_raw_fd(), &socket.addr, libc::connect)
                 .map(NotificationResult::Value)
         }
-        SocketKind::Unix | SocketKind::Other => Ok(NotificationResult::Continue),
+        SocketKind::Unix => handle_unix_connect(policy, request.pid, &socket),
+        SocketKind::Other => Ok(NotificationResult::Continue),
         SocketKind::Unsupported => Err(libc::EAFNOSUPPORT),
     }
+}
+
+fn handle_unix_connect(
+    policy: &AccessPolicy,
+    pid: u32,
+    socket: &RemoteSocket,
+) -> SysResult<NotificationResult> {
+    let Some((target, relative)) = unix_path_target(pid, &socket.addr)? else {
+        return Err(libc::EACCES);
+    };
+    authorize_unix_path(policy, &target)?;
+
+    let mut addr = socket.addr.clone();
+    if relative {
+        rewrite_unix_path(&mut addr, &target)?;
+    }
+
+    broker_addr_call(socket.sock.as_raw_fd(), &addr, libc::connect).map(NotificationResult::Value)
 }
 
 fn handle_unix_bind(
@@ -274,40 +303,62 @@ fn handle_unix_bind(
     pid: u32,
     socket: &mut RemoteSocket,
 ) -> SysResult<NotificationResult> {
-    let sun_path = mem::size_of::<libc::sa_family_t>();
-    if socket.addr.len() > sun_path && socket.addr[sun_path] != 0 {
-        let path = &socket.addr[sun_path..];
-        let end = path
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(path.len());
-        if end > 0 {
-            let path = Path::new(OsStr::from_bytes(&path[..end]));
-            let target = if path.is_absolute() {
-                create_path(path)
-            } else {
-                let pid = i32::try_from(pid).map_err(|_| libc::EINVAL)?;
-                let cwd = fs::read_link(format!("/proc/{pid}/cwd"))
-                    .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
-                create_path(&cwd.join(path))
-            };
+    let Some((target, relative)) = unix_path_target(pid, &socket.addr)? else {
+        return Err(libc::EACCES);
+    };
+    authorize_unix_path(policy, &target)?;
 
-            if !policy
-                .write_roots
-                .iter()
-                .any(|root| target == *root || target.starts_with(root))
-            {
-                return Err(libc::EACCES);
-            }
+    if !policy
+        .write_roots
+        .iter()
+        .any(|root| target == *root || target.starts_with(root))
+    {
+        return Err(libc::EACCES);
+    }
 
-            if !path.is_absolute() {
-                rewrite_unix_path(&mut socket.addr, &target)?;
-            }
-        }
+    if relative {
+        rewrite_unix_path(&mut socket.addr, &target)?;
     }
 
     broker_addr_call(socket.sock.as_raw_fd(), &socket.addr, libc::bind)
         .map(NotificationResult::Value)
+}
+
+fn unix_path_target(pid: u32, addr: &[u8]) -> SysResult<Option<(PathBuf, bool)>> {
+    let sun_path = mem::size_of::<libc::sa_family_t>();
+    if addr.len() <= sun_path || addr[sun_path] == 0 {
+        return Ok(None);
+    }
+
+    let path = &addr[sun_path..];
+    let end = path
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(path.len());
+    if end == 0 {
+        return Ok(None);
+    }
+
+    let path = Path::new(OsStr::from_bytes(&path[..end]));
+    if path.is_absolute() {
+        Ok(Some((create_path(path), false)))
+    } else {
+        let pid = i32::try_from(pid).map_err(|_| libc::EINVAL)?;
+        let cwd = fs::read_link(format!("/proc/{pid}/cwd"))
+            .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
+        Ok(Some((create_path(&cwd.join(path)), true)))
+    }
+}
+
+fn authorize_unix_path(policy: &AccessPolicy, target: &Path) -> SysResult<()> {
+    match &policy.network_access.unix_socket_access {
+        UnixSocketAccess::Unrestricted => Ok(()),
+        UnixSocketAccess::AllowPaths(paths) => paths
+            .iter()
+            .any(|path| target == path || target.starts_with(path))
+            .then_some(())
+            .ok_or(libc::EACCES),
+    }
 }
 
 fn rewrite_unix_path(addr: &mut Vec<u8>, target: &Path) -> SysResult<()> {
@@ -455,26 +506,78 @@ fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> SysResult
     }
 }
 
-pub(crate) fn network_filter(notify_bind: bool, notify_connect: bool) -> Result<ScmpFilterContext> {
+pub(crate) fn network_filter(config: NetworkFilter) -> Result<ScmpFilterContext> {
     let syscalls = NotificationSyscalls::new()?;
     let mut filter = ScmpFilterContext::new(ScmpAction::Allow)
         .map_err(|source| Error::with_source("seccomp: filter", source))?;
 
     add_socket_family_filter(&mut filter, syscalls.socket)?;
+    add_unix_socket_filters(
+        &mut filter,
+        syscalls.socket,
+        syscalls.socketpair,
+        config.unix_sockets,
+    )?;
 
-    if notify_bind {
+    if config.notify_bind {
         filter
             .add_rule(ScmpAction::Notify, syscalls.bind)
             .map_err(|source| Error::with_source("seccomp: rule bind", source))?;
     }
 
-    if notify_connect {
+    if config.notify_connect {
         filter
             .add_rule(ScmpAction::Notify, syscalls.connect)
             .map_err(|source| Error::with_source("seccomp: rule connect", source))?;
     }
 
     Ok(filter)
+}
+
+fn add_unix_socket_filters(
+    filter: &mut ScmpFilterContext,
+    socket: ScmpSyscall,
+    socketpair: ScmpSyscall,
+    policy: UnixSocketFilter,
+) -> Result<()> {
+    match policy {
+        UnixSocketFilter::Unrestricted => {}
+        UnixSocketFilter::PathMediated => {
+            add_socket_domain_filter(filter, socketpair, libc::AF_UNIX)?;
+        }
+        UnixSocketFilter::DenyAll => {
+            add_socket_domain_filter(filter, socket, libc::AF_UNIX)?;
+            add_socket_domain_filter(filter, socketpair, libc::AF_UNIX)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn needs_unix_socket_broker(access: &UnixSocketAccess) -> bool {
+    matches!(access, UnixSocketAccess::AllowPaths(paths) if !paths.is_empty())
+}
+
+fn unix_socket_filter(access: &UnixSocketAccess) -> UnixSocketFilter {
+    match access {
+        UnixSocketAccess::Unrestricted => UnixSocketFilter::Unrestricted,
+        UnixSocketAccess::AllowPaths(paths) if paths.is_empty() => UnixSocketFilter::DenyAll,
+        UnixSocketAccess::AllowPaths(_) => UnixSocketFilter::PathMediated,
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct NetworkFilter {
+    pub(crate) notify_bind: bool,
+    pub(crate) notify_connect: bool,
+    pub(crate) unix_sockets: UnixSocketFilter,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum UnixSocketFilter {
+    Unrestricted,
+    PathMediated,
+    DenyAll,
 }
 
 fn add_socket_family_filter(filter: &mut ScmpFilterContext, socket: ScmpSyscall) -> Result<()> {
@@ -682,6 +785,7 @@ struct NotificationSyscalls {
     bind: ScmpSyscall,
     connect: ScmpSyscall,
     socket: ScmpSyscall,
+    socketpair: ScmpSyscall,
 }
 
 impl NotificationSyscalls {
@@ -693,6 +797,8 @@ impl NotificationSyscalls {
                 .map_err(|source| Error::with_source("seccomp: syscall connect", source))?,
             socket: ScmpSyscall::from_name("socket")
                 .map_err(|source| Error::with_source("seccomp: syscall socket", source))?,
+            socketpair: ScmpSyscall::from_name("socketpair")
+                .map_err(|source| Error::with_source("seccomp: syscall socketpair", source))?,
         })
     }
 }
