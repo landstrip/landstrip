@@ -3,17 +3,33 @@
 
 //! macOS Seatbelt (SBPL) sandbox backend.
 
-use crate::backend::Backend;
+use crate::backend::{Backend, exec_unix_command};
 use crate::error::{Error, Result};
-use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
+use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::Write;
-use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 const SBPL_PROFILE_FLAGS: u64 = 0;
+
+#[cfg(target_os = "macos")]
+pub(crate) struct MacosBackend;
+
+#[cfg(target_os = "macos")]
+impl Backend for MacosBackend {
+    fn execute(
+        &self,
+        policy: &AccessPolicy,
+        _policy_base: &Path,
+        command: &OsStr,
+        args: &[OsString],
+    ) -> Result<()> {
+        let profile = render_profile(policy, command);
+        <SystemSeatbelt as Seatbelt>::apply_profile(&profile)?;
+        exec_unix_command(command, args)
+    }
+}
 
 trait Seatbelt {
     fn apply_profile(profile: &str) -> Result<()>;
@@ -39,51 +55,6 @@ impl Seatbelt for SystemSeatbelt {
         } else {
             Err(Error::SeatbeltInit(take_sandbox_error(errorbuf)))
         }
-    }
-}
-
-fn take_sandbox_error(errorbuf: *mut libc::c_char) -> String {
-    if errorbuf.is_null() {
-        return "sandbox_init failed without an error message".to_string();
-    }
-
-    // SAFETY: sandbox_init returns a NULL-terminated error buffer on failure.
-    let message = unsafe { CStr::from_ptr(errorbuf) }
-        .to_string_lossy()
-        .into_owned();
-    // SAFETY: errorbuf was allocated by sandbox_init for this API.
-    unsafe { ffi::sandbox_free_error(errorbuf) };
-    message
-}
-
-mod ffi {
-    use libc::{c_char, c_int};
-
-    #[link(name = "sandbox")]
-    unsafe extern "C" {
-        pub(super) fn sandbox_init(
-            profile: *const c_char,
-            flags: u64,
-            errorbuf: *mut *mut c_char,
-        ) -> c_int;
-        pub(super) fn sandbox_free_error(errorbuf: *mut c_char);
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) struct SeatbeltBackend;
-
-#[cfg(target_os = "macos")]
-impl Backend for SeatbeltBackend {
-    fn execute(&self, policy: &AccessPolicy, command: &OsStr, args: &[OsString]) -> Result<()> {
-        let profile = render_profile(policy, command);
-        <SystemSeatbelt as Seatbelt>::apply_profile(&profile)?;
-
-        let error = Command::new(command).args(args).exec();
-        Err(Error::Exec {
-            command: command.to_os_string(),
-            source: error,
-        })
     }
 }
 
@@ -128,7 +99,7 @@ fn render_read_rules(sb: &mut String, read_access: &ReadAccess) {
     }
 }
 
-fn render_network_rules(sb: &mut String, network: &crate::policy::NetworkAccess) {
+fn render_network_rules(sb: &mut String, network: &NetworkAccess) {
     // Outbound TCP: deny everything, then allow only proxy loopback ports.
     if network.restrict_connect_tcp {
         sb.push_str("(deny network-outbound)\n");
@@ -193,4 +164,32 @@ fn escape_sbpl_literal(path: &str) -> String {
         }
     }
     escaped
+}
+
+fn take_sandbox_error(errorbuf: *mut libc::c_char) -> String {
+    if errorbuf.is_null() {
+        return "sandbox_init failed without an error message".to_string();
+    }
+
+    // SAFETY: sandbox_init returns a NULL-terminated error buffer on failure.
+    let message = unsafe { CStr::from_ptr(errorbuf) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: errorbuf was allocated by sandbox_init for this API.
+    unsafe { ffi::sandbox_free_error(errorbuf) };
+    message
+}
+
+mod ffi {
+    use libc::{c_char, c_int};
+
+    #[link(name = "sandbox")]
+    unsafe extern "C" {
+        pub(super) fn sandbox_init(
+            profile: *const c_char,
+            flags: u64,
+            errorbuf: *mut *mut c_char,
+        ) -> c_int;
+        pub(super) fn sandbox_free_error(errorbuf: *mut c_char);
+    }
 }

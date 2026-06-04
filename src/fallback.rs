@@ -10,11 +10,18 @@ use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::policy::AccessPolicy;
 use std::ffi::{OsStr, OsString};
+use std::path::Path;
 
 pub(crate) struct FallbackBackend;
 
 impl Backend for FallbackBackend {
-    fn execute(&self, _policy: &AccessPolicy, _command: &OsStr, _args: &[OsString]) -> Result<()> {
+    fn execute(
+        &self,
+        _policy: &AccessPolicy,
+        _policy_base: &Path,
+        _command: &OsStr,
+        _args: &[OsString],
+    ) -> Result<()> {
         Err(Error::UnsupportedPlatform)
     }
 }

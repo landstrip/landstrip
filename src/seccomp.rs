@@ -265,7 +265,15 @@ fn handle_connect(policy: &AccessPolicy, request: &ScmpNotifReq) -> SysResult<No
     match socket.kind() {
         SocketKind::Tcp => {
             let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
-            authorize_proxy_endpoint(&policy.network_access.connect_tcp_ports, endpoint)?;
+            if !endpoint.loopback
+                || !policy
+                    .network_access
+                    .connect_tcp_ports
+                    .contains(&endpoint.port)
+            {
+                return Err(Error::PolicyDenied);
+            }
+
             broker_addr_call(socket.sock.as_raw_fd(), &socket.addr, libc::connect)
                 .map(NotificationResult::Value)
         }
@@ -371,16 +379,13 @@ fn rewrite_unix_path(addr: &mut Vec<u8>, target: &Path) -> SysResult<()> {
     Ok(())
 }
 
-fn authorize_proxy_endpoint(ports: &[u16], endpoint: TcpEndpoint) -> SysResult<()> {
-    if !endpoint.loopback || !ports.contains(&endpoint.port) {
-        return Err(Error::PolicyDenied);
-    }
-
-    Ok(())
-}
-
 fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
-    match (domain, sockaddr_family(addr)?) {
+    let family = addr
+        .get(..mem::size_of::<libc::sa_family_t>())
+        .ok_or(Error::InvalidAddress)?;
+    let family = <[u8; 2]>::try_from(family).map_err(|_| Error::InvalidAddress)?;
+
+    match (domain, i32::from(libc::sa_family_t::from_ne_bytes(family))) {
         (libc::AF_INET, libc::AF_INET) => {
             if addr.len() < mem::size_of::<libc::sockaddr_in>() {
                 return Err(Error::InvalidAddress);
@@ -409,15 +414,6 @@ fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
         }
         _ => Err(Error::AddressFamilyNotSupported),
     }
-}
-
-fn sockaddr_family(addr: &[u8]) -> SysResult<i32> {
-    let family = addr
-        .get(..mem::size_of::<libc::sa_family_t>())
-        .ok_or(Error::InvalidAddress)?;
-    let family = <[u8; 2]>::try_from(family).map_err(|_| Error::InvalidAddress)?;
-
-    Ok(i32::from(libc::sa_family_t::from_ne_bytes(family)))
 }
 
 fn target_socket(request: &ScmpNotifReq) -> SysResult<TargetSocket> {

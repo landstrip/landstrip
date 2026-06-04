@@ -20,20 +20,20 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
     pub(crate) read_access: ReadAccess,
     pub(crate) network_access: NetworkAccess,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ReadAccess {
     Unrestricted,
     AllowRoots(Vec<PathBuf>),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NetworkAccess {
     pub(crate) restrict_connect_tcp: bool,
     pub(crate) connect_tcp_ports: Vec<u16>,
@@ -42,7 +42,7 @@ pub(crate) struct NetworkAccess {
     pub(crate) unix_socket_access: UnixSocketAccess,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) enum UnixSocketAccess {
     Unrestricted,
     AllowPaths(Vec<PathBuf>),
@@ -55,7 +55,12 @@ pub(crate) fn lower_sandbox_policy(
 ) -> Result<AccessPolicy> {
     let home_dir = dirs::home_dir();
     let home = home_dir.as_deref();
-    let policy_base = absolute_policy_base(policy_base)?;
+    let policy_base = if policy_base.is_absolute() {
+        policy_base.to_path_buf()
+    } else {
+        env::current_dir()?.join(policy_base)
+    };
+    let policy_base = normalize_path(&policy_base);
 
     let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
     let write_deny = resolve_paths(&filesystem.deny_write, &policy_base, home)?;
@@ -136,7 +141,11 @@ fn resolve_paths(
 
     for path in paths {
         let path = resolve_sandbox_path(path, policy_base, home)?;
-        if contains_glob_chars(&path) {
+        if path
+            .to_string_lossy()
+            .bytes()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
+        {
             resolved.extend(expand_glob_path(&path)?);
         } else {
             resolved.push(normalize_path(&path));
@@ -147,17 +156,6 @@ fn resolve_paths(
 
     Ok(resolved)
 }
-
-fn absolute_policy_base(policy_base: &Path) -> Result<PathBuf> {
-    let policy_base = if policy_base.is_absolute() {
-        policy_base.to_path_buf()
-    } else {
-        env::current_dir()?.join(policy_base)
-    };
-
-    Ok(normalize_path(&policy_base))
-}
-
 fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<PathBuf> {
     if path.is_empty() {
         return Err(Error::PolicyPathEmpty);
@@ -177,12 +175,6 @@ fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<
     };
 
     Ok(normalize_path_lexically(&resolved))
-}
-
-fn contains_glob_chars(path: &Path) -> bool {
-    path.to_string_lossy()
-        .bytes()
-        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
 }
 
 fn expand_glob_path(pattern: &Path) -> Result<Vec<PathBuf>> {
@@ -223,7 +215,12 @@ fn glob_base(pattern: &str) -> PathBuf {
 
 fn collect_glob_matches(path: &Path, pattern: &str, matches: &mut Vec<PathBuf>) -> Result<()> {
     let candidate = normalize_path_lexically(path);
-    if glob_matches(pattern.as_bytes(), candidate.to_string_lossy().as_bytes()) {
+    let candidate_text = candidate.to_string_lossy();
+    let pattern_bytes = pattern.as_bytes();
+    let candidate_bytes = candidate_text.as_bytes();
+    let mut memo = vec![vec![None; candidate_bytes.len() + 1]; pattern_bytes.len() + 1];
+
+    if glob_matches_at(pattern_bytes, candidate_bytes, 0, 0, &mut memo) {
         matches.push(candidate.clone());
     }
 
@@ -238,12 +235,6 @@ fn collect_glob_matches(path: &Path, pattern: &str, matches: &mut Vec<PathBuf>) 
 
     Ok(())
 }
-
-fn glob_matches(pattern: &[u8], text: &[u8]) -> bool {
-    let mut memo = vec![vec![None; text.len() + 1]; pattern.len() + 1];
-    glob_matches_at(pattern, text, 0, 0, &mut memo)
-}
-
 fn glob_matches_at(
     pattern: &[u8],
     text: &[u8],

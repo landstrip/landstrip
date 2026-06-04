@@ -13,7 +13,7 @@ use landlock::{
     ABI, AccessFs, AccessNet, BitFlags, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
     RulesetCreated, RulesetCreatedAttr, RulesetStatus,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub(crate) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
     let write_access = AccessFs::from_write(ABI::V7);
@@ -23,8 +23,25 @@ pub(crate) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
         ReadAccess::AllowRoots(_) => write_access | read_access,
     };
 
+    let mut network_access = BitFlags::<AccessNet>::EMPTY;
+
+    if policy.network_access.restrict_connect_tcp {
+        network_access |= AccessNet::ConnectTcp;
+    }
+
+    if policy.network_access.restrict_bind_tcp {
+        network_access |= AccessNet::BindTcp;
+    }
+
     let ruleset = Ruleset::default().handle_access(handled_access)?;
-    let mut ruleset = handle_network_access(ruleset, policy)?.create()?;
+    let mut ruleset = if network_access.is_empty() {
+        ruleset
+    } else {
+        ruleset
+            .handle_access(network_access)
+            .map_err(Error::LandlockRuleset)?
+    }
+    .create()?;
 
     ruleset = add_path_rules(ruleset, &policy.write_roots, write_access, "write")?;
 
@@ -43,26 +60,6 @@ pub(crate) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
     }
 }
 
-fn handle_network_access(ruleset: Ruleset, policy: &AccessPolicy) -> Result<Ruleset> {
-    let mut access = BitFlags::<AccessNet>::EMPTY;
-
-    if policy.network_access.restrict_connect_tcp {
-        access |= AccessNet::ConnectTcp;
-    }
-
-    if policy.network_access.restrict_bind_tcp {
-        access |= AccessNet::BindTcp;
-    }
-
-    if access.is_empty() {
-        return Ok(ruleset);
-    }
-
-    ruleset
-        .handle_access(access)
-        .map_err(Error::LandlockRuleset)
-}
-
 fn add_path_rules(
     mut ruleset: RulesetCreated,
     paths: &[PathBuf],
@@ -71,7 +68,12 @@ fn add_path_rules(
 ) -> Result<RulesetCreated> {
     for path in paths {
         let fd = PathFd::new(path)?;
-        let rule = PathBeneath::new(fd, access_for_path(path, access));
+        let path_access = if path.is_dir() {
+            access
+        } else {
+            access & AccessFs::from_file(ABI::V7)
+        };
+        let rule = PathBeneath::new(fd, path_access);
         ruleset = ruleset.add_rule(rule)?;
     }
 
@@ -89,12 +91,4 @@ fn add_network_rules(mut ruleset: RulesetCreated, policy: &AccessPolicy) -> Resu
     }
 
     Ok(ruleset)
-}
-
-fn access_for_path(path: &Path, access: BitFlags<AccessFs>) -> BitFlags<AccessFs> {
-    if path.is_dir() {
-        access
-    } else {
-        access & AccessFs::from_file(ABI::V7)
-    }
 }

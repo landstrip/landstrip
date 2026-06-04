@@ -21,9 +21,12 @@ mod seccomp;
 mod traversal;
 
 #[cfg(target_os = "macos")]
-mod apple;
+mod macos;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod fallback;
 
 use crate::backend::Backend;
@@ -40,28 +43,24 @@ fn main() {
             _ => 1,
         };
 
-        eprintln!("{error:?}");
+        eprintln!("{error}");
         process::exit(exit_code);
     }
 }
 
 fn run() -> Result<()> {
     let cli = parse_cli()?;
-    init_logger(cli.debug);
+    let default_filter = if cli.debug { "debug" } else { "warn" };
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
+        .format_timestamp(None)
+        .init();
 
     log::debug!("policy: base {}", cli.policy_base.display());
     let settings = load_settings(&cli.policy_paths)?;
     let policy = lower_sandbox_policy(&settings.filesystem, &settings.network, &cli.policy_base)?;
 
-    backend::PlatformBackend.execute(&policy, &cli.command, &cli.command_args)?;
+    backend::PlatformBackend.execute(&policy, &cli.policy_base, &cli.command, &cli.command_args)?;
 
     Ok(())
-}
-
-fn init_logger(debug: bool) {
-    let default_filter = if debug { "debug" } else { "warn" };
-
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
-        .format_timestamp(None)
-        .init();
 }

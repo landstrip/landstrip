@@ -5,7 +5,6 @@ use crate::error::{Error, Result};
 use argh::FromArgs;
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -71,7 +70,11 @@ fn parse_cli_action(
     program: &OsStr,
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<CliAction> {
-    let program_name = program_name(program);
+    let program_name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(PROGRAM_NAME)
+        .to_owned();
     let (option_args, command_tail) = split_cli_args(args);
     let options = match parse_cli_options(&program_name, option_args)? {
         ParsedOptions::Options(options) => options,
@@ -90,8 +93,19 @@ fn parse_cli_action(
     }
 
     let policy_base = env::current_dir()?;
+    debug_assert!(options.command.is_none());
+    let mut command_tail = command_tail.into_iter();
+    let command = command_tail
+        .next()
+        .ok_or_else(|| Error::Usage(command_required_usage(PROGRAM_NAME)))?;
 
-    cli_from_options(options, policy_base, command_tail).map(CliAction::Run)
+    Ok(CliAction::Run(Cli {
+        policy_paths: options.policy,
+        policy_base,
+        debug: options.debug,
+        command,
+        command_args: command_tail.collect(),
+    }))
 }
 
 fn split_cli_args(args: impl IntoIterator<Item = OsString>) -> (Vec<OsString>, Vec<OsString>) {
@@ -111,7 +125,7 @@ fn split_cli_args(args: impl IntoIterator<Item = OsString>) -> (Vec<OsString>, V
             continue;
         }
 
-        if arg.as_os_str().as_bytes().starts_with(b"-") {
+        if arg.to_string_lossy().starts_with('-') {
             option_args.push(arg);
             continue;
         }
@@ -122,27 +136,6 @@ fn split_cli_args(args: impl IntoIterator<Item = OsString>) -> (Vec<OsString>, V
     }
 
     (option_args, Vec::new())
-}
-
-fn cli_from_options(
-    options: CliOptions,
-    policy_base: PathBuf,
-    command_tail: Vec<OsString>,
-) -> Result<Cli> {
-    debug_assert!(options.command.is_none());
-
-    let mut command_tail = command_tail.into_iter();
-    let command = command_tail
-        .next()
-        .ok_or_else(|| Error::Usage(command_required_usage(PROGRAM_NAME)))?;
-
-    Ok(Cli {
-        policy_paths: options.policy,
-        policy_base,
-        debug: options.debug,
-        command,
-        command_args: command_tail.collect(),
-    })
 }
 
 fn parse_policy_path(path: &str) -> std::result::Result<PathBuf, String> {
@@ -162,53 +155,37 @@ fn parse_cli_options(
     program_name: &str,
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<ParsedOptions> {
-    let arg_strings =
-        option_args_to_strings(args).map_err(|_| Error::Usage("argument encoding".to_owned()))?;
+    let args = args.into_iter();
+    let mut arg_strings = Vec::with_capacity(args.size_hint().0);
+
+    for arg in args {
+        let string = arg
+            .into_string()
+            .map_err(|_| Error::Usage("argument encoding".to_owned()))?;
+
+        arg_strings.push(string);
+    }
+
     let arg_refs = arg_strings.iter().map(String::as_str).collect::<Vec<_>>();
 
     match CliOptions::from_args(&[program_name], &arg_refs) {
         Ok(options) => Ok(ParsedOptions::Options(options)),
-        Err(early_exit) => handle_cli_options_early_exit(&early_exit),
+        Err(early_exit) => {
+            if early_exit.status.is_ok() {
+                Ok(ParsedOptions::Exit(early_exit.output))
+            } else {
+                let message = early_exit
+                    .output
+                    .lines()
+                    .next()
+                    .filter(|line| !line.is_empty())
+                    .unwrap_or("arguments invalid");
+                Err(Error::Usage(message.to_owned()))
+            }
+        }
     }
-}
-
-fn option_args_to_strings(
-    args: impl IntoIterator<Item = OsString>,
-) -> std::result::Result<Vec<String>, OsString> {
-    let args = args.into_iter();
-    let mut strings = Vec::with_capacity(args.size_hint().0);
-
-    for arg in args {
-        let string = arg.into_string()?;
-
-        strings.push(string);
-    }
-
-    Ok(strings)
-}
-
-fn handle_cli_options_early_exit(early_exit: &argh::EarlyExit) -> Result<ParsedOptions> {
-    if early_exit.status.is_ok() {
-        return Ok(ParsedOptions::Exit(early_exit.output.clone()));
-    }
-
-    let message = early_exit
-        .output
-        .lines()
-        .next()
-        .filter(|line| !line.is_empty())
-        .unwrap_or("arguments invalid");
-    Err(Error::Usage(message.to_owned()))
 }
 
 fn command_required_usage(program_name: &str) -> String {
     format!("Usage: {program_name} [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.")
-}
-
-fn program_name(program: &OsStr) -> String {
-    Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(PROGRAM_NAME)
-        .to_owned()
 }

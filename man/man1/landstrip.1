@@ -3,7 +3,7 @@
 .Os
 .Sh NAME
 .Nm landstrip
-.Nd run a command inside an OS-level sandbox (Landlock on Linux, Seatbelt on macOS)
+.Nd run a command inside an OS-level sandbox
 .Sh SYNOPSIS
 .Nm
 .Op Fl -debug
@@ -15,8 +15,8 @@
 .Fl V
 .Sh DESCRIPTION
 .Nm
-loads a JSON policy, lowers the sandbox configuration into a Landlock
-allowlist, applies that ruleset to itself, and then executes
+loads a JSON policy, lowers the sandbox configuration into the platform sandbox
+model, applies that sandbox, and then executes
 .Ar command .
 If no policy file is specified, the policy document is read from standard
 input.
@@ -108,6 +108,10 @@ those when needed. Domain filtering is likewise a caller/runtime responsibility.
 Direct TCP remains denied except for configured proxy ports.
 Other settings are ignored.
 .Pp
+On Windows, TCP proxy-port filtering is not yet implemented. Policies that
+request proxy ports or local binding are rejected before launch. The Windows
+backend runs without network capabilities when no TCP access is requested.
+.Pp
 .Va allowUnixSockets
 permits pathname Unix socket
 .Xr connect 2
@@ -120,6 +124,8 @@ and inherited descriptors are not path-mediated.
 .Va allowAllUnixSockets
 permits new Unix sockets without path checks. By default, new Unix sockets are
 denied.
+.Pp
+Unix socket policy is unsupported on Windows and is rejected before launch.
 .Sh SANDBOX MODEL
 Landlock rules are tied to filesystem objects opened while the sandbox is
 created, not to path strings. If an allowed directory is removed and the same
@@ -130,6 +136,19 @@ Existing open file descriptors are not retroactively revoked.
 The traversal step gives deny rules snapshot semantics. Directories created
 outside the sandbox after policy setup are not exposed merely because their
 paths match a previous traversal result.
+.Pp
+On macOS,
+.Nm
+uses Seatbelt path rules.
+.Pp
+On Windows,
+.Nm
+uses a Less-Privileged AppContainer. The backend creates or reuses a
+deterministic AppContainer profile and grants that AppContainer SID access to
+the lowered read and write roots with Windows ACL entries. Because LPAC has no
+broad filesystem read capability, Windows policies must use explicit read
+allowlists; unrestricted read policy is rejected. AppContainer profiles and ACL
+grants can persist after the sandboxed process exits.
 .Sh EXIT STATUS
 On success,
 .Nm
