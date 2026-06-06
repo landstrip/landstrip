@@ -3,15 +3,16 @@
 
 //! Linux sandbox backend using Landlock and seccomp.
 
-use crate::backend::{Backend, exec_unix_command};
+use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::fd::close_inherited_fds;
 use crate::landlock::enforce_access_policy;
 use crate::policy::AccessPolicy;
 use crate::seccomp::{self, NetworkFilter};
 use std::ffi::{OsStr, OsString};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process;
+use std::process::{self, Command};
 
 pub(crate) struct LinuxBackend;
 
@@ -46,6 +47,10 @@ impl Backend for LinuxBackend {
             filter.load().map_err(Error::Seccomp)?;
         }
         close_inherited_fds();
-        exec_unix_command(command, args)
+        let error = Command::new(command).args(args).exec();
+        Err(Error::Exec {
+            command: command.to_os_string(),
+            source: error,
+        })
     }
 }

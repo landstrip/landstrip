@@ -3,12 +3,14 @@
 
 //! macOS Seatbelt (SBPL) sandbox backend.
 
-use crate::backend::{Backend, exec_unix_command};
+use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::Write;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr;
 
 const SBPL_PROFILE_FLAGS: u64 = 0;
@@ -27,7 +29,11 @@ impl Backend for MacosBackend {
     ) -> Result<()> {
         let profile = render_profile(policy, command);
         <SystemSeatbelt as Seatbelt>::apply_profile(&profile)?;
-        exec_unix_command(command, args)
+        let error = Command::new(command).args(args).exec();
+        Err(Error::Exec {
+            command: command.to_os_string(),
+            source: error,
+        })
     }
 }
 

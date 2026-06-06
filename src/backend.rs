@@ -3,16 +3,10 @@
 
 //! OS-specific sandbox execution backends.
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::error::Error;
 use crate::error::Result;
 use crate::policy::AccessPolicy;
 use std::ffi::{OsStr, OsString};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::process::Command;
 
 /// Trait for platform-specific sandbox backends.
 pub(crate) trait Backend {
@@ -27,15 +21,6 @@ pub(crate) trait Backend {
         command: &OsStr,
         args: &[OsString],
     ) -> Result<()>;
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn exec_unix_command(command: &OsStr, args: &[OsString]) -> Result<()> {
-    let error = Command::new(command).args(args).exec();
-    Err(Error::Exec {
-        command: command.to_os_string(),
-        source: error,
-    })
 }
 
 /// Compile-time platform backend selection.
