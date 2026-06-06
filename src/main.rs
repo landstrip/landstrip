@@ -4,6 +4,13 @@
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
 
+#[cfg_attr(target_os = "linux", path = "linux.rs")]
+#[cfg_attr(target_os = "macos", path = "macos.rs")]
+#[cfg_attr(target_os = "windows", path = "windows.rs")]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    path = "fallback.rs"
+)]
 mod backend;
 mod cli;
 mod config;
@@ -12,24 +19,12 @@ mod error;
 mod fd;
 #[cfg(target_os = "linux")]
 mod landlock;
-#[cfg(target_os = "linux")]
-mod linux;
 mod paths;
 mod policy;
 #[cfg(target_os = "linux")]
 mod seccomp;
 mod traversal;
 
-#[cfg(target_os = "macos")]
-mod macos;
-
-#[cfg(target_os = "windows")]
-mod windows;
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-mod fallback;
-
-use crate::backend::Backend;
 use crate::cli::parse_cli;
 use crate::config::load_settings;
 use crate::error::{Error, Result};
@@ -60,7 +55,7 @@ fn run() -> Result<()> {
     let settings = load_settings(&cli.policy_paths)?;
     let policy = lower_sandbox_policy(&settings.filesystem, &settings.network, &cli.policy_base)?;
 
-    backend::PlatformBackend.execute(&policy, &cli.policy_base, &cli.command, &cli.command_args)?;
+    backend::execute(&policy, &cli.policy_base, &cli.command, &cli.command_args)?;
 
     Ok(())
 }

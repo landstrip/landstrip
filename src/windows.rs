@@ -3,7 +3,6 @@
 
 //! Windows sandbox backend using LPAC `AppContainer`.
 
-use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
 use std::collections::hash_map::DefaultHasher;
@@ -43,25 +42,20 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICA
 
 const INFINITE: u32 = 0xffff_ffff;
 
-pub(crate) struct WindowsBackend;
+pub(crate) fn execute(
+    policy: &AccessPolicy,
+    policy_base: &Path,
+    command: &OsStr,
+    args: &[OsString],
+) -> Result<()> {
+    reject_unsupported_policy(policy)?;
 
-impl Backend for WindowsBackend {
-    fn execute(
-        &self,
-        policy: &AccessPolicy,
-        policy_base: &Path,
-        command: &OsStr,
-        args: &[OsString],
-    ) -> Result<()> {
-        reject_unsupported_policy(policy)?;
+    let moniker = appcontainer_moniker(policy_base, command, policy);
+    let mut profile = AppContainerProfile::new(&moniker)?;
+    grant_policy_access(policy, profile.sid())?;
 
-        let moniker = appcontainer_moniker(policy_base, command, policy);
-        let mut profile = AppContainerProfile::new(&moniker)?;
-        grant_policy_access(policy, profile.sid())?;
-
-        let exit_code = create_process_in_appcontainer(profile.sid(), command, args)?;
-        std::process::exit(i32::from_ne_bytes(exit_code.to_ne_bytes()));
-    }
+    let exit_code = create_process_in_appcontainer(profile.sid(), command, args)?;
+    std::process::exit(i32::from_ne_bytes(exit_code.to_ne_bytes()));
 }
 
 fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {

@@ -3,7 +3,6 @@
 
 //! macOS Seatbelt (SBPL) sandbox backend.
 
-use crate::backend::Backend;
 use crate::error::{Error, Result};
 use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -15,26 +14,19 @@ use std::ptr;
 
 const SBPL_PROFILE_FLAGS: u64 = 0;
 
-#[cfg(target_os = "macos")]
-pub(crate) struct MacosBackend;
-
-#[cfg(target_os = "macos")]
-impl Backend for MacosBackend {
-    fn execute(
-        &self,
-        policy: &AccessPolicy,
-        _policy_base: &Path,
-        command: &OsStr,
-        args: &[OsString],
-    ) -> Result<()> {
-        let profile = render_profile(policy, command);
-        <SystemSeatbelt as Seatbelt>::apply_profile(&profile)?;
-        let error = Command::new(command).args(args).exec();
-        Err(Error::Exec {
-            command: command.to_os_string(),
-            source: error,
-        })
-    }
+pub(crate) fn execute(
+    policy: &AccessPolicy,
+    _policy_base: &Path,
+    command: &OsStr,
+    args: &[OsString],
+) -> Result<()> {
+    let profile = render_profile(policy, command);
+    <SystemSeatbelt as Seatbelt>::apply_profile(&profile)?;
+    let error = Command::new(command).args(args).exec();
+    Err(Error::Exec {
+        command: command.to_os_string(),
+        source: error,
+    })
 }
 
 trait Seatbelt {
