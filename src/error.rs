@@ -60,27 +60,27 @@ pub(crate) enum Error {
     #[error("policy denied operation")]
     PolicyDenied,
 
-    #[error("policy file {file}: {error}", file = path.display())]
+    #[error("policy: {file}: {error}", file = path.display())]
     PolicyFile {
         path: PathBuf,
         #[source]
         error: io::Error,
     },
 
-    #[error("policy file {file}: {error}", file = path.display())]
+    #[error("policy: {file}: {error}", file = path.display())]
     PolicyFileJson {
         path: PathBuf,
         #[source]
         error: serde_json::Error,
     },
 
-    #[error("policy home unavailable")]
+    #[error("policy: home unavailable")]
     PolicyHomeUnavailable,
 
-    #[error("policy path empty")]
+    #[error("policy: path empty")]
     PolicyPathEmpty,
 
-    #[error("{0} port out of range")]
+    #[error("policy: {0} port out of range")]
     PolicyPortOutOfRange(PolicyPort),
 
     #[error("failed with {errno}")]
@@ -89,7 +89,7 @@ pub(crate) enum Error {
     #[error("unsupported platform")]
     UnsupportedPlatform,
 
-    #[error("unsupported policy: {0}")]
+    #[error("policy: unsupported: {0}")]
     UnsupportedPolicy(&'static str),
 
     #[error("{0}")]

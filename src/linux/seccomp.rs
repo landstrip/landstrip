@@ -17,10 +17,6 @@ use super::landlock::enforce_access_policy;
 use crate::error::{Error, Result};
 use crate::paths::normalize_path;
 use crate::policy::{AccessPolicy, UnixSocketAccess};
-use libseccomp::{
-    ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpNotifReq, ScmpNotifResp,
-    ScmpNotifRespFlags, ScmpSyscall, ScmpVersion, get_api as seccomp_api_level, notify_id_valid,
-};
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, fcntl};
 use nix::poll::{PollFd, PollFlags, poll};
@@ -28,6 +24,11 @@ use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, s
 use nix::sys::uio::{RemoteIoVec, process_vm_readv};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
+use seccompiler::{
+    BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule, TargetArch,
+};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
@@ -41,11 +42,32 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 
-const NOTIFY_API: u32 = 6;
 const POLL_MS: u16 = 100;
 const SOCK_TYPE_MASK: u64 = 0x0f;
+const SECCOMP_IOC_MAGIC: u8 = b'!';
+
+nix::ioctl_readwrite!(
+    seccomp_notif_recv,
+    SECCOMP_IOC_MAGIC,
+    0,
+    libc::seccomp_notif
+);
+nix::ioctl_readwrite!(
+    seccomp_notif_send,
+    SECCOMP_IOC_MAGIC,
+    1,
+    libc::seccomp_notif_resp
+);
+nix::ioctl_write_ptr!(seccomp_notif_id_valid, SECCOMP_IOC_MAGIC, 2, u64);
+
+#[repr(C)]
+struct SockFprog {
+    len: libc::c_ushort,
+    filter: *const seccompiler::sock_filter,
+}
 
 type SysResult<T> = std::result::Result<T, Error>;
+type RuleMap = BTreeMap<i64, Vec<SeccompRule>>;
 type SocketAddrCall =
     unsafe extern "C" fn(libc::c_int, *const libc::sockaddr, libc::socklen_t) -> libc::c_int;
 
@@ -55,25 +77,17 @@ pub(super) fn run_network_broker(
     command: &OsStr,
     args: &[OsString],
 ) -> Result<i32> {
-    let api_level = seccomp_api_level();
-    let version = ScmpVersion::current().map_err(|error| Error::BackendSetup(error.to_string()))?;
-
-    if api_level < NOTIFY_API {
-        return Err(Error::BackendUnavailable(format!(
-            "seccomp notify API {version} is too old: required {NOTIFY_API}, current {api_level}"
-        )));
-    }
-
     let notify_unix_sockets = needs_unix_socket_broker(&policy.network_access.unix_socket_access);
     let notify_bind = policy.network_access.local_tcp_bind || notify_unix_sockets;
     let notify_connect = !policy.network_access.connect_tcp_ports.is_empty() || notify_unix_sockets;
     let unix_sockets = unix_socket_filter(&policy.network_access.unix_socket_access);
-    let _filter = network_filter(NetworkFilter {
+    ensure_notification_supported()?;
+    let filters = network_filter(NetworkFilter {
         notify_bind,
         notify_connect,
         unix_sockets,
     })?;
-    let syscalls = NotificationSyscalls::new()?;
+    let syscalls = NotificationSyscalls::new();
     let (parent, child_sock) = UnixStream::pair()?;
 
     // SAFETY: landstrip forks before spawning threads; the child either execs the target or exits.
@@ -88,20 +102,10 @@ pub(super) fn run_network_broker(
 
                 {
                     let child_sock = child_sock;
-                    let filter = network_filter(NetworkFilter {
-                        notify_bind,
-                        notify_connect,
-                        unix_sockets,
-                    })?;
-                    filter
-                        .load()
-                        .map_err(|error| Error::BackendSetup(error.to_string()))?;
-                    let notify = filter
-                        .get_notify_fd()
-                        .map_err(|error| Error::BackendSetup(error.to_string()))?;
+                    let notify = filters.load_with_listener()?;
 
                     // SAFETY: notify is borrowed only for the duration of fcntl(2).
-                    let notify_fd = unsafe { BorrowedFd::borrow_raw(notify) };
+                    let notify_fd = unsafe { BorrowedFd::borrow_raw(notify.as_raw_fd()) };
                     let notify =
                         fcntl(notify_fd, FcntlArg::F_DUPFD_CLOEXEC(0)).map_err(|error| {
                             Error::SystemCall {
@@ -197,13 +201,11 @@ fn supervise_child(
             }
         }
 
-        let request = ScmpNotifReq::receive(notify_fd)
-            .map_err(|error| Error::BackendSetup(error.to_string()))?;
+        let request = receive_notification(notify_fd)?;
         let response = handle_notification(policy, &request, syscalls);
 
-        notify_id_valid(notify_fd, request.id)
-            .map_err(|error| Error::BackendSetup(error.to_string()))?;
-        if let Err(source) = response.respond(notify_fd) {
+        validate_notification_id(notify_fd, request.id)?;
+        if let Err(source) = respond_notification(notify_fd, response) {
             loop {
                 match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
                     Ok(WaitStatus::StillAlive) => break,
@@ -224,27 +226,126 @@ fn supervise_child(
 
 fn handle_notification(
     policy: &AccessPolicy,
-    request: &ScmpNotifReq,
+    request: &libc::seccomp_notif,
     syscalls: &NotificationSyscalls,
-) -> ScmpNotifResp {
-    let result = if request.data.syscall == syscalls.bind {
+) -> libc::seccomp_notif_resp {
+    let syscall = i64::from(request.data.nr);
+    let result = if syscall == syscalls.bind {
         handle_bind(policy, request)
-    } else if request.data.syscall == syscalls.connect {
+    } else if syscall == syscalls.connect {
         handle_connect(policy, request)
     } else {
         Ok(NotificationResult::Continue)
     };
 
     match result {
-        Ok(NotificationResult::Value(value)) => {
-            ScmpNotifResp::new_val(request.id, value, ScmpNotifRespFlags::empty())
-        }
-        Ok(NotificationResult::Continue) => {
-            ScmpNotifResp::new_continue(request.id, ScmpNotifRespFlags::empty())
-        }
+        Ok(NotificationResult::Value(value)) => notification_value(request.id, value),
+        Ok(NotificationResult::Continue) => notification_continue(request.id),
         Err(error) => {
             let errno = notification_errno(&error);
-            ScmpNotifResp::new_error(request.id, -errno.abs(), ScmpNotifRespFlags::empty())
+            notification_error(request.id, -errno.abs())
+        }
+    }
+}
+
+fn notification_value(id: u64, value: i64) -> libc::seccomp_notif_resp {
+    libc::seccomp_notif_resp {
+        id,
+        val: value,
+        error: 0,
+        flags: 0,
+    }
+}
+
+fn notification_continue(id: u64) -> libc::seccomp_notif_resp {
+    libc::seccomp_notif_resp {
+        id,
+        val: 0,
+        error: 0,
+        flags: libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32,
+    }
+}
+
+fn notification_error(id: u64, error: i32) -> libc::seccomp_notif_resp {
+    libc::seccomp_notif_resp {
+        id,
+        val: 0,
+        error,
+        flags: 0,
+    }
+}
+
+fn ensure_notification_supported() -> Result<()> {
+    let mut action = libc::SECCOMP_RET_USER_NOTIF;
+    seccomp_probe(
+        libc::SECCOMP_GET_ACTION_AVAIL,
+        ptr::addr_of_mut!(action).cast::<libc::c_void>(),
+    )?;
+
+    // SAFETY: zero is a valid initial byte pattern for this plain kernel UAPI struct.
+    let mut sizes = unsafe { mem::zeroed::<libc::seccomp_notif_sizes>() };
+    seccomp_probe(
+        libc::SECCOMP_GET_NOTIF_SIZES,
+        ptr::addr_of_mut!(sizes).cast::<libc::c_void>(),
+    )
+}
+
+fn seccomp_probe(operation: libc::c_uint, data: *mut libc::c_void) -> Result<()> {
+    // SAFETY: seccomp(2) copies the operation-specific data pointer before returning.
+    let rc = unsafe { libc::syscall(libc::SYS_seccomp, operation, 0, data) };
+    if rc < 0 {
+        return Err(Error::BackendUnavailable(format!(
+            "seccomp user notifications are unavailable: {}",
+            Errno::last()
+        )));
+    }
+
+    Ok(())
+}
+
+fn receive_notification(fd: RawFd) -> Result<libc::seccomp_notif> {
+    loop {
+        // SAFETY: zero is a valid initial byte pattern for this plain kernel UAPI struct.
+        let mut request = unsafe { mem::zeroed::<libc::seccomp_notif>() };
+        // SAFETY: request points to writable storage for SECCOMP_IOCTL_NOTIF_RECV.
+        match unsafe { seccomp_notif_recv(fd, ptr::addr_of_mut!(request)) } {
+            Ok(_) => return Ok(request),
+            Err(Errno::EINTR) => continue,
+            Err(error) => {
+                return Err(Error::SystemCall {
+                    errno: error as i32,
+                });
+            }
+        }
+    }
+}
+
+fn respond_notification(fd: RawFd, mut response: libc::seccomp_notif_resp) -> Result<()> {
+    loop {
+        // SAFETY: response points to initialized storage for SECCOMP_IOCTL_NOTIF_SEND.
+        match unsafe { seccomp_notif_send(fd, ptr::addr_of_mut!(response)) } {
+            Ok(_) => return Ok(()),
+            Err(Errno::EINTR) => continue,
+            Err(error) => {
+                return Err(Error::SystemCall {
+                    errno: error as i32,
+                });
+            }
+        }
+    }
+}
+
+fn validate_notification_id(fd: RawFd, id: u64) -> Result<()> {
+    loop {
+        // SAFETY: id points to initialized storage for SECCOMP_IOCTL_NOTIF_ID_VALID.
+        match unsafe { seccomp_notif_id_valid(fd, ptr::addr_of!(id)) } {
+            Ok(_) => return Ok(()),
+            Err(Errno::EINTR) => continue,
+            Err(error) => {
+                return Err(Error::SystemCall {
+                    errno: error as i32,
+                });
+            }
         }
     }
 }
@@ -264,7 +365,10 @@ fn notification_errno(error: &Error) -> i32 {
     }
 }
 
-fn handle_bind(policy: &AccessPolicy, request: &ScmpNotifReq) -> SysResult<NotificationResult> {
+fn handle_bind(
+    policy: &AccessPolicy,
+    request: &libc::seccomp_notif,
+) -> SysResult<NotificationResult> {
     let mut socket = target_socket(request)?;
 
     match socket.kind() {
@@ -286,7 +390,10 @@ fn handle_bind(policy: &AccessPolicy, request: &ScmpNotifReq) -> SysResult<Notif
     }
 }
 
-fn handle_connect(policy: &AccessPolicy, request: &ScmpNotifReq) -> SysResult<NotificationResult> {
+fn handle_connect(
+    policy: &AccessPolicy,
+    request: &libc::seccomp_notif,
+) -> SysResult<NotificationResult> {
     let socket = target_socket(request)?;
 
     match socket.kind() {
@@ -443,7 +550,7 @@ fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
     }
 }
 
-fn target_socket(request: &ScmpNotifReq) -> SysResult<TargetSocket> {
+fn target_socket(request: &libc::seccomp_notif) -> SysResult<TargetSocket> {
     let fd = RawFd::try_from(request.data.args[0]).map_err(|_| Error::BadFileDescriptor)?;
     let target_addr = usize::try_from(request.data.args[1]).map_err(|_| Error::BadAddress)?;
     let addr_len = usize::try_from(request.data.args[2]).map_err(|_| Error::InvalidAddress)?;
@@ -534,48 +641,201 @@ fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> SysResult
     }
 }
 
-pub(super) fn network_filter(config: NetworkFilter) -> Result<ScmpFilterContext> {
-    let syscalls = NotificationSyscalls::new()?;
-    let mut filter = ScmpFilterContext::new(ScmpAction::Allow)
-        .map_err(|error| Error::BackendSetup(error.to_string()))?;
+pub(super) fn network_filter(config: NetworkFilter) -> Result<NetworkFilters> {
+    let syscalls = NotificationSyscalls::new();
+    let mut errno_rules = RuleMap::new();
 
-    add_socket_family_filter(&mut filter, syscalls.socket)?;
+    add_socket_family_filter(&mut errno_rules, syscalls.socket)?;
     add_unix_socket_filters(
-        &mut filter,
+        &mut errno_rules,
         syscalls.socket,
         syscalls.socketpair,
         config.unix_sockets,
     )?;
 
-    if config.notify_bind {
-        filter
-            .add_rule(ScmpAction::Notify, syscalls.bind)
-            .map_err(|error| Error::BackendSetup(error.to_string()))?;
+    let eafnosupport = u32::try_from(libc::EAFNOSUPPORT).map_err(|_| Error::InvalidAddress)?;
+    let errno = build_filter(errno_rules, SeccompAction::Errno(eafnosupport))?;
+    let notify = if config.notify_bind || config.notify_connect {
+        let mut notify_syscalls = Vec::new();
+        if config.notify_bind {
+            notify_syscalls.push(syscalls.bind);
+        }
+        if config.notify_connect {
+            notify_syscalls.push(syscalls.connect);
+        }
+        Some(build_notify_filter(&notify_syscalls)?)
+    } else {
+        None
+    };
+
+    Ok(NetworkFilters { errno, notify })
+}
+
+pub(super) struct NetworkFilters {
+    errno: BpfProgram,
+    notify: Option<BpfProgram>,
+}
+
+impl NetworkFilters {
+    pub(super) fn load(&self) -> Result<()> {
+        load_program(&self.errno, 0)?;
+        if let Some(notify) = &self.notify {
+            load_program(notify, 0)?;
+        }
+
+        Ok(())
     }
 
-    if config.notify_connect {
-        filter
-            .add_rule(ScmpAction::Notify, syscalls.connect)
-            .map_err(|error| Error::BackendSetup(error.to_string()))?;
+    fn load_with_listener(&self) -> Result<OwnedFd> {
+        load_program(&self.errno, 0)?;
+        let notify = self
+            .notify
+            .as_ref()
+            .ok_or_else(|| Error::BackendSetup("missing seccomp notification filter".into()))?;
+
+        load_program(notify, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)?.ok_or_else(|| {
+            Error::BackendSetup("seccomp did not return a notification listener".into())
+        })
+    }
+}
+
+fn build_filter(rules: RuleMap, match_action: SeccompAction) -> Result<BpfProgram> {
+    let filter = SeccompFilter::new(rules, SeccompAction::Allow, match_action, target_arch()?)
+        .map_err(|error| Error::BackendSetup(error.to_string()))?;
+    let program = <BpfProgram as TryFrom<SeccompFilter>>::try_from(filter)
+        .map_err(|error| Error::BackendSetup(error.to_string()))?;
+
+    Ok(program)
+}
+
+fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
+    let mut program = BpfProgram::with_capacity(syscalls.len() * 2 + 2);
+
+    program.push(bpf_stmt(
+        (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+        0,
+    ));
+    for syscall in syscalls {
+        program.push(bpf_jump(
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            u32::try_from(*syscall).map_err(|_| Error::InvalidAddress)?,
+            0,
+            1,
+        ));
+        program.push(bpf_stmt(
+            (libc::BPF_RET | libc::BPF_K) as u16,
+            libc::SECCOMP_RET_USER_NOTIF,
+        ));
+    }
+    program.push(bpf_stmt(
+        (libc::BPF_RET | libc::BPF_K) as u16,
+        libc::SECCOMP_RET_ALLOW,
+    ));
+
+    Ok(program)
+}
+
+fn bpf_stmt(code: u16, k: u32) -> seccompiler::sock_filter {
+    seccompiler::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    }
+}
+
+fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> seccompiler::sock_filter {
+    seccompiler::sock_filter { code, jt, jf, k }
+}
+
+fn target_arch() -> Result<TargetArch> {
+    match std::env::consts::ARCH {
+        "x86_64" => Ok(TargetArch::x86_64),
+        "aarch64" => Ok(TargetArch::aarch64),
+        "riscv64" => Ok(TargetArch::riscv64),
+        arch => Err(Error::BackendUnavailable(format!(
+            "seccompiler does not support Linux architecture {arch}"
+        ))),
+    }
+}
+
+fn load_program(program: &BpfProgram, flags: libc::c_ulong) -> Result<Option<OwnedFd>> {
+    if program.is_empty() {
+        return Err(Error::BackendSetup("empty seccomp filter".into()));
     }
 
-    Ok(filter)
+    // SAFETY: prctl(2) copies scalar arguments only.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(Error::SystemCall {
+            errno: Errno::last() as i32,
+        });
+    }
+
+    let len = libc::c_ushort::try_from(program.len()).map_err(|_| Error::InvalidAddress)?;
+    let filter = SockFprog {
+        len,
+        filter: program.as_ptr(),
+    };
+
+    // SAFETY: filter points to a live seccomp BPF program for the duration of the syscall.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            flags,
+            ptr::addr_of!(filter),
+        )
+    };
+    if rc < 0 {
+        return Err(Error::SystemCall {
+            errno: Errno::last() as i32,
+        });
+    }
+
+    if flags & libc::SECCOMP_FILTER_FLAG_NEW_LISTENER == 0 {
+        return Ok(None);
+    }
+
+    let fd = RawFd::try_from(rc).map_err(|_| Error::InvalidAddress)?;
+    // SAFETY: seccomp returned a new listener fd when NEW_LISTENER was set.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+fn seccomp_condition(
+    arg_index: u8,
+    operator: SeccompCmpOp,
+    value: u64,
+) -> Result<SeccompCondition> {
+    SeccompCondition::new(arg_index, SeccompCmpArgLen::Dword, operator, value)
+        .map_err(|error| Error::BackendSetup(error.to_string()))
+}
+
+fn add_conditional_rule(
+    rules: &mut RuleMap,
+    syscall: i64,
+    conditions: Vec<SeccompCondition>,
+) -> Result<()> {
+    let rule =
+        SeccompRule::new(conditions).map_err(|error| Error::BackendSetup(error.to_string()))?;
+    rules.entry(syscall).or_default().push(rule);
+
+    Ok(())
 }
 
 fn add_unix_socket_filters(
-    filter: &mut ScmpFilterContext,
-    socket: ScmpSyscall,
-    socketpair: ScmpSyscall,
+    rules: &mut RuleMap,
+    socket: i64,
+    socketpair: i64,
     policy: UnixSocketFilter,
 ) -> Result<()> {
     match policy {
         UnixSocketFilter::Unrestricted => {}
         UnixSocketFilter::PathMediated => {
-            add_socket_domain_filter(filter, socketpair, libc::AF_UNIX)?;
+            add_socket_domain_filter(rules, socketpair, libc::AF_UNIX)?;
         }
         UnixSocketFilter::DenyAll => {
-            add_socket_domain_filter(filter, socket, libc::AF_UNIX)?;
-            add_socket_domain_filter(filter, socketpair, libc::AF_UNIX)?;
+            add_socket_domain_filter(rules, socket, libc::AF_UNIX)?;
+            add_socket_domain_filter(rules, socketpair, libc::AF_UNIX)?;
         }
     }
 
@@ -608,7 +868,7 @@ pub(super) enum UnixSocketFilter {
     DenyAll,
 }
 
-fn add_socket_family_filter(filter: &mut ScmpFilterContext, socket: ScmpSyscall) -> Result<()> {
+fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Result<()> {
     let stream = u64::try_from(libc::SOCK_STREAM).map_err(|_| Error::InvalidAddress)?;
     let tcp = u64::try_from(libc::IPPROTO_TCP).map_err(|_| Error::InvalidAddress)?;
 
@@ -620,67 +880,54 @@ fn add_socket_family_filter(filter: &mut ScmpFilterContext, socket: ScmpSyscall)
                 continue;
             }
 
-            filter
-                .add_rule_conditional(
-                    ScmpAction::Errno(libc::EAFNOSUPPORT),
-                    socket,
-                    &[
-                        ScmpArgCompare::new(0, ScmpCompareOp::Equal, domain),
-                        ScmpArgCompare::new(1, ScmpCompareOp::MaskedEqual(SOCK_TYPE_MASK), ty),
-                    ],
-                )
-                .map_err(|error| Error::BackendSetup(error.to_string()))?;
+            add_conditional_rule(
+                rules,
+                socket,
+                vec![
+                    seccomp_condition(0, SeccompCmpOp::Eq, domain)?,
+                    seccomp_condition(1, SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK), ty)?,
+                ],
+            )?;
         }
 
         for proto in 1..tcp {
-            filter
-                .add_rule_conditional(
-                    ScmpAction::Errno(libc::EAFNOSUPPORT),
-                    socket,
-                    &[
-                        ScmpArgCompare::new(0, ScmpCompareOp::Equal, domain),
-                        ScmpArgCompare::new(1, ScmpCompareOp::MaskedEqual(SOCK_TYPE_MASK), stream),
-                        ScmpArgCompare::new(2, ScmpCompareOp::Equal, proto),
-                    ],
-                )
-                .map_err(|error| Error::BackendSetup(error.to_string()))?;
+            add_conditional_rule(
+                rules,
+                socket,
+                vec![
+                    seccomp_condition(0, SeccompCmpOp::Eq, domain)?,
+                    seccomp_condition(1, SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK), stream)?,
+                    seccomp_condition(2, SeccompCmpOp::Eq, proto)?,
+                ],
+            )?;
         }
 
-        filter
-            .add_rule_conditional(
-                ScmpAction::Errno(libc::EAFNOSUPPORT),
-                socket,
-                &[
-                    ScmpArgCompare::new(0, ScmpCompareOp::Equal, domain),
-                    ScmpArgCompare::new(1, ScmpCompareOp::MaskedEqual(SOCK_TYPE_MASK), stream),
-                    ScmpArgCompare::new(2, ScmpCompareOp::Greater, tcp),
-                ],
-            )
-            .map_err(|error| Error::BackendSetup(error.to_string()))?;
+        add_conditional_rule(
+            rules,
+            socket,
+            vec![
+                seccomp_condition(0, SeccompCmpOp::Eq, domain)?,
+                seccomp_condition(1, SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK), stream)?,
+                seccomp_condition(2, SeccompCmpOp::Gt, tcp)?,
+            ],
+        )?;
     }
 
     for domain in [libc::AF_PACKET, libc::AF_NETLINK] {
-        add_socket_domain_filter(filter, socket, domain)?;
+        add_socket_domain_filter(rules, socket, domain)?;
     }
 
     Ok(())
 }
 
-fn add_socket_domain_filter(
-    filter: &mut ScmpFilterContext,
-    socket: ScmpSyscall,
-    domain: i32,
-) -> Result<()> {
+fn add_socket_domain_filter(rules: &mut RuleMap, socket: i64, domain: i32) -> Result<()> {
     let domain = u64::try_from(domain).map_err(|_| Error::InvalidAddress)?;
 
-    filter
-        .add_rule_conditional(
-            ScmpAction::Errno(libc::EAFNOSUPPORT),
-            socket,
-            &[ScmpArgCompare::new(0, ScmpCompareOp::Equal, domain)],
-        )
-        .map(|_| ())
-        .map_err(|error| Error::BackendSetup(error.to_string()))
+    add_conditional_rule(
+        rules,
+        socket,
+        vec![seccomp_condition(0, SeccompCmpOp::Eq, domain)?],
+    )
 }
 
 fn create_path(path: &Path) -> PathBuf {
@@ -836,24 +1083,20 @@ enum NotificationResult {
 }
 
 struct NotificationSyscalls {
-    bind: ScmpSyscall,
-    connect: ScmpSyscall,
-    socket: ScmpSyscall,
-    socketpair: ScmpSyscall,
+    bind: i64,
+    connect: i64,
+    socket: i64,
+    socketpair: i64,
 }
 
 impl NotificationSyscalls {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            bind: ScmpSyscall::from_name("bind")
-                .map_err(|error| Error::BackendSetup(error.to_string()))?,
-            connect: ScmpSyscall::from_name("connect")
-                .map_err(|error| Error::BackendSetup(error.to_string()))?,
-            socket: ScmpSyscall::from_name("socket")
-                .map_err(|error| Error::BackendSetup(error.to_string()))?,
-            socketpair: ScmpSyscall::from_name("socketpair")
-                .map_err(|error| Error::BackendSetup(error.to_string()))?,
-        })
+    fn new() -> Self {
+        Self {
+            bind: i64::from(libc::SYS_bind),
+            connect: i64::from(libc::SYS_connect),
+            socket: i64::from(libc::SYS_socket),
+            socketpair: i64::from(libc::SYS_socketpair),
+        }
     }
 }
 

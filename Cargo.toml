@@ -24,8 +24,8 @@ thiserror = "2.0.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
-libseccomp = "0.4"
-nix = { version = "0.30", features = ["fs", "poll", "process", "socket", "uio"] }
+seccompiler = "0.5"
+nix = { version = "0.30", features = ["fs", "ioctl", "poll", "process", "socket", "uio"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.60", features = [

@@ -43,9 +43,7 @@ pub(crate) fn execute(
             notify_connect: false,
             unix_sockets: seccomp::unix_socket_filter(&network.unix_socket_access),
         })?;
-        filter
-            .load()
-            .map_err(|error| Error::BackendSetup(error.to_string()))?;
+        filter.load()?;
     }
     close_inherited_fds();
     let error = Command::new(command).args(args).exec();
