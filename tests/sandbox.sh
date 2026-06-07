@@ -144,7 +144,7 @@ expect_listener_allowed() {
 
 policy_read=$tmp/policy-read.json
 printf '{"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%s/allowed"]}}' "$tmp" >"$policy_read"
-expect_success "unrestricted read policy runs command" \
+expect_success "unrestricted read policy runs tool" \
     "$bin" -p "$policy_read" "$sandbox_shell" -c 'printf ok\\n'
 
 policy_fs=$tmp/policy-fs.json

@@ -20,7 +20,7 @@ use std::process::{self, Command};
 pub(crate) fn execute(
     policy: &AccessPolicy,
     _policy_base: &Path,
-    command: &OsStr,
+    tool: &OsStr,
     args: &[OsString],
 ) -> Result<()> {
     let network = &policy.network_access;
@@ -31,7 +31,7 @@ pub(crate) fn execute(
             || !network.connect_tcp_ports.is_empty()
             || seccomp::needs_unix_socket_broker(&network.unix_socket_access))
     {
-        let status = seccomp::run_network_broker(policy, command, args)?;
+        let status = seccomp::run_network_broker(policy, tool, args)?;
         process::exit(status);
     }
 
@@ -46,9 +46,6 @@ pub(crate) fn execute(
         filter.load()?;
     }
     close_inherited_fds();
-    let error = Command::new(command).args(args).exec();
-    Err(Error::command(
-        Some(command.to_os_string()),
-        error.to_string(),
-    ))
+    let error = Command::new(tool).args(args).exec();
+    Err(Error::tool(Some(tool.to_os_string()), error.to_string()))
 }

@@ -15,15 +15,15 @@ pub(crate) struct Cli {
     pub(crate) policy_paths: Vec<PathBuf>,
     pub(crate) policy_base: PathBuf,
     pub(crate) debug: bool,
-    pub(crate) command: OsString,
-    pub(crate) command_args: Vec<OsString>,
+    pub(crate) tool: OsString,
+    pub(crate) tool_args: Vec<OsString>,
 }
 
 #[derive(Debug, FromArgs)]
 #[argh(
     help_triggers("-h", "--help"),
     description = "Landlock sandbox runner",
-    usage = "[OPTIONS] <COMMAND> [ARG...]",
+    usage = "[OPTIONS] <TOOL> [ARG...]",
     example = "{command_name} -p policy.json cargo test"
 )]
 struct CliOptions {
@@ -39,9 +39,9 @@ struct CliOptions {
     #[argh(option, short = 'p', from_str_fn(parse_policy_path))]
     policy: Vec<PathBuf>,
 
-    /// command to run inside the sandbox, followed by its arguments
+    /// tool to run inside the sandbox, followed by its arguments
     #[argh(positional)]
-    command: Option<String>,
+    tool: Option<String>,
 }
 
 #[derive(Debug)]
@@ -75,7 +75,7 @@ fn parse_cli_action(
         .and_then(|name| name.to_str())
         .unwrap_or(PROGRAM_NAME)
         .to_owned();
-    let (option_args, command_tail) = split_cli_args(args);
+    let (option_args, tool_tail) = split_cli_args(args);
     let options = match parse_cli_options(&program_name, option_args)? {
         ParsedOptions::Options(options) => options,
         ParsedOptions::Exit(output) => return Ok(CliAction::Exit(output)),
@@ -88,23 +88,23 @@ fn parse_cli_action(
         )));
     }
 
-    if command_tail.is_empty() {
-        return Err(Error::Usage(command_required_usage(&program_name)));
+    if tool_tail.is_empty() {
+        return Err(Error::Usage(tool_required_usage(&program_name)));
     }
 
     let policy_base = env::current_dir()?;
-    debug_assert!(options.command.is_none());
-    let mut command_tail = command_tail.into_iter();
-    let command = command_tail
+    debug_assert!(options.tool.is_none());
+    let mut tool_tail = tool_tail.into_iter();
+    let tool = tool_tail
         .next()
-        .ok_or_else(|| Error::Usage(command_required_usage(PROGRAM_NAME)))?;
+        .ok_or_else(|| Error::Usage(tool_required_usage(PROGRAM_NAME)))?;
 
     Ok(CliAction::Run(Cli {
         policy_paths: options.policy,
         policy_base,
         debug: options.debug,
-        command,
-        command_args: command_tail.collect(),
+        tool,
+        tool_args: tool_tail.collect(),
     }))
 }
 
@@ -130,9 +130,9 @@ fn split_cli_args(args: impl IntoIterator<Item = OsString>) -> (Vec<OsString>, V
             continue;
         }
 
-        let mut command_tail = vec![arg];
-        command_tail.extend(args);
-        return (option_args, command_tail);
+        let mut tool_tail = vec![arg];
+        tool_tail.extend(args);
+        return (option_args, tool_tail);
     }
 
     (option_args, Vec::new())
@@ -186,6 +186,6 @@ fn parse_cli_options(
     }
 }
 
-fn command_required_usage(program_name: &str) -> String {
-    format!("Usage: {program_name} [OPTIONS] <COMMAND>\n\nFor more information, try '--help'.")
+fn tool_required_usage(program_name: &str) -> String {
+    format!("Usage: {program_name} [OPTIONS] <TOOL>\n\nFor more information, try '--help'.")
 }

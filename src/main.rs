@@ -54,27 +54,27 @@ fn response_error(error: &Error) -> Option<Response<'_>> {
         Error::Policy { file, message } => Some(Response {
             code: "policy",
             file: file.as_ref().map(|file| file.display().to_string()),
-            command: None,
+            program: None,
             message,
         }),
-        Error::Command { command, message } => Some(Response {
-            code: "command",
+        Error::Tool { program, message } => Some(Response {
+            code: "tool",
             file: None,
-            command: command
+            program: program
                 .as_ref()
-                .map(|command| command.to_string_lossy().into_owned()),
+                .map(|program| program.to_string_lossy().into_owned()),
             message,
         }),
         Error::Capability { message } => Some(Response {
             code: "capability",
             file: None,
-            command: None,
+            program: None,
             message,
         }),
         Error::System { message } => Some(Response {
             code: "system",
             file: None,
-            command: None,
+            program: None,
             message,
         }),
     }
@@ -86,7 +86,7 @@ struct Response<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    command: Option<String>,
+    program: Option<String>,
     message: &'a str,
 }
 
@@ -102,7 +102,7 @@ fn run() -> Result<()> {
     let settings = load_settings(&cli.policy_paths)?;
     let policy = lower_sandbox_policy(&settings.filesystem, &settings.network, &cli.policy_base)?;
 
-    backend::execute(&policy, &cli.policy_base, &cli.command, &cli.command_args)?;
+    backend::execute(&policy, &cli.policy_base, &cli.tool, &cli.tool_args)?;
 
     Ok(())
 }

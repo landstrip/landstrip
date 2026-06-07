@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! File descriptor cleanup before executing the sandboxed command.
+//! File descriptor cleanup before executing the sandboxed tool.
 //!
 //! Descriptors above stdio are closed so ambient inherited handles do not bypass
 //! the sandbox.

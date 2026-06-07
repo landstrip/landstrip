@@ -17,8 +17,8 @@ pub(crate) enum Error {
         file: Option<PathBuf>,
         message: String,
     },
-    Command {
-        command: Option<OsString>,
+    Tool {
+        program: Option<OsString>,
         message: String,
     },
     Capability {
@@ -44,9 +44,9 @@ impl Error {
         }
     }
 
-    pub(crate) fn command(command: Option<OsString>, message: impl Into<String>) -> Self {
-        Self::Command {
-            command,
+    pub(crate) fn tool(program: Option<OsString>, message: impl Into<String>) -> Self {
+        Self::Tool {
+            program,
             message: message.into(),
         }
     }
@@ -68,18 +68,18 @@ impl fmt::Display for Error {
             }
             | Self::Capability { message }
             | Self::System { message }
-            | Self::Command {
-                command: None,
+            | Self::Tool {
+                program: None,
                 message,
             } => f.write_str(message),
             Self::Policy {
                 file: Some(file),
                 message,
             } => write!(f, "{}: {message}", file.display()),
-            Self::Command {
-                command: Some(command),
+            Self::Tool {
+                program: Some(program),
                 message,
-            } => write!(f, "{}: {message}", command.to_string_lossy()),
+            } => write!(f, "{}: {message}", program.to_string_lossy()),
         }
     }
 }

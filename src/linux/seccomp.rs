@@ -104,7 +104,7 @@ impl BrokerError {
 #[allow(clippy::too_many_lines)]
 pub(super) fn run_network_broker(
     policy: &AccessPolicy,
-    command: &OsStr,
+    tool: &OsStr,
     args: &[OsString],
 ) -> Result<i32> {
     let notify_unix_sockets = needs_unix_socket_broker(&policy.network_access.unix_socket_access);
@@ -120,7 +120,7 @@ pub(super) fn run_network_broker(
     let syscalls = NotificationSyscalls::new();
     let (parent, child_sock) = UnixStream::pair()?;
 
-    // SAFETY: landstrip forks before spawning threads; the child either execs the target or exits.
+    // SAFETY: landstrip forks before spawning threads; the child either execs the tool or exits.
     match unsafe { fork() }.map_err(|error| system_errno(error as i32))? {
         ForkResult::Child => {
             drop(parent);
@@ -143,14 +143,11 @@ pub(super) fn run_network_broker(
                 }
                 close_inherited_fds();
 
-                let mut child_command = Command::new(command);
-                child_command.args(args);
+                let mut child_tool = Command::new(tool);
+                child_tool.args(args);
 
-                let error = child_command.exec();
-                Err(Error::command(
-                    Some(command.to_os_string()),
-                    error.to_string(),
-                ))
+                let error = child_tool.exec();
+                Err(Error::tool(Some(tool.to_os_string()), error.to_string()))
             })();
 
             if let Err(error) = result {

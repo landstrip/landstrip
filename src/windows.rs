@@ -45,16 +45,16 @@ const INFINITE: u32 = 0xffff_ffff;
 pub(crate) fn execute(
     policy: &AccessPolicy,
     policy_base: &Path,
-    command: &OsStr,
+    tool: &OsStr,
     args: &[OsString],
 ) -> Result<()> {
     reject_unsupported_policy(policy)?;
 
-    let moniker = appcontainer_moniker(policy_base, command, policy);
+    let moniker = appcontainer_moniker(policy_base, tool, policy);
     let mut profile = AppContainerProfile::new(&moniker)?;
     grant_policy_access(policy, profile.sid())?;
 
-    let exit_code = create_process_in_appcontainer(profile.sid(), command, args)?;
+    let exit_code = create_process_in_appcontainer(profile.sid(), tool, args)?;
     std::process::exit(i32::from_ne_bytes(exit_code.to_ne_bytes()));
 }
 
@@ -89,10 +89,10 @@ fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
     Ok(())
 }
 
-fn appcontainer_moniker(policy_base: &Path, command: &OsStr, policy: &AccessPolicy) -> String {
+fn appcontainer_moniker(policy_base: &Path, tool: &OsStr, policy: &AccessPolicy) -> String {
     let mut hasher = DefaultHasher::new();
     policy_base.hash(&mut hasher);
-    PathBuf::from(command).hash(&mut hasher);
+    PathBuf::from(tool).hash(&mut hasher);
     policy.hash(&mut hasher);
     format!("landstrip.{:016x}", hasher.finish())
 }
@@ -253,8 +253,8 @@ fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
     Ok(())
 }
 
-fn create_process_in_appcontainer(sid: PSID, command: &OsStr, args: &[OsString]) -> Result<u32> {
-    let command_line = command_line(command, args)?;
+fn create_process_in_appcontainer(sid: PSID, tool: &OsStr, args: &[OsString]) -> Result<u32> {
+    let command_line = command_line(tool, args)?;
     let mut command_line = wide_string(&command_line);
     let mut startup_info = unsafe { mem::zeroed::<STARTUPINFOEXW>() };
     startup_info.StartupInfo.cb = u32::try_from(mem::size_of::<STARTUPINFOEXW>())
@@ -301,8 +301,8 @@ fn create_process_in_appcontainer(sid: PSID, command: &OsStr, args: &[OsString])
 
     if created == 0 {
         let code = unsafe { GetLastError() };
-        return Err(Error::command(
-            Some(command.to_os_string()),
+        return Err(Error::tool(
+            Some(tool.to_os_string()),
             format!("CreateProcessW failed: error {code}"),
         ));
     }
@@ -406,16 +406,16 @@ impl Drop for Handle {
     }
 }
 
-fn command_line(command: &OsStr, args: &[OsString]) -> Result<String> {
+fn command_line(tool: &OsStr, args: &[OsString]) -> Result<String> {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(
-        quote_command_arg(command)
-            .map_err(|message| Error::command(Some(command.to_os_string()), message))?,
+        quote_command_arg(tool)
+            .map_err(|message| Error::tool(Some(tool.to_os_string()), message))?,
     );
     for arg in args {
         parts.push(
             quote_command_arg(arg)
-                .map_err(|message| Error::command(Some(command.to_os_string()), message))?,
+                .map_err(|message| Error::tool(Some(tool.to_os_string()), message))?,
         );
     }
     Ok(parts.join(" "))

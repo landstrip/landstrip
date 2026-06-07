@@ -14,7 +14,7 @@ use std::path::Path;
 pub(crate) fn execute(
     _policy: &AccessPolicy,
     _policy_base: &Path,
-    _command: &OsStr,
+    _tool: &OsStr,
     _args: &[OsString],
 ) -> Result<()> {
     Err(Error::Capability {

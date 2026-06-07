@@ -17,17 +17,13 @@ const SBPL_PROFILE_FLAGS: u64 = 0;
 pub(crate) fn execute(
     policy: &AccessPolicy,
     _policy_base: &Path,
-    command: &OsStr,
+    tool: &OsStr,
     args: &[OsString],
 ) -> Result<()> {
-    let profile =
-        render_profile(policy, command).map_err(|error| Error::system(error.to_string()))?;
+    let profile = render_profile(policy, tool).map_err(|error| Error::system(error.to_string()))?;
     <SystemSeatbelt as Seatbelt>::apply_profile(&profile)?;
-    let error = Command::new(command).args(args).exec();
-    Err(Error::command(
-        Some(command.to_os_string()),
-        error.to_string(),
-    ))
+    let error = Command::new(tool).args(args).exec();
+    Err(Error::tool(Some(tool.to_os_string()), error.to_string()))
 }
 
 trait Seatbelt {
@@ -58,15 +54,12 @@ impl Seatbelt for SystemSeatbelt {
     }
 }
 
-fn render_profile(
-    policy: &AccessPolicy,
-    command: &OsStr,
-) -> std::result::Result<String, fmt::Error> {
+fn render_profile(policy: &AccessPolicy, tool: &OsStr) -> std::result::Result<String, fmt::Error> {
     let mut sb = String::new();
     writeln!(sb, "(version 1)")?;
     writeln!(sb, "(deny default)")?;
 
-    render_process_rules(&mut sb, command)?;
+    render_process_rules(&mut sb, tool)?;
     render_write_rules(&mut sb, &policy.write_roots)?;
     render_read_rules(&mut sb, &policy.read_access)?;
     render_network_rules(&mut sb, &policy.network_access)?;
@@ -74,12 +67,12 @@ fn render_profile(
     Ok(sb)
 }
 
-fn render_process_rules(sb: &mut String, command: &OsStr) -> fmt::Result {
-    let cmd_str = command.to_string_lossy();
+fn render_process_rules(sb: &mut String, tool: &OsStr) -> fmt::Result {
+    let tool = tool.to_string_lossy();
     writeln!(
         sb,
         "(allow process-exec (literal \"{}\"))",
-        escape_sbpl_literal(&cmd_str)
+        escape_sbpl_literal(&tool)
     )?;
     writeln!(sb, "(allow process-fork)")
 }
