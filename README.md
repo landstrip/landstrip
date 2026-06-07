@@ -64,7 +64,7 @@ exit with status 2.
 ```
 
 ```json
-{"code":"command","command":"missing-tool","message":"No such file or directory"}
+{"code":"command","command":"cargo","message":"No such file or directory"}
 ```
 
 The `code` field is one of `policy`, `command`, `capability`, or `system`. The
