@@ -23,18 +23,71 @@ use crate::cli::parse_cli;
 use crate::config::load_settings;
 use crate::error::{Error, Result};
 use crate::policy::lower_sandbox_policy;
+use serde::Serialize;
 use std::process;
 
 fn main() {
     if let Err(error) = run() {
-        let exit_code = match error {
-            Error::Usage(_) => 2,
-            _ => 1,
-        };
+        if let Error::Usage(_) = &error {
+            eprintln!("{error}");
+            process::exit(2);
+        }
 
-        eprintln!("{error}");
-        process::exit(exit_code);
+        if let Err(error) = print_error_response(&error) {
+            eprintln!("failed to serialize error response: {error}");
+        }
+        process::exit(1);
     }
+}
+fn print_error_response(error: &Error) -> std::result::Result<(), serde_json::Error> {
+    let Some(response) = response_error(error) else {
+        return Ok(());
+    };
+
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
+fn response_error(error: &Error) -> Option<Response<'_>> {
+    match error {
+        Error::Usage(_) => None,
+        Error::Policy { file, message } => Some(Response {
+            code: "policy",
+            file: file.as_ref().map(|file| file.display().to_string()),
+            command: None,
+            message,
+        }),
+        Error::Command { command, message } => Some(Response {
+            code: "command",
+            file: None,
+            command: command
+                .as_ref()
+                .map(|command| command.to_string_lossy().into_owned()),
+            message,
+        }),
+        Error::Capability { message } => Some(Response {
+            code: "capability",
+            file: None,
+            command: None,
+            message,
+        }),
+        Error::System { message } => Some(Response {
+            code: "system",
+            file: None,
+            command: None,
+            message,
+        }),
+    }
+}
+
+#[derive(Serialize)]
+struct Response<'a> {
+    code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    message: &'a str,
 }
 
 fn run() -> Result<()> {

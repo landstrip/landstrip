@@ -67,10 +67,39 @@ struct SockFprog {
     filter: *const seccompiler::sock_filter,
 }
 
-type SysResult<T> = std::result::Result<T, Error>;
+type SysResult<T> = std::result::Result<T, BrokerError>;
 type RuleMap = BTreeMap<i64, Vec<SeccompRule>>;
 type SocketAddrCall =
     unsafe extern "C" fn(libc::c_int, *const libc::sockaddr, libc::socklen_t) -> libc::c_int;
+
+#[derive(Debug)]
+enum BrokerError {
+    AddressFamilyNotSupported,
+    BadAddress,
+    BadFileDescriptor,
+    InvalidAddress,
+    MissingFileDescriptor,
+    NameTooLong,
+    PeerClosed,
+    PolicyDenied,
+    SystemCall { errno: i32 },
+}
+
+impl BrokerError {
+    fn errno(&self) -> i32 {
+        match self {
+            Self::PolicyDenied => libc::EACCES,
+            Self::AddressFamilyNotSupported => libc::EAFNOSUPPORT,
+            Self::InvalidAddress => libc::EINVAL,
+            Self::BadFileDescriptor => libc::EBADF,
+            Self::BadAddress => libc::EFAULT,
+            Self::NameTooLong => libc::ENAMETOOLONG,
+            Self::SystemCall { errno } => *errno,
+            Self::PeerClosed => libc::ECONNRESET,
+            Self::MissingFileDescriptor => libc::EBADMSG,
+        }
+    }
+}
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn run_network_broker(
@@ -92,9 +121,7 @@ pub(super) fn run_network_broker(
     let (parent, child_sock) = UnixStream::pair()?;
 
     // SAFETY: landstrip forks before spawning threads; the child either execs the target or exits.
-    match unsafe { fork() }.map_err(|error| Error::SystemCall {
-        errno: error as i32,
-    })? {
+    match unsafe { fork() }.map_err(|error| system_errno(error as i32))? {
         ForkResult::Child => {
             drop(parent);
 
@@ -107,12 +134,8 @@ pub(super) fn run_network_broker(
 
                     // SAFETY: notify is borrowed only for the duration of fcntl(2).
                     let notify_fd = unsafe { BorrowedFd::borrow_raw(notify.as_raw_fd()) };
-                    let notify =
-                        fcntl(notify_fd, FcntlArg::F_DUPFD_CLOEXEC(0)).map_err(|error| {
-                            Error::SystemCall {
-                                errno: error as i32,
-                            }
-                        })?;
+                    let notify = fcntl(notify_fd, FcntlArg::F_DUPFD_CLOEXEC(0))
+                        .map_err(|error| system_errno(error as i32))?;
                     // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
                     let notify = unsafe { OwnedFd::from_raw_fd(notify) };
 
@@ -124,10 +147,10 @@ pub(super) fn run_network_broker(
                 child_command.args(args);
 
                 let error = child_command.exec();
-                Err(Error::Exec {
-                    command: command.to_os_string(),
-                    error,
-                })
+                Err(Error::command(
+                    Some(command.to_os_string()),
+                    error.to_string(),
+                ))
             })();
 
             if let Err(error) = result {
@@ -161,9 +184,7 @@ fn supervise_child(
                 Ok(status) => return Ok(ExitCode::from(status).into()),
                 Err(Errno::EINTR) => continue,
                 Err(error) => {
-                    return Err(Error::SystemCall {
-                        errno: error as i32,
-                    });
+                    return Err(system_errno(error as i32));
                 }
             }
         }
@@ -177,9 +198,7 @@ fn supervise_child(
                 Ok(_) => break poll_fd[0].revents().unwrap_or_else(PollFlags::empty),
                 Err(Errno::EINTR) => continue,
                 Err(error) => {
-                    return Err(Error::SystemCall {
-                        errno: error as i32,
-                    });
+                    return Err(system_errno(error as i32));
                 }
             }
         };
@@ -194,9 +213,7 @@ fn supervise_child(
                     Ok(status) => return Ok(ExitCode::from(status).into()),
                     Err(Errno::EINTR) => continue,
                     Err(error) => {
-                        return Err(Error::SystemCall {
-                            errno: error as i32,
-                        });
+                        return Err(system_errno(error as i32));
                     }
                 }
             }
@@ -213,14 +230,12 @@ fn supervise_child(
                     Ok(status) => return Ok(ExitCode::from(status).into()),
                     Err(Errno::EINTR) => continue,
                     Err(error) => {
-                        return Err(Error::SystemCall {
-                            errno: error as i32,
-                        });
+                        return Err(system_errno(error as i32));
                     }
                 }
             }
 
-            return Err(Error::BackendSetup(source.to_string()));
+            return Err(Error::system(source.to_string()));
         }
     }
 }
@@ -295,10 +310,12 @@ fn seccomp_probe(operation: libc::c_uint, data: *mut libc::c_void) -> Result<()>
     // SAFETY: seccomp(2) copies the operation-specific data pointer before returning.
     let rc = unsafe { libc::syscall(libc::SYS_seccomp, operation, 0, data) };
     if rc < 0 {
-        return Err(Error::BackendUnavailable(format!(
-            "seccomp user notifications are unavailable: {}",
-            Errno::last()
-        )));
+        return Err(Error::Capability {
+            message: format!(
+                "seccomp user notifications are unavailable: {}",
+                Errno::last()
+            ),
+        });
     }
 
     Ok(())
@@ -313,9 +330,7 @@ fn receive_notification(fd: RawFd) -> Result<libc::seccomp_notif> {
             Ok(_) => return Ok(request),
             Err(Errno::EINTR) => continue,
             Err(error) => {
-                return Err(Error::SystemCall {
-                    errno: error as i32,
-                });
+                return Err(system_errno(error as i32));
             }
         }
     }
@@ -328,9 +343,7 @@ fn respond_notification(fd: RawFd, mut response: libc::seccomp_notif_resp) -> Re
             Ok(_) => return Ok(()),
             Err(Errno::EINTR) => continue,
             Err(error) => {
-                return Err(Error::SystemCall {
-                    errno: error as i32,
-                });
+                return Err(system_errno(error as i32));
             }
         }
     }
@@ -343,27 +356,18 @@ fn validate_notification_id(fd: RawFd, id: u64) -> Result<()> {
             Ok(_) => return Ok(()),
             Err(Errno::EINTR) => continue,
             Err(error) => {
-                return Err(Error::SystemCall {
-                    errno: error as i32,
-                });
+                return Err(system_errno(error as i32));
             }
         }
     }
 }
 
-fn notification_errno(error: &Error) -> i32 {
-    match error {
-        Error::PolicyDenied => libc::EACCES,
-        Error::AddressFamilyNotSupported => libc::EAFNOSUPPORT,
-        Error::InvalidAddress => libc::EINVAL,
-        Error::BadFileDescriptor => libc::EBADF,
-        Error::BadAddress => libc::EFAULT,
-        Error::NameTooLong => libc::ENAMETOOLONG,
-        Error::SystemCall { errno } => *errno,
-        Error::PeerClosed => libc::ECONNRESET,
-        Error::MissingFileDescriptor => libc::EBADMSG,
-        _ => libc::EIO,
-    }
+fn system_errno(errno: i32) -> Error {
+    Error::system(format!("failed with {errno}"))
+}
+
+fn notification_errno(error: &BrokerError) -> i32 {
+    error.errno()
 }
 
 fn handle_bind(
@@ -375,18 +379,18 @@ fn handle_bind(
     match socket.kind() {
         SocketKind::Tcp => {
             if !policy.network_access.local_tcp_bind {
-                return Err(Error::PolicyDenied);
+                return Err(BrokerError::PolicyDenied);
             }
             let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
             if !endpoint.loopback {
-                return Err(Error::PolicyDenied);
+                return Err(BrokerError::PolicyDenied);
             }
 
             broker_addr_call(socket.sock.as_raw_fd(), &socket.addr, libc::bind)
                 .map(NotificationResult::Value)
         }
         SocketKind::Unix => handle_unix_bind(policy, request.pid, &mut socket),
-        SocketKind::NotSupported => Err(Error::AddressFamilyNotSupported),
+        SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
         SocketKind::Other => Ok(NotificationResult::Continue),
     }
 }
@@ -406,7 +410,7 @@ fn handle_connect(
                     .connect_tcp_ports
                     .contains(&endpoint.port)
             {
-                return Err(Error::PolicyDenied);
+                return Err(BrokerError::PolicyDenied);
             }
 
             broker_addr_call(socket.sock.as_raw_fd(), &socket.addr, libc::connect)
@@ -414,7 +418,7 @@ fn handle_connect(
         }
         SocketKind::Unix => handle_unix_connect(policy, request.pid, &socket),
         SocketKind::Other => Ok(NotificationResult::Continue),
-        SocketKind::NotSupported => Err(Error::AddressFamilyNotSupported),
+        SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
     }
 }
 
@@ -424,7 +428,7 @@ fn handle_unix_connect(
     socket: &TargetSocket,
 ) -> SysResult<NotificationResult> {
     let Some((target, relative)) = unix_path_target(pid, &socket.addr)? else {
-        return Err(Error::PolicyDenied);
+        return Err(BrokerError::PolicyDenied);
     };
     authorize_unix_path(policy, &target)?;
 
@@ -442,7 +446,7 @@ fn handle_unix_bind(
     socket: &mut TargetSocket,
 ) -> SysResult<NotificationResult> {
     let Some((target, relative)) = unix_path_target(pid, &socket.addr)? else {
-        return Err(Error::PolicyDenied);
+        return Err(BrokerError::PolicyDenied);
     };
     authorize_unix_path(policy, &target)?;
 
@@ -451,7 +455,7 @@ fn handle_unix_bind(
         .iter()
         .any(|root| target == *root || target.starts_with(root))
     {
-        return Err(Error::PolicyDenied);
+        return Err(BrokerError::PolicyDenied);
     }
 
     if relative {
@@ -481,8 +485,11 @@ fn unix_path_target(pid: u32, addr: &[u8]) -> SysResult<Option<(PathBuf, bool)>>
     if path.is_absolute() {
         Ok(Some((create_path(path), false)))
     } else {
-        let pid = i32::try_from(pid).map_err(|_| Error::InvalidAddress)?;
-        let cwd = fs::read_link(format!("/proc/{pid}/cwd")).map_err(Error::Io)?;
+        let pid = i32::try_from(pid).map_err(|_| BrokerError::InvalidAddress)?;
+        let cwd =
+            fs::read_link(format!("/proc/{pid}/cwd")).map_err(|error| BrokerError::SystemCall {
+                errno: error.raw_os_error().unwrap_or(libc::EIO),
+            })?;
         Ok(Some((create_path(&cwd.join(path)), true)))
     }
 }
@@ -494,7 +501,7 @@ fn authorize_unix_path(policy: &AccessPolicy, target: &Path) -> SysResult<()> {
             .iter()
             .any(|path| target == path || target.starts_with(path))
             .then_some(())
-            .ok_or(Error::PolicyDenied),
+            .ok_or(BrokerError::PolicyDenied),
     }
 }
 
@@ -503,7 +510,7 @@ fn rewrite_unix_path(addr: &mut Vec<u8>, target: &Path) -> SysResult<()> {
     let path = target.as_os_str().as_bytes();
     let max_path = mem::size_of::<libc::sockaddr_un>() - sun_path;
     if path.len() + 1 > max_path {
-        return Err(Error::NameTooLong);
+        return Err(BrokerError::NameTooLong);
     }
 
     let mut rewritten = vec![0_u8; sun_path + path.len() + 1];
@@ -517,13 +524,13 @@ fn rewrite_unix_path(addr: &mut Vec<u8>, target: &Path) -> SysResult<()> {
 fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
     let family = addr
         .get(..mem::size_of::<libc::sa_family_t>())
-        .ok_or(Error::InvalidAddress)?;
-    let family = <[u8; 2]>::try_from(family).map_err(|_| Error::InvalidAddress)?;
+        .ok_or(BrokerError::InvalidAddress)?;
+    let family = <[u8; 2]>::try_from(family).map_err(|_| BrokerError::InvalidAddress)?;
 
     match (domain, i32::from(libc::sa_family_t::from_ne_bytes(family))) {
         (libc::AF_INET, libc::AF_INET) => {
             if addr.len() < mem::size_of::<libc::sockaddr_in>() {
-                return Err(Error::InvalidAddress);
+                return Err(BrokerError::InvalidAddress);
             }
 
             let port = u16::from_be_bytes([addr[2], addr[3]]);
@@ -535,30 +542,31 @@ fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
         }
         (libc::AF_INET6, libc::AF_INET6) => {
             if addr.len() < mem::size_of::<libc::sockaddr_in6>() {
-                return Err(Error::InvalidAddress);
+                return Err(BrokerError::InvalidAddress);
             }
 
             let port = u16::from_be_bytes([addr[2], addr[3]]);
             let ip = Ipv6Addr::from(
-                <[u8; 16]>::try_from(&addr[8..24]).map_err(|_| Error::InvalidAddress)?,
+                <[u8; 16]>::try_from(&addr[8..24]).map_err(|_| BrokerError::InvalidAddress)?,
             );
             Ok(TcpEndpoint {
                 port,
                 loopback: ip.is_loopback(),
             })
         }
-        _ => Err(Error::AddressFamilyNotSupported),
+        _ => Err(BrokerError::AddressFamilyNotSupported),
     }
 }
 
 fn target_socket(request: &libc::seccomp_notif) -> SysResult<TargetSocket> {
-    let fd = RawFd::try_from(request.data.args[0]).map_err(|_| Error::BadFileDescriptor)?;
-    let target_addr = usize::try_from(request.data.args[1]).map_err(|_| Error::BadAddress)?;
-    let addr_len = usize::try_from(request.data.args[2]).map_err(|_| Error::InvalidAddress)?;
-    let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| Error::InvalidAddress)?);
+    let fd = RawFd::try_from(request.data.args[0]).map_err(|_| BrokerError::BadFileDescriptor)?;
+    let target_addr = usize::try_from(request.data.args[1]).map_err(|_| BrokerError::BadAddress)?;
+    let addr_len =
+        usize::try_from(request.data.args[2]).map_err(|_| BrokerError::InvalidAddress)?;
+    let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
 
     if addr_len > mem::size_of::<libc::sockaddr_storage>() {
-        return Err(Error::InvalidAddress);
+        return Err(BrokerError::InvalidAddress);
     }
 
     let addr = read_target_addr(pid, target_addr, addr_len)?;
@@ -570,7 +578,7 @@ fn target_socket(request: &libc::seccomp_notif) -> SysResult<TargetSocket> {
 
 fn read_target_addr(pid: Pid, target_addr: usize, addr_len: usize) -> SysResult<Vec<u8>> {
     if addr_len < mem::size_of::<libc::sa_family_t>() {
-        return Err(Error::InvalidAddress);
+        return Err(BrokerError::InvalidAddress);
     }
 
     let mut addr = vec![0_u8; addr_len];
@@ -579,11 +587,11 @@ fn read_target_addr(pid: Pid, target_addr: usize, addr_len: usize) -> SysResult<
         base: target_addr,
         len: addr_len,
     }];
-    if process_vm_readv(pid, &mut local, &target).map_err(|error| Error::SystemCall {
+    if process_vm_readv(pid, &mut local, &target).map_err(|error| BrokerError::SystemCall {
         errno: error as i32,
     })? != addr_len
     {
-        return Err(Error::BadAddress);
+        return Err(BrokerError::BadAddress);
     }
 
     Ok(addr)
@@ -593,7 +601,7 @@ fn duplicate_target_fd(pid: Pid, fd: RawFd) -> SysResult<OwnedFd> {
     // SAFETY: pidfd_open copies scalar arguments and returns a new fd on success.
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
     if pidfd < 0 {
-        return Err(Error::SystemCall {
+        return Err(BrokerError::SystemCall {
             errno: Errno::last() as i32,
         });
     }
@@ -603,7 +611,7 @@ fn duplicate_target_fd(pid: Pid, fd: RawFd) -> SysResult<OwnedFd> {
     // SAFETY: pidfd_getfd copies scalar arguments and returns a duplicated fd.
     let sock = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
     if sock < 0 {
-        return Err(Error::SystemCall {
+        return Err(BrokerError::SystemCall {
             errno: Errno::last() as i32,
         });
     }
@@ -623,7 +631,8 @@ fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> SysResult
             addr.len(),
         );
     }
-    let addr_len = libc::socklen_t::try_from(addr.len()).map_err(|_| Error::InvalidAddress)?;
+    let addr_len =
+        libc::socklen_t::try_from(addr.len()).map_err(|_| BrokerError::InvalidAddress)?;
 
     // SAFETY: storage contains copied target sockaddr bytes and is aligned.
     let rc = unsafe {
@@ -634,7 +643,7 @@ fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> SysResult
         )
     };
     if rc < 0 {
-        Err(Error::SystemCall {
+        Err(BrokerError::SystemCall {
             errno: Errno::last() as i32,
         })
     } else {
@@ -654,7 +663,8 @@ pub(super) fn network_filter(config: NetworkFilter) -> Result<NetworkFilters> {
         config.unix_sockets,
     )?;
 
-    let eafnosupport = u32::try_from(libc::EAFNOSUPPORT).map_err(|_| Error::InvalidAddress)?;
+    let eafnosupport =
+        u32::try_from(libc::EAFNOSUPPORT).map_err(|_| Error::system("invalid address"))?;
     let errno = build_filter(errno_rules, SeccompAction::Errno(eafnosupport))?;
     let notify = if config.notify_bind || config.notify_connect {
         let mut notify_syscalls = Vec::new();
@@ -692,19 +702,18 @@ impl NetworkFilters {
         let notify = self
             .notify
             .as_ref()
-            .ok_or_else(|| Error::BackendSetup("missing seccomp notification filter".into()))?;
+            .ok_or_else(|| Error::system("missing seccomp notification filter"))?;
 
-        load_program(notify, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)?.ok_or_else(|| {
-            Error::BackendSetup("seccomp did not return a notification listener".into())
-        })
+        load_program(notify, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)?
+            .ok_or_else(|| Error::system("seccomp did not return a notification listener"))
     }
 }
 
 fn build_filter(rules: RuleMap, match_action: SeccompAction) -> Result<BpfProgram> {
     let filter = SeccompFilter::new(rules, SeccompAction::Allow, match_action, target_arch()?)
-        .map_err(|error| Error::BackendSetup(error.to_string()))?;
+        .map_err(|error| Error::system(error.to_string()))?;
     let program = <BpfProgram as TryFrom<SeccompFilter>>::try_from(filter)
-        .map_err(|error| Error::BackendSetup(error.to_string()))?;
+        .map_err(|error| Error::system(error.to_string()))?;
 
     Ok(program)
 }
@@ -719,7 +728,7 @@ fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
     for syscall in syscalls {
         program.push(bpf_jump(
             jump_eq,
-            u32::try_from(*syscall).map_err(|_| Error::InvalidAddress)?,
+            u32::try_from(*syscall).map_err(|_| Error::system("invalid address"))?,
             0,
             1,
         ));
@@ -731,7 +740,7 @@ fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
 }
 
 fn bpf_code(code: u32) -> Result<u16> {
-    u16::try_from(code).map_err(|_| Error::InvalidAddress)
+    u16::try_from(code).map_err(|_| Error::system("invalid address"))
 }
 
 fn bpf_stmt(code: u16, k: u32) -> seccompiler::sock_filter {
@@ -752,25 +761,24 @@ fn target_arch() -> Result<TargetArch> {
         "x86_64" => Ok(TargetArch::x86_64),
         "aarch64" => Ok(TargetArch::aarch64),
         "riscv64" => Ok(TargetArch::riscv64),
-        arch => Err(Error::BackendUnavailable(format!(
-            "seccompiler does not support Linux architecture {arch}"
-        ))),
+        arch => Err(Error::Capability {
+            message: format!("seccompiler does not support Linux architecture {arch}"),
+        }),
     }
 }
 
 fn load_program(program: &BpfProgram, flags: libc::c_ulong) -> Result<Option<OwnedFd>> {
     if program.is_empty() {
-        return Err(Error::BackendSetup("empty seccomp filter".into()));
+        return Err(Error::system("empty seccomp filter"));
     }
 
     // SAFETY: prctl(2) copies scalar arguments only.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(Error::SystemCall {
-            errno: Errno::last() as i32,
-        });
+        return Err(system_errno(Errno::last() as i32));
     }
 
-    let len = libc::c_ushort::try_from(program.len()).map_err(|_| Error::InvalidAddress)?;
+    let len =
+        libc::c_ushort::try_from(program.len()).map_err(|_| Error::system("invalid address"))?;
     let filter = SockFprog {
         len,
         filter: program.as_ptr(),
@@ -786,16 +794,14 @@ fn load_program(program: &BpfProgram, flags: libc::c_ulong) -> Result<Option<Own
         )
     };
     if rc < 0 {
-        return Err(Error::SystemCall {
-            errno: Errno::last() as i32,
-        });
+        return Err(system_errno(Errno::last() as i32));
     }
 
     if flags & libc::SECCOMP_FILTER_FLAG_NEW_LISTENER == 0 {
         return Ok(None);
     }
 
-    let fd = RawFd::try_from(rc).map_err(|_| Error::InvalidAddress)?;
+    let fd = RawFd::try_from(rc).map_err(|_| Error::system("invalid address"))?;
     // SAFETY: seccomp returned a new listener fd when NEW_LISTENER was set.
     Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
@@ -806,7 +812,7 @@ fn seccomp_condition(
     value: u64,
 ) -> Result<SeccompCondition> {
     SeccompCondition::new(arg_index, SeccompCmpArgLen::Dword, operator, value)
-        .map_err(|error| Error::BackendSetup(error.to_string()))
+        .map_err(|error| Error::system(error.to_string()))
 }
 
 fn add_conditional_rule(
@@ -814,8 +820,7 @@ fn add_conditional_rule(
     syscall: i64,
     conditions: Vec<SeccompCondition>,
 ) -> Result<()> {
-    let rule =
-        SeccompRule::new(conditions).map_err(|error| Error::BackendSetup(error.to_string()))?;
+    let rule = SeccompRule::new(conditions).map_err(|error| Error::system(error.to_string()))?;
     rules.entry(syscall).or_default().push(rule);
 
     Ok(())
@@ -868,11 +873,11 @@ pub(super) enum UnixSocketFilter {
 }
 
 fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Result<()> {
-    let stream = u64::try_from(libc::SOCK_STREAM).map_err(|_| Error::InvalidAddress)?;
-    let tcp = u64::try_from(libc::IPPROTO_TCP).map_err(|_| Error::InvalidAddress)?;
+    let stream = u64::try_from(libc::SOCK_STREAM).map_err(|_| Error::system("invalid address"))?;
+    let tcp = u64::try_from(libc::IPPROTO_TCP).map_err(|_| Error::system("invalid address"))?;
 
     for domain in [libc::AF_INET, libc::AF_INET6] {
-        let domain = u64::try_from(domain).map_err(|_| Error::InvalidAddress)?;
+        let domain = u64::try_from(domain).map_err(|_| Error::system("invalid address"))?;
 
         for ty in 0..=SOCK_TYPE_MASK {
             if ty == stream {
@@ -920,7 +925,7 @@ fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Result<()> {
 }
 
 fn add_socket_domain_filter(rules: &mut RuleMap, socket: i64, domain: i32) -> Result<()> {
-    let domain = u64::try_from(domain).map_err(|_| Error::InvalidAddress)?;
+    let domain = u64::try_from(domain).map_err(|_| Error::system("invalid address"))?;
 
     add_conditional_rule(
         rules,
@@ -942,8 +947,8 @@ fn create_path(path: &Path) -> PathBuf {
 
 fn sockopt(fd: RawFd, level: libc::c_int, name: libc::c_int) -> SysResult<i32> {
     let mut value = 0;
-    let mut len =
-        libc::socklen_t::try_from(mem::size_of_val(&value)).map_err(|_| Error::InvalidAddress)?;
+    let mut len = libc::socklen_t::try_from(mem::size_of_val(&value))
+        .map_err(|_| BrokerError::InvalidAddress)?;
 
     // SAFETY: value and len point to initialized storage for getsockopt(2) to update.
     let rc = unsafe {
@@ -956,7 +961,7 @@ fn sockopt(fd: RawFd, level: libc::c_int, name: libc::c_int) -> SysResult<i32> {
         )
     };
     if rc < 0 {
-        Err(Error::SystemCall {
+        Err(BrokerError::SystemCall {
             errno: Errno::last() as i32,
         })
     } else {
@@ -977,9 +982,7 @@ fn send_fd(socket: &UnixStream, fd: RawFd) -> Result<()> {
         None,
     )
     .map(|_| ())
-    .map_err(|error| Error::SystemCall {
-        errno: error as i32,
-    })
+    .map_err(|error| system_errno(error as i32))
 }
 
 fn recv_fd(socket: &UnixStream) -> Result<OwnedFd> {
@@ -992,17 +995,16 @@ fn recv_fd(socket: &UnixStream) -> Result<OwnedFd> {
         Some(&mut control),
         MsgFlags::empty(),
     )
-    .map_err(|error| Error::SystemCall {
-        errno: error as i32,
-    })?;
+    .map_err(|error| system_errno(error as i32))?;
 
     if message.bytes == 0 {
-        return Err(Error::PeerClosed);
+        return Err(Error::system("peer closed connection"));
     }
 
-    for control in message.cmsgs().map_err(|error| Error::SystemCall {
-        errno: error as i32,
-    })? {
+    for control in message
+        .cmsgs()
+        .map_err(|error| system_errno(error as i32))?
+    {
         if let ControlMessageOwned::ScmRights(fds) = control {
             let Some(fd) = fds.first().copied() else {
                 continue;
@@ -1012,7 +1014,7 @@ fn recv_fd(socket: &UnixStream) -> Result<OwnedFd> {
         }
     }
 
-    Err(Error::MissingFileDescriptor)
+    Err(Error::system("missing file descriptor"))
 }
 
 #[derive(Debug)]

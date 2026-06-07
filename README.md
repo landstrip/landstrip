@@ -52,6 +52,29 @@ On Linux and macOS, `allowNetwork` disables landstrip network enforcement while
 leaving filesystem policy enforcement in place. Windows rejects unrestricted
 network policies until Windows network support exists.
 
+## JSON Output
+
+Failures reported by `landstrip` are printed as one compact JSON object on
+standard output. This covers policy, command launch, capability, and system
+errors. Usage errors are not JSON responses; they remain on standard error and
+exit with status 2.
+
+```json
+{"code":"policy","file":"policy.json","message":"expected value at line 1 column 1"}
+```
+
+```json
+{"code":"command","command":"missing-tool","message":"No such file or directory"}
+```
+
+The `code` field is one of `policy`, `command`, `capability`, or `system`. The
+`file` field is present when a policy error is tied to a policy file. The
+`command` field is present when landstrip could not start or encode a command.
+
+Logs and sandboxed command output are not part of the JSON response. Normal
+successful command execution does not print a landstrip JSON response because
+standard output belongs to the sandboxed command.
+
 ## Development
 
 ### Commit messages

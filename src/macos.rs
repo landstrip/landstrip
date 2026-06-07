@@ -21,13 +21,13 @@ pub(crate) fn execute(
     args: &[OsString],
 ) -> Result<()> {
     let profile =
-        render_profile(policy, command).map_err(|error| Error::BackendSetup(error.to_string()))?;
+        render_profile(policy, command).map_err(|error| Error::system(error.to_string()))?;
     <SystemSeatbelt as Seatbelt>::apply_profile(&profile)?;
     let error = Command::new(command).args(args).exec();
-    Err(Error::Exec {
-        command: command.to_os_string(),
-        error,
-    })
+    Err(Error::command(
+        Some(command.to_os_string()),
+        error.to_string(),
+    ))
 }
 
 trait Seatbelt {
@@ -40,7 +40,7 @@ impl Seatbelt for SystemSeatbelt {
     fn apply_profile(profile: &str) -> Result<()> {
         let profile = CString::new(profile).map_err(|source| {
             let nul_position = source.nul_position();
-            Error::BackendSetup(format!(
+            Error::system(format!(
                 "generated SBPL profile contains an interior NUL byte at offset {nul_position}"
             ))
         })?;
@@ -53,7 +53,7 @@ impl Seatbelt for SystemSeatbelt {
         if rc == 0 {
             Ok(())
         } else {
-            Err(Error::BackendSetup(take_sandbox_error(errorbuf)))
+            Err(Error::system(take_sandbox_error(errorbuf)))
         }
     }
 }

@@ -60,30 +60,30 @@ pub(crate) fn execute(
 
 fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
     if matches!(policy.read_access, ReadAccess::Unrestricted) {
-        return Err(Error::UnsupportedPolicy(
-            "read access must use explicit allow roots",
-        ));
+        return Err(Error::Capability {
+            message: "read access must use explicit allow roots".to_owned(),
+        });
     }
 
     let network = &policy.network_access;
 
     if network.is_unrestricted() {
-        return Err(Error::UnsupportedPolicy(
-            "unrestricted network is not supported yet",
-        ));
+        return Err(Error::Capability {
+            message: "unrestricted network is not supported yet".to_owned(),
+        });
     }
 
     if network.local_tcp_bind || !network.connect_tcp_ports.is_empty() {
-        return Err(Error::UnsupportedPolicy(
-            "TCP policies are not supported yet",
-        ));
+        return Err(Error::Capability {
+            message: "TCP policies are not supported yet".to_owned(),
+        });
     }
 
     if !matches!(&network.unix_socket_access, UnixSocketAccess::AllowPaths(paths) if paths.is_empty())
     {
-        return Err(Error::UnsupportedPolicy(
-            "Unix socket policies are not supported",
-        ));
+        return Err(Error::Capability {
+            message: "Unix socket policies are not supported".to_owned(),
+        });
     }
 
     Ok(())
@@ -123,16 +123,18 @@ impl AppContainerProfile {
         }
 
         if hresult_value(hr) & 0xffff != ERROR_ALREADY_EXISTS {
-            return Err(Error::BackendCall {
-                code: hresult_value(hr),
-            });
+            let code = hresult_value(hr);
+            return Err(Error::system(format!(
+                "CreateAppContainerProfile failed: HRESULT {code}"
+            )));
         }
 
         let hr = unsafe { DeriveAppContainerSidFromAppContainerName(moniker.as_ptr(), &mut sid) };
         if hr != 0 {
-            return Err(Error::BackendCall {
-                code: hresult_value(hr),
-            });
+            let code = hresult_value(hr);
+            return Err(Error::system(format!(
+                "DeriveAppContainerSidFromAppContainerName failed: HRESULT {code}"
+            )));
         }
 
         Ok(Self { sid })
@@ -155,9 +157,9 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<()> {
     let read_roots = match &policy.read_access {
         ReadAccess::AllowRoots(read_roots) => read_roots,
         ReadAccess::Unrestricted => {
-            return Err(Error::UnsupportedPolicy(
-                "read access must use explicit allow roots",
-            ));
+            return Err(Error::Capability {
+                message: "read access must use explicit allow roots".to_owned(),
+            });
         }
     };
 
@@ -198,7 +200,9 @@ fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
         )
     };
     if status != 0 {
-        return Err(Error::BackendCall { code: status });
+        return Err(Error::system(format!(
+            "GetNamedSecurityInfoW failed: status {status}"
+        )));
     }
 
     let explicit_access = EXPLICIT_ACCESS_W {
@@ -218,7 +222,9 @@ fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
     let status = unsafe { SetEntriesInAclW(1, &explicit_access, old_dacl, &mut new_dacl) };
     if status != 0 {
         unsafe { LocalFree(security_descriptor) };
-        return Err(Error::BackendCall { code: status });
+        return Err(Error::system(format!(
+            "SetEntriesInAclW failed: status {status}"
+        )));
     }
 
     let status = unsafe {
@@ -239,7 +245,9 @@ fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
     }
 
     if status != 0 {
-        return Err(Error::BackendCall { code: status });
+        return Err(Error::system(format!(
+            "SetNamedSecurityInfoW failed: status {status}"
+        )));
     }
 
     Ok(())
@@ -250,7 +258,7 @@ fn create_process_in_appcontainer(sid: PSID, command: &OsStr, args: &[OsString])
     let mut command_line = wide_string(&command_line);
     let mut startup_info = unsafe { mem::zeroed::<STARTUPINFOEXW>() };
     startup_info.StartupInfo.cb = u32::try_from(mem::size_of::<STARTUPINFOEXW>())
-        .map_err(|_| Error::BackendSetup("startup info size exceeds u32".into()))?;
+        .map_err(|_| Error::system("startup info size exceeds u32"))?;
 
     let mut attribute_list = ProcThreadAttributeList::new(2)?;
     let mut capabilities = SECURITY_CAPABILITIES {
@@ -292,20 +300,30 @@ fn create_process_in_appcontainer(sid: PSID, command: &OsStr, args: &[OsString])
     };
 
     if created == 0 {
-        return Err(last_error());
+        let code = unsafe { GetLastError() };
+        return Err(Error::command(
+            Some(command.to_os_string()),
+            format!("CreateProcessW failed: error {code}"),
+        ));
     }
 
     let process = Handle(process_info.hProcess);
     let thread = Handle(process_info.hThread);
     let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
     if wait == WAIT_FAILED {
-        return Err(last_error());
+        let code = unsafe { GetLastError() };
+        return Err(Error::system(format!(
+            "WaitForSingleObject failed: error {code}"
+        )));
     }
 
     let mut exit_code = 0;
     let ok = unsafe { GetExitCodeProcess(process.0, &mut exit_code) };
     if ok == 0 {
-        return Err(last_error());
+        let code = unsafe { GetLastError() };
+        return Err(Error::system(format!(
+            "GetExitCodeProcess failed: error {code}"
+        )));
     }
 
     drop(thread);
@@ -331,7 +349,10 @@ fn update_attribute(
         )
     };
     if ok == 0 {
-        return Err(last_error());
+        let code = unsafe { GetLastError() };
+        return Err(Error::system(format!(
+            "UpdateProcThreadAttribute failed: error {code}"
+        )));
     }
     Ok(())
 }
@@ -344,15 +365,21 @@ impl ProcThreadAttributeList {
     fn new(count: u32) -> Result<Self> {
         let mut size = 0;
         let ok = unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), count, 0, &mut size) };
-        if ok != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
-            return Err(last_error());
+        let code = unsafe { GetLastError() };
+        if ok != 0 || code != ERROR_INSUFFICIENT_BUFFER {
+            return Err(Error::system(format!(
+                "InitializeProcThreadAttributeList failed: error {code}"
+            )));
         }
 
         let mut storage = vec![0_u8; size];
         let list = storage.as_mut_ptr().cast();
         let ok = unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) };
         if ok == 0 {
-            return Err(last_error());
+            let code = unsafe { GetLastError() };
+            return Err(Error::system(format!(
+                "InitializeProcThreadAttributeList failed: error {code}"
+            )));
         }
 
         Ok(Self { storage })
@@ -381,19 +408,23 @@ impl Drop for Handle {
 
 fn command_line(command: &OsStr, args: &[OsString]) -> Result<String> {
     let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(quote_command_arg(command)?);
+    parts.push(
+        quote_command_arg(command)
+            .map_err(|message| Error::command(Some(command.to_os_string()), message))?,
+    );
     for arg in args {
-        parts.push(quote_command_arg(arg)?);
+        parts.push(
+            quote_command_arg(arg)
+                .map_err(|message| Error::command(Some(command.to_os_string()), message))?,
+        );
     }
     Ok(parts.join(" "))
 }
 
-fn quote_command_arg(arg: &OsStr) -> Result<String> {
+fn quote_command_arg(arg: &OsStr) -> std::result::Result<String, &'static str> {
     let arg = arg.to_string_lossy();
     if arg.contains('\0') {
-        return Err(Error::InvalidCommand(
-            "command line contains an interior NUL byte",
-        ));
+        return Err("command line contains an interior NUL byte");
     }
 
     if arg.is_empty() {
@@ -434,12 +465,6 @@ fn wide_string(value: &str) -> Vec<u16> {
         .encode_wide()
         .chain(iter::once(0))
         .collect()
-}
-
-fn last_error() -> Error {
-    Error::BackendCall {
-        code: unsafe { GetLastError() },
-    }
 }
 
 fn hresult_value(hr: i32) -> u32 {

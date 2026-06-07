@@ -149,7 +149,7 @@ fn push_proxy_port(ports: &mut Vec<u16>, port: Option<u16>, port_name: PolicyPor
     };
 
     if port == 0 {
-        return Err(Error::PolicyPortOutOfRange(port_name));
+        return Err(Error::policy(format!("{port_name} port out of range")));
     }
 
     ports.push(port);
@@ -182,7 +182,7 @@ fn resolve_paths(
 }
 fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<PathBuf> {
     if path.is_empty() {
-        return Err(Error::PolicyPathEmpty);
+        return Err(Error::policy("path empty"));
     }
 
     let raw = Path::new(path);
@@ -190,10 +190,10 @@ fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<
         raw.to_path_buf()
     } else if path == "~" {
         home.map(Path::to_path_buf)
-            .ok_or(Error::PolicyHomeUnavailable)?
+            .ok_or_else(|| Error::policy("home unavailable"))?
     } else if let Some(rest) = path.strip_prefix("~/") {
         home.map(|home| home.join(rest))
-            .ok_or(Error::PolicyHomeUnavailable)?
+            .ok_or_else(|| Error::policy("home unavailable"))?
     } else {
         base.join(raw)
     };

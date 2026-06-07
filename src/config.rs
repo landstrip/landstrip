@@ -40,27 +40,24 @@ pub(crate) fn load_settings(policy_paths: &[PathBuf]) -> Result<Settings> {
 
     if policy_paths.is_empty() {
         let mut json = String::new();
-        io::stdin().read_to_string(&mut json)?;
+        io::stdin()
+            .read_to_string(&mut json)
+            .map_err(|error| Error::policy(error.to_string()))?;
         let value: Value = serde_json::from_str(&json)?;
         merge_json(&mut merged, value);
     } else {
         for path in policy_paths {
             log::debug!("policy: file {}", path.display());
 
-            let json = fs::read_to_string(path).map_err(|source| Error::PolicyFile {
-                path: path.clone(),
-                error: source,
-            })?;
-            let value: Value =
-                serde_json::from_str(&json).map_err(|source| Error::PolicyFileJson {
-                    path: path.clone(),
-                    error: source,
-                })?;
+            let json = fs::read_to_string(path)
+                .map_err(|source| Error::policy_file(path.clone(), source.to_string()))?;
+            let value: Value = serde_json::from_str(&json)
+                .map_err(|source| Error::policy_file(path.clone(), source.to_string()))?;
             merge_json(&mut merged, value);
         }
     }
 
-    serde_json::from_value(merged).map_err(Error::Json)
+    serde_json::from_value(merged).map_err(Error::from)
 }
 
 fn merge_json(base: &mut Value, overlay: Value) {

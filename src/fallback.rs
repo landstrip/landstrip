@@ -3,7 +3,7 @@
 
 //! Fallback backend for unsupported platforms.
 //!
-//! Returns [`Error::UnsupportedPlatform`] to communicate that the current
+//! Returns [`Error::Capability`] to communicate that the current
 //! operating system is not yet supported by landstrip.
 
 use crate::error::{Error, Result};
@@ -17,5 +17,7 @@ pub(crate) fn execute(
     _command: &OsStr,
     _args: &[OsString],
 ) -> Result<()> {
-    Err(Error::UnsupportedPlatform)
+    Err(Error::Capability {
+        message: "platform sandbox support is missing".to_owned(),
+    })
 }

@@ -149,6 +149,34 @@ the lowered read and write roots with Windows ACL entries. Because LPAC has no
 broad filesystem read capability, Windows policies must use explicit read
 allowlists; unrestricted read policy is rejected. AppContainer profiles and ACL
 grants can persist after the sandboxed process exits.
+.Sh JSON OUTPUT
+.Nm
+prints landstrip failures as one compact JSON object on standard output. This
+covers policy, command launch, capability, and system errors.
+.Bd -literal -offset indent
+{"code":"policy","file":"policy.json","message":"expected value at line 1 column 1"}
+.Ed
+.Pp
+The
+.Va code
+field is one of
+.Va policy ,
+.Va command ,
+.Va capability ,
+or
+.Va system .
+The
+.Va file
+field is present when a policy error is tied to a policy file. The
+.Va command
+field is present when
+.Nm
+could not start or encode a command.
+.Pp
+Usage errors are not JSON responses; they are printed on standard error and
+exit with status 2. Logs and sandboxed command output are not part of the JSON
+response. Normal successful command execution does not print a JSON response
+because standard output belongs to the sandboxed command.
 .Sh EXIT STATUS
 On success,
 .Nm
@@ -159,7 +187,7 @@ and returns that command's exit status. When seccomp user notification is needed
 supervises the sandboxed child and exits with the child's status. If policy
 loading or sandbox setup fails,
 .Nm
-prints an error and exits non-zero.
+prints a JSON response and exits non-zero.
 Usage errors exit with status 2.
 .Sh AUTHORS
 .An Jarkko Sakkinen Aq Mt jarkko.sakkinen@iki.fi

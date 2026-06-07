@@ -36,16 +36,16 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
 
     let ruleset = Ruleset::default()
         .handle_access(handled_access)
-        .map_err(|error| Error::BackendSetup(error.to_string()))?;
+        .map_err(|error| Error::system(error.to_string()))?;
     let mut ruleset = if network_access.is_empty() {
         ruleset
     } else {
         ruleset
             .handle_access(network_access)
-            .map_err(|error| Error::BackendSetup(error.to_string()))?
+            .map_err(|error| Error::system(error.to_string()))?
     }
     .create()
-    .map_err(|error| Error::BackendSetup(error.to_string()))?;
+    .map_err(|error| Error::system(error.to_string()))?;
 
     ruleset = add_path_rules(ruleset, &policy.write_roots, write_access, "write")?;
 
@@ -57,16 +57,16 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
 
     let status = ruleset
         .restrict_self()
-        .map_err(|error| Error::BackendSetup(error.to_string()))?;
+        .map_err(|error| Error::system(error.to_string()))?;
 
     match status.ruleset {
         RulesetStatus::FullyEnforced => Ok(()),
-        RulesetStatus::PartiallyEnforced => Err(Error::BackendUnavailable(
-            "sandbox ruleset partially enforced".to_owned(),
-        )),
-        RulesetStatus::NotEnforced => Err(Error::BackendUnavailable(
-            "sandbox ruleset not enforced".to_owned(),
-        )),
+        RulesetStatus::PartiallyEnforced => Err(Error::Capability {
+            message: "sandbox ruleset partially enforced".to_owned(),
+        }),
+        RulesetStatus::NotEnforced => Err(Error::Capability {
+            message: "sandbox ruleset not enforced".to_owned(),
+        }),
     }
 }
 
@@ -85,7 +85,7 @@ fn add_path_rules(
                 log::debug!("policy: {label} path {} missing, skipping", path.display());
                 continue;
             }
-            Err(error) => return Err(Error::BackendSetup(error.to_string())),
+            Err(error) => return Err(Error::system(error.to_string())),
         };
         let path_access = if path.is_dir() {
             access
@@ -95,7 +95,7 @@ fn add_path_rules(
         let rule = PathBeneath::new(fd, path_access);
         ruleset = ruleset
             .add_rule(rule)
-            .map_err(|error| Error::BackendSetup(error.to_string()))?;
+            .map_err(|error| Error::system(error.to_string()))?;
     }
 
     Ok(ruleset)
@@ -110,7 +110,7 @@ fn add_network_rules(mut ruleset: RulesetCreated, policy: &AccessPolicy) -> Resu
         let rule = NetPort::new(*port, AccessNet::ConnectTcp);
         ruleset = ruleset
             .add_rule(rule)
-            .map_err(|error| Error::BackendSetup(error.to_string()))?;
+            .map_err(|error| Error::system(error.to_string()))?;
     }
 
     Ok(ruleset)

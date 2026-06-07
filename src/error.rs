@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use std::ffi::OsString;
+use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use strum_macros::Display;
@@ -9,91 +10,92 @@ use strum_macros::Display;
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 #[allow(dead_code)]
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub(crate) enum Error {
-    #[error("address family not supported")]
-    AddressFamilyNotSupported,
-
-    #[error("backend call failed with {code}")]
-    BackendCall { code: u32 },
-
-    #[error("backend setup failed: {0}")]
-    BackendSetup(String),
-
-    #[error("backend unavailable: {0}")]
-    BackendUnavailable(String),
-
-    #[error("bad address")]
-    BadAddress,
-
-    #[error("bad file descriptor")]
-    BadFileDescriptor,
-
-    #[error("{command} failed with {error}", command = command.to_string_lossy())]
-    Exec {
-        command: OsString,
-        #[source]
-        error: io::Error,
-    },
-
-    #[error("invalid address")]
-    InvalidAddress,
-
-    #[error("invalid command: {0}")]
-    InvalidCommand(&'static str),
-
-    #[error(transparent)]
-    Io(#[from] io::Error),
-
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-
-    #[error("missing file descriptor")]
-    MissingFileDescriptor,
-
-    #[error("name too long")]
-    NameTooLong,
-
-    #[error("peer closed connection")]
-    PeerClosed,
-
-    #[error("policy denied operation")]
-    PolicyDenied,
-
-    #[error("policy: {file}: {error}", file = path.display())]
-    PolicyFile {
-        path: PathBuf,
-        #[source]
-        error: io::Error,
-    },
-
-    #[error("policy: {file}: {error}", file = path.display())]
-    PolicyFileJson {
-        path: PathBuf,
-        #[source]
-        error: serde_json::Error,
-    },
-
-    #[error("policy: home unavailable")]
-    PolicyHomeUnavailable,
-
-    #[error("policy: path empty")]
-    PolicyPathEmpty,
-
-    #[error("policy: {0} port out of range")]
-    PolicyPortOutOfRange(PolicyPort),
-
-    #[error("failed with {errno}")]
-    SystemCall { errno: i32 },
-
-    #[error("unsupported platform")]
-    UnsupportedPlatform,
-
-    #[error("policy: unsupported: {0}")]
-    UnsupportedPolicy(&'static str),
-
-    #[error("{0}")]
     Usage(String),
+    Policy {
+        file: Option<PathBuf>,
+        message: String,
+    },
+    Command {
+        command: Option<OsString>,
+        message: String,
+    },
+    Capability {
+        message: String,
+    },
+    System {
+        message: String,
+    },
+}
+
+impl Error {
+    pub(crate) fn policy(message: impl Into<String>) -> Self {
+        Self::Policy {
+            file: None,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn policy_file(path: PathBuf, message: impl Into<String>) -> Self {
+        Self::Policy {
+            file: Some(path),
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn command(command: Option<OsString>, message: impl Into<String>) -> Self {
+        Self::Command {
+            command,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn system(message: impl Into<String>) -> Self {
+        Self::System {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage(message)
+            | Self::Policy {
+                file: None,
+                message,
+            }
+            | Self::Capability { message }
+            | Self::System { message }
+            | Self::Command {
+                command: None,
+                message,
+            } => f.write_str(message),
+            Self::Policy {
+                file: Some(file),
+                message,
+            } => write!(f, "{}: {message}", file.display()),
+            Self::Command {
+                command: Some(command),
+                message,
+            } => write!(f, "{}: {message}", command.to_string_lossy()),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Self::system(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::policy(error.to_string())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Display)]

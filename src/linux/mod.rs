@@ -47,8 +47,8 @@ pub(crate) fn execute(
     }
     close_inherited_fds();
     let error = Command::new(command).args(args).exec();
-    Err(Error::Exec {
-        command: command.to_os_string(),
-        error,
-    })
+    Err(Error::command(
+        Some(command.to_os_string()),
+        error.to_string(),
+    ))
 }
