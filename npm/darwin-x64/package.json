@@ -15,7 +15,8 @@
     "x64"
   ],
   "files": [
-    "bin/landstrip"
+    "bin/landstrip",
+    "LICENSE-LGPL-2.1"
   ],
   "publishConfig": {
     "access": "public"

@@ -75,4 +75,5 @@ the return values on error:
 
 ## Licensing
 
-`landstrip` is licensed under `LGPL-2.1-or-later`.
+The JavaScript npm wrapper is licensed under `Apache-2.0`. The Rust source and
+native binaries are licensed under `LGPL-2.1-or-later`.
