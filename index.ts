@@ -75,7 +75,7 @@ interface BashSandboxState {
 
 type ToastVariant = 'info' | 'success' | 'warning' | 'error';
 
-const LANDSTRIP_VERSION = [0, 9, 2] as const;
+const LANDSTRIP_VERSION = [0, 9, 5] as const;
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 
 const DEFAULT_CONFIG: SandboxConfig = {
@@ -777,7 +777,7 @@ export default (async ({ client, directory }: PluginInput, options?: PluginOptio
     if (!hasMinimumVersion(version, LANDSTRIP_VERSION)) {
       landstripCheck = {
         ok: false,
-        reason: `landstrip 0.9.2 or newer is required; found: ${version}`,
+        reason: `landstrip 0.9.5 or newer is required; found: ${version}`,
       };
       return landstripCheck;
     }
@@ -942,8 +942,34 @@ export default (async ({ client, directory }: PluginInput, options?: PluginOptio
       Object.assign(output.env, proxyEnv(state.port));
     },
 
-    'tool.execute.after': async (input) => {
-      if (input.tool === 'bash') await cleanupBash(input.callID);
+    'tool.execute.after': async (input, output) => {
+      if (input.tool !== 'bash') return;
+
+      const state = activeBash.get(input.callID);
+      if (!state) return;
+
+      const errors = parseLandstripErrors(output?.output ?? '');
+      if (errors.length > 0) {
+        const message = formatLandstripErrors(errors);
+        await client.tui
+          .showToast({
+            body: { title: 'opencode-landstrip', message, variant: 'error' },
+            query: { directory },
+          })
+          .catch(() => undefined);
+        await client.app
+          .log({
+            body: {
+              service: 'opencode-landstrip',
+              level: 'error',
+              message,
+            },
+            query: { directory },
+          })
+          .catch(() => undefined);
+      }
+
+      await cleanupBash(input.callID);
     },
 
     dispose: async () => {

@@ -35,8 +35,8 @@ test('bash wrapping is idempotent for repeated before hooks', async () => {
     await writeFile(
       fakeLandstrip,
       process.platform === 'win32'
-        ? '@echo landstrip 0.9.2\r\n'
-        : '#!/bin/sh\nprintf "landstrip 0.9.2\\n"\n',
+        ? '@echo landstrip 0.9.5\r\n'
+        : '#!/bin/sh\nprintf "landstrip 0.9.5\\n"\n',
     );
     if (process.platform !== 'win32') await chmod(fakeLandstrip, 0o755);
 
@@ -98,7 +98,7 @@ test('bash wrapping is idempotent for repeated before hooks', async () => {
       assert.equal(output.args.description, 'Shows concise git status (landstrip)');
       assert.equal(wrapped.match(/'-p'/g)?.length, 1);
     } finally {
-      await hooks['tool.execute.after'](input);
+      await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
     }
   } finally {
     if (originalHome === undefined) delete process.env.HOME;
