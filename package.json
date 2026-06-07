@@ -1,6 +1,6 @@
 {
   "name": "pi-landstrip",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Landlock-based sandboxing for pi with interactive permission prompts",
   "keywords": [
     "landstrip",
