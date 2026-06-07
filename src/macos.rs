@@ -88,11 +88,14 @@ fn render_write_rules(sb: &mut String, write_roots: &[PathBuf]) {
 }
 
 fn render_read_rules(sb: &mut String, read_access: &ReadAccess) {
-    if let ReadAccess::AllowRoots(roots) = read_access {
-        writeln!(sb, "(deny file-read*)").unwrap();
-        for root in roots {
-            let escaped = escape_sbpl_literal(&root.to_string_lossy());
-            writeln!(sb, "(allow file-read* (subpath \"{escaped}\"))").unwrap();
+    match read_access {
+        ReadAccess::Unrestricted => sb.push_str("(allow file-read*)\n"),
+        ReadAccess::AllowRoots(roots) => {
+            writeln!(sb, "(deny file-read*)").unwrap();
+            for root in roots {
+                let escaped = escape_sbpl_literal(&root.to_string_lossy());
+                writeln!(sb, "(allow file-read* (subpath \"{escaped}\"))").unwrap();
+            }
         }
     }
 }
