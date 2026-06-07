@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! Windows sandbox backend using LPAC `AppContainer`.
+//! Windows sandbox platform using LPAC `AppContainer`.
 
 use crate::error::{Error, Result};
 use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
@@ -60,7 +60,7 @@ pub(crate) fn execute(
 
 fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
     if matches!(policy.read_access, ReadAccess::Unrestricted) {
-        return Err(Error::Capability {
+        return Err(Error::Platform {
             message: "read access must use explicit allow roots".to_owned(),
         });
     }
@@ -68,20 +68,20 @@ fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
     let network = &policy.network_access;
 
     if network.is_unrestricted() {
-        return Err(Error::Capability {
+        return Err(Error::Platform {
             message: "unrestricted network is not supported yet".to_owned(),
         });
     }
 
     if network.local_tcp_bind || !network.connect_tcp_ports.is_empty() {
-        return Err(Error::Capability {
+        return Err(Error::Platform {
             message: "TCP policies are not supported yet".to_owned(),
         });
     }
 
     if !matches!(&network.unix_socket_access, UnixSocketAccess::AllowPaths(paths) if paths.is_empty())
     {
-        return Err(Error::Capability {
+        return Err(Error::Platform {
             message: "Unix socket policies are not supported".to_owned(),
         });
     }
@@ -157,7 +157,7 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<()> {
     let read_roots = match &policy.read_access {
         ReadAccess::AllowRoots(read_roots) => read_roots,
         ReadAccess::Unrestricted => {
-            return Err(Error::Capability {
+            return Err(Error::Platform {
                 message: "read access must use explicit allow roots".to_owned(),
             });
         }
@@ -301,10 +301,11 @@ fn create_process_in_appcontainer(sid: PSID, tool: &OsStr, args: &[OsString]) ->
 
     if created == 0 {
         let code = unsafe { GetLastError() };
-        return Err(Error::tool(
-            Some(tool.to_os_string()),
-            format!("CreateProcessW failed: error {code}"),
-        ));
+        return Err(Error::ToolLaunch {
+            program: Some(tool.to_os_string()),
+            message: format!("CreateProcessW failed: error {code}"),
+            cause: None,
+        });
     }
 
     let process = Handle(process_info.hProcess);
@@ -409,13 +410,19 @@ impl Drop for Handle {
 fn command_line(tool: &OsStr, args: &[OsString]) -> Result<String> {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(
-        quote_command_arg(tool)
-            .map_err(|message| Error::tool(Some(tool.to_os_string()), message))?,
+        quote_command_arg(tool).map_err(|message| Error::ToolEncoding {
+            program: Some(tool.to_os_string()),
+            message: message.to_owned(),
+            cause: None,
+        })?,
     );
     for arg in args {
         parts.push(
-            quote_command_arg(arg)
-                .map_err(|message| Error::tool(Some(tool.to_os_string()), message))?,
+            quote_command_arg(arg).map_err(|message| Error::ToolEncoding {
+                program: Some(tool.to_os_string()),
+                message: message.to_owned(),
+                cause: None,
+            })?,
         );
     }
     Ok(parts.join(" "))

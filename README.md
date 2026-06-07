@@ -19,7 +19,7 @@ npx landstrip -p policy.json cargo test
 The npm package installs a small Node.js wrapper and a platform-specific native
 binary package.
 
-## Backends
+## Platforms
 
 | Area         | macOS                    | Linux                        | Windows                         |
 | ------------ | ------------------------ | ---------------------------- | ------------------------------- |
@@ -28,7 +28,7 @@ binary package.
 | TCP          | localhost proxy ports    | loopback proxy ports         | unsupported                     |
 | Unix sockets | allowlist                | allowlist via seccomp broker | unsupported                     |
 
-Windows uses an AppContainer. The backend grants the generated AppContainer SID
+Windows uses an AppContainer. The platform grants the generated AppContainer SID
 access to the lowered read and write roots, so Windows policies must use
 explicit read allowlists. Fine-grained TCP and Unix socket policies are rejected
 until Windows enforcement exists.
@@ -55,21 +55,23 @@ network policies until Windows network support exists.
 ## JSON Output
 
 Failures reported by `landstrip` are printed as one compact JSON object on
-standard output. This covers policy, tool launch, capability, and system
+standard output. This covers policy, tool launch, platform, and system
 errors. Usage errors are not JSON responses; they remain on standard error and
 exit with status 2.
 
 ```json
-{"code":"policy","file":"policy.json","message":"expected value at line 1 column 1"}
+{"category":"policy","file":"policy.json","message":"expected value at line 1 column 1"}
 ```
 
 ```json
-{"code":"tool","program":"cargo","message":"No such file or directory"}
+{"category":"tool","program":"cargo","kind":"launch","message":"No such file or directory"}
 ```
 
-The `code` field is one of `policy`, `tool`, `capability`, or `system`. The
+The `category` field is one of `policy`, `tool`, `platform`, or `system`. The
 `file` field is present when a policy error is tied to a policy file. The
-`program` field is present when landstrip could not start or encode a tool.
+`program` field is present when landstrip could not start or encode a tool. The
+`kind` field is present for tool errors and is either `launch` (failed to start
+the tool) or `encoding` (failed to encode the command line).
 
 Logs and sandboxed tool output are not part of the JSON response. Normal
 successful tool execution does not print a landstrip JSON response because

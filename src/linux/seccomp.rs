@@ -78,9 +78,7 @@ enum BrokerError {
     BadAddress,
     BadFileDescriptor,
     InvalidAddress,
-    MissingFileDescriptor,
     NameTooLong,
-    PeerClosed,
     PolicyDenied,
     SystemCall { errno: i32 },
 }
@@ -95,8 +93,6 @@ impl BrokerError {
             Self::BadAddress => libc::EFAULT,
             Self::NameTooLong => libc::ENAMETOOLONG,
             Self::SystemCall { errno } => *errno,
-            Self::PeerClosed => libc::ECONNRESET,
-            Self::MissingFileDescriptor => libc::EBADMSG,
         }
     }
 }
@@ -147,7 +143,7 @@ pub(super) fn run_network_broker(
                 child_tool.args(args);
 
                 let error = child_tool.exec();
-                Err(Error::tool(Some(tool.to_os_string()), error.to_string()))
+                Err(Error::tool_exec(Some(tool.to_os_string()), error))
             })();
 
             if let Err(error) = result {
@@ -232,7 +228,7 @@ fn supervise_child(
                 }
             }
 
-            return Err(Error::system(source.to_string()));
+            return Err(Error::system_source(source));
         }
     }
 }
@@ -307,7 +303,7 @@ fn seccomp_probe(operation: libc::c_uint, data: *mut libc::c_void) -> Result<()>
     // SAFETY: seccomp(2) copies the operation-specific data pointer before returning.
     let rc = unsafe { libc::syscall(libc::SYS_seccomp, operation, 0, data) };
     if rc < 0 {
-        return Err(Error::Capability {
+        return Err(Error::Platform {
             message: format!(
                 "seccomp user notifications are unavailable: {}",
                 Errno::last()
@@ -708,9 +704,9 @@ impl NetworkFilters {
 
 fn build_filter(rules: RuleMap, match_action: SeccompAction) -> Result<BpfProgram> {
     let filter = SeccompFilter::new(rules, SeccompAction::Allow, match_action, target_arch()?)
-        .map_err(|error| Error::system(error.to_string()))?;
-    let program = <BpfProgram as TryFrom<SeccompFilter>>::try_from(filter)
-        .map_err(|error| Error::system(error.to_string()))?;
+        .map_err(Error::system_source)?;
+    let program =
+        <BpfProgram as TryFrom<SeccompFilter>>::try_from(filter).map_err(Error::system_source)?;
 
     Ok(program)
 }
@@ -758,7 +754,7 @@ fn target_arch() -> Result<TargetArch> {
         "x86_64" => Ok(TargetArch::x86_64),
         "aarch64" => Ok(TargetArch::aarch64),
         "riscv64" => Ok(TargetArch::riscv64),
-        arch => Err(Error::Capability {
+        arch => Err(Error::Platform {
             message: format!("seccompiler does not support Linux architecture {arch}"),
         }),
     }
@@ -809,7 +805,7 @@ fn seccomp_condition(
     value: u64,
 ) -> Result<SeccompCondition> {
     SeccompCondition::new(arg_index, SeccompCmpArgLen::Dword, operator, value)
-        .map_err(|error| Error::system(error.to_string()))
+        .map_err(Error::system_source)
 }
 
 fn add_conditional_rule(
@@ -817,7 +813,7 @@ fn add_conditional_rule(
     syscall: i64,
     conditions: Vec<SeccompCondition>,
 ) -> Result<()> {
-    let rule = SeccompRule::new(conditions).map_err(|error| Error::system(error.to_string()))?;
+    let rule = SeccompRule::new(conditions).map_err(Error::system_source)?;
     rules.entry(syscall).or_default().push(rule);
 
     Ok(())

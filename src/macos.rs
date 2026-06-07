@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! macOS Seatbelt (SBPL) sandbox backend.
+//! macOS Seatbelt (SBPL) sandbox platform.
 
 use crate::error::{Error, Result};
 use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
@@ -20,10 +20,10 @@ pub(crate) fn execute(
     tool: &OsStr,
     args: &[OsString],
 ) -> Result<()> {
-    let profile = render_profile(policy, tool).map_err(|error| Error::system(error.to_string()))?;
+    let profile = render_profile(policy, tool).map_err(Error::system_source)?;
     <SystemSeatbelt as Seatbelt>::apply_profile(&profile)?;
     let error = Command::new(tool).args(args).exec();
-    Err(Error::tool(Some(tool.to_os_string()), error.to_string()))
+    Err(Error::tool_exec(Some(tool.to_os_string()), error))
 }
 
 trait Seatbelt {

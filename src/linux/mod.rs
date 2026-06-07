@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! Linux sandbox backend using Landlock and seccomp.
+//! Linux sandbox platform using Landlock and seccomp.
 
 mod fd;
 mod landlock;
@@ -47,5 +47,5 @@ pub(crate) fn execute(
     }
     close_inherited_fds();
     let error = Command::new(tool).args(args).exec();
-    Err(Error::tool(Some(tool.to_os_string()), error.to_string()))
+    Err(Error::tool_exec(Some(tool.to_os_string()), error))
 }

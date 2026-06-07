@@ -4,6 +4,10 @@
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
 
+mod cli;
+mod config;
+mod error;
+mod paths;
 #[cfg_attr(target_os = "linux", path = "linux/mod.rs")]
 #[cfg_attr(target_os = "macos", path = "macos.rs")]
 #[cfg_attr(target_os = "windows", path = "windows.rs")]
@@ -11,11 +15,7 @@
     not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
     path = "fallback.rs"
 )]
-mod backend;
-mod cli;
-mod config;
-mod error;
-mod paths;
+mod platform;
 mod policy;
 mod traversal;
 
@@ -23,7 +23,6 @@ use crate::cli::parse_cli;
 use crate::config::load_settings;
 use crate::error::{Error, Result};
 use crate::policy::lower_sandbox_policy;
-use serde::Serialize;
 use std::process;
 
 fn main() {
@@ -40,54 +39,12 @@ fn main() {
     }
 }
 fn print_error_response(error: &Error) -> std::result::Result<(), serde_json::Error> {
-    let Some(response) = response_error(error) else {
+    let Some(response) = error.response() else {
         return Ok(());
     };
 
     println!("{}", serde_json::to_string(&response)?);
     Ok(())
-}
-
-fn response_error(error: &Error) -> Option<Response<'_>> {
-    match error {
-        Error::Usage(_) => None,
-        Error::Policy { file, message } => Some(Response {
-            code: "policy",
-            file: file.as_ref().map(|file| file.display().to_string()),
-            program: None,
-            message,
-        }),
-        Error::Tool { program, message } => Some(Response {
-            code: "tool",
-            file: None,
-            program: program
-                .as_ref()
-                .map(|program| program.to_string_lossy().into_owned()),
-            message,
-        }),
-        Error::Capability { message } => Some(Response {
-            code: "capability",
-            file: None,
-            program: None,
-            message,
-        }),
-        Error::System { message } => Some(Response {
-            code: "system",
-            file: None,
-            program: None,
-            message,
-        }),
-    }
-}
-
-#[derive(Serialize)]
-struct Response<'a> {
-    code: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    file: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    program: Option<String>,
-    message: &'a str,
 }
 
 fn run() -> Result<()> {
@@ -102,7 +59,7 @@ fn run() -> Result<()> {
     let settings = load_settings(&cli.policy_paths)?;
     let policy = lower_sandbox_policy(&settings.filesystem, &settings.network, &cli.policy_base)?;
 
-    backend::execute(&policy, &cli.policy_base, &cli.tool, &cli.tool_args)?;
+    platform::execute(&policy, &cli.policy_base, &cli.tool, &cli.tool_args)?;
 
     Ok(())
 }

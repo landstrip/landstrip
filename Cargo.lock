@@ -289,7 +289,6 @@ dependencies = [
  "serde_json",
  "strum",
  "strum_macros",
- "thiserror",
  "windows-sys 0.60.2",
 ]
 

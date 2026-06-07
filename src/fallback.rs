@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! Fallback backend for unsupported platforms.
+//! Fallback platform implementation for unsupported platforms.
 //!
-//! Returns [`Error::Capability`] to communicate that the current
+//! Returns [`Error::Platform`] to communicate that the current
 //! operating system is not yet supported by landstrip.
 
 use crate::error::{Error, Result};
@@ -17,7 +17,7 @@ pub(crate) fn execute(
     _tool: &OsStr,
     _args: &[OsString],
 ) -> Result<()> {
-    Err(Error::Capability {
+    Err(Error::Platform {
         message: "platform sandbox support is missing".to_owned(),
     })
 }
