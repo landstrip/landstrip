@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - '*.*.*'
+      - 'v*.*.*'
   workflow_dispatch:
   schedule:
     - cron: '17 3 * * *'
@@ -40,7 +41,7 @@ jobs:
         id: version
         run: |
           node <<'NODE'
-          const { execSync } = require('node:child_process');
+          const { execFileSync, execSync } = require('node:child_process');
           const fs = require('node:fs');
 
           function parseVersion(value) {
@@ -67,9 +68,38 @@ jobs:
             return 0;
           }
 
-          function npmVersion(packageName) {
+          function tagHasFile(tag, file) {
             try {
-              return execSync(`npm view ${packageName} version --json`, {
+              execFileSync('git', ['cat-file', '-e', `${tag}:${file}`], {
+                stdio: ['ignore', 'ignore', 'ignore'],
+              });
+              return true;
+            } catch {
+              return false;
+            }
+          }
+
+          function isPublishableTag({ tag }) {
+            return [
+              'Cargo.toml',
+              'package.json',
+              'npm/darwin-arm64/package.json',
+              'npm/darwin-x64/package.json',
+              'npm/linux-x64/package.json',
+              'npm/win32-x64/package.json',
+            ].every((file) => tagHasFile(tag, file));
+          }
+
+          function readTagFile(tag, file) {
+            return execFileSync('git', ['show', `${tag}:${file}`], {
+              encoding: 'utf8',
+              stdio: ['ignore', 'pipe', 'inherit'],
+            });
+          }
+
+          function npmPackageVersion(packageName, packageVersion) {
+            try {
+              return execFileSync('npm', ['view', `${packageName}@${packageVersion}`, 'version', '--json'], {
                 encoding: 'utf8',
                 stdio: ['ignore', 'pipe', 'pipe'],
               }).trim().replace(/^"|"$/g, '');
@@ -91,37 +121,52 @@ jobs:
             .filter(({ parsed }) => parsed)
             .sort((a, b) => compareVersions(a.parsed, b.parsed));
 
-          if (tags.length === 0) {
-            throw new Error('cannot find a version tag');
+          const publishableTags = tags.filter(isPublishableTag);
+
+          if (publishableTags.length === 0) {
+            throw new Error('no version tag contains npm package metadata');
           }
 
-          const latest = tags.at(-1);
-          const latestNpmVersion = npmVersion('@jarkkojs/landstrip');
-          const parsedNpmVersion = latestNpmVersion ? parseVersion(latestNpmVersion) : null;
+          const latest = publishableTags.at(-1);
+          const packageFiles = [
+            'package.json',
+            'npm/darwin-arm64/package.json',
+            'npm/darwin-x64/package.json',
+            'npm/linux-x64/package.json',
+            'npm/win32-x64/package.json',
+          ];
+          const packages = packageFiles.map((file) => JSON.parse(readTagFile(latest.tag, file)));
+          const missingPackages = packages.filter((data) =>
+            npmPackageVersion(data.name, data.version) !== data.version
+          );
 
-          if (latestNpmVersion && !parsedNpmVersion) {
-            throw new Error(`cannot parse npm version: ${latestNpmVersion}`);
-          }
-
-          const shouldPublish = !parsedNpmVersion || compareVersions(latest.parsed, parsedNpmVersion) > 0;
+          const shouldPublish = missingPackages.length > 0;
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `should_publish=${shouldPublish}\n`);
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `tag=${latest.tag}\n`);
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${latest.parsed.version}\n`);
 
           console.log(`latest git tag: ${latest.tag}`);
-          console.log(`latest npm version: ${latestNpmVersion ?? '<not published>'}`);
+          if (missingPackages.length > 0) {
+            console.log(`missing npm packages: ${missingPackages.map(({ name, version }) => `${name}@${version}`).join(', ')}`);
+          } else {
+            console.log('all npm packages are already published');
+          }
           console.log(`should publish: ${shouldPublish}`);
           NODE
 
-      - name: Checkout latest tag
-        if: steps.version.outputs.should_publish == 'true'
-        run: git checkout --detach "${{ steps.version.outputs.tag }}"
-
       - name: Validate package metadata
-        if: steps.version.outputs.should_publish == 'true'
         run: |
           node <<'NODE'
-          const fs = require('node:fs');
+          const { execFileSync } = require('node:child_process');
+
+          const tag = process.env.TAG_REF;
+
+          function readTagFile(file) {
+            return execFileSync('git', ['show', `${tag}:${file}`], {
+              encoding: 'utf8',
+              stdio: ['ignore', 'pipe', 'inherit'],
+            });
+          }
 
           const packageDirs = [
             'npm/darwin-arm64',
@@ -129,8 +174,8 @@ jobs:
             'npm/linux-x64',
             'npm/win32-x64',
           ];
-          const root = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          const cargoToml = fs.readFileSync('Cargo.toml', 'utf8');
+          const root = JSON.parse(readTagFile('package.json'));
+          const cargoToml = readTagFile('Cargo.toml');
           const cargoVersion = cargoToml.match(/^\s*version\s*=\s*"([^"]+)"/m)?.[1];
 
           if (!cargoVersion) {
@@ -147,7 +192,7 @@ jobs:
           }
 
           for (const packageDir of packageDirs) {
-            const data = JSON.parse(fs.readFileSync(`${packageDir}/package.json`, 'utf8'));
+            const data = JSON.parse(readTagFile(`${packageDir}/package.json`));
 
             if (data.version !== root.version) {
               throw new Error(`${packageDir}/package.json version ${data.version} does not match ${root.version}`);
@@ -160,12 +205,12 @@ jobs:
 
           NODE
         env:
+          TAG_REF: ${{ steps.version.outputs.tag }}
           TAG_VERSION: ${{ steps.version.outputs.version }}
 
   build:
     name: Build ${{ matrix.package }}
     needs: metadata
-    if: needs.metadata.outputs.should_publish == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -230,7 +275,6 @@ jobs:
   publish:
     name: Publish packages
     needs: [metadata, build]
-    if: needs.metadata.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -244,6 +288,11 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+
+      - name: Verify npm authentication
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
 
       - name: Download darwin-arm64 binary
         uses: actions/download-artifact@v4
