@@ -7,9 +7,15 @@
     "allowedDomains": [
       "github.com",
       "*.github.com",
+      "api.github.com",
       "raw.githubusercontent.com",
+      "objects.githubusercontent.com",
+      "codeload.github.com",
       "registry.npmjs.org",
+      "npmjs.org",
       "*.npmjs.org",
+      "nodejs.org",
+      "*.nodejs.org",
       "crates.io",
       "*.crates.io",
       "static.crates.io"
@@ -18,8 +24,34 @@
   },
   "filesystem": {
     "denyRead": ["/home"],
-    "allowRead": [".", "~/.config/opencode", "~/.local", "~/.cargo"],
-    "allowWrite": [".", "/tmp", "~/.cargo", "~/.rustup"],
+    "allowRead": [
+      ".",
+      "/tmp",
+      "/var/tmp",
+      "/dev/null",
+      "~/.config/opencode",
+      "~/.config/git",
+      "~/.gitconfig",
+      "~/.local",
+      "~/.cargo",
+      "~/.rustup",
+      "~/.npm",
+      "~/.cache",
+      "~/.bun",
+      "~/.node-gyp"
+    ],
+    "allowWrite": [
+      ".",
+      "/tmp",
+      "/var/tmp",
+      "/dev/null",
+      "~/.cargo",
+      "~/.rustup",
+      "~/.npm",
+      "~/.cache",
+      "~/.bun",
+      "~/.node-gyp"
+    ],
     "denyWrite": [".env", ".env.*", "*.pem", "*.key"]
   }
 }

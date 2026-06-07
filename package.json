@@ -31,13 +31,15 @@
     }
   },
   "scripts": {
-    "fmt": "oxfmt index.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md",
+    "fmt": "oxfmt index.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md test/*.test.mjs",
     "lint": "oxlint index.ts",
     "check": "tsc --noEmit",
-    "all": "npm run fmt && npm run lint && npm run check",
-    "ci:fmt": "oxfmt --check index.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md",
+    "test": "node --test test/*.test.mjs",
+    "all": "npm run fmt && npm run lint && npm run check && npm test",
+    "ci:fmt": "oxfmt --check index.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md test/*.test.mjs",
     "ci:lint": "npm run lint",
-    "ci:check": "npm run check"
+    "ci:check": "npm run check",
+    "ci:test": "npm test"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.16.2",

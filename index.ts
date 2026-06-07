@@ -62,6 +62,8 @@ interface SandboxConfigOverrides {
 }
 
 interface BashSandboxState {
+  originalCommand: string;
+  wrappedCommand: string;
   policyDir: string;
   port: number;
   stop: () => Promise<void>;
@@ -97,7 +99,7 @@ const DEFAULT_CONFIG: SandboxConfig = {
   },
   filesystem: {
     denyRead: ['/Users', '/home'],
-    allowRead: ['.', '~/.config/opencode', '~/.local', '~/.cargo'],
+    allowRead: ['.', '~/.config/opencode', '~/.config/git', '~/.gitconfig', '~/.local', '~/.cargo'],
     allowWrite: ['.', '/tmp'],
     denyWrite: ['.env', '.env.*', '*.pem', '*.key'],
   },
@@ -621,6 +623,18 @@ function buildWrappedCommand(
   return args.map(shellQuote).join(' ');
 }
 
+function isGeneratedWrappedCommand(config: SandboxConfig, command: string): boolean {
+  return (
+    command.startsWith(`${shellQuote(config.landstrip.command)} `) &&
+    command.includes(` ${shellQuote('-p')} `) &&
+    command.includes('opencode-landstrip-')
+  );
+}
+
+function landstripDescription(description: string): string {
+  return description.endsWith(' (landstrip)') ? description : `${description} (landstrip)`;
+}
+
 function getToolPath(args: Record<string, unknown>): string | undefined {
   const filePath = args.filePath ?? args.path;
   return typeof filePath === 'string' ? filePath : undefined;
@@ -810,7 +824,24 @@ export default (async ({ client, directory }: PluginInput, options?: PluginOptio
     config: SandboxConfig,
   ): Promise<void> {
     if (typeof args.command !== 'string') return;
-    await cleanupBash(callID);
+
+    const existing = activeBash.get(callID);
+    if (existing) {
+      if (args.command === existing.originalCommand || args.command === existing.wrappedCommand) {
+        args.command = existing.wrappedCommand;
+        if (typeof args.description === 'string')
+          args.description = landstripDescription(args.description);
+        return;
+      }
+
+      await cleanupBash(callID);
+    }
+
+    if (isGeneratedWrappedCommand(config, args.command)) {
+      if (typeof args.description === 'string')
+        args.description = landstripDescription(args.description);
+      return;
+    }
 
     const blockedDomain = firstBlockedDomain(args.command, config);
     if (blockedDomain) {
@@ -834,19 +865,25 @@ export default (async ({ client, directory }: PluginInput, options?: PluginOptio
       throw error;
     }
 
+    const originalCommand = args.command;
+    const wrappedCommand = buildWrappedCommand(
+      config,
+      policy.path,
+      configuredShell ?? process.env.SHELL ?? '/bin/sh',
+      originalCommand,
+    );
+
     activeBash.set(callID, {
+      originalCommand,
+      wrappedCommand,
       policyDir: policy.dir,
       port: proxy.port,
       stop: proxy.stop,
     });
 
-    args.command = buildWrappedCommand(
-      config,
-      policy.path,
-      configuredShell ?? process.env.SHELL ?? '/bin/sh',
-      args.command,
-    );
-    if (typeof args.description === 'string') args.description = `${args.description} (landstrip)`;
+    args.command = wrappedCommand;
+    if (typeof args.description === 'string')
+      args.description = landstripDescription(args.description);
   }
 
   const hooks: Hooks = {
