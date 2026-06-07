@@ -86,8 +86,8 @@ try {
     }
     $AllowedFile = Join-Path $Allowed "ok.txt"
     $DeniedFile = Join-Path $Denied "nope.txt"
-    Expect-Success "explicit read/write policy permits configured root" $PolicyFs @($Cmd, "/C", "echo ok> `"$AllowedFile`"")
-    Expect-Failure "explicit read/write policy denies other root" $PolicyFs @($Cmd, "/C", "echo nope> `"$DeniedFile`"")
+    Expect-Success "explicit read/write policy permits configured root" $PolicyFs @($Cmd, "/C", "echo", "ok>", $AllowedFile)
+    Expect-Failure "explicit read/write policy denies other root" $PolicyFs @($Cmd, "/C", "echo", "nope>", $DeniedFile)
 
     $PolicyRead = Join-Path $Tmp "policy-read.json"
     Write-Policy $PolicyRead @{
