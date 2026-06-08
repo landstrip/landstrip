@@ -10,7 +10,7 @@ mod seccomp;
 use crate::error::{Error, Result};
 use crate::policy::AccessPolicy;
 use fd::close_inherited_fds;
-use landlock::enforce_access_policy;
+use landlock::{enforce_access_policy, landlock_features};
 use seccomp::NetworkFilter;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
@@ -25,17 +25,18 @@ pub(crate) fn execute(
 ) -> Result<()> {
     let network = &policy.network_access;
     let unrestricted_network = network.is_unrestricted();
+    let landlock_features = landlock_features()?;
 
     if !unrestricted_network
         && (network.local_tcp_bind
             || !network.connect_tcp_ports.is_empty()
             || seccomp::needs_unix_socket_broker(&network.unix_socket_access))
     {
-        let status = seccomp::run_network_broker(policy, tool, args)?;
+        let status = seccomp::run_network_broker(policy, landlock_features, tool, args)?;
         process::exit(status);
     }
 
-    enforce_access_policy(policy)?;
+    enforce_access_policy(policy, landlock_features)?;
 
     if !unrestricted_network {
         let filter = seccomp::network_filter(NetworkFilter {

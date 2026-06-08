@@ -83,14 +83,22 @@ struct NetPortAttr {
     port: u64,
 }
 
-pub(super) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
-    let resolve_unix = unix_socket_path_access(policy);
-    let abi = landlock_abi()?;
-    if resolve_unix && abi < ABI_RESOLVE_UNIX {
-        return Err(Error::Platform {
-            message: format!("Landlock ABI v{ABI_RESOLVE_UNIX} required for Unix socket paths"),
-        });
-    }
+#[derive(Clone, Copy)]
+pub(super) struct LandlockFeatures {
+    pub(super) resolve_unix: bool,
+}
+
+pub(super) fn landlock_features() -> Result<LandlockFeatures> {
+    Ok(LandlockFeatures {
+        resolve_unix: landlock_abi()? >= ABI_RESOLVE_UNIX,
+    })
+}
+
+pub(super) fn enforce_access_policy(
+    policy: &AccessPolicy,
+    features: LandlockFeatures,
+) -> Result<()> {
+    let resolve_unix = features.resolve_unix && unix_socket_path_access(policy);
 
     let mut handled_access_fs = match &policy.read_access {
         ReadAccess::Unrestricted => WRITE_ACCESS,
@@ -121,8 +129,10 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
         add_path_rules(&ruleset, read_roots, READ_ACCESS, "read")?;
     }
 
-    if let UnixSocketAccess::AllowPaths(paths) = &policy.network_access.unix_socket_access {
-        add_path_rules(&ruleset, paths, ACCESS_FS_RESOLVE_UNIX, "unix socket")?;
+    if resolve_unix {
+        if let UnixSocketAccess::AllowPaths(paths) = &policy.network_access.unix_socket_access {
+            add_path_rules(&ruleset, paths, ACCESS_FS_RESOLVE_UNIX, "unix socket")?;
+        }
     }
 
     add_network_rules(&ruleset, policy)?;

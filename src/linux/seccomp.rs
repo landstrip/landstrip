@@ -13,7 +13,7 @@
 //! path checks.
 
 use super::fd::close_inherited_fds;
-use super::landlock::enforce_access_policy;
+use super::landlock::{enforce_access_policy, LandlockFeatures};
 use crate::error::{Error, Result};
 use crate::paths::normalize_path;
 use crate::policy::{AccessPolicy, UnixSocketAccess};
@@ -100,6 +100,7 @@ impl BrokerError {
 #[allow(clippy::too_many_lines)]
 pub(super) fn run_network_broker(
     policy: &AccessPolicy,
+    landlock_features: LandlockFeatures,
     tool: &OsStr,
     args: &[OsString],
 ) -> Result<i32> {
@@ -122,7 +123,7 @@ pub(super) fn run_network_broker(
             drop(parent);
 
             let result = (|| -> Result<()> {
-                enforce_access_policy(policy)?;
+                enforce_access_policy(policy, landlock_features)?;
 
                 {
                     let child_sock = child_sock;
@@ -159,13 +160,14 @@ pub(super) fn run_network_broker(
             drop(parent);
             let notify_fd = notify.as_raw_fd();
 
-            supervise_child(policy, child, notify_fd, &syscalls)
+            supervise_child(policy, landlock_features, child, notify_fd, &syscalls)
         }
     }
 }
 
 fn supervise_child(
     policy: &AccessPolicy,
+    landlock_features: LandlockFeatures,
     child: Pid,
     notify_fd: RawFd,
     syscalls: &NotificationSyscalls,
@@ -213,7 +215,7 @@ fn supervise_child(
         }
 
         let request = receive_notification(notify_fd)?;
-        let response = handle_notification(policy, &request, syscalls);
+        let response = handle_notification(policy, landlock_features, &request, syscalls);
 
         validate_notification_id(notify_fd, request.id)?;
         if let Err(source) = respond_notification(notify_fd, response) {
@@ -235,6 +237,7 @@ fn supervise_child(
 
 fn handle_notification(
     policy: &AccessPolicy,
+    landlock_features: LandlockFeatures,
     request: &libc::seccomp_notif,
     syscalls: &NotificationSyscalls,
 ) -> libc::seccomp_notif_resp {
@@ -242,7 +245,7 @@ fn handle_notification(
     let result = if syscall == syscalls.bind {
         handle_bind(policy, request)
     } else if syscall == syscalls.connect {
-        handle_connect(policy, request)
+        handle_connect(policy, landlock_features, request)
     } else {
         Ok(NotificationResult::Continue)
     };
@@ -390,6 +393,7 @@ fn handle_bind(
 
 fn handle_connect(
     policy: &AccessPolicy,
+    landlock_features: LandlockFeatures,
     request: &libc::seccomp_notif,
 ) -> SysResult<NotificationResult> {
     let socket = target_socket(request)?;
@@ -409,7 +413,7 @@ fn handle_connect(
             broker_addr_call(socket.sock.as_raw_fd(), &socket.addr, libc::connect)
                 .map(NotificationResult::Value)
         }
-        SocketKind::Unix => handle_unix_connect(policy, request.pid, &socket),
+        SocketKind::Unix => handle_unix_connect(policy, landlock_features, request.pid, &socket),
         SocketKind::Other => Ok(NotificationResult::Continue),
         SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
     }
@@ -417,15 +421,25 @@ fn handle_connect(
 
 fn handle_unix_connect(
     policy: &AccessPolicy,
+    landlock_features: LandlockFeatures,
     pid: u32,
     socket: &TargetSocket,
 ) -> SysResult<NotificationResult> {
-    let Some((target, _relative)) = unix_path_target(pid, &socket.addr)? else {
+    let Some((target, relative)) = unix_path_target(pid, &socket.addr)? else {
         return Err(BrokerError::PolicyDenied);
     };
     authorize_unix_path(policy, &target)?;
 
-    Ok(NotificationResult::Continue)
+    if landlock_features.resolve_unix {
+        return Ok(NotificationResult::Continue);
+    }
+
+    let mut addr = socket.addr.clone();
+    if relative {
+        rewrite_unix_path(&mut addr, &target)?;
+    }
+
+    broker_addr_call(socket.sock.as_raw_fd(), &addr, libc::connect).map(NotificationResult::Value)
 }
 
 fn handle_unix_bind(
