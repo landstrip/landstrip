@@ -176,7 +176,7 @@ fn supervise_child(
         loop {
             match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::StillAlive) => break,
-                Ok(status) => return Ok(ExitCode::from(status).into()),
+                Ok(status) => return Ok(exit_code(status)),
                 Err(Errno::EINTR) => continue,
                 Err(error) => {
                     return Err(system_errno(error as i32));
@@ -205,7 +205,7 @@ fn supervise_child(
         if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
             loop {
                 match waitpid(child, None) {
-                    Ok(status) => return Ok(ExitCode::from(status).into()),
+                    Ok(status) => return Ok(exit_code(status)),
                     Err(Errno::EINTR) => continue,
                     Err(error) => {
                         return Err(system_errno(error as i32));
@@ -222,7 +222,7 @@ fn supervise_child(
             loop {
                 match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
                     Ok(WaitStatus::StillAlive) => break,
-                    Ok(status) => return Ok(ExitCode::from(status).into()),
+                    Ok(status) => return Ok(exit_code(status)),
                     Err(Errno::EINTR) => continue,
                     Err(error) => {
                         return Err(system_errno(error as i32));
@@ -254,7 +254,7 @@ fn handle_notification(
         Ok(NotificationResult::Value(value)) => notification_value(request.id, value),
         Ok(NotificationResult::Continue) => notification_continue(request.id),
         Err(error) => {
-            let errno = notification_errno(&error);
+            let errno = error.errno();
             notification_error(request.id, -errno.abs())
         }
     }
@@ -362,17 +362,13 @@ fn system_errno(errno: i32) -> Error {
     Error::system(format!("failed with {errno}"))
 }
 
-fn notification_errno(error: &BrokerError) -> i32 {
-    error.errno()
-}
-
 fn handle_bind(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
 ) -> SysResult<NotificationResult> {
     let mut socket = target_socket(request)?;
 
-    match socket.kind() {
+    match socket.info.kind() {
         SocketKind::Tcp => {
             if !policy.network_access.local_tcp_bind {
                 return Err(BrokerError::PolicyDenied);
@@ -398,7 +394,7 @@ fn handle_connect(
 ) -> SysResult<NotificationResult> {
     let socket = target_socket(request)?;
 
-    match socket.kind() {
+    match socket.info.kind() {
         SocketKind::Tcp => {
             let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
             if !endpoint.loopback
@@ -943,8 +939,10 @@ fn create_path(path: &Path) -> PathBuf {
         .unwrap_or_else(|| Path::new("/"));
     let parent = normalize_path(parent);
 
-    path.file_name()
-        .map_or(parent.clone(), |name| parent.join(name))
+    match path.file_name() {
+        Some(name) => parent.join(name),
+        None => parent,
+    }
 }
 
 fn sockopt(fd: RawFd, level: libc::c_int, name: libc::c_int) -> SysResult<i32> {
@@ -1026,12 +1024,6 @@ struct TargetSocket {
     info: SocketInfo,
 }
 
-impl TargetSocket {
-    fn kind(&self) -> SocketKind {
-        self.info.kind()
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SocketInfo {
     domain: i32,
@@ -1103,20 +1095,10 @@ impl NotificationSyscalls {
     }
 }
 
-struct ExitCode(i32);
-
-impl From<WaitStatus> for ExitCode {
-    fn from(status: WaitStatus) -> Self {
-        Self(match status {
-            WaitStatus::Exited(_, code) => code,
-            WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
-            _ => 1,
-        })
-    }
-}
-
-impl From<ExitCode> for i32 {
-    fn from(code: ExitCode) -> Self {
-        code.0
+fn exit_code(status: WaitStatus) -> i32 {
+    match status {
+        WaitStatus::Exited(_, code) => code,
+        WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
+        _ => 1,
     }
 }

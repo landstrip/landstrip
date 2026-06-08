@@ -42,16 +42,11 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICA
 
 const INFINITE: u32 = 0xffff_ffff;
 
-pub(crate) fn execute(
-    policy: &AccessPolicy,
-    policy_base: &Path,
-    tool: &OsStr,
-    args: &[OsString],
-) -> Result<()> {
+pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<()> {
     reject_unsupported_policy(policy)?;
 
-    let moniker = appcontainer_moniker(policy_base, tool, policy);
-    let mut profile = AppContainerProfile::new(&moniker)?;
+    let moniker = appcontainer_moniker(tool, policy);
+    let profile = AppContainerProfile::new(&moniker)?;
     grant_policy_access(policy, profile.sid())?;
 
     let exit_code = create_process_in_appcontainer(profile.sid(), tool, args)?;
@@ -89,9 +84,8 @@ fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
     Ok(())
 }
 
-fn appcontainer_moniker(policy_base: &Path, tool: &OsStr, policy: &AccessPolicy) -> String {
+fn appcontainer_moniker(tool: &OsStr, policy: &AccessPolicy) -> String {
     let mut hasher = DefaultHasher::new();
-    policy_base.hash(&mut hasher);
     PathBuf::from(tool).hash(&mut hasher);
     policy.hash(&mut hasher);
     format!("landstrip.{:016x}", hasher.finish())
@@ -140,7 +134,7 @@ impl AppContainerProfile {
         Ok(Self { sid })
     }
 
-    fn sid(&mut self) -> PSID {
+    fn sid(&self) -> PSID {
         self.sid
     }
 }
@@ -410,21 +404,20 @@ impl Drop for Handle {
 
 fn command_line(tool: &OsStr, args: &[OsString]) -> Result<String> {
     let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(quote_command_arg(tool).map_err(|message| Error::Tool {
+    parts.push(quote_command_arg(tool).map_err(|message| tool_encoding_error(tool, message))?);
+    for arg in args {
+        parts.push(quote_command_arg(arg).map_err(|message| tool_encoding_error(tool, message))?);
+    }
+    Ok(parts.join(" "))
+}
+
+fn tool_encoding_error(tool: &OsStr, message: &str) -> Error {
+    Error::Tool {
         program: Some(tool.to_os_string()),
         r#type: ToolType::Encoding,
         message: message.to_owned(),
         cause: None,
-    })?);
-    for arg in args {
-        parts.push(quote_command_arg(arg).map_err(|message| Error::Tool {
-            program: Some(tool.to_os_string()),
-            r#type: ToolType::Encoding,
-            message: message.to_owned(),
-            cause: None,
-        })?);
     }
-    Ok(parts.join(" "))
 }
 
 fn quote_command_arg(arg: &OsStr) -> std::result::Result<String, &'static str> {

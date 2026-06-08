@@ -59,7 +59,7 @@ fn run() -> Result<()> {
     let settings = load_settings(&cli.policy_paths)?;
     let policy = resolve_policy(&settings.filesystem, &settings.network, &cwd)?;
 
-    platform::execute(&policy, &cwd, &cli.tool, &cli.tool_args)?;
+    platform::execute(&policy, &cli.tool, &cli.tool_args)?;
 
     Ok(())
 }

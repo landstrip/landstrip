@@ -9,14 +9,8 @@
 use crate::error::{Error, Result};
 use crate::policy::AccessPolicy;
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
 
-pub(crate) fn execute(
-    _policy: &AccessPolicy,
-    _policy_base: &Path,
-    _tool: &OsStr,
-    _args: &[OsString],
-) -> Result<()> {
+pub(crate) fn execute(_policy: &AccessPolicy, _tool: &OsStr, _args: &[OsString]) -> Result<()> {
     Err(Error::Platform {
         message: "platform sandbox support is missing".to_owned(),
     })

@@ -14,15 +14,9 @@ use landlock::{enforce_access_policy, landlock_features};
 use seccomp::NetworkFilter;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
 use std::process::{self, Command};
 
-pub(crate) fn execute(
-    policy: &AccessPolicy,
-    _policy_base: &Path,
-    tool: &OsStr,
-    args: &[OsString],
-) -> Result<()> {
+pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<()> {
     let network = &policy.network_access;
     let unrestricted_network = network.is_unrestricted();
     let landlock_features = landlock_features()?;

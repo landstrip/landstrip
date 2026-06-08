@@ -8,49 +8,35 @@ use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::ptr;
 
 const SBPL_PROFILE_FLAGS: u64 = 0;
 
-pub(crate) fn execute(
-    policy: &AccessPolicy,
-    _policy_base: &Path,
-    tool: &OsStr,
-    args: &[OsString],
-) -> Result<()> {
+pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<()> {
     let profile = render_profile(policy, tool).map_err(Error::system_source)?;
-    <SystemSeatbelt as Seatbelt>::apply_profile(&profile)?;
+    apply_profile(&profile)?;
     let error = Command::new(tool).args(args).exec();
     Err(Error::tool_exec(Some(tool.to_os_string()), error))
 }
 
-trait Seatbelt {
-    fn apply_profile(profile: &str) -> Result<()>;
-}
+fn apply_profile(profile: &str) -> Result<()> {
+    let profile = CString::new(profile).map_err(|source| {
+        let nul_position = source.nul_position();
+        Error::system(format!(
+            "generated SBPL profile contains an interior NUL byte at offset {nul_position}"
+        ))
+    })?;
+    let mut errorbuf = ptr::null_mut();
 
-struct SystemSeatbelt;
-
-impl Seatbelt for SystemSeatbelt {
-    fn apply_profile(profile: &str) -> Result<()> {
-        let profile = CString::new(profile).map_err(|source| {
-            let nul_position = source.nul_position();
-            Error::system(format!(
-                "generated SBPL profile contains an interior NUL byte at offset {nul_position}"
-            ))
-        })?;
-        let mut errorbuf = ptr::null_mut();
-
-        // SAFETY: profile is a live NULL-terminated C string and errorbuf points to writable
-        // storage through a raw out pointer.
-        let rc =
-            unsafe { ffi::sandbox_init(profile.as_ptr(), SBPL_PROFILE_FLAGS, &raw mut errorbuf) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(Error::system(take_sandbox_error(errorbuf)))
-        }
+    // SAFETY: profile is a live NULL-terminated C string and errorbuf points to writable
+    // storage through a raw out pointer.
+    let rc = unsafe { ffi::sandbox_init(profile.as_ptr(), SBPL_PROFILE_FLAGS, &raw mut errorbuf) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Error::system(take_sandbox_error(errorbuf)))
     }
 }
 
