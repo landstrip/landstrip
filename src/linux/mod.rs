@@ -26,6 +26,14 @@ pub(crate) fn execute(
     let network = &policy.network_access;
     let unrestricted_network = network.is_unrestricted();
     let landlock_features = landlock_features()?;
+    if seccomp::needs_unix_socket_broker(&network.unix_socket_access) {
+        let engine = if landlock_features.resolve_unix {
+            "landlock"
+        } else {
+            "seccomp"
+        };
+        log::debug!("{engine}: Unix socket policy enabled");
+    }
 
     if !unrestricted_network
         && (network.local_tcp_bind
