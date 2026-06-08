@@ -80,7 +80,7 @@ pub(crate) fn resolve_policy(
     } else {
         env::current_dir()?.join(policy_base)
     };
-    let policy_base = normalize_path(&policy_base);
+    let policy_base = normalize_path_lexically(&policy_base);
 
     let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
     let write_deny = resolve_paths(&filesystem.deny_write, &policy_base, home)?;
