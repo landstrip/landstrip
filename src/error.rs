@@ -149,7 +149,7 @@ impl Error {
     }
 
     pub(crate) fn tool_exec(program: Option<OsString>, error: io::Error) -> Self {
-        let r#type = if error.to_string().contains("No such file") {
+        let r#type = if error.kind() == io::ErrorKind::NotFound {
             ToolType::Launch
         } else {
             ToolType::Encoding
