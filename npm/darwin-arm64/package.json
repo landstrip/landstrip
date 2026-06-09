@@ -1,6 +1,6 @@
 {
   "name": "@jarkkojs/landstrip-darwin-arm64",
-  "version": "0.9.7",
+  "version": "0.9.8",
   "description": "macOS arm64 binary for landstrip",
   "license": "LGPL-2.1-or-later",
   "homepage": "https://github.com/jarkkojs/landstrip#readme",
