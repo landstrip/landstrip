@@ -384,6 +384,8 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download darwin-arm64 binary
         uses: actions/download-artifact@v4
         with:
