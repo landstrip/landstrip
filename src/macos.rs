@@ -15,10 +15,24 @@ use std::ptr;
 const SBPL_PROFILE_FLAGS: u64 = 0;
 
 pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<()> {
-    let profile = render_profile(policy, tool).map_err(Error::system_source)?;
+    let profile = render_profile(policy).map_err(Error::system_source)?;
+    let args = canonicalize_args(args);
     apply_profile(&profile)?;
-    let error = Command::new(tool).args(args).exec();
+    let error = Command::new(tool).args(&args).exec();
     Err(Error::tool_exec(Some(tool.to_os_string()), error))
+}
+
+fn canonicalize_args(args: &[OsString]) -> Vec<OsString> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        let path = PathBuf::from(arg);
+        let resolved = match std::fs::canonicalize(&path) {
+            Ok(canonical) => canonical.into_os_string(),
+            Err(_) => arg.clone(),
+        };
+        out.push(resolved);
+    }
+    out
 }
 
 fn apply_profile(profile: &str) -> Result<()> {
@@ -40,12 +54,12 @@ fn apply_profile(profile: &str) -> Result<()> {
     }
 }
 
-fn render_profile(policy: &AccessPolicy, tool: &OsStr) -> std::result::Result<String, fmt::Error> {
+fn render_profile(policy: &AccessPolicy) -> std::result::Result<String, fmt::Error> {
     let mut sb = String::new();
     writeln!(sb, "(version 1)")?;
     writeln!(sb, "(deny default)")?;
 
-    render_process_rules(&mut sb, tool)?;
+    render_process_rules(&mut sb)?;
     render_write_rules(&mut sb, &policy.write_roots)?;
     render_read_rules(&mut sb, &policy.read_access)?;
     render_network_rules(&mut sb, &policy.network_access)?;
@@ -53,13 +67,8 @@ fn render_profile(policy: &AccessPolicy, tool: &OsStr) -> std::result::Result<St
     Ok(sb)
 }
 
-fn render_process_rules(sb: &mut String, tool: &OsStr) -> fmt::Result {
-    let tool = tool.to_string_lossy();
-    writeln!(
-        sb,
-        "(allow process-exec (literal \"{}\"))",
-        escape_sbpl_literal(&tool)
-    )?;
+fn render_process_rules(sb: &mut String) -> fmt::Result {
+    writeln!(sb, "(allow process-exec)")?;
     writeln!(sb, "(allow process-fork)")
 }
 
@@ -77,13 +86,38 @@ fn render_read_rules(sb: &mut String, read_access: &ReadAccess) -> fmt::Result {
         ReadAccess::Unrestricted => sb.push_str("(allow file-read*)\n"),
         ReadAccess::AllowRoots(roots) => {
             writeln!(sb, "(deny file-read*)")?;
+            writeln!(sb, "(allow file-read* (literal \"/\"))")?;
             for root in roots {
                 let escaped = escape_sbpl_literal(&root.to_string_lossy());
                 writeln!(sb, "(allow file-read* (subpath \"{escaped}\"))")?;
             }
+            render_parent_dir_rules(sb, roots)?;
         }
     }
 
+    Ok(())
+}
+
+fn render_parent_dir_rules(sb: &mut String, roots: &[PathBuf]) -> fmt::Result {
+    let mut ancestors: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let mut current = root.as_path();
+        while let Some(parent) = current.parent() {
+            if parent.as_os_str().is_empty() {
+                break;
+            }
+            if let Ok(real) = std::fs::canonicalize(parent) {
+                ancestors.push(real);
+            }
+            current = parent;
+        }
+    }
+    ancestors.sort_unstable();
+    ancestors.dedup();
+    for ancestor in &ancestors {
+        let escaped = escape_sbpl_literal(&ancestor.to_string_lossy());
+        writeln!(sb, "(allow file-read-data (literal \"{escaped}\"))")?;
+    }
     Ok(())
 }
 

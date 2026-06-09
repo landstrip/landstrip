@@ -27,6 +27,7 @@ pub(crate) enum Error {
         message: String,
         cause: Option<Cause>,
     },
+    #[allow(dead_code)]
     Platform {
         message: String,
     },
