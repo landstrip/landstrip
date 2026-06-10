@@ -5,6 +5,8 @@ import type { Hooks, Plugin, PluginInput, PluginOptions } from '@opencode-ai/plu
 
 import { binaryPath } from '@jarkkojs/landstrip';
 
+export { tui } from './tui.js';
+
 import { spawnSync } from 'node:child_process';
 import {
   existsSync,
