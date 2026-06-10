@@ -3,7 +3,7 @@
 
 import type { TuiPlugin } from '@opencode-ai/plugin/tui';
 
-export const tui: TuiPlugin = async (api) => {
+const tui: TuiPlugin = async (api) => {
   api.command?.register(() => [
     {
       title: 'Sandbox',
@@ -16,3 +16,6 @@ export const tui: TuiPlugin = async (api) => {
     },
   ]);
 };
+
+export { tui };
+export default { tui };
