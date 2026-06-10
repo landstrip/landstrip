@@ -80,7 +80,7 @@ interface LandstripErrorResponse {
   message: string;
 }
 
-const LANDSTRIP_VERSION = [0, 10, 2] as const;
+const LANDSTRIP_VERSION = [0, 10, 3] as const;
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 
 const DEFAULT_CONFIG: SandboxConfig = {
@@ -337,7 +337,26 @@ function normalizeBlockedPath(path: string, cwd: string): string {
   return canonicalizePath(isAbsolute(path) ? path : join(cwd, path));
 }
 
-function extractBlockedPath(output: string, cwd: string): string | null {
+function extractCandidatePaths(command: string): string[] {
+  const paths: string[] = [];
+  // Split on whitespace, preserving quoted strings minimally
+  const tokens = command.match(/[^\s"']+|"[^"]*"|'[^']*'/g) ?? [];
+  for (const token of tokens) {
+    const clean = token.replace(/^["']|["']$/g, '').replace(/[,;]$/, '');
+    if (
+      clean.startsWith('/') ||
+      clean.startsWith('~/') ||
+      clean === '~' ||
+      clean.startsWith('./') ||
+      clean.startsWith('../')
+    ) {
+      paths.push(clean);
+    }
+  }
+  return paths;
+}
+
+function extractBlockedPath(output: string, cwd: string, command?: string): string | null {
   // bash/sh: line X: /path: Permission denied
   let match = output.match(
     /(?:\/bin\/bash|bash|sh): (?:line \d+: )?([^:\n]+): (?:Operation not permitted|Permission denied)/,
@@ -362,11 +381,26 @@ function extractBlockedPath(output: string, cwd: string): string | null {
     if (error.file) return normalizeBlockedPath(error.file, cwd);
   }
 
+  // If landstrip reported an error but without a file field, try to
+  // extract the blocked path from the command itself
+  if (landstripErrors.length > 0 && command) {
+    const config = loadConfig(cwd);
+    for (const candidate of extractCandidatePaths(command)) {
+      const resolved = canonicalizePath(candidate);
+      if (
+        matchesPattern(resolved, config.filesystem.denyRead) ||
+        !matchesPattern(resolved, config.filesystem.allowRead)
+      ) {
+        return resolved;
+      }
+    }
+  }
+
   return null;
 }
 
-function extractBlockedWritePath(output: string, cwd: string): string | null {
-  return extractBlockedPath(output, cwd);
+function extractBlockedWritePath(output: string, cwd: string, command?: string): string | null {
+  return extractBlockedPath(output, cwd, command);
 }
 
 function parseLandstripErrors(output: string): LandstripErrorResponse[] {
@@ -1045,7 +1079,7 @@ export function createLandstripIntegration(
               return;
             }
 
-            const blockedPath = extractBlockedPath(stderrAcc, cwd);
+            const blockedPath = extractBlockedPath(stderrAcc, cwd, command);
             if (blockedPath && ctx.hasUI) {
               const config = loadConfig(cwd);
               const isDeniedByDenyRead = matchesPattern(blockedPath, config.filesystem.denyRead);
@@ -1117,7 +1151,7 @@ export function createLandstripIntegration(
       const message = formatLandstripErrors(landstripErrors);
       result.content.unshift({ type: 'text', text: `\n${message}\n` });
     }
-    const blockedPath = extractBlockedWritePath(outputText, ctx.cwd);
+    const blockedPath = extractBlockedWritePath(outputText, ctx.cwd, params.command);
 
     if (!blockedPath || !ctx.hasUI) return result;
 
