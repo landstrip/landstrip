@@ -99,25 +99,63 @@ impl BrokerError {
 }
 
 #[allow(clippy::too_many_lines)]
-pub(super) fn run_network_broker(
+pub(super) fn run_broker(
     policy: &AccessPolicy,
     landlock_features: LandlockFeatures,
     tool: &OsStr,
     args: &[OsString],
-    notify_filesystem: bool,
+    needs_network: bool,
+    needs_filesystem: bool,
 ) -> Result<i32> {
     let notify_unix_sockets = needs_unix_socket_broker(&policy.network_access.unix_socket_access);
-    let notify_bind = policy.network_access.local_tcp_bind || notify_unix_sockets;
-    let notify_connect = !policy.network_access.connect_tcp_ports.is_empty() || notify_unix_sockets;
+    let notify_bind =
+        needs_network && (policy.network_access.local_tcp_bind || notify_unix_sockets);
+    let notify_connect = needs_network
+        && (!policy.network_access.connect_tcp_ports.is_empty() || notify_unix_sockets);
+    let notify_filesystem = needs_filesystem;
     let unix_sockets = unix_socket_filter(&policy.network_access.unix_socket_access);
     ensure_notification_supported()?;
-    let filters = network_filter(NetworkFilter {
-        notify_bind,
-        notify_connect,
-        notify_filesystem,
-        unix_sockets,
-    })?;
+
     let syscalls = NotificationSyscalls::new();
+    let mut errno_rules = RuleMap::new();
+    if needs_network {
+        add_socket_family_filter(&mut errno_rules, syscalls.socket)?;
+        add_unix_socket_filters(
+            &mut errno_rules,
+            syscalls.socket,
+            syscalls.socketpair,
+            unix_sockets,
+        )?;
+    }
+
+    let eafnosupport =
+        u32::try_from(libc::EAFNOSUPPORT).map_err(|_| Error::system("invalid address"))?;
+    let errno = if errno_rules.is_empty() {
+        None
+    } else {
+        Some(build_filter(
+            errno_rules,
+            SeccompAction::Errno(eafnosupport),
+        )?)
+    };
+
+    let mut notify_syscalls: Vec<i64> = Vec::new();
+    if notify_bind {
+        notify_syscalls.push(syscalls.bind);
+    }
+    if notify_connect {
+        notify_syscalls.push(syscalls.connect);
+    }
+    if notify_filesystem {
+        notify_syscalls.extend(syscalls.filesystem_syscalls());
+    }
+    let notify = if notify_syscalls.is_empty() {
+        None
+    } else {
+        Some(build_notify_filter(&notify_syscalls)?)
+    };
+
+    let filters = NetworkFilters { errno, notify };
     let (parent, child_sock) = UnixStream::pair()?;
 
     // SAFETY: landstrip forks before spawning threads; the child either execs the tool or exits.
@@ -163,7 +201,14 @@ pub(super) fn run_network_broker(
             drop(parent);
             let notify_fd = notify.as_raw_fd();
 
-            supervise_child(policy, landlock_features, child, notify_fd, &syscalls, notify_filesystem)
+            supervise_child(
+                policy,
+                landlock_features,
+                child,
+                notify_fd,
+                &syscalls,
+                notify_filesystem,
+            )
         }
     }
 }
@@ -667,21 +712,30 @@ fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> SysResult
     }
 }
 
-pub(super) fn network_filter(config: NetworkFilter) -> Result<NetworkFilters> {
+pub(super) fn network_filter(config: NetworkFilter, needs_network: bool) -> Result<NetworkFilters> {
     let syscalls = NotificationSyscalls::new();
     let mut errno_rules = RuleMap::new();
 
-    add_socket_family_filter(&mut errno_rules, syscalls.socket)?;
-    add_unix_socket_filters(
-        &mut errno_rules,
-        syscalls.socket,
-        syscalls.socketpair,
-        config.unix_sockets,
-    )?;
+    if needs_network {
+        add_socket_family_filter(&mut errno_rules, syscalls.socket)?;
+        add_unix_socket_filters(
+            &mut errno_rules,
+            syscalls.socket,
+            syscalls.socketpair,
+            config.unix_sockets,
+        )?;
+    }
 
     let eafnosupport =
         u32::try_from(libc::EAFNOSUPPORT).map_err(|_| Error::system("invalid address"))?;
-    let errno = build_filter(errno_rules, SeccompAction::Errno(eafnosupport))?;
+    let errno = if errno_rules.is_empty() {
+        None
+    } else {
+        Some(build_filter(
+            errno_rules,
+            SeccompAction::Errno(eafnosupport),
+        )?)
+    };
     let notify = if config.notify_bind || config.notify_connect || config.notify_filesystem {
         let mut notify_syscalls = Vec::new();
         if config.notify_bind {
@@ -702,13 +756,15 @@ pub(super) fn network_filter(config: NetworkFilter) -> Result<NetworkFilters> {
 }
 
 pub(super) struct NetworkFilters {
-    errno: BpfProgram,
+    errno: Option<BpfProgram>,
     notify: Option<BpfProgram>,
 }
 
 impl NetworkFilters {
     pub(super) fn load(&self) -> Result<()> {
-        load_program(&self.errno, 0)?;
+        if let Some(errno) = &self.errno {
+            load_program(errno, 0)?;
+        }
         if let Some(notify) = &self.notify {
             load_program(notify, 0)?;
         }
@@ -717,7 +773,9 @@ impl NetworkFilters {
     }
 
     fn load_with_listener(&self) -> Result<OwnedFd> {
-        load_program(&self.errno, 0)?;
+        if let Some(errno) = &self.errno {
+            load_program(errno, 0)?;
+        }
         let notify = self
             .notify
             .as_ref()
@@ -976,6 +1034,8 @@ fn handle_openat(
     request: &libc::seccomp_notif,
     fs_seen: &mut HashSet<PathBuf>,
 ) -> SysResult<NotificationResult> {
+    // args[0] is dirfd: an i32 (including AT_FDCWD=-100) stored as u64.
+    #[allow(clippy::cast_possible_truncation)]
     let dirfd = request.data.args[0] as i32;
     let path_ptr = usize::try_from(request.data.args[1]).map_err(|_| BrokerError::BadAddress)?;
     let flags = i32::try_from(request.data.args[2]).map_err(|_| BrokerError::InvalidAddress)?;
@@ -986,7 +1046,8 @@ fn handle_openat(
     };
 
     let resolved = resolve_child_path(pid, dirfd, &path)?;
-    let wants_write = (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)) != 0;
+    let wants_write =
+        (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)) != 0;
     let wants_read = (flags & libc::O_WRONLY) == 0;
 
     if wants_write && check_fs_write(policy, &resolved).is_err() {
@@ -1006,6 +1067,8 @@ fn handle_fstatat(
     request: &libc::seccomp_notif,
     fs_seen: &mut HashSet<PathBuf>,
 ) -> SysResult<NotificationResult> {
+    // args[0] is dirfd: an i32 (including AT_FDCWD=-100) stored as u64.
+    #[allow(clippy::cast_possible_truncation)]
     let dirfd = request.data.args[0] as i32;
     let path_ptr = usize::try_from(request.data.args[1]).map_err(|_| BrokerError::BadAddress)?;
     let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
@@ -1044,8 +1107,8 @@ fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>
         base: addr,
         len: max_len,
     }];
-    let n = process_vm_readv(pid, &mut local, &target)
-        .map_err(|error| BrokerError::SystemCall {
+    let n =
+        process_vm_readv(pid, &mut local, &target).map_err(|error| BrokerError::SystemCall {
             errno: error as i32,
         })?;
 
@@ -1060,19 +1123,19 @@ fn resolve_child_path(pid: Pid, dirfd: i32, path: &Path) -> SysResult<PathBuf> {
     }
 
     if dirfd == libc::AT_FDCWD {
-        let cwd = fs::read_link(format!("/proc/{pid}/cwd")).map_err(|error| {
-            BrokerError::SystemCall {
+        let cwd =
+            fs::read_link(format!("/proc/{pid}/cwd")).map_err(|error| BrokerError::SystemCall {
                 errno: error.raw_os_error().unwrap_or(libc::EIO),
-            }
-        })?;
+            })?;
         return Ok(normalize_path(&cwd.join(path)));
     }
 
     // dirfd is a file descriptor; resolve relative to /proc/<pid>/fd/<dirfd>
-    let dir_path =
-        fs::read_link(format!("/proc/{pid}/fd/{dirfd}")).map_err(|error| BrokerError::SystemCall {
+    let dir_path = fs::read_link(format!("/proc/{pid}/fd/{dirfd}")).map_err(|error| {
+        BrokerError::SystemCall {
             errno: error.raw_os_error().unwrap_or(libc::EBADF),
-        })?;
+        }
+    })?;
     Ok(normalize_path(&dir_path.join(path)))
 }
 
@@ -1080,7 +1143,10 @@ fn check_fs_read(policy: &AccessPolicy, path: &Path) -> SysResult<()> {
     match &policy.read_access {
         ReadAccess::Unrestricted => Ok(()),
         ReadAccess::AllowRoots(roots) => {
-            if roots.iter().any(|root| path == root || path.starts_with(root)) {
+            if roots
+                .iter()
+                .any(|root| path == root || path.starts_with(root))
+            {
                 return Ok(());
             }
             Err(BrokerError::PolicyDenied)
