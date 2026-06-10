@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "landstrip"
-version = "0.10.3"
+version = "0.11.0"
 dependencies = [
  "argh",
  "dirs",
