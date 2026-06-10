@@ -725,13 +725,35 @@ function assertApplyPatchAllowed(
     assertWriteAllowed(path, config, baseDirectory);
 }
 
-export default (async ({ client, directory }: PluginInput, options?: PluginOptions) => {
+const plugin: Plugin = async ({ client, directory }: PluginInput, options?: PluginOptions) => {
   const optionOverrides = normalizeOptions(options);
   const activeBash = new Map<string, BashSandboxState>();
   const notified = new Set<string>();
   let enabledNotified = false;
   let configuredShell: string | undefined;
   let landstripCheck: { ok: true; version: string } | { ok: false; reason: string } | undefined;
+
+  client.app
+    .log({
+      body: {
+        service: 'opencode-landstrip',
+        level: 'info',
+        message: `plugin loaded for ${directory}`,
+      },
+      query: { directory },
+    })
+    .catch(() => undefined);
+
+  client.tui
+    .showToast({
+      body: {
+        title: 'Sandbox',
+        message: `Loaded for ${directory}`,
+        variant: 'info',
+        duration: 5000,
+      },
+    })
+    .catch(() => undefined);
 
   async function notifyOnce(key: string, message: string, variant: ToastVariant): Promise<void> {
     if (notified.has(key)) return;
@@ -1007,17 +1029,16 @@ export default (async ({ client, directory }: PluginInput, options?: PluginOptio
     },
 
     'command.execute.before': async (input, output) => {
-      if (input.command !== 'sandbox') return;
+      if (input.command !== 'sandbox' && input.command !== '/sandbox') return;
 
       const config = loadConfig(directory, optionOverrides);
       const summary = buildConfigSummary(config);
-      output.parts.unshift({
-        id: `landstrip-sandbox-${Date.now()}`,
-        sessionID: input.sessionID,
-        messageID: input.sessionID,
-        type: 'text',
-        text: `\n${summary}\n`,
-      });
+      await client.tui
+        .showToast({
+          body: { title: 'Sandbox', message: summary, variant: 'info', duration: 15000 },
+          query: { directory },
+        })
+        .catch(() => undefined);
     },
 
     dispose: async () => {
@@ -1026,4 +1047,6 @@ export default (async ({ client, directory }: PluginInput, options?: PluginOptio
   };
 
   return hooks;
-}) satisfies Plugin;
+};
+
+export default plugin;

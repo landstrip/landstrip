@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["/home/jarkko/work/github.com/jarkkojs/opencode-landstrip"],
+  "command": {
+    "sandbox": {
+      "template": "The sandbox configuration has been displayed above. Acknowledge with a brief confirmation.",
+      "description": "Show sandbox configuration"
+    }
+  }
+}
