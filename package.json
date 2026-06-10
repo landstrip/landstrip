@@ -42,7 +42,7 @@
     "ci:test": "npm test"
   },
   "dependencies": {
-    "@jarkkojs/landstrip": "^0.9.7"
+    "@jarkkojs/landstrip": "^0.10.1"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.16.2",

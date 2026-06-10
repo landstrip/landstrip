@@ -54,8 +54,7 @@ interface LandstripErrorResponse {
   category: 'policy' | 'tool' | 'platform' | 'system';
   file?: string;
   program?: string;
-  target?: 'filesystem' | 'network' | 'platform';
-  kind?: 'launch' | 'encoding';
+  type?: 'filesystem' | 'network' | 'platform' | 'launch' | 'encoding';
   message: string;
 }
 
@@ -75,7 +74,7 @@ interface BashSandboxState {
 
 type ToastVariant = 'info' | 'success' | 'warning' | 'error';
 
-const LANDSTRIP_VERSION = [0, 9, 7] as const;
+const LANDSTRIP_VERSION = [0, 10, 1] as const;
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 
 const DEFAULT_CONFIG: SandboxConfig = {
@@ -384,6 +383,9 @@ function parseLandstripErrors(output: string): LandstripErrorResponse[] {
         parsed !== null &&
         typeof parsed.category === 'string' &&
         ['policy', 'tool', 'platform', 'system'].includes(parsed.category) &&
+        (parsed.type === undefined ||
+          (typeof parsed.type === 'string' &&
+            ['filesystem', 'network', 'platform', 'launch', 'encoding'].includes(parsed.type))) &&
         typeof parsed.message === 'string' &&
         parsed.message.length > 0
       ) {
@@ -402,14 +404,14 @@ function formatLandstripErrors(errors: LandstripErrorResponse[]): string {
     .map((err) => {
       const parts: string[] = [`landstrip: ${err.category}`];
 
-      if (err.target) {
-        parts.push(`(${err.target})`);
+      if (err.file) {
+        parts.push(` (${err.file})`);
       }
       if (err.program) {
         parts.push(` ${err.program}`);
       }
-      if (err.kind) {
-        parts.push(`:${err.kind}`);
+      if (err.type) {
+        parts.push(`:${err.type}`);
       }
       parts.push(`: ${err.message}`);
 
@@ -777,7 +779,7 @@ export default (async ({ client, directory }: PluginInput, options?: PluginOptio
     if (!hasMinimumVersion(version, LANDSTRIP_VERSION)) {
       landstripCheck = {
         ok: false,
-        reason: `landstrip 0.9.7 or newer is required; found: ${version}`,
+        reason: `landstrip 0.10.1 or newer is required; found: ${version}`,
       };
       return landstripCheck;
     }
@@ -898,6 +900,38 @@ export default (async ({ client, directory }: PluginInput, options?: PluginOptio
       args.description = landstripDescription(args.description);
   }
 
+  function buildConfigSummary(config: SandboxConfig): string {
+    const { globalPath, projectPath } = getConfigPaths(directory);
+    const check = checkLandstrip();
+    const version = check?.ok === true ? check.version : 'unknown';
+    const status = config.enabled && check?.ok === true ? 'enabled' : 'disabled';
+
+    const lines = [
+      'Sandbox Configuration',
+      `  Status:         ${status}`,
+      `  Project config: ${projectPath}`,
+      `  Global config:  ${globalPath}`,
+      `  landstrip:      ${binaryPath()} (v${version})`,
+      '',
+      'Network (bash commands go through HTTP proxy):',
+      `  Allow local binding: ${config.network.allowLocalBinding}`,
+      `  Allow all Unix sockets: ${config.network.allowAllUnixSockets}`,
+      ...(config.network.allowUnixSockets.length > 0
+        ? [`  Allow Unix sockets: ${config.network.allowUnixSockets.join(', ')}`]
+        : []),
+      `  Allowed domains: ${config.network.allowedDomains.join(', ') || '(none)'}`,
+      `  Denied domains:  ${config.network.deniedDomains.join(', ') || '(none)'}`,
+      '',
+      'Filesystem (bash + read/write/edit tools):',
+      `  Deny Read:   ${config.filesystem.denyRead.join(', ') || '(none)'}`,
+      `  Allow Read:  ${config.filesystem.allowRead.join(', ') || '(none)'}`,
+      `  Allow Write: ${config.filesystem.allowWrite.join(', ') || '(none)'}`,
+      `  Deny Write:  ${config.filesystem.denyWrite.join(', ') || '(none)'}`,
+    ];
+
+    return lines.join('\n');
+  }
+
   const hooks: Hooks = {
     config: async (config) => {
       configuredShell = configuredShellPath(config);
@@ -970,6 +1004,20 @@ export default (async ({ client, directory }: PluginInput, options?: PluginOptio
       }
 
       await cleanupBash(input.callID);
+    },
+
+    'command.execute.before': async (input, output) => {
+      if (input.command !== 'sandbox') return;
+
+      const config = loadConfig(directory, optionOverrides);
+      const summary = buildConfigSummary(config);
+      output.parts.unshift({
+        id: `landstrip-sandbox-${Date.now()}`,
+        sessionID: input.sessionID,
+        messageID: input.sessionID,
+        type: 'text',
+        text: `\n${summary}\n`,
+      });
     },
 
     dispose: async () => {
