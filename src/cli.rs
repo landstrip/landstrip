@@ -13,7 +13,8 @@ const PROGRAM_NAME: &str = "landstrip";
 #[derive(Debug)]
 pub(crate) struct Cli {
     pub(crate) policy_paths: Vec<PathBuf>,
-    pub(crate) policy_format: PolicyFormat,
+    pub(crate) input_format: PolicyFormat,
+    pub(crate) output_format: PolicyFormat,
     pub(crate) debug: bool,
     pub(crate) tool: OsString,
     pub(crate) tool_args: Vec<OsString>,
@@ -45,9 +46,13 @@ struct CliOptions {
     #[argh(option, short = 'p', from_str_fn(parse_policy_path))]
     policy: Vec<PathBuf>,
 
-    /// policy format: json or yaml; defaults to json
+    /// policy input format: json or yaml; defaults to json
     #[argh(option, from_str_fn(parse_policy_format))]
-    format: Option<PolicyFormat>,
+    input_format: Option<PolicyFormat>,
+
+    /// error output format: json or yaml; defaults to json
+    #[argh(option, from_str_fn(parse_policy_format))]
+    output_format: Option<PolicyFormat>,
 
     /// tool to run inside the sandbox, followed by its arguments
     #[argh(positional)]
@@ -110,7 +115,8 @@ fn parse_cli_action(
 
     Ok(CliAction::Run(Cli {
         policy_paths: options.policy,
-        policy_format: options.format.unwrap_or(PolicyFormat::Json),
+        input_format: options.input_format.unwrap_or(PolicyFormat::Json),
+        output_format: options.output_format.unwrap_or(PolicyFormat::Json),
         debug: options.debug,
         tool,
         tool_args: tool_tail.collect(),
@@ -134,7 +140,7 @@ fn split_cli_args(args: impl IntoIterator<Item = OsString>) -> (Vec<OsString>, V
             continue;
         }
 
-        if arg == OsStr::new("--format") {
+        if arg == OsStr::new("--input-format") || arg == OsStr::new("--output-format") {
             option_args.push(arg);
             if let Some(value) = args.next() {
                 option_args.push(value);

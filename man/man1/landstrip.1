@@ -7,7 +7,8 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl -debug
-.Op Fl -format Ar format
+.Op Fl -input-format Ar format
+.Op Fl -output-format Ar format
 .Op Fl p Ar policy
 .Op Fl -policy Ar policy
 .Ar command
@@ -30,8 +31,15 @@ uses. Unknown fields are ignored.
 .Bl -tag -width Ds
 .It Fl -debug
 Enable debug logging.
-.It Fl -format Ar format
-Select the policy format. The accepted values are
+.It Fl -input-format Ar format
+Select the policy input format. The accepted values are
+.Va json
+and
+.Va yaml .
+The default is
+.Va json .
+.It Fl -output-format Ar format
+Select the error output format. The accepted values are
 .Va json
 and
 .Va yaml .
@@ -68,7 +76,7 @@ The relevant policy shape is:
 .Ed
 .Pp
 When
-.Fl -format Ar yaml
+.Fl -input-format Ar yaml
 is used, path fields can also be written as one statement per non-empty line:
 .Bd -literal -offset indent
 filesystem:
@@ -173,10 +181,12 @@ the lowered read and write roots with Windows ACL entries. Because LPAC has no
 broad filesystem read capability, Windows policies must use explicit read
 allowlists; unrestricted read policy is rejected. AppContainer profiles and ACL
 grants can persist after the sandboxed process exits.
-.Sh JSON OUTPUT
+.Sh OUTPUT
 .Nm
-prints landstrip failures as one compact JSON object on standard error. This
-covers policy, tool launch, platform, and system errors.
+prints landstrip failures as one compact object on standard error, formatted as
+JSON by default. Use
+.Fl -output-format Ar yaml
+for YAML output.
 .Bd -literal -offset indent
 {"category":"policy","file":"policy.json","message":"expected value at line 1 column 1"}
 .Ed

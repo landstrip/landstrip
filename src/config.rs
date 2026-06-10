@@ -45,7 +45,7 @@ pub(crate) struct SandboxNetwork {
 
 pub(crate) fn load_settings(
     policy_paths: &[PathBuf],
-    policy_format: PolicyFormat,
+    input_format: PolicyFormat,
 ) -> Result<Settings> {
     let mut merged = Value::Object(Map::new());
 
@@ -54,12 +54,11 @@ pub(crate) fn load_settings(
         io::stdin()
             .read_to_string(&mut document)
             .map_err(|source| Error::policy_stdin_source(PolicyType::Platform, source))?;
-        let value = parse_policy_document(&document, policy_format)
+        let value = parse_policy_document(&document, input_format)
             .map_err(|source| Error::policy_stdin_source(PolicyType::Platform, source))?;
         merge_json(&mut merged, value);
-        serde_json::from_value(merged).map_err(|source| {
-            Error::policy_stdin_source(PolicyType::Platform, source)
-        })
+        serde_json::from_value(merged)
+            .map_err(|source| Error::policy_stdin_source(PolicyType::Platform, source))
     } else {
         for path in policy_paths {
             log::debug!("config: {}", path.display());
@@ -67,26 +66,22 @@ pub(crate) fn load_settings(
             let document = fs::read_to_string(path).map_err(|source| {
                 Error::policy_file_source(path.clone(), PolicyType::Platform, source)
             })?;
-            let value = parse_policy_document(&document, policy_format).map_err(|source| {
+            let value = parse_policy_document(&document, input_format).map_err(|source| {
                 Error::policy_file_source(path.clone(), PolicyType::Platform, source)
             })?;
             merge_json(&mut merged, value);
         }
         serde_json::from_value(merged).map_err(|source| {
-            Error::policy_file_source(
-                policy_paths[0].clone(),
-                PolicyType::Platform,
-                source,
-            )
+            Error::policy_file_source(policy_paths[0].clone(), PolicyType::Platform, source)
         })
     }
 }
 
 fn parse_policy_document(
     document: &str,
-    policy_format: PolicyFormat,
+    input_format: PolicyFormat,
 ) -> std::result::Result<Value, PolicyDocumentError> {
-    match policy_format {
+    match input_format {
         PolicyFormat::Json => serde_json::from_str(document).map_err(PolicyDocumentError::Json),
         PolicyFormat::Yaml => serde_yml::from_str(document).map_err(PolicyDocumentError::Yaml),
     }

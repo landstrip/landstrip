@@ -249,7 +249,6 @@ impl From<io::Error> for Error {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Display)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum PolicyPort {

@@ -189,12 +189,12 @@ printf '%s\n' \
     '    /' \
     >"$policy_yaml"
 expect_success "yaml line policy permits configured root" \
-    "$bin" --format yaml -p "$policy_yaml" "$sandbox_shell" -c ': > "$1/yaml-ok.txt"; test -f "$1/yaml-ok.txt"' _ "$tmp/allowed"
+    "$bin" --input-format yaml -p "$policy_yaml" "$sandbox_shell" -c ': > "$1/yaml-ok.txt"; test -f "$1/yaml-ok.txt"' _ "$tmp/allowed"
 expect_failure "yaml line policy denies other root" \
-    "$bin" --format yaml -p "$policy_yaml" "$sandbox_shell" -c ': > "$1/yaml-nope.txt"' _ "$tmp/denied"
+    "$bin" --input-format yaml -p "$policy_yaml" "$sandbox_shell" -c ': > "$1/yaml-nope.txt"' _ "$tmp/denied"
 
 expect_success "stdin yaml policy runs tool" \
-    "$sandbox_shell" -c 'printf "%s\n" "network:" "  allowNetwork: true" "filesystem:" "  denyRead: |" "    /" "  allowRead: |" "    /" | "$1" --format yaml "$2" -c "printf ok\\n"' _ "$bin" "$sandbox_shell"
+    "$sandbox_shell" -c 'printf "%s\n" "network:" "  allowNetwork: true" "filesystem:" "  denyRead: |" "    /" "  allowRead: |" "    /" | "$1" --input-format yaml "$2" -c "printf ok\\n"' _ "$bin" "$sandbox_shell"
 
 policy=$(write_policy '{"filesystem":{"denyRead":["/"],"allowRead":["/"]}}')
 expect_listener_denied "default network denies TCP listener" "$policy"

@@ -35,12 +35,14 @@ until Windows enforcement exists.
 
 ## Policy Format
 
-JSON is the default policy format. Use `--format yaml` for YAML policy files or
+JSON is the default policy format. Use `--input-format yaml` for YAML policy files or
 YAML read from standard input.
 
 ```sh
-landstrip --format yaml -p policy.yaml cargo test
+landstrip --input-format yaml -p policy.yaml cargo test
 ```
+
+Error output is JSON by default. Use `--output-format yaml` for YAML error output.
 
 YAML path fields can use normal lists or one statement per line:
 
