@@ -27,6 +27,7 @@ interface SandboxFilesystemConfig {
 }
 
 interface SandboxNetworkConfig {
+  allowNetwork: boolean;
   allowLocalBinding: boolean;
   allowAllUnixSockets: boolean;
   allowUnixSockets: string[];
@@ -42,20 +43,21 @@ interface SandboxConfig {
 
 interface LandstripPolicy {
   network: {
+    allowNetwork: boolean;
     allowLocalBinding: boolean;
     allowAllUnixSockets: boolean;
     allowUnixSockets: string[];
-    httpProxyPort: number;
+    httpProxyPort?: number;
   };
   filesystem: SandboxFilesystemConfig;
 }
 
 interface LandstripErrorResponse {
-  category: 'policy' | 'tool' | 'platform' | 'system';
+  reason: 'Other' | 'LaunchFailed' | 'SetupFailed' | 'Usage';
   file?: string;
   program?: string;
   type?: 'filesystem' | 'network' | 'platform' | 'launch' | 'encoding';
-  message: string;
+  source: string;
 }
 
 interface SandboxConfigOverrides {
@@ -68,18 +70,19 @@ interface BashSandboxState {
   originalCommand: string;
   wrappedCommand: string;
   policyDir: string;
-  port: number;
-  stop: () => Promise<void>;
+  port: number | null;
+  stop: (() => Promise<void>) | null;
 }
 
 type ToastVariant = 'info' | 'success' | 'warning' | 'error';
 
-const LANDSTRIP_VERSION = [0, 10, 1] as const;
+const LANDSTRIP_VERSION = [0, 11, 0] as const;
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 
 const DEFAULT_CONFIG: SandboxConfig = {
   enabled: true,
   network: {
+    allowNetwork: false,
     allowLocalBinding: false,
     allowAllUnixSockets: false,
     allowUnixSockets: [],
@@ -102,8 +105,16 @@ const DEFAULT_CONFIG: SandboxConfig = {
   },
   filesystem: {
     denyRead: ['/Users', '/home'],
-    allowRead: ['.', '~/.config/opencode', '~/.config/git', '~/.gitconfig', '~/.local', '~/.cargo'],
-    allowWrite: ['.', '/tmp'],
+    allowRead: [
+      '.',
+      '/dev/null',
+      '~/.config/opencode',
+      '~/.config/git',
+      '~/.gitconfig',
+      '~/.local',
+      '~/.cargo',
+    ],
+    allowWrite: ['.', '/tmp', '/dev/null'],
     denyWrite: ['.env', '.env.*', '*.pem', '*.key'],
   },
 };
@@ -121,6 +132,7 @@ function normalizeNetworkConfig(value: unknown): Partial<SandboxNetworkConfig> |
   if (!isRecord(value)) return undefined;
 
   const config: Partial<SandboxNetworkConfig> = {};
+  if (typeof value.allowNetwork === 'boolean') config.allowNetwork = value.allowNetwork;
   if (typeof value.allowLocalBinding === 'boolean')
     config.allowLocalBinding = value.allowLocalBinding;
   if (typeof value.allowAllUnixSockets === 'boolean')
@@ -330,6 +342,81 @@ function allowsAllDomains(allowedDomains: string[]): boolean {
   return allowedDomains.includes('*');
 }
 
+function normalizeBlockedPath(path: string, baseDirectory: string): string {
+  return canonicalizePath(isAbsolute(path) ? path : join(baseDirectory, path), baseDirectory);
+}
+
+function extractCandidatePaths(command: string): string[] {
+  const paths: string[] = [];
+  const tokens = command.match(/[^\s"']+|"[^"]*"|'[^']*'/g) ?? [];
+  for (const token of tokens) {
+    const clean = token.replace(/^["']|["']$/g, '').replace(/[,;]$/, '');
+    if (
+      clean.startsWith('/') ||
+      clean.startsWith('~/') ||
+      clean === '~' ||
+      clean.startsWith('./') ||
+      clean.startsWith('../')
+    ) {
+      paths.push(clean);
+    }
+  }
+  return paths;
+}
+
+function extractBlockedPath(
+  output: string,
+  baseDirectory: string,
+  command?: string,
+): string | null {
+  // bash/sh: line X: /path: Permission denied
+  let match = output.match(
+    /(?:\/bin\/bash|bash|sh): (?:line \d+: )?([^:\n]+): (?:Operation not permitted|Permission denied)/,
+  );
+  if (match) return normalizeBlockedPath(match[1], baseDirectory);
+
+  // ls/cat/cp: cannot open/access/stat '/path': Permission denied
+  match = output.match(
+    /^[a-zA-Z0-9_-]+: cannot (?:open|access|stat|create)(?: directory)? '?([^'\n]+?)'?(?: for (?:reading|writing))?: Permission denied$/m,
+  );
+  if (match) return normalizeBlockedPath(match[1], baseDirectory);
+
+  // Generic: cmd: /absolute/path: Permission denied or Operation not permitted
+  match = output.match(
+    /^[a-zA-Z0-9_-]+: (\/[^\n:]+): (?:Operation not permitted|Permission denied)$/m,
+  );
+  if (match) return normalizeBlockedPath(match[1], baseDirectory);
+
+  // Landstrip structured error format with file field
+  const landstripErrors = parseLandstripErrors(output);
+  for (const error of landstripErrors) {
+    if (error.file) return normalizeBlockedPath(error.file, baseDirectory);
+  }
+
+  // If landstrip reported an error but without a file field, try to
+  // extract the blocked path from the command itself
+  if (landstripErrors.length > 0 && command) {
+    for (const candidate of extractCandidatePaths(command)) {
+      const resolved = canonicalizePath(candidate, baseDirectory);
+      return resolved;
+    }
+  }
+
+  return null;
+}
+
+function extractBlockedWritePath(
+  output: string,
+  baseDirectory: string,
+  command?: string,
+): string | null {
+  return extractBlockedPath(output, baseDirectory, command);
+}
+
+function isBlockedByDenyRead(path: string, config: SandboxConfig, baseDirectory: string): boolean {
+  return matchesPattern(path, config.filesystem.denyRead, baseDirectory);
+}
+
 function firstBlockedDomain(
   command: string,
   config: SandboxConfig,
@@ -374,25 +461,38 @@ function hasMinimumVersion(version: string, minimum: readonly [number, number, n
 function parseLandstripErrors(output: string): LandstripErrorResponse[] {
   const errors: LandstripErrorResponse[] = [];
 
-  for (const line of output.split('\n')) {
-    try {
-      const parsed = JSON.parse(line);
+  for (const block of output.trim().split(/\n\n+/)) {
+    const fields: Record<string, string> = {};
+
+    for (const line of block.split('\n')) {
+      const colonIndex = line.indexOf(':');
+      if (colonIndex === -1) continue;
+      const key = line.slice(0, colonIndex).trim();
+      const value = line.slice(colonIndex + 1).trim();
+      if (key.length > 0 && value.length > 0) fields[key] = value;
+    }
+
+    if (
+      fields.reason &&
+      ['Other', 'LaunchFailed', 'SetupFailed', 'Usage'].includes(fields.reason) &&
+      fields.source
+    ) {
+      const error: LandstripErrorResponse = {
+        reason: fields.reason as LandstripErrorResponse['reason'],
+        source: fields.source,
+      };
+
+      if (fields.file) error.file = fields.file;
+      if (fields.program) error.program = fields.program;
 
       if (
-        typeof parsed === 'object' &&
-        parsed !== null &&
-        typeof parsed.category === 'string' &&
-        ['policy', 'tool', 'platform', 'system'].includes(parsed.category) &&
-        (parsed.type === undefined ||
-          (typeof parsed.type === 'string' &&
-            ['filesystem', 'network', 'platform', 'launch', 'encoding'].includes(parsed.type))) &&
-        typeof parsed.message === 'string' &&
-        parsed.message.length > 0
+        fields.type &&
+        ['filesystem', 'network', 'platform', 'launch', 'encoding'].includes(fields.type)
       ) {
-        errors.push(parsed as LandstripErrorResponse);
+        error.type = fields.type as LandstripErrorResponse['type'];
       }
-    } catch {
-      // ignore non-JSON lines
+
+      errors.push(error);
     }
   }
 
@@ -402,7 +502,7 @@ function parseLandstripErrors(output: string): LandstripErrorResponse[] {
 function formatLandstripErrors(errors: LandstripErrorResponse[]): string {
   return errors
     .map((err) => {
-      const parts: string[] = [`landstrip: ${err.category}`];
+      const parts: string[] = [`landstrip: ${err.reason}`];
 
       if (err.file) {
         parts.push(` (${err.file})`);
@@ -413,7 +513,7 @@ function formatLandstripErrors(errors: LandstripErrorResponse[]): string {
       if (err.type) {
         parts.push(`:${err.type}`);
       }
-      parts.push(`: ${err.message}`);
+      parts.push(`: ${err.source}`);
 
       return parts.join('');
     })
@@ -458,14 +558,15 @@ function pipeSockets(client: Socket, upstream: Socket, initialData?: Buffer): vo
 function buildLandstripPolicy(
   config: SandboxConfig,
   baseDirectory: string,
-  proxyPort: number,
+  proxyPort: number | null,
 ): LandstripPolicy {
   return {
     network: {
+      allowNetwork: config.network.allowNetwork,
       allowLocalBinding: config.network.allowLocalBinding,
       allowAllUnixSockets: config.network.allowAllUnixSockets,
       allowUnixSockets: config.network.allowUnixSockets,
-      httpProxyPort: proxyPort,
+      ...(proxyPort !== null ? { httpProxyPort: proxyPort } : {}),
     },
     filesystem: resolveFilesystemConfig(config.filesystem, baseDirectory),
   };
@@ -474,7 +575,7 @@ function buildLandstripPolicy(
 function writePolicyFile(
   config: SandboxConfig,
   baseDirectory: string,
-  proxyPort: number,
+  proxyPort: number | null,
 ): { dir: string; path: string } {
   const dir = mkdtempSync(join(tmpdir(), 'opencode-landstrip-XXXXXX'));
   const path = join(dir, 'policy.json');
@@ -612,7 +713,8 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
   });
 }
 
-function proxyEnv(port: number): Record<string, string> {
+function proxyEnv(port: number | null): Record<string, string> | undefined {
+  if (port === null) return undefined;
   const url = `http://127.0.0.1:${port}`;
 
   return {
@@ -687,9 +789,22 @@ function errorWithConfigPaths(baseDirectory: string, message: string): Error {
   return new Error(`${message}\n\nUpdate sandbox config in:\n  ${projectPath}\n  ${globalPath}`);
 }
 
-function assertReadAllowed(path: string, config: SandboxConfig, baseDirectory: string): void {
+function assertReadAllowed(
+  path: string,
+  config: SandboxConfig,
+  baseDirectory: string,
+  effectiveAllowRead: string[],
+): void {
   const filePath = canonicalizePath(path, baseDirectory);
-  if (!shouldPromptForRead(filePath, config.filesystem.allowRead, baseDirectory)) return;
+
+  if (!shouldPromptForRead(filePath, effectiveAllowRead, baseDirectory)) return;
+
+  if (isBlockedByDenyRead(filePath, config, baseDirectory)) {
+    throw errorWithConfigPaths(
+      baseDirectory,
+      `Sandbox: read access denied for "${filePath}" (denyRead overrides allowRead).`,
+    );
+  }
 
   throw errorWithConfigPaths(
     baseDirectory,
@@ -697,8 +812,15 @@ function assertReadAllowed(path: string, config: SandboxConfig, baseDirectory: s
   );
 }
 
-function assertWriteAllowed(path: string, config: SandboxConfig, baseDirectory: string): void {
+function assertWriteAllowed(
+  path: string,
+  config: SandboxConfig,
+  baseDirectory: string,
+  effectiveAllowWrite: string[],
+): void {
   const filePath = canonicalizePath(path, baseDirectory);
+
+  if (!shouldPromptForWrite(filePath, effectiveAllowWrite, baseDirectory)) return;
 
   if (matchesPattern(filePath, config.filesystem.denyWrite, baseDirectory)) {
     throw errorWithConfigPaths(
@@ -706,8 +828,6 @@ function assertWriteAllowed(path: string, config: SandboxConfig, baseDirectory: 
       `Sandbox: write access denied for "${filePath}" (in filesystem.denyWrite).`,
     );
   }
-
-  if (!shouldPromptForWrite(filePath, config.filesystem.allowWrite, baseDirectory)) return;
 
   throw errorWithConfigPaths(
     baseDirectory,
@@ -719,19 +839,31 @@ function assertApplyPatchAllowed(
   args: Record<string, unknown>,
   config: SandboxConfig,
   baseDirectory: string,
+  effectiveAllowWrite: string[],
 ): void {
   if (typeof args.patchText !== 'string') return;
   for (const path of extractPatchPaths(args.patchText))
-    assertWriteAllowed(path, config, baseDirectory);
+    assertWriteAllowed(path, config, baseDirectory, effectiveAllowWrite);
 }
 
 const plugin: Plugin = async ({ client, directory }: PluginInput, options?: PluginOptions) => {
   const optionOverrides = normalizeOptions(options);
   const activeBash = new Map<string, BashSandboxState>();
   const notified = new Set<string>();
+  const sessionAllowedDomains: string[] = [];
+  const sessionAllowedReadPaths: string[] = [];
+  const sessionAllowedWritePaths: string[] = [];
   let enabledNotified = false;
   let configuredShell: string | undefined;
   let landstripCheck: { ok: true; version: string } | { ok: false; reason: string } | undefined;
+
+  function getEffectiveAllowRead(config: SandboxConfig): string[] {
+    return [...config.filesystem.allowRead, ...sessionAllowedReadPaths];
+  }
+
+  function getEffectiveAllowWrite(config: SandboxConfig): string[] {
+    return [...config.filesystem.allowWrite, ...sessionAllowedWritePaths];
+  }
 
   client.app
     .log({
@@ -801,7 +933,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     if (!hasMinimumVersion(version, LANDSTRIP_VERSION)) {
       landstripCheck = {
         ok: false,
-        reason: `landstrip 0.10.1 or newer is required; found: ${version}`,
+        reason: `landstrip 0.11.0 or newer is required; found: ${version}`,
       };
       return landstripCheck;
     }
@@ -826,20 +958,28 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
     if (!enabledNotified) {
       enabledNotified = true;
-      const networkLabel = allowsAllDomains(config.network.allowedDomains)
-        ? 'all domains'
-        : `${config.network.allowedDomains.length} domains`;
-      await notifyOnce(
-        'enabled',
-        `Sandbox enabled: ${networkLabel}, ${config.filesystem.allowWrite.length} write paths`,
-        'info',
-      );
-      if (allowsAllDomains(config.network.allowedDomains)) {
+      if (config.network.allowNetwork) {
         await notifyOnce(
-          'network-all',
-          'Network sandbox allows all domains because network.allowedDomains contains "*".',
+          'network-allow',
+          'Network sandbox is disabled because network.allowNetwork is true.',
           'warning',
         );
+      } else {
+        const networkLabel = allowsAllDomains(config.network.allowedDomains)
+          ? 'all domains'
+          : `${config.network.allowedDomains.length} domains`;
+        await notifyOnce(
+          'enabled',
+          `Sandbox enabled: ${networkLabel}, ${config.filesystem.allowWrite.length} write paths`,
+          'info',
+        );
+        if (allowsAllDomains(config.network.allowedDomains)) {
+          await notifyOnce(
+            'network-all',
+            'Network sandbox allows all domains because network.allowedDomains contains "*".',
+            'warning',
+          );
+        }
       }
     }
 
@@ -851,7 +991,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     if (!state) return;
 
     activeBash.delete(callID);
-    await state.stop().catch(() => undefined);
+    if (state.stop) await state.stop().catch(() => undefined);
     rmSync(state.policyDir, { recursive: true, force: true });
   }
 
@@ -880,25 +1020,30 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       return;
     }
 
-    const blockedDomain = firstBlockedDomain(args.command, config);
-    if (blockedDomain) {
-      const reason =
-        blockedDomain.reason === 'deniedDomains'
-          ? 'is blocked by network.deniedDomains'
-          : 'is not in network.allowedDomains';
-      throw errorWithConfigPaths(
-        directory,
-        `Sandbox: network access denied for "${blockedDomain.domain}" (${reason}).`,
-      );
+    const allowNetwork = config.network.allowNetwork;
+
+    if (!allowNetwork) {
+      const blockedDomain = firstBlockedDomain(args.command, config);
+      if (blockedDomain) {
+        const reason =
+          blockedDomain.reason === 'deniedDomains'
+            ? 'is blocked by network.deniedDomains'
+            : 'is not in network.allowedDomains';
+        throw errorWithConfigPaths(
+          directory,
+          `Sandbox: network access denied for "${blockedDomain.domain}" (${reason}).`,
+        );
+      }
     }
 
-    const proxy = await startProxy(config);
+    const proxy = allowNetwork ? null : await startProxy(config);
+    const proxyPort = proxy ? proxy.port : null;
     let policy: { dir: string; path: string };
 
     try {
-      policy = writePolicyFile(config, directory, proxy.port);
+      policy = writePolicyFile(config, directory, proxyPort);
     } catch (error) {
-      await proxy.stop().catch(() => undefined);
+      if (proxy) await proxy.stop().catch(() => undefined);
       throw error;
     }
 
@@ -913,8 +1058,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       originalCommand,
       wrappedCommand,
       policyDir: policy.dir,
-      port: proxy.port,
-      stop: proxy.stop,
+      port: proxyPort,
+      stop: proxy ? proxy.stop : null,
     });
 
     args.command = wrappedCommand;
@@ -934,6 +1079,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       `  Project config: ${projectPath}`,
       `  Global config:  ${globalPath}`,
       `  landstrip:      ${binaryPath()} (v${version})`,
+      '',
+      `  Allow network:  ${config.network.allowNetwork}`,
       '',
       'Network (bash commands go through HTTP proxy):',
       `  Allow local binding: ${config.network.allowLocalBinding}`,
@@ -965,6 +1112,9 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       const config = await activeConfig();
       if (!config) return;
 
+      const effectiveAllowRead = getEffectiveAllowRead(config);
+      const effectiveAllowWrite = getEffectiveAllowWrite(config);
+
       if (input.tool === 'bash') {
         await prepareBash(input.callID, output.args, config);
         return;
@@ -972,22 +1122,23 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
       if (input.tool === 'read') {
         const path = getToolPath(output.args);
-        if (path) assertReadAllowed(path, config, directory);
+        if (path) assertReadAllowed(path, config, directory, effectiveAllowRead);
         return;
       }
 
       if (input.tool === 'glob' || input.tool === 'grep' || input.tool === 'list') {
-        assertReadAllowed(getSearchPath(output.args), config, directory);
+        assertReadAllowed(getSearchPath(output.args), config, directory, effectiveAllowRead);
         return;
       }
 
       if (input.tool === 'write' || input.tool === 'edit') {
         const path = getToolPath(output.args);
-        if (path) assertWriteAllowed(path, config, directory);
+        if (path) assertWriteAllowed(path, config, directory, effectiveAllowWrite);
         return;
       }
 
-      if (input.tool === 'apply_patch') assertApplyPatchAllowed(output.args, config, directory);
+      if (input.tool === 'apply_patch')
+        assertApplyPatchAllowed(output.args, config, directory, effectiveAllowWrite);
     },
 
     'shell.env': async (input, output) => {
@@ -995,16 +1146,21 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       const state = activeBash.get(input.callID);
       if (!state) return;
 
-      Object.assign(output.env, proxyEnv(state.port));
+      const envVars = proxyEnv(state.port);
+      if (envVars) Object.assign(output.env, envVars);
     },
 
     'tool.execute.after': async (input, output) => {
       if (input.tool !== 'bash') return;
 
       const state = activeBash.get(input.callID);
-      if (!state) return;
+      if (!state) {
+        await cleanupBash(input.callID);
+        return;
+      }
 
-      const errors = parseLandstripErrors(output?.output ?? '');
+      const outputText = output?.output ?? '';
+      const errors = parseLandstripErrors(outputText);
       if (errors.length > 0) {
         const message = formatLandstripErrors(errors);
         await client.tui
@@ -1025,20 +1181,60 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
           .catch(() => undefined);
       }
 
+      const blockedPath = extractBlockedWritePath(outputText, directory, state.originalCommand);
+      if (blockedPath) {
+        const config = loadConfig(directory, optionOverrides);
+        if (
+          !sessionAllowedWritePaths.includes(blockedPath) &&
+          !matchesPattern(blockedPath, config.filesystem.allowWrite, directory) &&
+          !matchesPattern(blockedPath, config.filesystem.denyWrite, directory)
+        ) {
+          sessionAllowedWritePaths.push(blockedPath);
+          await notifyOnce(
+            `write-allow:${blockedPath}`,
+            `Write access granted for session: "${blockedPath}"`,
+            'warning',
+          );
+        }
+      }
+
       await cleanupBash(input.callID);
     },
 
     'command.execute.before': async (input, output) => {
-      if (input.command !== 'sandbox' && input.command !== '/sandbox') return;
+      if (input.command === 'sandbox' || input.command === '/sandbox') {
+        const config = loadConfig(directory, optionOverrides);
+        const summary = buildConfigSummary(config);
+        await client.tui
+          .showToast({
+            body: { title: 'Sandbox', message: summary, variant: 'info', duration: 15000 },
+            query: { directory },
+          })
+          .catch(() => undefined);
+        return;
+      }
 
-      const config = loadConfig(directory, optionOverrides);
-      const summary = buildConfigSummary(config);
-      await client.tui
-        .showToast({
-          body: { title: 'Sandbox', message: summary, variant: 'info', duration: 15000 },
-          query: { directory },
-        })
-        .catch(() => undefined);
+      // Check domain in user shell commands (commands starting with !)
+      if (input.command.startsWith('!')) {
+        const shellCommand = input.command.slice(1).trim();
+        const config = await activeConfig();
+        if (!config || config.network.allowNetwork) return;
+
+        const blockedDomain = firstBlockedDomain(shellCommand, config);
+        if (blockedDomain) {
+          const reason =
+            blockedDomain.reason === 'deniedDomains'
+              ? 'is blocked by network.deniedDomains'
+              : 'is not in network.allowedDomains';
+          output.parts.push({
+            type: 'text',
+            text: `Sandbox: network access denied for "${blockedDomain.domain}" (${reason}).`,
+            id: '',
+            sessionID: input.sessionID,
+            messageID: '',
+          });
+        }
+      }
     },
 
     dispose: async () => {

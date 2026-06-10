@@ -35,8 +35,8 @@ test('bash wrapping is idempotent for repeated before hooks', async () => {
     await writeFile(
       fakeLandstrip,
       process.platform === 'win32'
-        ? '@echo landstrip 0.9.7\r\n'
-        : '#!/bin/sh\nprintf "landstrip 0.9.7\\n"\n',
+        ? '@echo landstrip 0.11.0\r\n'
+        : '#!/bin/sh\nprintf "landstrip 0.11.0\\n"\n',
     );
     if (process.platform !== 'win32') await chmod(fakeLandstrip, 0o755);
 

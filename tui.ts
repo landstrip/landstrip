@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) Jarkko Sakkinen 2026
 
-const tui = async (api: any) => {
+import type { TuiPlugin } from '@opencode-ai/plugin/tui';
+
+const tui: TuiPlugin = async (api) => {
   try {
     api.keymap.registerLayer({
       commands: [
@@ -10,9 +12,11 @@ const tui = async (api: any) => {
           title: 'Sandbox',
           description: 'Show sandbox configuration',
           category: 'plugin',
+          keybind: 'ctrl+x b',
+          suggested: true,
           slash: { name: 'sandbox' },
           run: async () => {
-            await api.client.tui.executeCommand({ body: { command: 'sandbox' } });
+            await api.client.tui.executeCommand({ command: 'sandbox' });
             return true;
           },
         },
@@ -23,11 +27,9 @@ const tui = async (api: any) => {
     if (client?.tui?.showToast) {
       client.tui
         .showToast({
-          body: {
-            title: 'Sandbox',
-            message: '/sandbox command registered',
-            variant: 'info',
-          },
+          title: 'Sandbox',
+          message: '/sandbox command registered',
+          variant: 'info',
         })
         .catch(() => undefined);
     }
@@ -36,17 +38,13 @@ const tui = async (api: any) => {
     if (client?.tui?.showToast) {
       client.tui
         .showToast({
-          body: {
-            title: 'Sandbox error',
-            message: err instanceof Error ? err.message : String(err),
-            variant: 'error',
-          },
+          title: 'Sandbox error',
+          message: err instanceof Error ? err.message : String(err),
+          variant: 'error',
         })
         .catch(() => undefined);
     }
   }
-
-  return {};
 };
 
 export { tui };
