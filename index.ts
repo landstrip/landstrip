@@ -310,7 +310,7 @@ function shouldPromptForWrite(path: string, allowWrite: string[], baseDirectory:
 }
 
 function extractDomainsFromCommand(command: string): string[] {
-  const urlRegex = /https?:\/\/([^\s/:?#]+)(?::\d+)?(?:[/?#]|\s|$)/g;
+  const urlRegex = /https?:\/\/([^\s/:?#'"]+)(?::\d+)?(?:[/?#]|\s|$)/g;
   const domains = new Set<string>();
   let match: RegExpExecArray | null;
 
@@ -577,7 +577,7 @@ function writePolicyFile(
   baseDirectory: string,
   proxyPort: number | null,
 ): { dir: string; path: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'opencode-landstrip-XXXXXX'));
+  const dir = mkdtempSync(join(tmpdir(), 'opencode-landstrip-'));
   const path = join(dir, 'policy.json');
   writeFileSync(
     path,
@@ -666,8 +666,11 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
       buffered = Buffer.concat([buffered, chunk]);
       const headerEnd = buffered.indexOf('\r\n\r\n');
       if (headerEnd === -1) {
-        if (buffered.length > 65536)
+        if (buffered.length > 65536) {
+          client.removeAllListeners('data');
+          client.pause();
           denyProxyRequest(client, '431 Request Header Fields Too Large');
+        }
         return;
       }
 
@@ -756,6 +759,43 @@ function isGeneratedWrappedCommand(command: string): boolean {
 
 function landstripDescription(description: string): string {
   return description.endsWith(' (landstrip)') ? description : `${description} (landstrip)`;
+}
+
+function splitShellQuotedArgs(command: string): string[] {
+  const args: string[] = [];
+  let i = 0;
+  while (i < command.length) {
+    while (i < command.length && command[i] === ' ') i++;
+    if (i >= command.length) break;
+    if (command[i] === "'") {
+      i++;
+      let arg = '';
+      while (i < command.length && command[i] !== "'") {
+        arg += command[i];
+        i++;
+      }
+      if (i < command.length) i++;
+      args.push(arg);
+    } else {
+      let arg = '';
+      while (i < command.length && command[i] !== ' ') {
+        arg += command[i];
+        i++;
+      }
+      args.push(arg);
+    }
+  }
+  return args;
+}
+
+function extractOriginalCommand(wrappedCommand: string): string | null {
+  const args = splitShellQuotedArgs(wrappedCommand);
+  const pIdx = args.indexOf('-p');
+  if (pIdx === -1 || pIdx + 3 >= args.length) return null;
+  const flagIdx = pIdx + 3;
+  const flag = args[flagIdx];
+  if (flag !== '-lc' && flag !== '-c') return null;
+  return args.slice(flagIdx + 1).join(' ');
 }
 
 function getToolPath(args: Record<string, unknown>): string | undefined {
@@ -850,10 +890,10 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
   const optionOverrides = normalizeOptions(options);
   const activeBash = new Map<string, BashSandboxState>();
   const notified = new Set<string>();
-  const sessionAllowedDomains: string[] = [];
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
   let enabledNotified = false;
+  let sandboxDisabled = false;
   let configuredShell: string | undefined;
   let landstripCheck: { ok: true; version: string } | { ok: false; reason: string } | undefined;
 
@@ -865,8 +905,55 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     return [...config.filesystem.allowWrite, ...sessionAllowedWritePaths];
   }
 
+  function pushCommandText(
+    input: { sessionID: string },
+    output: { parts: unknown[] },
+    text: string,
+  ): void {
+    output.parts.push({
+      type: 'text',
+      text,
+      id: '',
+      sessionID: input.sessionID,
+      messageID: '',
+    });
+  }
+
+  function sandboxSummary(config: SandboxConfig): string {
+    const { globalPath, projectPath } = getConfigPaths(directory);
+    const networkMode = config.network.allowNetwork ? 'unrestricted' : 'proxied';
+    const allowed = config.network.allowedDomains.join(', ') || '(none)';
+    const denied = config.network.deniedDomains.join(', ') || '(none)';
+    const denyRead = config.filesystem.denyRead.join(', ') || '(none)';
+    const allowRead = getEffectiveAllowRead(config).join(', ') || '(none)';
+    const allowWrite = getEffectiveAllowWrite(config).join(', ') || '(none)';
+    const denyWrite = config.filesystem.denyWrite.join(', ') || '(none)';
+
+    return [
+      '# Sandbox Configuration',
+      '',
+      `Status: ${sandboxDisabled ? 'disabled for this session' : 'active'}`,
+      `landstrip: ${binaryPath()}`,
+      '',
+      'Config files:',
+      `- project: ${projectPath}`,
+      `- global: ${globalPath}`,
+      '',
+      `Network (${networkMode}):`,
+      `- allow network: ${config.network.allowNetwork ? 'yes' : 'no'}`,
+      `- allowed: ${allowed}`,
+      `- denied: ${denied}`,
+      '',
+      'Filesystem:',
+      `- deny read: ${denyRead}`,
+      `- allow read: ${allowRead}`,
+      `- allow write: ${allowWrite}`,
+      `- deny write: ${denyWrite}`,
+    ].join('\n');
+  }
+
   client.app
-    .log({
+    ?.log?.({
       body: {
         service: 'opencode-landstrip',
         level: 'info',
@@ -874,10 +961,10 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       },
       query: { directory },
     })
-    .catch(() => undefined);
+    ?.catch?.(() => undefined);
 
   client.tui
-    .showToast({
+    ?.showToast?.({
       body: {
         title: 'Sandbox',
         message: `Loaded for ${directory}`,
@@ -885,29 +972,41 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
         duration: 5000,
       },
     })
-    .catch(() => undefined);
+    ?.catch?.(() => undefined);
+
+  const notifyGate = new Map<string, Promise<void>>();
 
   async function notifyOnce(key: string, message: string, variant: ToastVariant): Promise<void> {
     if (notified.has(key)) return;
-    notified.add(key);
+    const pending = notifyGate.get(key);
+    if (pending) return pending;
 
-    await client.tui
-      .showToast({
-        body: { title: 'opencode-landstrip', message, variant },
-        query: { directory },
-      })
-      .catch(() => undefined);
+    const promise = (async () => {
+      notified.add(key);
 
-    await client.app
-      .log({
-        body: {
-          service: 'opencode-landstrip',
-          level: variant === 'error' ? 'error' : variant === 'warning' ? 'warn' : 'info',
-          message,
-        },
-        query: { directory },
-      })
-      .catch(() => undefined);
+      await client.tui
+        ?.showToast?.({
+          body: { title: 'opencode-landstrip', message, variant },
+          query: { directory },
+        })
+        ?.catch?.(() => undefined);
+
+      await client.app
+        ?.log?.({
+          body: {
+            service: 'opencode-landstrip',
+            level: variant === 'error' ? 'error' : variant === 'warning' ? 'warn' : 'info',
+            message,
+          },
+          query: { directory },
+        })
+        ?.catch?.(() => undefined);
+
+      notifyGate.delete(key);
+    })();
+
+    notifyGate.set(key, promise);
+    return promise;
   }
 
   function checkLandstrip(): typeof landstripCheck {
@@ -943,6 +1042,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
   }
 
   async function activeConfig(): Promise<SandboxConfig | null> {
+    if (sandboxDisabled) return null;
+
     const config = loadConfig(directory, optionOverrides);
     if (!config.enabled) return null;
 
@@ -1014,16 +1115,24 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       await cleanupBash(callID);
     }
 
-    if (isGeneratedWrappedCommand(args.command)) {
-      if (typeof args.description === 'string')
-        args.description = landstripDescription(args.description);
-      return;
+    if (isGeneratedWrappedCommand(args.command as string)) {
+      const policyMatch = (args.command as string).match(/\s'-p'\s+'([^']+)'/);
+      if (policyMatch && existsSync(policyMatch[1])) {
+        if (typeof args.description === 'string')
+          args.description = landstripDescription(args.description);
+        return;
+      }
+      if (activeBash.has(callID)) await cleanupBash(callID);
+      const original = extractOriginalCommand(args.command as string);
+      if (original) {
+        args.command = original;
+      }
     }
 
     const allowNetwork = config.network.allowNetwork;
 
     if (!allowNetwork) {
-      const blockedDomain = firstBlockedDomain(args.command, config);
+      const blockedDomain = firstBlockedDomain(args.command as string, config);
       if (blockedDomain) {
         const reason =
           blockedDomain.reason === 'deniedDomains'
@@ -1047,7 +1156,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       throw error;
     }
 
-    const originalCommand = args.command;
+    const originalCommand = args.command as string;
     const wrappedCommand = buildWrappedCommand(
       policy.path,
       configuredShell ?? process.env.SHELL ?? '/bin/sh',
@@ -1065,40 +1174,6 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     args.command = wrappedCommand;
     if (typeof args.description === 'string')
       args.description = landstripDescription(args.description);
-  }
-
-  function buildConfigSummary(config: SandboxConfig): string {
-    const { globalPath, projectPath } = getConfigPaths(directory);
-    const check = checkLandstrip();
-    const version = check?.ok === true ? check.version : 'unknown';
-    const status = config.enabled && check?.ok === true ? 'enabled' : 'disabled';
-
-    const lines = [
-      'Sandbox Configuration',
-      `  Status:         ${status}`,
-      `  Project config: ${projectPath}`,
-      `  Global config:  ${globalPath}`,
-      `  landstrip:      ${binaryPath()} (v${version})`,
-      '',
-      `  Allow network:  ${config.network.allowNetwork}`,
-      '',
-      'Network (bash commands go through HTTP proxy):',
-      `  Allow local binding: ${config.network.allowLocalBinding}`,
-      `  Allow all Unix sockets: ${config.network.allowAllUnixSockets}`,
-      ...(config.network.allowUnixSockets.length > 0
-        ? [`  Allow Unix sockets: ${config.network.allowUnixSockets.join(', ')}`]
-        : []),
-      `  Allowed domains: ${config.network.allowedDomains.join(', ') || '(none)'}`,
-      `  Denied domains:  ${config.network.deniedDomains.join(', ') || '(none)'}`,
-      '',
-      'Filesystem (bash + read/write/edit tools):',
-      `  Deny Read:   ${config.filesystem.denyRead.join(', ') || '(none)'}`,
-      `  Allow Read:  ${config.filesystem.allowRead.join(', ') || '(none)'}`,
-      `  Allow Write: ${config.filesystem.allowWrite.join(', ') || '(none)'}`,
-      `  Deny Write:  ${config.filesystem.denyWrite.join(', ') || '(none)'}`,
-    ];
-
-    return lines.join('\n');
   }
 
   const hooks: Hooks = {
@@ -1164,13 +1239,13 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       if (errors.length > 0) {
         const message = formatLandstripErrors(errors);
         await client.tui
-          .showToast({
+          ?.showToast?.({
             body: { title: 'opencode-landstrip', message, variant: 'error' },
             query: { directory },
           })
-          .catch(() => undefined);
+          ?.catch?.(() => undefined);
         await client.app
-          .log({
+          ?.log?.({
             body: {
               service: 'opencode-landstrip',
               level: 'error',
@@ -1178,7 +1253,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
             },
             query: { directory },
           })
-          .catch(() => undefined);
+          ?.catch?.(() => undefined);
       }
 
       const blockedPath = extractBlockedWritePath(outputText, directory, state.originalCommand);
@@ -1196,43 +1271,88 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
             'warning',
           );
         }
+        if (
+          !sessionAllowedReadPaths.includes(blockedPath) &&
+          !matchesPattern(blockedPath, config.filesystem.allowRead, directory) &&
+          !matchesPattern(blockedPath, config.filesystem.denyRead, directory)
+        ) {
+          sessionAllowedReadPaths.push(blockedPath);
+          await notifyOnce(
+            `read-allow:${blockedPath}`,
+            `Read access granted for session: "${blockedPath}"`,
+            'warning',
+          );
+        }
       }
 
       await cleanupBash(input.callID);
     },
 
     'command.execute.before': async (input, output) => {
-      if (input.command === 'sandbox' || input.command === '/sandbox') {
+      if (input.command.trim() === '/sandbox') {
         const config = loadConfig(directory, optionOverrides);
-        const summary = buildConfigSummary(config);
-        await client.tui
-          .showToast({
-            body: { title: 'Sandbox', message: summary, variant: 'info', duration: 15000 },
-            query: { directory },
-          })
-          .catch(() => undefined);
+        pushCommandText(input, output, sandboxSummary(config));
         return;
       }
 
-      // Check domain in user shell commands (commands starting with !)
+      if (input.command.trim() === '/sandbox-disable') {
+        if (sandboxDisabled) {
+          pushCommandText(
+            input,
+            output,
+            'Sandbox is already disabled. Use /sandbox-enable to re-enable.',
+          );
+          return;
+        }
+        sandboxDisabled = true;
+        pushCommandText(
+          input,
+          output,
+          'Sandbox disabled for this session. Use /sandbox-enable to re-enable.',
+        );
+        return;
+      }
+
+      if (input.command.trim() === '/sandbox-enable') {
+        if (!sandboxDisabled) {
+          pushCommandText(
+            input,
+            output,
+            'Sandbox is already enabled. Use /sandbox-disable to pause.',
+          );
+          return;
+        }
+        sandboxDisabled = false;
+        pushCommandText(input, output, 'Sandbox re-enabled.');
+        return;
+      }
+
+      // Check domain and filesystem in user shell commands (commands starting with !)
       if (input.command.startsWith('!')) {
         const shellCommand = input.command.slice(1).trim();
         const config = await activeConfig();
-        if (!config || config.network.allowNetwork) return;
+        if (!config) return;
 
-        const blockedDomain = firstBlockedDomain(shellCommand, config);
-        if (blockedDomain) {
-          const reason =
-            blockedDomain.reason === 'deniedDomains'
-              ? 'is blocked by network.deniedDomains'
-              : 'is not in network.allowedDomains';
-          output.parts.push({
-            type: 'text',
-            text: `Sandbox: network access denied for "${blockedDomain.domain}" (${reason}).`,
-            id: '',
-            sessionID: input.sessionID,
-            messageID: '',
-          });
+        const effectiveAllowRead = getEffectiveAllowRead(config);
+        const effectiveAllowWrite = getEffectiveAllowWrite(config);
+
+        for (const path of extractCandidatePaths(shellCommand)) {
+          assertReadAllowed(path, config, directory, effectiveAllowRead);
+          assertWriteAllowed(path, config, directory, effectiveAllowWrite);
+        }
+
+        if (!config.network.allowNetwork) {
+          const blockedDomain = firstBlockedDomain(shellCommand, config);
+          if (blockedDomain) {
+            const reason =
+              blockedDomain.reason === 'deniedDomains'
+                ? 'is blocked by network.deniedDomains'
+                : 'is not in network.allowedDomains';
+            throw errorWithConfigPaths(
+              directory,
+              `Sandbox: network access denied for "${blockedDomain.domain}" (${reason}).`,
+            );
+          }
         }
       }
     },

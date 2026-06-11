@@ -14,6 +14,18 @@ Add the plugin to `opencode.json`:
 }
 ```
 
+Add the TUI entrypoint to `tui.json` if you install or configure the plugin
+manually:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-landstrip"]
+}
+```
+
+`opencode plugin install opencode-landstrip` configures both entrypoints.
+
 This installs `opencode-landstrip` and its `@jarkkojs/landstrip` dependency, which
 includes platform-specific native binaries for Linux, macOS, and Windows.
 
@@ -32,9 +44,12 @@ The plugin wraps opencode's AI `bash` tool in `landstrip`, routes proxy-aware
 network traffic through an allowlist proxy, and blocks read/write tool access
 outside configured filesystem allowlists.
 
+Run `/sandbox` in the TUI to inspect the active sandbox configuration.
+
 opencode's current server plugin API does not expose Pi-style custom permission
-dialogs or a way to rewrite manually typed shell-mode commands. Blocked access
-fails with an error that points at the sandbox config files.
+dialogs or a way to rewrite manually typed shell-mode commands. The `/sandbox`
+status view is provided by the TUI plugin entrypoint. Blocked access fails with
+an error that points at the sandbox config files.
 
 ## Disable
 
