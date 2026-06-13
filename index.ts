@@ -72,15 +72,36 @@ interface LandstripPolicy {
   filesystem: SandboxFilesystemConfig;
 }
 
+type LandstripErrorReason = 'Other' | 'AccessDenied' | 'LaunchFailed' | 'SetupFailed' | 'Usage';
+type LandstripOperation = 'read' | 'write';
+type LandstripErrorType = 'filesystem' | 'network' | 'platform' | 'launch' | 'encoding';
+
 interface LandstripErrorResponse {
-  reason: 'Other' | 'LaunchFailed' | 'SetupFailed' | 'Usage';
+  reason: LandstripErrorReason;
   file?: string;
+  operation?: LandstripOperation;
   program?: string;
-  type?: 'filesystem' | 'network' | 'platform' | 'launch' | 'encoding';
-  source: string;
+  type?: LandstripErrorType;
+  source?: string;
 }
 
-const LANDSTRIP_VERSION = [0, 11, 5] as const;
+const LANDSTRIP_VERSION = [0, 11, 6] as const;
+const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
+const LANDSTRIP_ERROR_REASONS = new Set<LandstripErrorReason>([
+  'Other',
+  'AccessDenied',
+  'LaunchFailed',
+  'SetupFailed',
+  'Usage',
+]);
+const LANDSTRIP_OPERATIONS = new Set<LandstripOperation>(['read', 'write']);
+const LANDSTRIP_ERROR_TYPES = new Set<LandstripErrorType>([
+  'filesystem',
+  'network',
+  'platform',
+  'launch',
+  'encoding',
+]);
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 
 const DEFAULT_CONFIG: SandboxConfig = {
@@ -348,6 +369,22 @@ function normalizePathMatch(value: string, cwd: string): string | null {
   return isPathLike(value) ? normalizeBlockedPath(value, cwd) : null;
 }
 
+function isFilesystemAccessDenied(error: LandstripErrorResponse): boolean {
+  return error.reason === 'AccessDenied' && error.type === 'filesystem';
+}
+
+function isLandstripErrorReason(value: string): value is LandstripErrorReason {
+  return LANDSTRIP_ERROR_REASONS.has(value as LandstripErrorReason);
+}
+
+function isLandstripOperation(value: string): value is LandstripOperation {
+  return LANDSTRIP_OPERATIONS.has(value as LandstripOperation);
+}
+
+function isLandstripErrorType(value: string): value is LandstripErrorType {
+  return LANDSTRIP_ERROR_TYPES.has(value as LandstripErrorType);
+}
+
 function extractCandidatePaths(command: string): string[] {
   const paths: string[] = [];
   // Split on whitespace, preserving quoted strings minimally
@@ -362,6 +399,26 @@ function extractCandidatePaths(command: string): string[] {
 }
 
 function extractBlockedPath(output: string, cwd: string, command?: string): string | null {
+  const landstripErrors = parseLandstripErrors(output).filter(isFilesystemAccessDenied);
+  for (const error of landstripErrors) {
+    if (error.file) return normalizeBlockedPath(error.file, cwd);
+  }
+
+  // If landstrip reported an error but without a file field, try to
+  // extract the blocked path from the command itself.
+  if (landstripErrors.length > 0 && command) {
+    const config = loadConfig(cwd);
+    for (const candidate of extractCandidatePaths(command)) {
+      const resolved = normalizeBlockedPath(candidate, cwd);
+      if (
+        matchesPattern(resolved, config.filesystem.denyRead) ||
+        !matchesPattern(resolved, config.filesystem.allowRead)
+      ) {
+        return resolved;
+      }
+    }
+  }
+
   // bash/sh: line X: /path: Permission denied
   let match = output.match(
     /(?:\/bin\/bash|bash|sh): (?:line \d+: )?([^:\n]+): (?:Operation not permitted|Permission denied)/,
@@ -376,36 +433,21 @@ function extractBlockedPath(output: string, cwd: string, command?: string): stri
 
   // Generic: cmd: /absolute/path: Permission denied or Operation not permitted
   match = output.match(
-    /^[a-zA-Z0-9_-]+: (\/[^\n:]+): (?:Operation not permitted|Permission denied)$/m,
+    /^[a-zA-Z0-9_-]+: (\/[^:\n]+): (?:Operation not permitted|Permission denied)$/m,
   );
   if (match) return normalizeBlockedPath(match[1], cwd);
-
-  // Landstrip structured error format with file field
-  const landstripErrors = parseLandstripErrors(output);
-  for (const error of landstripErrors) {
-    if (error.file) return normalizeBlockedPath(error.file, cwd);
-  }
-
-  // If landstrip reported an error but without a file field, try to
-  // extract the blocked path from the command itself
-  if (landstripErrors.length > 0 && command) {
-    const config = loadConfig(cwd);
-    for (const candidate of extractCandidatePaths(command)) {
-      const resolved = normalizeBlockedPath(candidate, cwd);
-      if (
-        matchesPattern(resolved, config.filesystem.denyRead) ||
-        !matchesPattern(resolved, config.filesystem.allowRead)
-      ) {
-        return resolved;
-      }
-    }
-  }
 
   return null;
 }
 
-function extractBlockedWritePath(output: string, cwd: string, command?: string): string | null {
-  return extractBlockedPath(output, cwd, command);
+function extractBlockedWritePath(output: string, cwd: string): string | null {
+  for (const error of parseLandstripErrors(output).filter(isFilesystemAccessDenied)) {
+    if (error.file && error.operation === 'write') {
+      return normalizeBlockedPath(error.file, cwd);
+    }
+  }
+
+  return null;
 }
 
 function parseLandstripErrors(output: string): LandstripErrorResponse[] {
@@ -424,22 +466,21 @@ function parseLandstripErrors(output: string): LandstripErrorResponse[] {
 
     if (
       fields.reason &&
-      ['Other', 'LaunchFailed', 'SetupFailed', 'Usage'].includes(fields.reason) &&
-      fields.source
+      isLandstripErrorReason(fields.reason) &&
+      (fields.source || fields.reason === 'AccessDenied')
     ) {
-      const error: LandstripErrorResponse = {
-        reason: fields.reason as LandstripErrorResponse['reason'],
-        source: fields.source,
-      };
+      const error: LandstripErrorResponse = { reason: fields.reason };
 
+      if (fields.source) error.source = fields.source;
       if (fields.file) error.file = fields.file;
       if (fields.program) error.program = fields.program;
 
-      if (
-        fields.type &&
-        ['filesystem', 'network', 'platform', 'launch', 'encoding'].includes(fields.type)
-      ) {
-        error.type = fields.type as LandstripErrorResponse['type'];
+      if (fields.operation && isLandstripOperation(fields.operation)) {
+        error.operation = fields.operation;
+      }
+
+      if (fields.type && isLandstripErrorType(fields.type)) {
+        error.type = fields.type;
       }
 
       errors.push(error);
@@ -463,7 +504,12 @@ function formatLandstripErrors(errors: LandstripErrorResponse[]): string {
       if (err.type) {
         parts.push(`:${err.type}`);
       }
-      parts.push(`: ${err.source}`);
+      if (err.operation) {
+        parts.push(`:${err.operation}`);
+      }
+      if (err.source) {
+        parts.push(`: ${err.source}`);
+      }
 
       return parts.join('');
     })
@@ -1085,6 +1131,7 @@ export function createLandstripIntegration(
             }
 
             const blockedPath = extractBlockedPath(stderrAcc, cwd, command);
+            const blockedWritePath = extractBlockedWritePath(stderrAcc, cwd);
             if (blockedPath && ctx.hasUI) {
               const config = loadConfig(cwd);
               const isDeniedByDenyRead = matchesPattern(blockedPath, config.filesystem.denyRead);
@@ -1095,7 +1142,10 @@ export function createLandstripIntegration(
                 matchesPattern,
               );
 
-              if (isDeniedByDenyRead || !isReadAllowed) {
+              if (blockedWritePath === blockedPath && !isWriteAllowed) {
+                const choice = await promptWriteBlock(ctx, blockedPath);
+                if (choice !== 'abort') await applyWriteChoice(choice, blockedPath, cwd);
+              } else if (isDeniedByDenyRead || !isReadAllowed) {
                 const choice = await promptReadBlock(
                   ctx,
                   blockedPath,
@@ -1147,16 +1197,12 @@ export function createLandstripIntegration(
       }
       throw error;
     }
-    const outputText = result.content
-      .filter((content) => content.type === 'text')
-      .map((content) => content.text)
-      .join('\n');
     const landstripErrors = parseLandstripErrors(landstripStderr);
     if (landstripErrors.length > 0) {
       const message = formatLandstripErrors(landstripErrors);
       result.content.unshift({ type: 'text', text: `\n${message}\n` });
     }
-    const blockedPath = extractBlockedWritePath(outputText, ctx.cwd, params.command);
+    const blockedPath = extractBlockedWritePath(landstripStderr, ctx.cwd);
 
     if (!blockedPath || !ctx.hasUI) return result;
 
@@ -1256,7 +1302,10 @@ export function createLandstripIntegration(
     if (!hasMinimumVersion(version, LANDSTRIP_VERSION)) {
       sandboxEnabled = false;
       sandboxReady = false;
-      ctx.ui.notify(`landstrip 0.11.5 or newer is required; found: ${version}`, 'error');
+      ctx.ui.notify(
+        `landstrip ${REQUIRED_LANDSTRIP_VERSION} or newer is required; found: ${version}`,
+        'error',
+      );
       return false;
     }
 
