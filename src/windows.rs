@@ -4,6 +4,7 @@
 //! Windows sandbox platform using LPAC `AppContainer`.
 
 use crate::error::{Error, ErrorKind, Result};
+use crate::error_fd::ErrorFd;
 use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString, c_void};
@@ -42,7 +43,12 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICA
 
 const INFINITE: u32 = 0xffff_ffff;
 
-pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<()> {
+pub(crate) fn execute(
+    policy: &AccessPolicy,
+    tool: &OsStr,
+    args: &[OsString],
+    _error_fd: ErrorFd,
+) -> Result<()> {
     reject_unsupported_policy(policy)?;
 
     let moniker = appcontainer_moniker(tool, policy);

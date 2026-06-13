@@ -15,6 +15,7 @@
 use super::fd::close_inherited_fds;
 use super::landlock::{LandlockFeatures, enforce_access_policy};
 use crate::error::{Error, ErrorKind, Result};
+use crate::error_fd::ErrorFd;
 use crate::paths::normalize_path;
 use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
 use nix::errno::Errno;
@@ -106,6 +107,7 @@ pub(super) fn run_broker(
     args: &[OsString],
     needs_network: bool,
     needs_filesystem: bool,
+    error_fd: ErrorFd,
 ) -> Result<i32> {
     let notify_unix_sockets = needs_unix_socket_broker(&policy.network_access.unix_socket_access);
     let notify_bind =
@@ -208,6 +210,7 @@ pub(super) fn run_broker(
                 notify_fd,
                 &syscalls,
                 notify_filesystem,
+                error_fd,
             )
         }
     }
@@ -220,8 +223,9 @@ fn supervise_child(
     notify_fd: RawFd,
     syscalls: &NotificationSyscalls,
     notify_filesystem: bool,
+    error_fd: ErrorFd,
 ) -> Result<i32> {
-    let mut fs_denials = FilesystemDenials::default();
+    let mut fs_denials = FilesystemDenials::new(error_fd);
     loop {
         loop {
             match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -315,11 +319,18 @@ struct FilesystemDenial {
 
 #[derive(Default)]
 struct FilesystemDenials {
+    error_fd: ErrorFd,
     seen: HashSet<FilesystemDenial>,
     pending: Vec<FilesystemDenial>,
 }
 
 impl FilesystemDenials {
+    fn new(error_fd: ErrorFd) -> Self {
+        Self {
+            error_fd,
+            ..Self::default()
+        }
+    }
     fn record(&mut self, path: &Path, operation: FilesystemOperation) {
         let denial = FilesystemDenial {
             path: path.to_path_buf(),
@@ -337,6 +348,11 @@ impl FilesystemDenials {
             .iter()
             .filter(|denial| code != 0 || denial.operation == FilesystemOperation::Write)
         {
+            self.error_fd.emit_filesystem_denial(
+                denial.operation.as_str(),
+                &denial.path,
+                "seccomp",
+            );
             Error::new(ErrorKind::AccessDenied)
                 .with_type("filesystem")
                 .with_operation(denial.operation.as_str())

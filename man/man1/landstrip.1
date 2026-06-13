@@ -8,6 +8,7 @@
 .Nm
 .Op Fl -debug
 .Op Fl -format Ar format
+.Op Fl -error-fd Ar fd
 .Op Fl p Ar policy
 .Op Fl -policy Ar policy
 .Ar command
@@ -37,6 +38,13 @@ and
 .Va yaml .
 The default is
 .Va json .
+.It Fl -error-fd Ar fd
+Write landstrip error response blocks to the already-open file descriptor
+.Ar fd .
+The descriptor must be 3 or greater. On Linux, filesystem denials observed by
+the seccomp broker are emitted using the same field format as formatted
+standard-error responses. The option is best-effort on backends that do not
+expose per-access denial callbacks.
 .It Fl p Ar policy , Fl -policy Ar policy
 Read a policy file. This option may be repeated. Later policy arguments
 are merged over earlier policy arguments. Object values are merged recursively,
@@ -213,6 +221,22 @@ exit with status 2. Logs and sandboxed command output are not part of the format
 response. Normal successful command execution does not print a response
 because standard error belongs to landstrip and standard output belongs to the
 sandboxed command.
+.Pp
+When
+.Fl -error-fd Ar fd
+is used,
+.Nm
+writes formatted response blocks to that file descriptor.
+For example, Linux filesystem denials are emitted as:
+.Bd -literal -offset indent
+reason: AccessDenied
+type: filesystem
+file: /repo/out
+operation: write
+mechanism: seccomp
+.Ed
+This error stream is separate from the sandboxed command's standard output
+and standard error.
 .Sh EXIT STATUS
 On success,
 .Nm

@@ -131,6 +131,41 @@ expect_success_access_denied() {
     fi
 }
 
+expect_error_fd_write_denied() {
+    name=$1
+    policy=$2
+    denied_file=$3
+    expected_real=$(CDPATH= cd -- "$(dirname -- "$denied_file")" && pwd -P)/$(basename -- "$denied_file")
+    diag=$tmp/error-fd-write-denied.txt
+    rm -f "$diag"
+    set +e
+    output=$("$bin" --error-fd 3 -p "$policy" "$sandbox_shell" -c \
+        'if test -e /proc/self/fd/3; then echo fd3-inherited >&2; fi; : > "$1"; exit 1' \
+        _ "$denied_file" 3>"$diag" 2>&1)
+    status=$?
+    set -e
+
+    has_expected_file=0
+    if grep -F -q \
+        -e "file: $denied_file" \
+        -e "file: $expected_real" \
+        "$diag"; then
+        has_expected_file=1
+    fi
+
+    if [ "$status" -ne 0 ] && [ "$has_expected_file" -eq 1 ] && \
+        grep -F -q 'reason: AccessDenied' "$diag" && \
+        grep -F -q 'type: filesystem' "$diag" && \
+        grep -F -q 'operation: write' "$diag" && \
+        grep -F -q 'mechanism: seccomp' "$diag" && \
+        ! printf '%s\n' "$output" | grep -F -q 'fd3-inherited'; then
+        pass "$name"
+    else
+        diag_output=$(cat "$diag" 2>/dev/null || true)
+        fail "$name" "status=$status output=$output error_fd=$diag_output"
+    fi
+}
+
 expect_failure_access_denied() {
     name=$1
     expected_file=$2
@@ -267,6 +302,10 @@ test_ok "dev null read and write are permitted" "$policy" "$sandbox_shell" -c 'c
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%s/allowed"],"denyRead":["/"],"allowRead":["/"]}}' "$tmp")
 expect_success_access_denied "successful write denial is reported" "/dev/null" write \
     "$bin" -p "$policy" "$sandbox_shell" -c 'cat /dev/null >/dev/null; true'
+if [ "$os_name" = Linux ]; then
+    expect_error_fd_write_denied "error fd reports write denial" \
+        "$policy" "$tmp/denied/error-fd.txt"
+fi
 
 policy_yaml=$tmp/policy-fs.yaml
 printf '%s\n' \

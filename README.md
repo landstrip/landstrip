@@ -110,6 +110,30 @@ tool execution does not print a landstrip response unless a write denial was
 observed, because standard error belongs to landstrip; standard output belongs
 to the sandboxed tool.
 
+## Error FD
+
+Use `--error-fd FD` to write landstrip error response blocks to an
+already-open file descriptor. This side channel is intended for wrappers that
+need to react to sandbox denials without parsing the sandboxed tool's stderr.
+
+```sh
+landstrip --error-fd 3 -p policy.json cargo test 3>landstrip-errors.txt
+```
+
+Linux emits filesystem denials observed by the seccomp broker using the same
+field format as landstrip's stderr responses:
+
+```text
+reason: AccessDenied
+type: filesystem
+file: /repo/out
+operation: write
+mechanism: seccomp
+```
+
+The option is best-effort on other backends; macOS Seatbelt and Windows
+AppContainer do not currently provide per-access denial callbacks.
+
 ## Development
 
 ### Commit messages

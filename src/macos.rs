@@ -4,6 +4,7 @@
 //! macOS Seatbelt (SBPL) sandbox platform.
 
 use crate::error::{Error, ErrorKind, Result};
+use crate::error_fd::ErrorFd;
 use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};
@@ -14,10 +15,16 @@ use std::ptr;
 
 const SBPL_PROFILE_FLAGS: u64 = 0;
 
-pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<()> {
+pub(crate) fn execute(
+    policy: &AccessPolicy,
+    tool: &OsStr,
+    args: &[OsString],
+    error_fd: ErrorFd,
+) -> Result<()> {
     let profile = render_profile(policy).map_err(Error::policy_stdin_source)?;
     let args = canonicalize_args(args);
     apply_profile(&profile)?;
+    error_fd.close();
     let error = Command::new(tool).args(&args).exec();
     Err(Error::tool_exec(Some(tool.to_os_string()), error))
 }

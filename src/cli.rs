@@ -15,6 +15,7 @@ pub(crate) struct Cli {
     pub(crate) policy_paths: Vec<PathBuf>,
     pub(crate) format: PolicyFormat,
     pub(crate) debug: bool,
+    pub(crate) error_fd: Option<i32>,
     pub(crate) tool: OsString,
     pub(crate) tool_args: Vec<OsString>,
 }
@@ -48,6 +49,10 @@ struct CliOptions {
     /// policy format: json or yaml; defaults to json
     #[argh(option, from_str_fn(parse_policy_format))]
     format: Option<PolicyFormat>,
+
+    /// write landstrip error responses to an already-open file descriptor
+    #[argh(option, from_str_fn(parse_error_fd))]
+    error_fd: Option<i32>,
 
     /// tool to run inside the sandbox, followed by its arguments
     #[argh(positional)]
@@ -112,6 +117,7 @@ fn parse_cli_action(
         policy_paths: options.policy,
         format: options.format.unwrap_or(PolicyFormat::Json),
         debug: options.debug,
+        error_fd: options.error_fd,
         tool,
         tool_args: tool_tail.collect(),
     }))
@@ -142,6 +148,14 @@ fn split_cli_args(args: impl IntoIterator<Item = OsString>) -> (Vec<OsString>, V
             continue;
         }
 
+        if arg == OsStr::new("--error-fd") {
+            option_args.push(arg);
+            if let Some(value) = args.next() {
+                option_args.push(value);
+            }
+            continue;
+        }
+
         if arg.to_string_lossy().starts_with('-') {
             option_args.push(arg);
             continue;
@@ -161,6 +175,16 @@ fn parse_policy_path(path: &str) -> std::result::Result<PathBuf, String> {
     }
 
     Ok(PathBuf::from(path))
+}
+
+fn parse_error_fd(fd: &str) -> std::result::Result<i32, String> {
+    let fd = fd
+        .parse::<i32>()
+        .map_err(|_| "error fd must be an integer >= 3".to_owned())?;
+    if fd < 3 {
+        return Err("error fd must be an integer >= 3".to_owned());
+    }
+    Ok(fd)
 }
 
 fn parse_policy_format(format: &str) -> std::result::Result<PolicyFormat, String> {

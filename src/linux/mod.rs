@@ -8,6 +8,7 @@ mod landlock;
 mod seccomp;
 
 use crate::error::{Error, Result};
+use crate::error_fd::ErrorFd;
 use crate::policy::AccessPolicy;
 use fd::close_inherited_fds;
 use landlock::{enforce_access_policy, landlock_features};
@@ -16,7 +17,12 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::process::{self, Command};
 
-pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<()> {
+pub(crate) fn execute(
+    policy: &AccessPolicy,
+    tool: &OsStr,
+    args: &[OsString],
+    error_fd: ErrorFd,
+) -> Result<()> {
     let network = &policy.network_access;
     let unrestricted_network = network.is_unrestricted();
     let landlock_features = landlock_features()?;
@@ -29,7 +35,7 @@ pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
         log::debug!("{engine}: Unix socket policy enabled");
     }
 
-    let needs_fs_broker = seccomp::needs_filesystem_broker(policy);
+    let needs_fs_broker = seccomp::needs_filesystem_broker(policy) || error_fd.is_enabled();
     let needs_network_broker = !unrestricted_network
         && (network.local_tcp_bind
             || !network.connect_tcp_ports.is_empty()
@@ -43,7 +49,9 @@ pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
             args,
             needs_network_broker,
             needs_fs_broker,
+            error_fd,
         )?;
+        error_fd.close();
         process::exit(status);
     }
 

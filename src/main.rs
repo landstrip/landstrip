@@ -9,6 +9,7 @@
 mod cli;
 mod config;
 mod error;
+mod error_fd;
 mod paths;
 #[cfg_attr(target_os = "linux", path = "linux/mod.rs")]
 #[cfg_attr(target_os = "macos", path = "macos.rs")]
@@ -24,6 +25,7 @@ mod traversal;
 use crate::cli::{Cli, parse_cli};
 use crate::config::load_settings;
 use crate::error::{ErrorKind, Result};
+use crate::error_fd::ErrorFd;
 use crate::policy::resolve_policy;
 use std::process;
 
@@ -63,7 +65,8 @@ fn run_with_cli(cli: &Cli) -> Result<()> {
     let settings = load_settings(&cli.policy_paths, cli.format)?;
     let policy = resolve_policy(&settings.filesystem, &settings.network, &cwd)?;
 
-    platform::execute(&policy, &cli.tool, &cli.tool_args)?;
+    let error_fd = ErrorFd::from_fd(cli.error_fd);
+    platform::execute(&policy, &cli.tool, &cli.tool_args, error_fd)?;
 
     Ok(())
 }

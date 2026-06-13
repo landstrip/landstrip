@@ -7,9 +7,15 @@
 //! operating system is not yet supported by landstrip.
 
 use crate::error::{Error, ErrorKind, Result};
+use crate::error_fd::ErrorFd;
 use crate::policy::AccessPolicy;
 use std::ffi::{OsStr, OsString};
 
-pub(crate) fn execute(_policy: &AccessPolicy, _tool: &OsStr, _args: &[OsString]) -> Result<()> {
+pub(crate) fn execute(
+    _policy: &AccessPolicy,
+    _tool: &OsStr,
+    _args: &[OsString],
+    _error_fd: ErrorFd,
+) -> Result<()> {
     Err(Error::new(ErrorKind::Unsupported))
 }
