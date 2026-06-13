@@ -80,7 +80,7 @@ interface LandstripErrorResponse {
   source: string;
 }
 
-const LANDSTRIP_VERSION = [0, 11, 1] as const;
+const LANDSTRIP_VERSION = [0, 11, 3] as const;
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 
 const DEFAULT_CONFIG: SandboxConfig = {
@@ -1251,7 +1251,7 @@ export function createLandstripIntegration(
     if (!hasMinimumVersion(version, LANDSTRIP_VERSION)) {
       sandboxEnabled = false;
       sandboxReady = false;
-      ctx.ui.notify(`landstrip 0.11.1 or newer is required; found: ${version}`, 'error');
+      ctx.ui.notify(`landstrip 0.11.3 or newer is required; found: ${version}`, 'error');
       return false;
     }
 
