@@ -133,3 +133,5 @@ the return values on error:
 
 The JavaScript npm wrapper is licensed under `Apache-2.0`. The Rust source and
 native binaries are licensed under `LGPL-2.1-or-later`.
+Corresponding source for each published native binary is available from the
+GitHub repository tag that matches the package version.
