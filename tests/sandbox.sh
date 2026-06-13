@@ -18,7 +18,8 @@ command -v "$nc_cmd" >/dev/null 2>&1 || {
     exit 1
 }
 nc_path=$(command -v "$nc_cmd")
-case $(uname -s) in
+os_name=$(uname -s)
+case $os_name in
     Darwin) sandbox_shell=/bin/bash ;;
     *) sandbox_shell=/bin/sh ;;
 esac
@@ -99,15 +100,31 @@ expect_success_access_denied() {
     output=$({ "$@"; } 2>&1)
     status=$?
     set -e
-    has_expected_file=0
+    has_expected_structured_file=0
     if printf '%s\n' "$output" | grep -F -q \
         -e "file: $expected_file" \
         -e "file: $expected_real"; then
-        has_expected_file=1
+        has_expected_structured_file=1
     fi
-    if [ "$status" -eq 0 ] && [ "$has_expected_file" -eq 1 ] && \
+    has_expected_native_file=0
+    if printf '%s\n' "$output" | grep -F -q \
+        -e "$expected_file" \
+        -e "$expected_real"; then
+        has_expected_native_file=1
+    fi
+    has_structured_denial=0
+    if [ "$has_expected_structured_file" -eq 1 ] && \
         printf '%s\n' "$output" | grep -F -q 'reason: AccessDenied' && \
         printf '%s\n' "$output" | grep -F -q "operation: $expected_operation"; then
+        has_structured_denial=1
+    fi
+    has_native_denial=0
+    if [ "$os_name" = Darwin ] && [ "$has_expected_native_file" -eq 1 ] && \
+        printf '%s\n' "$output" | grep -F -q 'Operation not permitted'; then
+        has_native_denial=1
+    fi
+    if [ "$status" -eq 0 ] && \
+        { [ "$has_structured_denial" -eq 1 ] || [ "$has_native_denial" -eq 1 ]; }; then
         pass "$name"
     else
         fail "$name" "status=$status output=$output"
