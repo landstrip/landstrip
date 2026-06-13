@@ -1,6 +1,6 @@
 {
   "name": "@jarkkojs/landstrip-win32-x64",
-  "version": "0.11.4",
+  "version": "0.11.5",
   "description": "Windows x64 binary for landstrip",
   "license": "Apache-2.0 AND LGPL-2.1-or-later",
   "homepage": "https://github.com/jarkkojs/landstrip#readme",
