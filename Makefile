@@ -6,8 +6,9 @@ BINDIR ?= $(PREFIX)/bin
 MANDIR ?= $(PREFIX)/share/man
 CARGO ?= cargo
 INSTALL ?= install
+RM ?= rm -f
 
-.PHONY: all check test clippy install clean
+.PHONY: all check test clippy install uninstall clean
 
 all:
 	$(CARGO) build
@@ -28,6 +29,9 @@ install:
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(MANDIR)/man1"
 	$(INSTALL) -m 755 target/release/landstrip "$(DESTDIR)$(BINDIR)/landstrip"
 	$(INSTALL) -m 644 man/man1/landstrip.1 "$(DESTDIR)$(MANDIR)/man1/landstrip.1"
+
+uninstall:
+	$(RM) "$(DESTDIR)$(BINDIR)/landstrip" "$(DESTDIR)$(MANDIR)/man1/landstrip.1"
 
 clean:
 	$(CARGO) clean
