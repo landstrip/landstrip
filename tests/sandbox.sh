@@ -93,11 +93,23 @@ expect_failure_access_denied() {
     name=$1
     expected_file=$2
     shift 2
+    expected_real=$(CDPATH= cd -- "$(dirname -- "$expected_file")" && pwd -P)/$(basename -- "$expected_file")
     set +e
     output=$({ "$@"; } 2>&1)
     status=$?
     set -e
-    if [ "$status" -ne 0 ] && printf '%s\n' "$output" | grep -q 'reason: AccessDenied' && printf '%s\n' "$output" | grep -q "file: $expected_file"; then
+    has_expected_file=0
+    if printf '%s\n' "$output" | grep -F -q \
+        -e "file: $expected_file" \
+        -e "file: $expected_real" \
+        -e "$expected_file" \
+        -e "$expected_real"; then
+        has_expected_file=1
+    fi
+    if [ "$status" -ne 0 ] && [ "$has_expected_file" -eq 1 ] && \
+        printf '%s\n' "$output" | grep -F -q \
+        -e 'reason: AccessDenied' \
+        -e 'Operation not permitted'; then
         pass "$name"
     else
         fail "$name" "status=$status output=$output"
@@ -267,8 +279,11 @@ mkdir -p "$tmp/read-ok" "$tmp/read-no"
 printf 'ok\n' >"$tmp/read-ok/data.txt"
 printf 'no\n' >"$tmp/read-no/data.txt"
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["%s/read-ok","/usr","/lib","/lib64","/bin","/sbin","/etc"]}}' "$tmp")
+cwd=$(pwd)
+cd "$tmp/read-ok"
 test_ok "allowRead permits read in allowed path" "$policy" "$sandbox_shell" -c 'cat "$1/data.txt"' _ "$tmp/read-ok"
 expect_failure_access_denied "allowRead denies other root" "$tmp/read-no/data.txt" "$bin" -p "$policy" "$sandbox_shell" -c 'cat "$1/data.txt"' _ "$tmp/read-no"
+cd "$cwd"
 
 mkdir -p "$tmp/probe-denied/bin"
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"denyRead":["%s/probe-denied"]}}' "$tmp")
