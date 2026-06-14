@@ -236,7 +236,7 @@ fn expand_glob_path(pattern: &Path) -> Result<Vec<PathBuf>> {
     let mut matches = Vec::new();
 
     match fs::symlink_metadata(&base) {
-        Ok(_) => collect_glob_matches(&base, &pattern, &mut matches)?,
+        Ok(_) => collect_glob_matches(&base, &pattern, &mut matches, 0)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(source) => return Err(source.into()),
     }
@@ -268,7 +268,18 @@ fn glob_base(pattern: &str) -> PathBuf {
     }
 }
 
-fn collect_glob_matches(path: &Path, pattern: &str, matches: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_glob_matches(
+    path: &Path,
+    pattern: &str,
+    matches: &mut Vec<PathBuf>,
+    depth: u32,
+) -> Result<()> {
+    const LIMIT: u32 = 40;
+
+    if depth >= LIMIT {
+        return Ok(());
+    }
+
     let candidate = normalize_path_lexically(path);
     let candidate_text = candidate.to_string_lossy();
     let pattern_bytes = pattern.as_bytes();
@@ -285,7 +296,7 @@ fn collect_glob_matches(path: &Path, pattern: &str, matches: &mut Vec<PathBuf>) 
     }
 
     for entry in fs::read_dir(path)? {
-        collect_glob_matches(&entry?.path(), pattern, matches)?;
+        collect_glob_matches(&entry?.path(), pattern, matches, depth + 1)?;
     }
 
     Ok(())

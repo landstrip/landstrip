@@ -680,7 +680,8 @@ fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
             );
             Ok(TcpEndpoint {
                 port,
-                loopback: ip.is_loopback(),
+                loopback: ip.is_loopback()
+                    || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
             })
         }
         _ => Err(BrokerError::AddressFamilyNotSupported),
