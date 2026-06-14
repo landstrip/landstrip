@@ -8,7 +8,7 @@ repository = "https://github.com/jarkkojs/landstrip"
 name = "landstrip"
 readme = "README.md"
 rust-version = "1.85"
-version = "0.11.9"
+version = "0.11.10"
 
 [dependencies]
 argh = "0.1.19"
