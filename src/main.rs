@@ -24,32 +24,26 @@ mod traversal;
 
 use crate::cli::{Cli, parse_cli};
 use crate::config::load_settings;
-use crate::error::{ErrorKind, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::error_fd::ErrorFd;
 use crate::policy::resolve_policy;
 use std::process;
 
 fn main() {
-    let cli = match parse_cli() {
-        Ok(cli) => cli,
-        Err(error) => {
-            error.emit();
-            process::exit(if matches!(error.kind, ErrorKind::Usage) {
-                2
-            } else {
-                1
-            });
-        }
-    };
+    let cli = parse_cli().unwrap_or_else(|e| exit_with_error(&e));
 
     if let Err(error) = run_with_cli(&cli) {
-        if let ErrorKind::Usage = error.kind {
-            eprintln!("{error}");
-            process::exit(2);
-        }
-        error.emit();
-        process::exit(1);
+        exit_with_error(&error);
     }
+}
+
+fn exit_with_error(error: &Error) -> ! {
+    if let ErrorKind::Usage = error.kind {
+        eprintln!("{error}");
+        process::exit(2);
+    }
+    error.emit();
+    process::exit(1);
 }
 
 fn run_with_cli(cli: &Cli) -> Result<()> {

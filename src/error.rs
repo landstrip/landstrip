@@ -12,12 +12,12 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 type Cause = Box<dyn StdError + Send + Sync + 'static>;
 
 #[derive(Debug, Display)]
-#[allow(dead_code)]
 pub(crate) enum ErrorKind {
     AccessDenied,
     ArchitectureNotSupported,
     ConnectionClosed,
     FeatureNotAvailable,
+    #[allow(dead_code)]
     FeatureNotSupported,
     FileDescriptorNotFound,
     HomeNotAvailable,
@@ -26,11 +26,12 @@ pub(crate) enum ErrorKind {
     InvalidPort,
     InvalidProfile,
     InvalidResponse,
-    InvariantViolation,
     LaunchFailed,
     Other,
+    #[allow(dead_code)]
     SetupFailed,
     SystemCallFailed,
+    #[allow(dead_code)]
     Unsupported,
     Usage,
 }
@@ -49,16 +50,13 @@ pub(crate) struct Error {
     pub(crate) errno: Option<String>,
     pub(crate) mechanism: Option<String>,
     pub(crate) action: Option<String>,
-    pub(crate) item: Option<String>,
     pub(crate) offset: Option<String>,
     pub(crate) port: Option<String>,
     pub(crate) arch: Option<String>,
     pub(crate) feature: Option<String>,
     pub(crate) cause_desc: Option<String>,
-    pub(crate) value: Option<String>,
 }
 
-#[allow(dead_code)]
 impl Error {
     pub(crate) fn new(kind: ErrorKind) -> Self {
         Self {
@@ -74,13 +72,11 @@ impl Error {
             errno: None,
             mechanism: None,
             action: None,
-            item: None,
             offset: None,
             port: None,
             arch: None,
             feature: None,
             cause_desc: None,
-            value: None,
         }
     }
 
@@ -116,9 +112,6 @@ impl Error {
         if let Some(ref value) = self.action {
             eprintln!("action: {value}");
         }
-        if let Some(ref value) = self.item {
-            eprintln!("item: {value}");
-        }
         if let Some(ref value) = self.offset {
             eprintln!("offset: {value}");
         }
@@ -133,9 +126,6 @@ impl Error {
         }
         if let Some(ref value) = self.cause_desc {
             eprintln!("cause: {value}");
-        }
-        if let Some(ref value) = self.value {
-            eprintln!("value: {value}");
         }
     }
 
@@ -154,6 +144,7 @@ impl Error {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_program(mut self, program: OsString) -> Self {
         self.program = Some(program);
         self
@@ -164,11 +155,13 @@ impl Error {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_api(mut self, api: impl Into<String>) -> Self {
         self.api = Some(api.into());
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_code(mut self, code: impl fmt::Display) -> Self {
         self.code = Some(code.to_string());
         self
@@ -189,11 +182,7 @@ impl Error {
         self
     }
 
-    pub(crate) fn with_item(mut self, item: impl Into<String>) -> Self {
-        self.item = Some(item.into());
-        self
-    }
-
+    #[allow(dead_code)]
     pub(crate) fn with_offset(mut self, offset: impl fmt::Display) -> Self {
         self.offset = Some(offset.to_string());
         self
@@ -209,6 +198,7 @@ impl Error {
         self
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_feature(mut self, feature: &'static str) -> Self {
         self.feature = Some(feature.to_owned());
         self
@@ -216,11 +206,6 @@ impl Error {
 
     pub(crate) fn with_cause_desc(mut self, cause_desc: &'static str) -> Self {
         self.cause_desc = Some(cause_desc.to_owned());
-        self
-    }
-
-    pub(crate) fn with_value(mut self, value: impl fmt::Display) -> Self {
-        self.value = Some(value.to_string());
         self
     }
 
@@ -313,9 +298,17 @@ impl From<io::Error> for Error {
     }
 }
 
-#[derive(Clone, Copy, Debug, Display)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum PolicyPort {
     HttpProxyPolicy,
     SocksProxyPolicy,
+}
+
+impl fmt::Display for PolicyPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HttpProxyPolicy => f.write_str("http_proxy_port"),
+            Self::SocksProxyPolicy => f.write_str("socks_proxy_port"),
+        }
+    }
 }
