@@ -430,64 +430,37 @@ const tui: TuiPlugin = async (api, options) => {
   api.keymap.registerLayer({
     commands: [
       {
+        namespace: 'palette',
         name: 'sandbox',
         title: 'Sandbox',
-        description: 'Show sandbox configuration',
+        desc: 'Show sandbox configuration',
         category: 'Sandbox',
         suggested: true,
-        slash: { name: 'sandbox' },
+        slashName: 'sandbox',
         run: showSandbox,
       },
       {
+        namespace: 'palette',
         name: 'sandbox-disable',
         title: 'Disable sandbox',
-        description: 'Disable sandbox for this session',
+        desc: 'Disable sandbox for this session',
         category: 'Sandbox',
         suggested: true,
-        slash: { name: 'sandbox-disable' },
+        slashName: 'sandbox-disable',
         run: () => executeServerCommand('sandbox-disable'),
       },
       {
+        namespace: 'palette',
         name: 'sandbox-enable',
         title: 'Enable sandbox',
-        description: 'Re-enable sandbox for this session',
+        desc: 'Re-enable sandbox for this session',
         category: 'Sandbox',
         suggested: true,
-        slash: { name: 'sandbox-enable' },
+        slashName: 'sandbox-enable',
         run: () => executeServerCommand('sandbox-enable'),
       },
     ],
   });
-
-  api.command?.register(() => [
-    {
-      title: 'Sandbox',
-      value: 'sandbox',
-      description: 'Show sandbox configuration',
-      category: 'Sandbox',
-      suggested: true,
-      slash: { name: 'sandbox' },
-      onSelect: showSandbox,
-    },
-    {
-      title: 'Disable sandbox',
-      value: 'sandbox-disable',
-      description: 'Disable sandbox for this session',
-      category: 'Sandbox',
-      suggested: true,
-      slash: { name: 'sandbox-disable' },
-      onSelect: () => executeServerCommand('sandbox-disable'),
-    },
-    {
-      title: 'Enable sandbox',
-      value: 'sandbox-enable',
-      description: 'Re-enable sandbox for this session',
-      category: 'Sandbox',
-      suggested: true,
-      slash: { name: 'sandbox-enable' },
-      onSelect: () => executeServerCommand('sandbox-enable'),
-    },
-  ]);
 };
 
 export { tui };
