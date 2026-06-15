@@ -193,33 +193,37 @@ grants can persist after the sandboxed process exits.
 .Sh OUTPUT
 .Nm
 prints trap responses as JSON objects on standard error,
-one object per line. Fields with no value are omitted.
+one object per line. Each object is tagged by the trap kind, with the kind
+name as the single top-level key.
 .Bd -literal -offset indent
-{"reason":"Internal","file":"policy.json","source":"expected value at line 1 column 1"}
+{"Internal":{"file":"policy.json","source":"expected value at line 1 column 1"}}
 .Ed
-The
-.Va type
-field is present when a trap has a category
-(e.g.,
-.Va filesystem ,
-.Va network ,
-.Va platform ,
-.Va launch ,
-.Va encoding ).
-The
-.Va reason
-field is the trap code (e.g.
-.Va AccessDenied ,
-.Va LaunchFailed ,
-.Va Internal ,
-.Va Usage ).
-The
-.Va file
-field is present when a trap is tied to a policy file. The
-.Va program
-field is present when
-.Nm
-could not start or encode a tool.
+The trap kinds are
+.Va Filesystem
+(a filesystem access denial, as
+.Bq Ar operation , path , mechanism
+where the operation is
+.Va read
+or
+.Va write
+and the mechanism is the kernel enforcement layer that detected the denial ) ,
+.Va Network
+(a denied TCP connect or bind, as
+.Bq Ar operation , target , mechanism
+where the operation is
+.Va connect
+or
+.Va bind
+and the target is
+.Ar address : Ns Ar port ) ,
+.Va Launch
+(the tool could not be started, as
+.Bq Ar program , message ) ,
+.Va Usage
+(a command-line usage error message string), and
+.Va Internal
+(any other policy, platform, or system error, as an object of diagnostic
+key/value pairs).
 .Pp
 Usage errors exit with status 2. Logs and sandboxed command output are not part
 of the trap response. Normal successful command execution does not print a trap
@@ -233,7 +237,7 @@ is used,
 writes JSON trap responses to that file descriptor.
 For example, Linux filesystem denials are emitted as:
 .Bd -literal -offset indent
-{"reason":"AccessDenied","type":"filesystem","file":"/repo/out","operation":"write","mechanism":"seccomp"}
+{"Filesystem":["write","/repo/out","seccomp"]}
 .Ed
 This trap stream is separate from the sandboxed command's standard output
 and standard error.

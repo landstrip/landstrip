@@ -59,13 +59,13 @@ pub(crate) fn load_settings(policy_paths: &[PathBuf], format: PolicyFormat) -> R
             log::debug!("config: {}", path.display());
 
             let document = fs::read_to_string(path)
-                .map_err(|source| Trap::policy_file_source(path.clone(), source))?;
+                .map_err(|source| Trap::policy_file_source(path, source))?;
             let value = parse_policy_document(&document, format)
-                .map_err(|source| Trap::policy_file_source(path.clone(), source))?;
+                .map_err(|source| Trap::policy_file_source(path, source))?;
             merge_json(&mut merged, value);
         }
         serde_json::from_value(merged)
-            .map_err(|source| Trap::policy_file_source(policy_paths[0].clone(), source))
+            .map_err(|source| Trap::policy_file_source(&policy_paths[0], source))
     }
 }
 

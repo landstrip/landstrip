@@ -16,7 +16,7 @@ use super::fd::close_inherited_fds;
 use super::landlock::{LandlockFeatures, enforce_access_policy};
 use crate::paths::normalize_path;
 use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
-use crate::trap::{Result, Trap, TrapCategory, TrapCode, TrapOperation};
+use crate::trap::{Result, Trap, TrapOperation};
 use crate::trap_fd::TrapFd;
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, fcntl};
@@ -35,7 +35,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
 use std::mem;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
@@ -130,8 +130,7 @@ pub(super) fn run_broker(
         )?;
     }
 
-    let eafnosupport =
-        u32::try_from(libc::EAFNOSUPPORT).map_err(|_| Trap::new(TrapCode::Internal))?;
+    let eafnosupport = u32::try_from(libc::EAFNOSUPPORT).map_err(|_| Trap::internal())?;
     let errno = if errno_rules.is_empty() {
         None
     } else {
@@ -187,7 +186,7 @@ pub(super) fn run_broker(
                 child_tool.args(args);
 
                 let error = child_tool.exec();
-                Err(Trap::tool_exec(Some(tool.to_os_string()), error))
+                Err(Trap::tool_exec(Some(tool.to_os_string()), &error))
             })();
 
             if let Err(error) = result {
@@ -225,12 +224,12 @@ fn supervise_child(
     notify_filesystem: bool,
     trap_fd: TrapFd,
 ) -> Result<i32> {
-    let mut fs_denials = FilesystemDenials::new(trap_fd);
+    let mut denials = Denials::new(trap_fd);
     loop {
         loop {
             match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::StillAlive) => break,
-                Ok(status) => return Ok(fs_denials.emit(status)),
+                Ok(status) => return Ok(denials.emit(status)),
                 Err(Errno::EINTR) => continue,
                 Err(error) => {
                     return Err(system_errno(error as i32));
@@ -259,7 +258,7 @@ fn supervise_child(
         if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
             loop {
                 match waitpid(child, None) {
-                    Ok(status) => return Ok(fs_denials.emit(status)),
+                    Ok(status) => return Ok(denials.emit(status)),
                     Err(Errno::EINTR) => continue,
                     Err(error) => {
                         return Err(system_errno(error as i32));
@@ -275,7 +274,7 @@ fn supervise_child(
             &request,
             syscalls,
             notify_filesystem,
-            &mut fs_denials,
+            &mut denials,
         );
 
         validate_notification_id(notify_fd, request.id)?;
@@ -283,7 +282,7 @@ fn supervise_child(
             loop {
                 match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
                     Ok(WaitStatus::StillAlive) => break,
-                    Ok(status) => return Ok(fs_denials.emit(status)),
+                    Ok(status) => return Ok(denials.emit(status)),
                     Err(Errno::EINTR) => continue,
                     Err(error) => {
                         return Err(system_errno(error as i32));
@@ -297,45 +296,62 @@ fn supervise_child(
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum FilesystemOperation {
-    Read,
-    Write,
+enum NetworkOperation {
+    Connect,
+    Bind,
 }
 
-impl FilesystemOperation {
+impl NetworkOperation {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Read => "read",
-            Self::Write => "write",
+            Self::Connect => "connect",
+            Self::Bind => "bind",
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct FilesystemDenial {
-    path: PathBuf,
-    operation: FilesystemOperation,
+enum Denial {
+    Filesystem(TrapOperation, PathBuf),
+    Network(NetworkOperation, String),
+}
+
+impl Denial {
+    fn report_on_success(&self) -> bool {
+        match self {
+            Self::Filesystem(operation, _) => *operation == TrapOperation::Write,
+            Self::Network(_, _) => true,
+        }
+    }
+
+    fn into_trap(self) -> Trap {
+        match self {
+            Self::Filesystem(operation, path) => {
+                Trap::Filesystem(operation, path, "seccomp".to_owned())
+            }
+            Self::Network(operation, target) => {
+                Trap::Network(operation.as_str().to_owned(), target, "seccomp".to_owned())
+            }
+        }
+    }
 }
 
 #[derive(Default)]
-struct FilesystemDenials {
+struct Denials {
     trap_fd: TrapFd,
-    seen: HashSet<FilesystemDenial>,
-    pending: Vec<FilesystemDenial>,
+    seen: HashSet<Denial>,
+    pending: Vec<Denial>,
 }
 
-impl FilesystemDenials {
+impl Denials {
     fn new(trap_fd: TrapFd) -> Self {
         Self {
             trap_fd,
             ..Self::default()
         }
     }
-    fn record(&mut self, path: &Path, operation: FilesystemOperation) {
-        let denial = FilesystemDenial {
-            path: path.to_path_buf(),
-            operation,
-        };
+
+    fn record(&mut self, denial: Denial) {
         if self.seen.insert(denial.clone()) {
             self.pending.push(denial);
         }
@@ -346,18 +362,11 @@ impl FilesystemDenials {
         for denial in self
             .pending
             .iter()
-            .filter(|denial| code != 0 || denial.operation == FilesystemOperation::Write)
+            .filter(|denial| code != 0 || denial.report_on_success())
         {
-            self.trap_fd
-                .emit_filesystem_denial(denial.operation.as_str(), &denial.path, "seccomp");
-            Trap::new(TrapCode::AccessDenied)
-                .with_category(TrapCategory::Filesystem)
-                .with_operation(match denial.operation {
-                    FilesystemOperation::Read => TrapOperation::Read,
-                    FilesystemOperation::Write => TrapOperation::Write,
-                })
-                .with_path(denial.path.clone())
-                .emit();
+            let trap = denial.clone().into_trap();
+            self.trap_fd.write(&trap);
+            trap.emit();
         }
         code
     }
@@ -369,15 +378,15 @@ fn handle_notification(
     request: &libc::seccomp_notif,
     syscalls: &NotificationSyscalls,
     notify_filesystem: bool,
-    fs_denials: &mut FilesystemDenials,
+    denials: &mut Denials,
 ) -> libc::seccomp_notif_resp {
     let syscall = i64::from(request.data.nr);
     let result = if syscall == syscalls.bind {
-        handle_bind(policy, request)
+        handle_bind(policy, request, denials)
     } else if syscall == syscalls.connect {
-        handle_connect(policy, landlock_features, request)
+        handle_connect(policy, landlock_features, request, denials)
     } else if notify_filesystem && syscall == syscalls.openat {
-        handle_openat(policy, request, fs_denials)
+        handle_openat(policy, request, denials)
     } else if notify_filesystem && syscall == syscalls.fstatat {
         handle_fstatat(policy, request)
     } else {
@@ -440,7 +449,7 @@ fn seccomp_probe(operation: libc::c_uint, data: *mut libc::c_void) -> Result<()>
     // SAFETY: seccomp(2) copies the operation-specific data pointer before returning.
     let rc = unsafe { libc::syscall(libc::SYS_seccomp, operation, 0, data) };
     if rc < 0 {
-        return Err(Trap::new(TrapCode::Internal)
+        return Err(Trap::internal()
             .with_detail("mechanism", "seccomp")
             .with_detail("errno", format!("{}", Errno::last())));
     }
@@ -490,22 +499,33 @@ fn validate_notification_id(fd: RawFd, id: u64) -> Result<()> {
 }
 
 fn system_errno(errno: i32) -> Trap {
-    Trap::new(TrapCode::Internal).with_detail("errno", errno.to_string())
+    Trap::internal().with_detail("errno", errno.to_string())
 }
 
 fn handle_bind(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
+    denials: &mut Denials,
 ) -> SysResult<NotificationResult> {
     let mut socket = target_socket(request)?;
 
     match socket.info.kind() {
         SocketKind::Tcp => {
             if !policy.network_access.local_tcp_bind {
+                if let Ok(endpoint) = tcp_endpoint(&socket.addr, socket.info.domain) {
+                    denials.record(Denial::Network(
+                        NetworkOperation::Bind,
+                        endpoint.addr.to_string(),
+                    ));
+                }
                 return Err(BrokerError::PolicyDenied);
             }
             let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
             if !endpoint.loopback {
+                denials.record(Denial::Network(
+                    NetworkOperation::Bind,
+                    endpoint.addr.to_string(),
+                ));
                 return Err(BrokerError::PolicyDenied);
             }
 
@@ -522,6 +542,7 @@ fn handle_connect(
     policy: &AccessPolicy,
     landlock_features: LandlockFeatures,
     request: &libc::seccomp_notif,
+    denials: &mut Denials,
 ) -> SysResult<NotificationResult> {
     let socket = target_socket(request)?;
 
@@ -534,6 +555,10 @@ fn handle_connect(
                     .connect_tcp_ports
                     .contains(&endpoint.port)
             {
+                denials.record(Denial::Network(
+                    NetworkOperation::Connect,
+                    endpoint.addr.to_string(),
+                ));
                 return Err(BrokerError::PolicyDenied);
             }
 
@@ -665,6 +690,7 @@ fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
             let port = u16::from_be_bytes([addr[2], addr[3]]);
             let ip = Ipv4Addr::new(addr[4], addr[5], addr[6], addr[7]);
             Ok(TcpEndpoint {
+                addr: SocketAddr::from((ip, port)),
                 port,
                 loopback: ip.is_loopback(),
             })
@@ -679,6 +705,7 @@ fn tcp_endpoint(addr: &[u8], domain: i32) -> SysResult<TcpEndpoint> {
                 <[u8; 16]>::try_from(&addr[8..24]).map_err(|_| BrokerError::InvalidAddress)?,
             );
             Ok(TcpEndpoint {
+                addr: SocketAddr::from((ip, port)),
                 port,
                 loopback: ip.is_loopback()
                     || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
@@ -795,8 +822,7 @@ pub(super) fn network_filter(config: NetworkFilter, needs_network: bool) -> Resu
         )?;
     }
 
-    let eafnosupport =
-        u32::try_from(libc::EAFNOSUPPORT).map_err(|_| Trap::new(TrapCode::Internal))?;
+    let eafnosupport = u32::try_from(libc::EAFNOSUPPORT).map_err(|_| Trap::internal())?;
     let errno = if errno_rules.is_empty() {
         None
     } else {
@@ -845,13 +871,9 @@ impl NetworkFilters {
         if let Some(errno) = &self.errno {
             load_program(errno, 0)?;
         }
-        let notify = self
-            .notify
-            .as_ref()
-            .ok_or_else(|| Trap::new(TrapCode::Internal))?;
+        let notify = self.notify.as_ref().ok_or_else(Trap::internal)?;
 
-        load_program(notify, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)?
-            .ok_or_else(|| Trap::new(TrapCode::Internal))
+        load_program(notify, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)?.ok_or_else(Trap::internal)
     }
 }
 
@@ -874,7 +896,7 @@ fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
     for syscall in syscalls {
         program.push(bpf_jump(
             jump_eq,
-            u32::try_from(*syscall).map_err(|_| Trap::new(TrapCode::Internal))?,
+            u32::try_from(*syscall).map_err(|_| Trap::internal())?,
             0,
             1,
         ));
@@ -886,7 +908,7 @@ fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
 }
 
 fn bpf_code(code: u32) -> Result<u16> {
-    u16::try_from(code).map_err(|_| Trap::new(TrapCode::Internal))
+    u16::try_from(code).map_err(|_| Trap::internal())
 }
 
 fn bpf_stmt(code: u16, k: u32) -> seccompiler::sock_filter {
@@ -907,13 +929,13 @@ fn target_arch() -> Result<TargetArch> {
         "x86_64" => Ok(TargetArch::x86_64),
         "aarch64" => Ok(TargetArch::aarch64),
         "riscv64" => Ok(TargetArch::riscv64),
-        arch => Err(Trap::new(TrapCode::Internal).with_detail("arch", arch)),
+        arch => Err(Trap::internal().with_detail("arch", arch)),
     }
 }
 
 fn load_program(program: &BpfProgram, flags: libc::c_ulong) -> Result<Option<OwnedFd>> {
     if program.is_empty() {
-        return Err(Trap::new(TrapCode::Internal));
+        return Err(Trap::internal());
     }
 
     // SAFETY: prctl(2) copies scalar arguments only.
@@ -921,7 +943,7 @@ fn load_program(program: &BpfProgram, flags: libc::c_ulong) -> Result<Option<Own
         return Err(system_errno(Errno::last() as i32));
     }
 
-    let len = libc::c_ushort::try_from(program.len()).map_err(|_| Trap::new(TrapCode::Internal))?;
+    let len = libc::c_ushort::try_from(program.len()).map_err(|_| Trap::internal())?;
     let filter = SockFilterProg {
         len,
         filter: program.as_ptr(),
@@ -944,7 +966,7 @@ fn load_program(program: &BpfProgram, flags: libc::c_ulong) -> Result<Option<Own
         return Ok(None);
     }
 
-    let fd = RawFd::try_from(rc).map_err(|_| Trap::new(TrapCode::Internal))?;
+    let fd = RawFd::try_from(rc).map_err(|_| Trap::internal())?;
     // SAFETY: seccomp returned a new listener fd when NEW_LISTENER was set.
     Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
@@ -1021,11 +1043,11 @@ pub(super) enum UnixSocketFilter {
 }
 
 fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Result<()> {
-    let stream = u64::try_from(libc::SOCK_STREAM).map_err(|_| Trap::new(TrapCode::Internal))?;
-    let tcp = u64::try_from(libc::IPPROTO_TCP).map_err(|_| Trap::new(TrapCode::Internal))?;
+    let stream = u64::try_from(libc::SOCK_STREAM).map_err(|_| Trap::internal())?;
+    let tcp = u64::try_from(libc::IPPROTO_TCP).map_err(|_| Trap::internal())?;
 
     for domain in [libc::AF_INET, libc::AF_INET6] {
-        let domain = u64::try_from(domain).map_err(|_| Trap::new(TrapCode::Internal))?;
+        let domain = u64::try_from(domain).map_err(|_| Trap::internal())?;
 
         for ty in 0..=SOCK_TYPE_MASK {
             if ty == stream {
@@ -1073,7 +1095,7 @@ fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Result<()> {
 }
 
 fn add_socket_domain_filter(rules: &mut RuleMap, socket: i64, domain: i32) -> Result<()> {
-    let domain = u64::try_from(domain).map_err(|_| Trap::new(TrapCode::Internal))?;
+    let domain = u64::try_from(domain).map_err(|_| Trap::internal())?;
 
     add_conditional_rule(
         rules,
@@ -1104,7 +1126,7 @@ fn path_exists(path: &Path) -> SysResult<bool> {
 fn handle_openat(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
-    fs_denials: &mut FilesystemDenials,
+    denials: &mut Denials,
 ) -> SysResult<NotificationResult> {
     // args[0] is dirfd: an i32 (including AT_FDCWD=-100) stored as u64.
     #[allow(clippy::cast_possible_truncation)]
@@ -1130,7 +1152,7 @@ fn handle_openat(
             });
         }
         if reports_write {
-            fs_denials.record(&resolved, FilesystemOperation::Write);
+            denials.record(Denial::Filesystem(TrapOperation::Write, resolved.clone()));
         }
         return Err(BrokerError::PolicyDenied);
     }
@@ -1140,7 +1162,7 @@ fn handle_openat(
                 errno: libc::ENOENT,
             });
         }
-        fs_denials.record(&resolved, FilesystemOperation::Read);
+        denials.record(Denial::Filesystem(TrapOperation::Read, resolved));
         return Err(BrokerError::PolicyDenied);
     }
 
@@ -1311,7 +1333,7 @@ fn recv_fd(socket: &UnixStream) -> Result<OwnedFd> {
     .map_err(|error| system_errno(error as i32))?;
 
     if message.bytes == 0 {
-        return Err(Trap::new(TrapCode::Internal));
+        return Err(Trap::internal());
     }
 
     for control in message
@@ -1327,7 +1349,7 @@ fn recv_fd(socket: &UnixStream) -> Result<OwnedFd> {
         }
     }
 
-    Err(Trap::new(TrapCode::Internal))
+    Err(Trap::internal())
 }
 
 #[derive(Debug)]
@@ -1381,6 +1403,7 @@ enum SocketKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TcpEndpoint {
+    addr: SocketAddr,
     port: u16,
     loopback: bool,
 }

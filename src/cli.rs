@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::trap::{Result, Trap, TrapCode};
+use crate::trap::{Result, Trap};
 use argh::FromArgs;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -104,14 +104,14 @@ fn parse_cli_action(
     }
 
     if tool_tail.is_empty() {
-        return Err(Trap::new(TrapCode::Usage).with_message(tool_required_usage(&program_name)));
+        return Err(Trap::Usage(tool_required_usage(&program_name)));
     }
 
     debug_assert!(options.tool.is_none());
     let mut tool_tail = tool_tail.into_iter();
-    let tool = tool_tail.next().ok_or_else(|| {
-        Trap::new(TrapCode::Usage).with_message(tool_required_usage(PROGRAM_NAME))
-    })?;
+    let tool = tool_tail
+        .next()
+        .ok_or_else(|| Trap::Usage(tool_required_usage(PROGRAM_NAME)))?;
 
     Ok(CliAction::Run(Cli {
         policy_paths: options.policy,
@@ -226,7 +226,7 @@ fn parse_cli_options(
     for arg in args {
         let string = arg
             .into_string()
-            .map_err(|_| Trap::new(TrapCode::Usage).with_message("argument encoding".to_owned()))?;
+            .map_err(|_| Trap::Usage("argument encoding".to_owned()))?;
 
         arg_strings.push(string);
     }
@@ -245,7 +245,7 @@ fn parse_cli_options(
                     .next()
                     .filter(|line| !line.is_empty())
                     .unwrap_or("arguments invalid");
-                Err(Trap::new(TrapCode::Usage).with_message(message.to_owned()))
+                Err(Trap::Usage(message.to_owned()))
             }
         }
     }

@@ -8,7 +8,7 @@
 //! a new object unless an allowed ancestor covers it.
 
 use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
-use crate::trap::{Result, Trap, TrapCode};
+use crate::trap::{Result, Trap};
 use nix::errno::Errno;
 use std::ffi::CString;
 use std::io;
@@ -209,7 +209,7 @@ fn landlock_abi() -> Result<i32> {
         return Err(landlock_error("query Landlock ABI"));
     }
 
-    i32::try_from(rc).map_err(|_| Trap::new(TrapCode::Internal))
+    i32::try_from(rc).map_err(|_| Trap::internal())
 }
 
 fn create_ruleset(attr: &RulesetAttr) -> Result<OwnedFd> {
@@ -226,7 +226,7 @@ fn create_ruleset(attr: &RulesetAttr) -> Result<OwnedFd> {
         return Err(landlock_error("create Landlock ruleset"));
     }
 
-    let fd = i32::try_from(rc).map_err(|_| Trap::new(TrapCode::Internal))?;
+    let fd = i32::try_from(rc).map_err(|_| Trap::internal())?;
     // SAFETY: landlock_create_ruleset returned a new owned file descriptor.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
@@ -291,11 +291,11 @@ fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {
 
 fn landlock_error(action: &str) -> Trap {
     match Errno::last() {
-        Errno::ENOSYS => Trap::new(TrapCode::Internal)
+        Errno::ENOSYS => Trap::internal()
             .with_detail("mechanism", "landlock")
             .with_detail("cause_desc", "not_implemented")
             .with_detail("action", action),
-        Errno::EOPNOTSUPP => Trap::new(TrapCode::Internal)
+        Errno::EOPNOTSUPP => Trap::internal()
             .with_detail("mechanism", "landlock")
             .with_detail("cause_desc", "disabled")
             .with_detail("action", action),

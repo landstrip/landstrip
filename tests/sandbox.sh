@@ -83,7 +83,7 @@ expect_success_no_access_denied() {
     output=$({ "$@"; } 2>&1)
     status=$?
     set -e
-    if [ "$status" -eq 0 ] && ! printf '%s\n' "$output" | grep -q 'reason: AccessDenied'; then
+    if [ "$status" -eq 0 ] && ! printf '%s\n' "$output" | grep -F -q '"Filesystem":['; then
         pass "$name"
     else
         fail "$name" "status=$status output=$output"
@@ -102,8 +102,8 @@ expect_success_access_denied() {
     set -e
     has_expected_structured_file=0
     if printf '%s\n' "$output" | grep -F -q \
-        -e "\"file\":\"$expected_file\"" \
-        -e "\"file\":\"$expected_real\""; then
+        -e "\"$expected_file\"" \
+        -e "\"$expected_real\""; then
         has_expected_structured_file=1
     fi
     has_expected_native_file=0
@@ -114,8 +114,8 @@ expect_success_access_denied() {
     fi
     has_structured_denial=0
     if [ "$has_expected_structured_file" -eq 1 ] && \
-        printf '%s\n' "$output" | grep -F -q '"reason":"AccessDenied"' && \
-        printf '%s\n' "$output" | grep -F -q "\"operation\":\"$expected_operation\""; then
+        printf '%s\n' "$output" | grep -F -q '"Filesystem":[' && \
+        printf '%s\n' "$output" | grep -F -q "\"$expected_operation\""; then
         has_structured_denial=1
     fi
     has_native_denial=0
@@ -147,17 +147,16 @@ expect_trap_fd_write_denied() {
 
     has_expected_file=0
     if grep -F -q \
-        -e "\"file\":\"$denied_file\"" \
-        -e "\"file\":\"$expected_real\"" \
+        -e "\"$denied_file\"" \
+        -e "\"$expected_real\"" \
         "$diag"; then
         has_expected_file=1
     fi
 
     if [ "$status" -ne 0 ] && [ "$has_expected_file" -eq 1 ] && \
-        grep -F -q '"reason":"AccessDenied"' "$diag" && \
-        grep -F -q '"type":"filesystem"' "$diag" && \
-        grep -F -q '"operation":"write"' "$diag" && \
-        grep -F -q '"mechanism":"seccomp"' "$diag" && \
+        grep -F -q '"Filesystem":[' "$diag" && \
+        grep -F -q '"write"' "$diag" && \
+        grep -F -q '"seccomp"' "$diag" && \
         ! printf '%s\n' "$output" | grep -F -q 'fd3-inherited'; then
         pass "$name"
     else
@@ -185,7 +184,7 @@ expect_failure_access_denied() {
     fi
     if [ "$status" -ne 0 ] && [ "$has_expected_file" -eq 1 ] && \
         printf '%s\n' "$output" | grep -F -q \
-        -e '"reason":"AccessDenied"' \
+        -e '"Filesystem":[' \
         -e 'Operation not permitted'; then
         pass "$name"
     else
@@ -287,6 +286,26 @@ expect_listener_allowed() {
     fi
 }
 
+expect_connect_denied() {
+    name=$1
+    policy=$2
+    port=$(next_port)
+    out=$tmp/connect-denied-$port.out
+    set +e
+    "$bin" -p "$policy" "$nc_path" -z -w1 127.0.0.1 "$port" >"$out" 2>&1
+    status=$?
+    set -e
+    if [ "$status" -ne 0 ] && \
+        grep -F -q '"Network":["connect",' "$out" && \
+        grep -F -q "\"127.0.0.1:$port\"" "$out" && \
+        grep -F -q '"seccomp"' "$out"; then
+        pass "$name"
+    else
+        output=$(while IFS= read -r line; do printf '%s ' "$line"; done < "$out")
+        fail "$name" "status=$status output=$output"
+    fi
+}
+
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%s/allowed"]}}' "$tmp")
 test_ok "unrestricted read policy runs tool" "$policy" "$sandbox_shell" -c 'printf ok\\n'
 
@@ -335,6 +354,11 @@ expect_listener_allowed "allowLocalBinding permits localhost listener" "$policy"
 
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}}')
 expect_listener_allowed "allowNetwork permits localhost listener" "$policy"
+
+if [ "$os_name" = Linux ]; then
+    policy=$(write_policy '{"network":{"httpProxyPort":1},"filesystem":{"denyRead":["/home"],"allowRead":["/usr","/lib","/lib64","/bin","/sbin","/etc"]}}')
+    expect_connect_denied "denied TCP connect is reported" "$policy"
+fi
 
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"allowWrite":[""]}}')
 test_fail "empty path is rejected" "$policy" "$sandbox_shell" -c 'printf ok\\n'

@@ -3,8 +3,6 @@
 
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
-// Large Err variant expected — Trap carries optional diagnostic context
-#![allow(clippy::result_large_err)]
 
 mod cli;
 mod config;
@@ -25,7 +23,7 @@ mod traversal;
 use crate::cli::{Cli, parse_cli};
 use crate::config::load_settings;
 use crate::policy::resolve_policy;
-use crate::trap::{Result, Trap, TrapCode};
+use crate::trap::{Result, Trap};
 use crate::trap_fd::TrapFd;
 use std::process;
 
@@ -38,12 +36,8 @@ fn main() {
 }
 
 fn exit_with_trap(trap: &Trap) -> ! {
-    if let TrapCode::Usage = trap.code {
-        eprintln!("{trap}");
-        process::exit(2);
-    }
     trap.emit();
-    process::exit(1);
+    process::exit(if trap.is_usage() { 2 } else { 1 });
 }
 
 fn run_with_cli(cli: &Cli) -> Result<()> {

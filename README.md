@@ -79,31 +79,35 @@ network policies until Windows network support exists.
 ## Error Output
 
 Failures reported by `landstrip` are printed as JSON objects on standard
-error, one object per line. Fields with no value are omitted. This covers
-policy, tool launch, platform, and system errors. Usage errors are not formatted
-responses; they remain on standard error and exit with status 2.
+error, one object per line. Each object is tagged by the trap kind, with the
+kind name as the single top-level key.
 
 ```json
-{"reason":"Internal","file":"policy.json","source":"expected value at line 1 column 1"}
+{"Internal":{"file":"policy.json","source":"expected value at line 1 column 1"}}
 ```
 
 ```json
-{"reason":"LaunchFailed","program":"cargo","type":"launch","source":"No such file or directory"}
+{"Launch":["cargo","No such file or directory"]}
 ```
 
-The `reason` field describes the error kind (`Internal`, `AccessDenied`,
-`LaunchFailed`, `Usage`). The `file` field is present when a trap is tied to a
-policy file or filesystem access denial. The `program` field is present when
-landstrip could not start or encode a tool. The `type` field is present for
-policy or tool errors and is either `filesystem`, `network`, or `platform` for
-policy errors, or `launch` (failed to start the tool) or `encoding` (failed to
-encode the command line) for tool errors. Filesystem access denials may include
-`operation` set to `read` or `write`.
+The trap kinds are:
+
+- `Filesystem`: a filesystem access denial, as `[operation, path, mechanism]`
+  where the operation is `read` or `write` and the mechanism is the kernel
+  enforcement layer that detected the denial.
+- `Network`: a denied TCP connect or bind, as `[operation, target, mechanism]`
+  where the operation is `connect` or `bind` and the target is `address:port`.
+- `Launch`: the tool could not be started, as `[program, message]`.
+- `Usage`: a command-line usage error, as a message string. Usage errors exit
+  with status 2.
+- `Internal`: any other policy, platform, or system error, as an object of
+  diagnostic key/value pairs (for example `source`, `file`, or platform API
+  details).
 
 Logs and sandboxed tool output are not part of the response. Normal successful
 tool execution does not print a landstrip response unless a write denial was
-observed, because standard error belongs to landstrip; standard output belongs
-to the sandboxed tool.
+observed (`{"Filesystem":["write","/repo/out","seccomp"]}`), because standard error
+belongs to landstrip; standard output belongs to the sandboxed tool.
 
 ## Trap FD
 
@@ -115,13 +119,15 @@ a newline.
 landstrip --trap-fd 3 -p policy.json cargo test 3>landstrip-traps.txt
 ```
 
-Linux filesystem denials observed by the seccomp broker are emitted as:
+Linux filesystem and network denials observed by the seccomp broker are
+emitted with the same shapes as standard error:
 
 ```json
-{"reason":"AccessDenied","type":"filesystem","file":"/repo/out","operation":"write","mechanism":"seccomp"}
+{"Filesystem":["write","/repo/out","seccomp"]}
+{"Network":["connect","127.0.0.1:9999","seccomp"]}
 ```
 
-The `mechanism` field records the kernel enforcement layer that detected
+The mechanism element records the kernel enforcement layer that detected
 the denial (e.g. `seccomp` or `landlock`).
 
 This stream is separate from the sandboxed tool's output. If the option is

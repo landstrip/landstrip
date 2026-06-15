@@ -71,5 +71,5 @@ pub(crate) fn execute(
     }
     close_inherited_fds();
     let error = Command::new(tool).args(args).exec();
-    Err(Trap::tool_exec(Some(tool.to_os_string()), error))
+    Err(Trap::tool_exec(Some(tool.to_os_string()), &error))
 }

@@ -4,7 +4,7 @@
 //! macOS Seatbelt (SBPL) sandbox platform.
 
 use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
-use crate::trap::{Result, Trap, TrapCategory, TrapCode};
+use crate::trap::{Result, Trap};
 use crate::trap_fd::TrapFd;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};
@@ -26,7 +26,7 @@ pub(crate) fn execute(
     apply_profile(&profile)?;
     trap_fd.close();
     let error = Command::new(tool).args(&args).exec();
-    Err(Trap::tool_exec(Some(tool.to_os_string()), error))
+    Err(Trap::tool_exec(Some(tool.to_os_string()), &error))
 }
 
 fn canonicalize_args(args: &[OsString]) -> Vec<OsString> {
@@ -45,10 +45,9 @@ fn canonicalize_args(args: &[OsString]) -> Vec<OsString> {
 fn apply_profile(profile: &str) -> Result<()> {
     let profile = CString::new(profile).map_err(|source| {
         let nul_position = source.nul_position();
-        Trap::new(TrapCode::Internal)
+        Trap::internal()
             .with_detail("offset", nul_position.to_string())
             .with_detail("mechanism", "sbpl")
-            .with_category(TrapCategory::Encoding)
     })?;
     let mut errorbuf = ptr::null_mut();
 
@@ -58,8 +57,8 @@ fn apply_profile(profile: &str) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(Trap::new(TrapCode::Internal)
-            .with_message(take_sandbox_error(errorbuf))
+        Err(Trap::internal()
+            .with_detail("source", take_sandbox_error(errorbuf))
             .with_detail("mechanism", "sbpl"))
     }
 }

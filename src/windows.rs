@@ -4,7 +4,7 @@
 //! Windows sandbox platform using LPAC `AppContainer`.
 
 use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
-use crate::trap::{Result, Trap, TrapCode};
+use crate::trap::{Result, Trap};
 use crate::trap_fd::TrapFd;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString, c_void};
@@ -61,22 +61,22 @@ pub(crate) fn execute(
 
 fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
     if matches!(policy.read_access, ReadAccess::Unrestricted) {
-        return Err(Trap::new(TrapCode::Internal).with_detail("feature", "read access"));
+        return Err(Trap::internal().with_detail("feature", "read access"));
     }
 
     let network = &policy.network_access;
 
     if network.is_unrestricted() {
-        return Err(Trap::new(TrapCode::Internal).with_detail("feature", "unrestricted network"));
+        return Err(Trap::internal().with_detail("feature", "unrestricted network"));
     }
 
     if network.local_tcp_bind || !network.connect_tcp_ports.is_empty() {
-        return Err(Trap::new(TrapCode::Internal).with_detail("feature", "TCP policies"));
+        return Err(Trap::internal().with_detail("feature", "TCP policies"));
     }
 
     if !matches!(&network.unix_socket_access, UnixSocketAccess::AllowPaths(paths) if paths.is_empty())
     {
-        return Err(Trap::new(TrapCode::Internal).with_detail("feature", "Unix socket policies"));
+        return Err(Trap::internal().with_detail("feature", "Unix socket policies"));
     }
 
     Ok(())
@@ -116,7 +116,7 @@ impl AppContainerProfile {
 
         if hresult_value(hr) & 0xffff != ERROR_ALREADY_EXISTS {
             let code = hresult_value(hr);
-            return Err(Trap::new(TrapCode::Internal)
+            return Err(Trap::internal()
                 .with_detail("api", "CreateAppContainerProfile")
                 .with_detail("code", code.to_string()));
         }
@@ -124,7 +124,7 @@ impl AppContainerProfile {
         let hr = unsafe { DeriveAppContainerSidFromAppContainerName(moniker.as_ptr(), &mut sid) };
         if hr != 0 {
             let code = hresult_value(hr);
-            return Err(Trap::new(TrapCode::Internal)
+            return Err(Trap::internal()
                 .with_detail("api", "DeriveAppContainerSidFromAppContainerName")
                 .with_detail("code", code.to_string()));
         }
@@ -149,7 +149,7 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<()> {
     let read_roots = match &policy.read_access {
         ReadAccess::AllowRoots(read_roots) => read_roots,
         ReadAccess::Unrestricted => {
-            return Err(Trap::new(TrapCode::Internal).with_detail("feature", "read access"));
+            return Err(Trap::internal().with_detail("feature", "read access"));
         }
     };
 
@@ -190,7 +190,7 @@ fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
         )
     };
     if status != 0 {
-        return Err(Trap::new(TrapCode::Internal)
+        return Err(Trap::internal()
             .with_detail("api", "GetNamedSecurityInfoW")
             .with_detail("code", status.to_string()));
     }
@@ -212,7 +212,7 @@ fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
     let status = unsafe { SetEntriesInAclW(1, &explicit_access, old_dacl, &mut new_dacl) };
     if status != 0 {
         unsafe { LocalFree(security_descriptor) };
-        return Err(Trap::new(TrapCode::Internal)
+        return Err(Trap::internal()
             .with_detail("api", "SetEntriesInAclW")
             .with_detail("code", status.to_string()));
     }
@@ -235,7 +235,7 @@ fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
     }
 
     if status != 0 {
-        return Err(Trap::new(TrapCode::Internal)
+        return Err(Trap::internal()
             .with_detail("api", "SetNamedSecurityInfoW")
             .with_detail("code", status.to_string()));
     }
@@ -247,8 +247,8 @@ fn create_process_in_appcontainer(sid: PSID, tool: &OsStr, args: &[OsString]) ->
     let command_line = command_line(tool, args)?;
     let mut command_line = wide_string(&command_line);
     let mut startup_info = unsafe { mem::zeroed::<STARTUPINFOEXW>() };
-    startup_info.StartupInfo.cb = u32::try_from(mem::size_of::<STARTUPINFOEXW>())
-        .map_err(|_| Trap::new(TrapCode::Internal))?;
+    startup_info.StartupInfo.cb =
+        u32::try_from(mem::size_of::<STARTUPINFOEXW>()).map_err(|_| Trap::internal())?;
 
     let mut attribute_list = ProcThreadAttributeList::new(2)?;
     let mut capabilities = SECURITY_CAPABILITIES {
@@ -291,9 +291,10 @@ fn create_process_in_appcontainer(sid: PSID, tool: &OsStr, args: &[OsString]) ->
 
     if created == 0 {
         let code = unsafe { GetLastError() };
-        return Err(Trap::new(TrapCode::LaunchFailed)
-            .with_program(tool.to_os_string())
-            .with_detail("code", code.to_string()));
+        return Err(Trap::Launch(
+            tool.to_string_lossy().into_owned(),
+            format!("CreateProcessW failed: {code}"),
+        ));
     }
 
     let process = Handle(process_info.hProcess);
@@ -301,7 +302,7 @@ fn create_process_in_appcontainer(sid: PSID, tool: &OsStr, args: &[OsString]) ->
     let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
     if wait == WAIT_FAILED {
         let code = unsafe { GetLastError() };
-        return Err(Trap::new(TrapCode::Internal)
+        return Err(Trap::internal()
             .with_detail("api", "WaitForSingleObject")
             .with_detail("code", code.to_string()));
     }
@@ -310,7 +311,7 @@ fn create_process_in_appcontainer(sid: PSID, tool: &OsStr, args: &[OsString]) ->
     let ok = unsafe { GetExitCodeProcess(process.0, &mut exit_code) };
     if ok == 0 {
         let code = unsafe { GetLastError() };
-        return Err(Trap::new(TrapCode::Internal)
+        return Err(Trap::internal()
             .with_detail("api", "GetExitCodeProcess")
             .with_detail("code", code.to_string()));
     }
@@ -339,7 +340,7 @@ fn update_attribute(
     };
     if ok == 0 {
         let code = unsafe { GetLastError() };
-        return Err(Trap::new(TrapCode::Internal)
+        return Err(Trap::internal()
             .with_detail("api", "UpdateProcThreadAttribute")
             .with_detail("code", code.to_string()));
     }
@@ -356,7 +357,7 @@ impl ProcThreadAttributeList {
         let ok = unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), count, 0, &mut size) };
         let code = unsafe { GetLastError() };
         if ok != 0 || code != ERROR_INSUFFICIENT_BUFFER {
-            return Err(Trap::new(TrapCode::Internal)
+            return Err(Trap::internal()
                 .with_detail("api", "InitializeProcThreadAttributeList")
                 .with_detail("code", code.to_string()));
         }
@@ -366,7 +367,7 @@ impl ProcThreadAttributeList {
         let ok = unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) };
         if ok == 0 {
             let code = unsafe { GetLastError() };
-            return Err(Trap::new(TrapCode::Internal)
+            return Err(Trap::internal()
                 .with_detail("api", "InitializeProcThreadAttributeList")
                 .with_detail("code", code.to_string()));
         }
@@ -405,9 +406,9 @@ fn command_line(tool: &OsStr, args: &[OsString]) -> Result<String> {
 }
 
 fn tool_encoding_error(tool: &OsStr, message: &str) -> Trap {
-    Trap::new(TrapCode::Internal)
-        .with_program(tool.to_os_string())
-        .with_message(message.to_owned())
+    Trap::internal()
+        .with_detail("program", tool.to_string_lossy())
+        .with_detail("source", message)
 }
 
 fn quote_command_arg(arg: &OsStr) -> std::result::Result<String, &'static str> {

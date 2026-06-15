@@ -3,7 +3,7 @@
 
 //! Separate file descriptor for landstrip trap response blocks.
 
-use std::path::Path;
+use crate::trap::Trap;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TrapFd {
@@ -26,20 +26,14 @@ impl TrapFd {
         close_trap_fd(fd);
     }
 
-    pub(crate) fn emit_filesystem_denial(self, operation: &str, path: &Path, mechanism: &str) {
+    pub(crate) fn write(self, trap: &Trap) {
         let Some(fd) = self.fd else {
             return;
         };
-
-        let json = serde_json::json!({
-            "reason": "AccessDenied",
-            "type": "filesystem",
-            "file": path.display().to_string(),
-            "operation": operation,
-            "mechanism": mechanism
-        });
-        let response = format!("{json}\n");
-        write_trap_line(fd, response.as_bytes());
+        let Ok(line) = serde_json::to_string(trap) else {
+            return;
+        };
+        write_trap_line(fd, format!("{line}\n").as_bytes());
     }
 }
 

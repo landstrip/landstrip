@@ -17,10 +17,11 @@ use crate::paths::normalize_path_lexically;
 use crate::paths::normalize_roots_lexically;
 #[cfg(not(target_os = "macos"))]
 use crate::paths::{normalize_path, normalize_roots};
-use crate::trap::{PolicyPort, Result, Trap, TrapCode};
+use crate::trap::{Result, Trap};
 use crate::traversal::subtract_denied_roots;
 use rayon::prelude::*;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -148,13 +149,28 @@ fn lower_network_policy(
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PolicyPort {
+    HttpProxyPolicy,
+    SocksProxyPolicy,
+}
+
+impl fmt::Display for PolicyPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HttpProxyPolicy => f.write_str("http_proxy_port"),
+            Self::SocksProxyPolicy => f.write_str("socks_proxy_port"),
+        }
+    }
+}
+
 fn push_proxy_port(ports: &mut Vec<u16>, port: Option<u16>, port_name: PolicyPort) -> Result<()> {
     let Some(port) = port else {
         return Ok(());
     };
 
     if port == 0 {
-        return Err(Trap::new(TrapCode::Internal).with_detail("port", port_name.to_string()));
+        return Err(Trap::internal().with_detail("port", port_name.to_string()));
     }
 
     ports.push(port);
@@ -221,18 +237,17 @@ fn normalize_policy_roots(paths: &mut Vec<PathBuf>) {
 }
 fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<PathBuf> {
     if path.is_empty() {
-        return Err(Trap::new(TrapCode::Internal));
+        return Err(Trap::internal());
     }
 
     let raw = Path::new(path);
     let resolved = if raw.has_root() {
         raw.to_path_buf()
     } else if path == "~" {
-        home.map(Path::to_path_buf)
-            .ok_or_else(|| Trap::new(TrapCode::Internal))?
+        home.map(Path::to_path_buf).ok_or_else(Trap::internal)?
     } else if let Some(rest) = path.strip_prefix("~/") {
         home.map(|home| home.join(rest))
-            .ok_or_else(|| Trap::new(TrapCode::Internal))?
+            .ok_or_else(Trap::internal)?
     } else {
         base.join(raw)
     };
