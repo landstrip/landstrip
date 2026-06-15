@@ -8,5 +8,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "tui.ts", "landstrip.d.ts"]
+  "include": ["index.ts", "tui.ts", "shared.ts", "landstrip.d.ts"]
 }

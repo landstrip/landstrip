@@ -29,6 +29,8 @@ manually:
 This installs `opencode-landstrip` and its `@jarkkojs/landstrip` dependency, which
 includes platform-specific native binaries for Linux, macOS, and Windows.
 
+Requires OpenCode `1.17.7` or newer.
+
 On unsupported platforms the plugin loads but leaves sandboxing disabled.
 
 ## Configure
@@ -48,12 +50,16 @@ access is off unless domains are allowed, reads are limited to the project,
 `~/.gitconfig`, and `/dev/null`, and writes are limited to the project and
 `/dev/null`.
 
-Run `/sandbox` in the TUI to inspect the active sandbox configuration.
+Run `/sandbox` in the TUI to inspect the active sandbox configuration. A compact
+status badge in the prompt area shows whether the sandbox is active and whether
+network is proxied or open.
 
-When OpenCode asks for a sandboxed permission, the TUI plugin adds choices to
-allow once, allow for the session, persist for the project, persist globally, or
-reject. Project approvals are written to `.opencode/sandbox.json`; global
-approvals are written to `~/.config/opencode/sandbox.json`.
+When OpenCode asks for a sandboxed permission, the TUI plugin plays the host's
+permission sound and desktop notification, then opens a single dialog with
+choices to allow once, allow for the session, persist for the project, persist
+globally, or reject. The dialog shows the exact path or domain being approved.
+Project approvals are written to `.opencode/sandbox.json`; global approvals are
+written to `~/.config/opencode/sandbox.json`.
 
 OpenCode's current plugin API allows wrapping AI `bash` tool calls, but does not
 allow a plugin to replace manually typed shell-mode commands with a landstrip

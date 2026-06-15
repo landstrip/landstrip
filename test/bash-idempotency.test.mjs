@@ -14,9 +14,8 @@ async function withPlugin(options, run, mock = {}) {
   const home = join(tempDir, 'home');
   const originalHome = process.env.HOME;
 
-  try {
-    const source = await readFile(join(root, 'index.ts'), 'utf8');
-    const compiled = ts.transpileModule(source, {
+  const transpile = (text) =>
+    ts.transpileModule(text, {
       compilerOptions: {
         module: ts.ModuleKind.ES2022,
         target: ts.ScriptTarget.ES2022,
@@ -24,7 +23,12 @@ async function withPlugin(options, run, mock = {}) {
       },
     }).outputText;
 
+  try {
+    const compiled = transpile(await readFile(join(root, 'index.ts'), 'utf8'));
+    const sharedCompiled = transpile(await readFile(join(root, 'shared.ts'), 'utf8'));
+
     await mkdir(home, { recursive: true });
+    await writeFile(join(tempDir, 'shared.js'), sharedCompiled);
     await writeFile(modulePath, compiled);
     process.env.HOME = home;
 

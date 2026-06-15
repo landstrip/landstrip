@@ -16,6 +16,7 @@
   "files": [
     "index.ts",
     "tui.ts",
+    "shared.ts",
     "landstrip.d.ts",
     "README.md",
     "sandbox.json"
@@ -37,8 +38,8 @@
     }
   },
   "scripts": {
-    "fmt": "oxfmt index.ts tui.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md test/*.test.mjs",
-    "lint": "oxlint index.ts tui.ts",
+    "fmt": "oxfmt index.ts tui.ts shared.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md test/*.test.mjs",
+    "lint": "oxlint index.ts tui.ts shared.ts",
     "check": "tsc --noEmit",
     "test": "node --test test/*.test.mjs",
     "all": "npm run fmt && npm run lint && npm run check && npm test",
@@ -51,7 +52,7 @@
     "@jarkkojs/landstrip": "^0.11.11"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.17.6",
+    "@opencode-ai/plugin": "^1.17.7",
     "@opentui/core": ">=0.3.4",
     "@opentui/keymap": ">=0.3.4",
     "@opentui/solid": ">=0.3.4",
@@ -61,7 +62,7 @@
     "typescript": "^5.8.2"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "^1.17.6"
+    "@opencode-ai/plugin": "^1.17.7"
   },
   "peerDependenciesMeta": {
     "@opencode-ai/plugin": {
@@ -69,6 +70,6 @@
     }
   },
   "engines": {
-    "opencode": ">=1.17.6"
+    "opencode": ">=1.17.7"
   }
 }

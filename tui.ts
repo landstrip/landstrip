@@ -1,230 +1,35 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) Jarkko Sakkinen 2026
 
-import type { TuiPlugin } from '@opencode-ai/plugin/tui';
+import type { TuiPlugin, TuiSlotContext, TuiSlotPlugin } from '@opencode-ai/plugin/tui';
 
-import { binaryPath } from '@jarkkojs/landstrip';
+import { existsSync } from 'node:fs';
 
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import {
+  type SandboxConfigOverrides,
+  getConfigPaths,
+  landstripBinaryPath,
+  loadConfig,
+  normalizeOptions,
+  permissionLabel,
+  permissionResource,
+  updateForPermission,
+  writeConfigFile,
+} from './shared.js';
 
-interface SandboxFilesystemConfig {
-  denyRead: string[];
-  allowRead: string[];
-  allowWrite: string[];
-  denyWrite: string[];
+// The shape shared by the `permission.asked` event payload and the entries
+// returned from `api.state.session.permission()`. Both carry `permission`
+// (the kind), `patterns`, and `tool.callID`; neither carries a `title`.
+interface PendingPermission {
+  id: string;
+  sessionID: string;
+  permission: string;
+  patterns: string[];
+  metadata: Record<string, unknown>;
+  tool?: { callID: string };
 }
 
-interface SandboxNetworkConfig {
-  allowNetwork: boolean;
-  allowLocalBinding: boolean;
-  allowAllUnixSockets: boolean;
-  allowUnixSockets: string[];
-  allowedDomains: string[];
-  deniedDomains: string[];
-}
-
-interface SandboxConfig {
-  enabled: boolean;
-  network: SandboxNetworkConfig;
-  filesystem: SandboxFilesystemConfig;
-}
-
-interface SandboxConfigOverrides {
-  enabled?: boolean;
-  network?: Partial<SandboxNetworkConfig>;
-  filesystem?: Partial<SandboxFilesystemConfig>;
-}
-
-const DEFAULT_CONFIG: SandboxConfig = {
-  enabled: true,
-  network: {
-    allowNetwork: false,
-    allowLocalBinding: false,
-    allowAllUnixSockets: false,
-    allowUnixSockets: [],
-    allowedDomains: [],
-    deniedDomains: [],
-  },
-  filesystem: {
-    denyRead: ['/Users', '/home'],
-    allowRead: ['.', '~/.gitconfig', '/dev/null'],
-    allowWrite: ['.', '/dev/null'],
-    denyWrite: ['**/.env', '**/.env.*', '**/*.pem', '**/*.key'],
-  },
-};
-const LANDSTRIP_PACKAGE_NAMES = new Set([
-  '@jarkkojs/landstrip',
-  '@jarkkojs/landstrip-darwin-arm64',
-  '@jarkkojs/landstrip-darwin-x64',
-  '@jarkkojs/landstrip-linux-x64',
-  '@jarkkojs/landstrip-win32-x64',
-]);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function stringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  return value.every((item) => typeof item === 'string') ? [...value] : undefined;
-}
-
-function normalizeNetworkConfig(value: unknown): Partial<SandboxNetworkConfig> | undefined {
-  if (!isRecord(value)) return undefined;
-
-  const config: Partial<SandboxNetworkConfig> = {};
-  if (typeof value.allowNetwork === 'boolean') config.allowNetwork = value.allowNetwork;
-  if (typeof value.allowLocalBinding === 'boolean')
-    config.allowLocalBinding = value.allowLocalBinding;
-  if (typeof value.allowAllUnixSockets === 'boolean')
-    config.allowAllUnixSockets = value.allowAllUnixSockets;
-
-  const allowUnixSockets = stringArray(value.allowUnixSockets);
-  if (allowUnixSockets) config.allowUnixSockets = allowUnixSockets;
-
-  const allowedDomains = stringArray(value.allowedDomains);
-  if (allowedDomains) config.allowedDomains = allowedDomains;
-
-  const deniedDomains = stringArray(value.deniedDomains);
-  if (deniedDomains) config.deniedDomains = deniedDomains;
-
-  return config;
-}
-
-function normalizeFilesystemConfig(value: unknown): Partial<SandboxFilesystemConfig> | undefined {
-  if (!isRecord(value)) return undefined;
-
-  const config: Partial<SandboxFilesystemConfig> = {};
-  const denyRead = stringArray(value.denyRead);
-  if (denyRead) config.denyRead = denyRead;
-
-  const allowRead = stringArray(value.allowRead);
-  if (allowRead) config.allowRead = allowRead;
-
-  const allowWrite = stringArray(value.allowWrite);
-  if (allowWrite) config.allowWrite = allowWrite;
-
-  const denyWrite = stringArray(value.denyWrite);
-  if (denyWrite) config.denyWrite = denyWrite;
-
-  return config;
-}
-
-function normalizeConfig(value: unknown): SandboxConfigOverrides {
-  if (!isRecord(value)) return {};
-
-  const config: SandboxConfigOverrides = {};
-  if (typeof value.enabled === 'boolean') config.enabled = value.enabled;
-
-  const network = normalizeNetworkConfig(value.network);
-  if (network) config.network = network;
-
-  const filesystem = normalizeFilesystemConfig(value.filesystem);
-  if (filesystem) config.filesystem = filesystem;
-
-  return config;
-}
-
-function normalizeOptions(options: unknown): SandboxConfigOverrides {
-  if (!isRecord(options)) return {};
-  return normalizeConfig(isRecord(options.config) ? options.config : options);
-}
-
-function mergeArray(base: string[], override?: string[]): string[] {
-  if (!override) return base;
-  return [...new Set([...base, ...override])];
-}
-
-function deepMerge(base: SandboxConfig, overrides: SandboxConfigOverrides): SandboxConfig {
-  const network = overrides.network;
-  const filesystem = overrides.filesystem;
-
-  return {
-    enabled: overrides.enabled ?? base.enabled,
-    network: {
-      allowNetwork: network?.allowNetwork ?? base.network.allowNetwork,
-      allowLocalBinding: network?.allowLocalBinding ?? base.network.allowLocalBinding,
-      allowAllUnixSockets: network?.allowAllUnixSockets ?? base.network.allowAllUnixSockets,
-      allowUnixSockets: mergeArray(base.network.allowUnixSockets, network?.allowUnixSockets),
-      allowedDomains: mergeArray(base.network.allowedDomains, network?.allowedDomains),
-      deniedDomains: mergeArray(base.network.deniedDomains, network?.deniedDomains),
-    },
-    filesystem: {
-      denyRead: mergeArray(base.filesystem.denyRead, filesystem?.denyRead),
-      allowRead: mergeArray(base.filesystem.allowRead, filesystem?.allowRead),
-      allowWrite: mergeArray(base.filesystem.allowWrite, filesystem?.allowWrite),
-      denyWrite: mergeArray(base.filesystem.denyWrite, filesystem?.denyWrite),
-    },
-  };
-}
-
-function getConfigPaths(baseDirectory: string): { globalPath: string; projectPath: string } {
-  return {
-    globalPath: join(homedir(), '.config', 'opencode', 'sandbox.json'),
-    projectPath: join(baseDirectory, '.opencode', 'sandbox.json'),
-  };
-}
-
-function readConfigFile(configPath: string): SandboxConfigOverrides | null {
-  if (!existsSync(configPath)) return {};
-
-  try {
-    return normalizeConfig(JSON.parse(readFileSync(configPath, 'utf-8')));
-  } catch {
-    return null;
-  }
-}
-
-function landstripBinaryPath(): string {
-  const filePath = realpathSync.native(binaryPath());
-  let probe = dirname(filePath);
-
-  while (true) {
-    const manifestPath = join(probe, 'package.json');
-    if (existsSync(manifestPath)) {
-      try {
-        const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as unknown;
-        if (isRecord(manifest) && LANDSTRIP_PACKAGE_NAMES.has(String(manifest.name))) {
-          return filePath;
-        }
-      } catch {
-        // malformed package.json — continue walking to parent
-      }
-    }
-
-    const parent = dirname(probe);
-    if (parent === probe) break;
-    probe = parent;
-  }
-
-  throw new Error(
-    `Refusing to use landstrip binary outside official @jarkkojs/landstrip packages: ${filePath}`,
-  );
-}
-
-function writeConfigFile(configPath: string, update: SandboxConfigOverrides): void {
-  const current = readConfigFile(configPath);
-  if (current === null) {
-    throw new Error(`Config file ${configPath} is corrupted; refusing to overwrite`);
-  }
-
-  const next = deepMerge(deepMerge(DEFAULT_CONFIG, current), update);
-
-  mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, JSON.stringify(next, null, 2) + '\n');
-}
-
-function loadConfig(baseDirectory: string, optionOverrides: SandboxConfigOverrides): SandboxConfig {
-  const { globalPath, projectPath } = getConfigPaths(baseDirectory);
-  const globalConfig = readConfigFile(globalPath);
-  const projectConfig = readConfigFile(projectPath);
-  return deepMerge(
-    deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig ?? {}), projectConfig ?? {}),
-    optionOverrides,
-  );
-}
+type PermissionChoice = 'once' | 'session' | 'project' | 'global' | 'reject';
 
 function list(values: string[]): string {
   return values.join(', ') || '(none)';
@@ -263,85 +68,72 @@ function sandboxSummary(baseDirectory: string, optionOverrides: SandboxConfigOve
   ].join('\n');
 }
 
-type PermissionChoice = 'once' | 'session' | 'project' | 'global' | 'reject';
-
-function permissionType(permission: Record<string, unknown>, fallback = ''): string {
-  if (typeof permission.permission === 'string') return permission.permission;
-  if (typeof permission.action === 'string') return permission.action;
-  if (typeof permission.type === 'string') return permission.type;
-  return fallback;
+function asRecord(permission: PendingPermission): Record<string, unknown> {
+  return permission as unknown as Record<string, unknown>;
 }
 
-function permissionPattern(permission: Record<string, unknown>): string | undefined {
-  const patterns = permission.patterns;
-  if (Array.isArray(patterns))
-    return patterns.find((item): item is string => typeof item === 'string');
-
-  const pattern = permission.pattern;
-  if (typeof pattern === 'string') return pattern;
-  if (Array.isArray(pattern))
-    return pattern.find((item): item is string => typeof item === 'string');
-
-  return undefined;
+function permissionDetail(permission: PendingPermission): string {
+  const label = permissionLabel(asRecord(permission));
+  const resource = permissionResource(asRecord(permission));
+  return resource && !label.includes(resource) ? `${label}: ${resource}` : label;
 }
 
-function domainsFromCommand(command: string): string[] {
-  const domains = new Set<string>();
-  const urlRegex = /https?:\/\/([^\s/:?#'"]+)(?::\d+)?(?:[/?#]|\s|$)/g;
-  let match: RegExpExecArray | null;
+const tui: TuiPlugin = async (api, options, meta) => {
+  const optionOverrides = normalizeOptions(options);
 
-  while ((match = urlRegex.exec(command)) !== null) domains.add(match[1]);
+  // Permission requests can arrive twice (the live event and a reconnect replay
+  // of `api.state`), so `resolved` tracks ids we have already answered and
+  // `activeId` guards against stacking a second sandbox dialog on the first.
+  const resolved = new Set<string>();
+  const queue: PendingPermission[] = [];
+  let activeId: string | undefined;
 
-  return [...domains];
-}
-
-function updateForPermission(permission: Record<string, unknown>): SandboxConfigOverrides | null {
-  const metadata = isRecord(permission.metadata) ? permission.metadata : {};
-  const type = permissionType(permission);
-  const pattern = permissionPattern(permission);
-
-  if (type === 'bash') {
-    const command = typeof metadata.command === 'string' ? metadata.command : pattern;
-    const domains = typeof command === 'string' ? domainsFromCommand(command) : [];
-    return domains.length > 0 ? { network: { allowedDomains: domains } } : null;
+  function pump(): void {
+    if (activeId !== undefined) return;
+    let next = queue.shift();
+    while (next && resolved.has(next.id)) next = queue.shift();
+    if (!next) return;
+    showPermission(next);
   }
 
-  if (type === 'read' || type === 'glob' || type === 'grep' || type === 'list') {
-    const filePath = typeof metadata.filepath === 'string' ? metadata.filepath : pattern;
-    return filePath ? { filesystem: { allowRead: [filePath] } } : null;
+  function enqueue(permission: PendingPermission): void {
+    if (!permission.id || resolved.has(permission.id)) return;
+    if (activeId === permission.id) return;
+    if (queue.some((item) => item.id === permission.id)) return;
+    queue.push(permission);
+    pump();
   }
 
-  if (type === 'edit' || type === 'write' || type === 'apply_patch') {
-    const filePath = typeof metadata.filepath === 'string' ? metadata.filepath : pattern;
-    return filePath ? { filesystem: { allowWrite: [filePath] } } : null;
+  // Safety net for missed/late events and reconnects: fold whatever the host
+  // still considers pending for this session back into the queue.
+  function reconcile(sessionID: string): void {
+    for (const pending of api.state.session.permission(sessionID)) {
+      enqueue(pending as PendingPermission);
+    }
   }
 
-  return null;
-}
-
-function permissionLabel(permission: Record<string, unknown>): string {
-  const type = permissionType(permission, 'permission');
-  const title = typeof permission.title === 'string' ? permission.title : type;
-  const pattern = permissionPattern(permission);
-  return pattern ? `${title}: ${pattern}` : title;
-}
-
-const tui: TuiPlugin = async (api, options) => {
-  const handledPermissions = new Set<string>();
+  function finishActive(id: string): void {
+    resolved.add(id);
+    if (activeId === id) {
+      activeId = undefined;
+      api.ui.dialog.clear();
+    }
+    pump();
+  }
 
   async function replyPermission(
-    permission: Record<string, unknown>,
+    permission: PendingPermission,
     choice: PermissionChoice,
   ): Promise<void> {
-    const id = typeof permission.id === 'string' ? permission.id : undefined;
-    if (!id || typeof permission.sessionID !== 'string') return;
+    const { id, sessionID } = permission;
+    if (!id || !sessionID) return;
 
     const directory = api.state.path.directory || process.cwd();
     const { globalPath, projectPath } = getConfigPaths(directory);
 
     try {
       if (choice === 'project' || choice === 'global') {
-        const update = updateForPermission(permission);
+        const update = updateForPermission(asRecord(permission));
         if (update) writeConfigFile(choice === 'project' ? projectPath : globalPath, update);
       }
 
@@ -362,54 +154,84 @@ const tui: TuiPlugin = async (api, options) => {
         variant: 'warning',
       });
     } finally {
-      api.ui.dialog.clear();
+      finishActive(id);
     }
   }
 
-  function showPermission(permission: Record<string, unknown>): void {
-    const id = typeof permission.id === 'string' ? permission.id : undefined;
-    if (!id || handledPermissions.has(id)) return;
-    handledPermissions.add(id);
+  function showPermission(permission: PendingPermission): void {
+    activeId = permission.id;
+
+    void api.attention.notify({
+      title: 'Sandbox permission',
+      message: permissionDetail(permission),
+      sound: { name: 'permission' },
+      notification: true,
+    });
 
     api.ui.dialog.replace(
       () =>
         api.ui.DialogSelect<PermissionChoice>({
           title: 'Sandbox Permission',
-          placeholder: permissionLabel(permission),
+          placeholder: permissionDetail(permission),
           options: [
-            { title: 'Allow once', value: 'once', description: 'Approve only this request' },
+            {
+              title: 'Allow once',
+              value: 'once',
+              category: 'This request',
+              description: 'Approve only this request',
+            },
             {
               title: 'Allow for session',
               value: 'session',
+              category: 'This request',
               description: 'Use OpenCode session approval for matching requests',
             },
             {
               title: 'Allow for project',
               value: 'project',
+              category: 'Persist to sandbox.json',
               description: 'Persist to .opencode/sandbox.json and approve this session',
             },
             {
               title: 'Allow globally',
               value: 'global',
+              category: 'Persist to sandbox.json',
               description: 'Persist to ~/.config/opencode/sandbox.json and approve this session',
             },
-            { title: 'Reject', value: 'reject', description: 'Deny this request' },
+            {
+              title: 'Reject',
+              value: 'reject',
+              category: 'Deny',
+              description: 'Deny this request',
+            },
           ],
           onSelect: (option) => {
             void replyPermission(permission, option.value);
           },
         }),
-      () => api.ui.dialog.clear(),
+      () => {
+        // Dialog dismissed (esc) without a choice: drop our hold so the next
+        // pending permission can surface, but leave it unresolved upstream.
+        if (activeId === permission.id) activeId = undefined;
+        api.ui.dialog.clear();
+        pump();
+      },
     );
   }
 
-  api.event.on('permission.asked', (event) => {
-    showPermission(event.properties as Record<string, unknown>);
+  const unsubscribeAsked = api.event.on('permission.asked', (event) => {
+    const pending = event.properties as PendingPermission;
+    enqueue(pending);
+    reconcile(pending.sessionID);
+  });
+
+  const unsubscribeReplied = api.event.on('permission.replied', (event) => {
+    finishActive(event.properties.requestID);
   });
 
   const showSandbox = () => {
     const directory = api.state.path.directory || process.cwd();
-    const message = sandboxSummary(directory, normalizeOptions(options));
+    const message = sandboxSummary(directory, optionOverrides);
 
     api.ui.dialog.replace(
       () =>
@@ -460,6 +282,54 @@ const tui: TuiPlugin = async (api, options) => {
         run: () => executeServerCommand('sandbox-enable'),
       },
     ],
+  });
+
+  // Persistent status badge in the prompt area. It needs the host's Solid
+  // runtime, imported defensively so a host that resolves plugin imports
+  // differently still loads the plugin — the badge just stays absent there.
+  try {
+    const { jsx } = await import('@opentui/solid/jsx-runtime');
+    const statusBadge = (ctx: TuiSlotContext) => {
+      const directory = api.state.path.directory || process.cwd();
+      const config = loadConfig(directory, optionOverrides);
+      const theme = ctx.theme.current;
+
+      if (!config.enabled) return jsx('text', { fg: theme.textMuted, children: 'sandbox off' });
+
+      const open = config.network.allowNetwork;
+      return jsx('text', {
+        fg: open ? theme.warning : theme.success,
+        children: `sandbox · ${open ? 'net open' : 'net proxied'}`,
+      });
+    };
+
+    const statusSlot: TuiSlotPlugin = {
+      slots: {
+        home_prompt_right: (ctx) => statusBadge(ctx),
+        session_prompt_right: (ctx) => statusBadge(ctx),
+      },
+    };
+    api.slots.register(statusSlot);
+  } catch {
+    // Solid runtime unavailable on this host — skip the status badge.
+  }
+
+  // First-run onboarding: a single quiet pointer to the default-strict policy
+  // and the inspector command. `meta.state` flags a freshly installed plugin;
+  // the kv flag keeps it from repeating across reloads.
+  if (meta.state === 'first' && !api.kv.get<boolean>('onboarded', false)) {
+    api.kv.set('onboarded', true);
+    api.ui.toast({
+      title: 'Sandbox active',
+      message: 'Landlock policy is on (default strict). Run /sandbox to inspect it.',
+      variant: 'info',
+      duration: 8000,
+    });
+  }
+
+  api.lifecycle.onDispose(() => {
+    unsubscribeAsked();
+    unsubscribeReplied();
   });
 };
 
