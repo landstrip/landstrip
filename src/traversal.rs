@@ -6,6 +6,7 @@ use crate::paths::normalize_roots;
 #[cfg(target_os = "macos")]
 use crate::paths::normalize_roots_lexically as normalize_roots;
 use crate::trap::{Result, Trap, TrapCode};
+use rayon::prelude::*;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,11 +20,13 @@ pub(crate) fn subtract_denied_roots(
     normalize_roots(&mut allowed);
     let mut denied = denied.to_vec();
     normalize_roots(&mut denied);
-    let mut roots = Vec::new();
-
-    for root in allowed {
-        roots.extend(scan_allowed_root(&root, &denied, true, 0)?);
-    }
+    let mut roots: Vec<PathBuf> = allowed
+        .par_iter()
+        .map(|root| scan_allowed_root(root, &denied, true, 0))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     normalize_roots(&mut roots);
 

@@ -19,6 +19,7 @@ use crate::paths::normalize_roots_lexically;
 use crate::paths::{normalize_path, normalize_roots};
 use crate::trap::{PolicyPort, Result, Trap, TrapCode};
 use crate::traversal::subtract_denied_roots;
+use rayon::prelude::*;
 use std::env;
 use std::fs;
 use std::io;
@@ -165,22 +166,31 @@ fn resolve_paths(
     policy_base: &Path,
     home: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
-    let mut resolved = Vec::with_capacity(paths.len());
-
-    for path in paths {
-        let path = resolve_sandbox_path(path, policy_base, home)?;
-        if path
-            .to_string_lossy()
-            .bytes()
-            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
-        {
-            for path in expand_glob_path(&path)? {
+    let mut resolved: Vec<PathBuf> = paths
+        .par_iter()
+        .map(|path| {
+            let path = resolve_sandbox_path(path, policy_base, home)?;
+            if path
+                .to_string_lossy()
+                .bytes()
+                .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']'))
+            {
+                let matches = expand_glob_path(&path)?;
+                let mut resolved = Vec::new();
+                for path in matches {
+                    push_path_variants(&mut resolved, &path);
+                }
+                Ok(resolved)
+            } else {
+                let mut resolved = Vec::new();
                 push_path_variants(&mut resolved, &path);
+                Ok(resolved)
             }
-        } else {
-            push_path_variants(&mut resolved, &path);
-        }
-    }
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     normalize_policy_roots(&mut resolved);
 
