@@ -1,6 +1,6 @@
 {
   "name": "@jarkkojs/landstrip-darwin-x64",
-  "version": "0.11.13",
+  "version": "0.12.0",
   "description": "macOS x64 binary for landstrip",
   "license": "Apache-2.0 AND LGPL-2.1-or-later",
   "homepage": "https://github.com/jarkkojs/landstrip#readme",
