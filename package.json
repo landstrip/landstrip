@@ -31,7 +31,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-tui": "^0.78.0",
-    "@jarkkojs/landstrip": "^0.12.2"
+    "@jarkkojs/landstrip": "^0.12.3"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.78.0",
