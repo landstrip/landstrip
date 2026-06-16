@@ -1019,9 +1019,16 @@ export function createLandstripIntegration(
         return;
       }
 
+      let settled = false;
       const upstream = connectNet(endpoint.port, endpoint.host, () => {
+        settled = true;
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         pipeSockets(client, upstream, rest);
+      });
+      upstream.once('error', () => {
+        if (settled) return;
+        settled = true;
+        denyProxyRequest(client, '502 Bad Gateway');
       });
     }
 
@@ -1061,9 +1068,16 @@ export function createLandstripIntegration(
       const rewrittenHeader = lines
         .filter((line) => !line.toLowerCase().startsWith('proxy-connection:'))
         .join('\r\n');
+      let settled = false;
       const upstream = connectNet(port, url.hostname, () => {
+        settled = true;
         upstream.write(`${rewrittenHeader}\r\n\r\n`);
         pipeSockets(client, upstream, rest);
+      });
+      upstream.once('error', () => {
+        if (settled) return;
+        settled = true;
+        denyProxyRequest(client, '502 Bad Gateway');
       });
     }
 
