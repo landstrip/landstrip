@@ -356,7 +356,7 @@ function evaluateDomainPermission(
   domain: string,
   config: SandboxConfig,
 ): SandboxPermissionDecision {
-  if (config.network.allowNetwork || domainMatchesAny(domain, config.network.allowedDomains)) {
+  if (config.network.allowNetwork) {
     return { status: 'allow', kind: 'domain', resource: domain, message: '' };
   }
 
@@ -367,6 +367,10 @@ function evaluateDomainPermission(
       resource: domain,
       message: `Sandbox: network access denied for "${domain}" (is blocked by network.deniedDomains).`,
     };
+  }
+
+  if (domainMatchesAny(domain, config.network.allowedDomains)) {
+    return { status: 'allow', kind: 'domain', resource: domain, message: '' };
   }
 
   return {

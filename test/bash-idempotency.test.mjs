@@ -323,6 +323,37 @@ test('proxy answers 502 instead of crashing when upstream is unreachable', async
   );
 });
 
+test('deniedDomains override allowedDomains for bash permission', async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      network: {
+        allowNetwork: false,
+        allowedDomains: ['evil.example'],
+        deniedDomains: ['evil.example'],
+      },
+    },
+    async ({ hooks }) => {
+      const permissionOutput = { status: 'allow' };
+      await hooks['permission.ask'](
+        {
+          id: 'permission-bash',
+          type: 'bash',
+          callID: 'bash-call',
+          sessionID: 'session',
+          messageID: 'message',
+          title: 'Run shell command',
+          metadata: { command: 'curl https://evil.example' },
+          time: { created: 0 },
+        },
+        permissionOutput,
+      );
+      assert.equal(permissionOutput.status, 'deny');
+    },
+  );
+});
+
 test('glob deny matches root and nested, single * stays in one segment', async () => {
   await withPlugin(
     {
@@ -336,7 +367,11 @@ test('glob deny matches root and nested, single * stays in one segment', async (
       network: { allowedDomains: ['*'], deniedDomains: [] },
     },
     async ({ hooks, tempDir }) => {
-      const denied = [join(tempDir, '.env'), join(tempDir, 'config', '.env'), join(tempDir, 'a.kee')];
+      const denied = [
+        join(tempDir, '.env'),
+        join(tempDir, 'config', '.env'),
+        join(tempDir, 'a.kee'),
+      ];
       for (const path of denied) {
         await assert.rejects(
           hooks['tool.execute.before'](
