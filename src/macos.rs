@@ -157,24 +157,17 @@ fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result
         sb.push_str("(allow network-inbound (local tcp \"localhost:*\"))\n");
     }
 
-    match &network.unix_socket_access {
-        UnixSocketAccess::Unrestricted => {}
-        UnixSocketAccess::AllowPaths(paths) if paths.is_empty() => {
-            sb.push_str("(deny network*)\n");
-        }
-        UnixSocketAccess::AllowPaths(paths) => {
-            sb.push_str("(deny network*)\n");
-            for path in paths {
-                let escaped = escape_sbpl_literal(&path.to_string_lossy());
-                writeln!(
-                    sb,
-                    "(allow network-outbound (remote unix-socket (path-literal \"{escaped}\")))"
-                )?;
-                writeln!(
-                    sb,
-                    "(allow network-bind (local unix-socket (path-literal \"{escaped}\")))"
-                )?;
-            }
+    if let UnixSocketAccess::AllowPaths(paths) = &network.unix_socket_access {
+        for path in paths {
+            let escaped = escape_sbpl_literal(&path.to_string_lossy());
+            writeln!(
+                sb,
+                "(allow network-outbound (remote unix-socket (path-literal \"{escaped}\")))"
+            )?;
+            writeln!(
+                sb,
+                "(allow network-bind (local unix-socket (path-literal \"{escaped}\")))"
+            )?;
         }
     }
 
