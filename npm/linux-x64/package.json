@@ -1,6 +1,6 @@
 {
   "name": "@jarkkojs/landstrip-linux-x64",
-  "version": "0.14.1",
+  "version": "0.14.2",
   "description": "Linux x64 binary for landstrip",
   "license": "Apache-2.0 AND LGPL-2.1-or-later",
   "homepage": "https://github.com/jarkkojs/landstrip#readme",
