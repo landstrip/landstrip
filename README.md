@@ -25,13 +25,23 @@ binary package.
 | ------------ | ------------------------ | ---------------------------- | ------------------------------- |
 | Policy       | path based rules         | file based rules             | access control list (ACL)       |
 | Timing       | dynamic subset of paths  | file based static ruleset    | persistent ACLs                 |
-| TCP          | localhost proxy ports    | loopback proxy ports         | unsupported                     |
-| Unix sockets | allowlist                | allowlist via seccomp broker | unsupported                     |
+| TCP          | localhost proxy ports    | loopback proxy ports         | allow all or deny all           |
+| Unix sockets | allowlist                | allowlist via seccomp broker | allow all or deny all           |
 
-Windows uses an AppContainer. The platform grants the generated AppContainer SID
-access to the lowered read and write roots, so Windows policies must use
-explicit read allowlists. Fine-grained TCP and Unix socket policies are rejected
-until Windows enforcement exists.
+### Windows AppContainer
+
+Win32 API provides AppContainer for application level sandboxing. The platform
+grants the generated AppContainer SID access to the lowered read and write
+roots, so Windows policies must use explicit read allowlists.
+
+With the current knowledge, the network access is gated by the AppContainer
+capabilities. That said, this might also be due my limited knowledge of Win32
+API.
+
+`allowNetwork` grants the internet and private-network capabilities, while the
+default container holds none and denies all network access. Fine-grained TCP and
+Unix socket policies are rejected because the container cannot enforce them in
+the process granularity.
 
 ## Policy Format
 
@@ -72,9 +82,9 @@ For a filesystem-only sandbox with unrestricted direct network access, set:
 }
 ```
 
-On Linux and macOS, `allowNetwork` disables landstrip network enforcement while
-leaving filesystem policy enforcement in place. Windows rejects unrestricted
-network policies until Windows network support exists.
+`allowNetwork` disables landstrip network enforcement while leaving filesystem
+policy enforcement in place. On Windows this grants the AppContainer its network
+capabilities; without it the container denies all network access.
 
 ## Error Output
 

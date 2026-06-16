@@ -26,8 +26,10 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, FreeSid, PSID, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, FreeSid, PSID, SECURITY_CAPABILITIES,
+    SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
+    WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
@@ -42,6 +44,13 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
 const INFINITE: u32 = 0xffff_ffff;
+const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+
+const NETWORK_CAPABILITY_SIDS: [WELL_KNOWN_SID_TYPE; 3] = [
+    WinCapabilityInternetClientSid,
+    WinCapabilityInternetClientServerSid,
+    WinCapabilityPrivateNetworkClientServerSid,
+];
 
 pub(crate) fn execute(
     policy: &AccessPolicy,
@@ -55,7 +64,8 @@ pub(crate) fn execute(
     let profile = AppContainerProfile::new(&moniker)?;
     grant_policy_access(policy, profile.sid())?;
 
-    let exit_code = create_process_in_appcontainer(profile.sid(), tool, args)?;
+    let grant_network = policy.network_access.is_unrestricted();
+    let exit_code = create_process_in_appcontainer(profile.sid(), tool, args, grant_network)?;
     std::process::exit(i32::from_ne_bytes(exit_code.to_ne_bytes()));
 }
 
@@ -67,7 +77,7 @@ fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
     let network = &policy.network_access;
 
     if network.is_unrestricted() {
-        return Err(Trap::internal().with_detail("feature", "unrestricted network"));
+        return Ok(());
     }
 
     if network.local_tcp_bind || !network.connect_tcp_ports.is_empty() {
@@ -243,7 +253,12 @@ fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
     Ok(())
 }
 
-fn create_process_in_appcontainer(sid: PSID, tool: &OsStr, args: &[OsString]) -> Result<u32> {
+fn create_process_in_appcontainer(
+    sid: PSID,
+    tool: &OsStr,
+    args: &[OsString],
+    grant_network: bool,
+) -> Result<u32> {
     let command_line = command_line(tool, args)?;
     let mut command_line = wide_string(&command_line);
     let mut startup_info = unsafe { mem::zeroed::<STARTUPINFOEXW>() };
@@ -251,10 +266,11 @@ fn create_process_in_appcontainer(sid: PSID, tool: &OsStr, args: &[OsString]) ->
         u32::try_from(mem::size_of::<STARTUPINFOEXW>()).map_err(|_| Trap::internal())?;
 
     let mut attribute_list = ProcThreadAttributeList::new(2)?;
+    let mut network_capabilities = NetworkCapabilities::new(grant_network)?;
     let mut capabilities = SECURITY_CAPABILITIES {
         AppContainerSid: sid,
-        Capabilities: ptr::null_mut::<SID_AND_ATTRIBUTES>(),
-        CapabilityCount: 0,
+        Capabilities: network_capabilities.as_mut_ptr(),
+        CapabilityCount: network_capabilities.count(),
         Reserved: 0,
     };
     let mut all_packages_policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
@@ -383,6 +399,62 @@ impl ProcThreadAttributeList {
 impl Drop for ProcThreadAttributeList {
     fn drop(&mut self) {
         unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
+    }
+}
+
+struct NetworkCapabilities {
+    /// Backing storage for the capability SIDs referenced by `entries`.
+    #[allow(dead_code)]
+    sids: Vec<[u8; SECURITY_MAX_SID_SIZE as usize]>,
+    entries: Vec<SID_AND_ATTRIBUTES>,
+}
+
+impl NetworkCapabilities {
+    fn new(grant_network: bool) -> Result<Self> {
+        if !grant_network {
+            return Ok(Self {
+                sids: Vec::new(),
+                entries: Vec::new(),
+            });
+        }
+
+        let mut sids = Vec::with_capacity(NETWORK_CAPABILITY_SIDS.len());
+        for kind in NETWORK_CAPABILITY_SIDS {
+            let mut sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
+            let mut size = SECURITY_MAX_SID_SIZE;
+            let ok = unsafe {
+                CreateWellKnownSid(kind, ptr::null_mut(), sid.as_mut_ptr().cast(), &mut size)
+            };
+            if ok == 0 {
+                let code = unsafe { GetLastError() };
+                return Err(Trap::internal()
+                    .with_detail("api", "CreateWellKnownSid")
+                    .with_detail("code", code.to_string()));
+            }
+            sids.push(sid);
+        }
+
+        let entries = sids
+            .iter_mut()
+            .map(|sid| SID_AND_ATTRIBUTES {
+                Sid: sid.as_mut_ptr().cast(),
+                Attributes: SE_GROUP_ENABLED,
+            })
+            .collect();
+
+        Ok(Self { sids, entries })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut SID_AND_ATTRIBUTES {
+        if self.entries.is_empty() {
+            ptr::null_mut()
+        } else {
+            self.entries.as_mut_ptr()
+        }
+    }
+
+    fn count(&self) -> u32 {
+        u32::try_from(self.entries.len()).unwrap_or(0)
     }
 }
 
