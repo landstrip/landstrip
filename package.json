@@ -1,5 +1,5 @@
 {
-  "name": "@landstrip/landstrip",
+  "name": "@landstrip-runtime/landstrip",
   "version": "0.14.3",
   "description": "Sandbox runner using Landlock, Seatbelt, and AppContainer",
   "license": "Apache-2.0 AND LGPL-2.1-or-later",
@@ -24,10 +24,10 @@
     "LICENSE-LGPL-2.1"
   ],
   "optionalDependencies": {
-    "@landstrip/landstrip-darwin-arm64": "0.14.3",
-    "@landstrip/landstrip-darwin-x64": "0.14.3",
-    "@landstrip/landstrip-linux-x64": "0.14.3",
-    "@landstrip/landstrip-win32-x64": "0.14.3"
+    "@landstrip-runtime/landstrip-darwin-arm64": "0.14.3",
+    "@landstrip-runtime/landstrip-darwin-x64": "0.14.3",
+    "@landstrip-runtime/landstrip-linux-x64": "0.14.3",
+    "@landstrip-runtime/landstrip-win32-x64": "0.14.3"
   },
   "publishConfig": {
     "access": "public"

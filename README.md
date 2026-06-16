@@ -9,7 +9,7 @@ Sandbox Runtime JSON subset as the policy, in JSON or YAML syntax.
 ### npm
 
 ```sh
-npm install --save-dev @landstrip/landstrip
+npm install --save-dev @landstrip-runtime/landstrip
 ```
 
 ```sh

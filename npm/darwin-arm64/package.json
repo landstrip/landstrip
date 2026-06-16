@@ -1,5 +1,5 @@
 {
-  "name": "@landstrip/landstrip-darwin-arm64",
+  "name": "@landstrip-runtime/landstrip-darwin-arm64",
   "version": "0.14.3",
   "description": "macOS arm64 binary for landstrip",
   "license": "Apache-2.0 AND LGPL-2.1-or-later",
