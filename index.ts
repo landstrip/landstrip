@@ -954,8 +954,8 @@ export function createLandstripIntegration(
       },
       filesystem: {
         denyRead: config.filesystem.denyRead,
-        allowRead: [...config.filesystem.allowRead, ...sessionAllowedReadPaths],
-        allowWrite: [...config.filesystem.allowWrite, ...sessionAllowedWritePaths],
+        allowRead: getEffectiveAllowRead(cwd),
+        allowWrite: getEffectiveAllowWrite(cwd),
         denyWrite: config.filesystem.denyWrite,
       },
     };
