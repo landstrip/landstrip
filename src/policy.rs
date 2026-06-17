@@ -53,17 +53,19 @@ impl AccessPolicy {
     }
 
     /// Why a write to `canonical` is mediated, or `None` when the policy permits
-    /// it. `allow_miss` (outside every `allowWrite` root) is surfaced only in
-    /// query mode; otherwise Landlock denies it and the broker stays silent.
+    /// it. `allow_miss` (outside every `allowWrite` root) is reported only when
+    /// `surface_allow_miss` is set: content syscalls leave it to Landlock unless
+    /// a query can resolve it, but metadata syscalls Landlock does not cover must
+    /// always surface it so the broker can gate them.
     pub(crate) fn to_reason(
         &self,
         canonical: &Path,
         lexical: &Path,
-        query_enabled: bool,
+        surface_allow_miss: bool,
     ) -> Option<&'static str> {
         if self.is_write_denied(canonical, lexical) {
             Some("deny_match")
-        } else if query_enabled
+        } else if surface_allow_miss
             && !self
                 .write_roots
                 .iter()
