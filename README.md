@@ -242,7 +242,11 @@ emitted with the same object shapes as standard error:
 ```
 
 The `mechanism` field records the kernel enforcement layer that detected the
-denial (e.g. `seccomp` or `landlock`).
+denial. Per-denial `Filesystem` and `Network` traps are always `seccomp`,
+because the user-notification broker is the only layer with a per-denial
+callback; Landlock enforces in-kernel without one. The `landlock` value
+appears only as a `mechanism` detail in an `Internal` trap when Landlock
+ruleset setup fails.
 
 This stream is separate from the sandboxed tool's output. If the option is
 omitted, landstrip is quiet unless it has to report a policy, launch, or
