@@ -149,6 +149,7 @@ pub(super) fn run_broker(
     }
     if notify_filesystem {
         notify_syscalls.extend(syscalls.filesystem_syscalls());
+        notify_syscalls.extend(MUTATION_SYSCALLS.iter().filter_map(|spec| spec.nr));
     }
     let notify = if notify_syscalls.is_empty() {
         None
@@ -390,6 +391,8 @@ fn handle_notification(
         handle_openat(policy, request, denials)
     } else if notify_filesystem && syscall == syscalls.fstatat {
         handle_fstatat(policy, request)
+    } else if notify_filesystem {
+        handle_mutation(policy, request, denials)
     } else {
         Ok(NotificationResult::Continue)
     };
@@ -1248,6 +1251,164 @@ fn handle_fstatat(
     Ok(NotificationResult::Continue)
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod legacy_syscall {
+    pub const RENAME: Option<i64> = Some(libc::SYS_rename);
+    pub const LINK: Option<i64> = Some(libc::SYS_link);
+    pub const SYMLINK: Option<i64> = Some(libc::SYS_symlink);
+    pub const UNLINK: Option<i64> = Some(libc::SYS_unlink);
+    pub const RMDIR: Option<i64> = Some(libc::SYS_rmdir);
+    pub const MKDIR: Option<i64> = Some(libc::SYS_mkdir);
+    pub const MKNOD: Option<i64> = Some(libc::SYS_mknod);
+    pub const CREAT: Option<i64> = Some(libc::SYS_creat);
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+mod legacy_syscall {
+    pub const RENAME: Option<i64> = None;
+    pub const LINK: Option<i64> = None;
+    pub const SYMLINK: Option<i64> = None;
+    pub const UNLINK: Option<i64> = None;
+    pub const RMDIR: Option<i64> = None;
+    pub const MKDIR: Option<i64> = None;
+    pub const MKNOD: Option<i64> = None;
+    pub const CREAT: Option<i64> = None;
+}
+
+struct Syscall {
+    nr: Option<i64>,
+    name: &'static str,
+    paths: &'static [(Option<usize>, usize)],
+}
+
+const MUTATION_SYSCALLS: &[Syscall] = &[
+    Syscall {
+        nr: Some(libc::SYS_renameat2),
+        name: "renameat2",
+        paths: &[(Some(0), 1), (Some(2), 3)],
+    },
+    Syscall {
+        nr: Some(libc::SYS_renameat),
+        name: "renameat",
+        paths: &[(Some(0), 1), (Some(2), 3)],
+    },
+    Syscall {
+        nr: Some(libc::SYS_linkat),
+        name: "linkat",
+        paths: &[(Some(0), 1), (Some(2), 3)],
+    },
+    Syscall {
+        nr: Some(libc::SYS_symlinkat),
+        name: "symlinkat",
+        paths: &[(Some(1), 2)],
+    },
+    Syscall {
+        nr: Some(libc::SYS_unlinkat),
+        name: "unlinkat",
+        paths: &[(Some(0), 1)],
+    },
+    Syscall {
+        nr: Some(libc::SYS_mkdirat),
+        name: "mkdirat",
+        paths: &[(Some(0), 1)],
+    },
+    Syscall {
+        nr: Some(libc::SYS_mknodat),
+        name: "mknodat",
+        paths: &[(Some(0), 1)],
+    },
+    Syscall {
+        nr: Some(libc::SYS_truncate),
+        name: "truncate",
+        paths: &[(None, 0)],
+    },
+    Syscall {
+        nr: legacy_syscall::RENAME,
+        name: "rename",
+        paths: &[(None, 0), (None, 1)],
+    },
+    Syscall {
+        nr: legacy_syscall::LINK,
+        name: "link",
+        paths: &[(None, 0), (None, 1)],
+    },
+    Syscall {
+        nr: legacy_syscall::SYMLINK,
+        name: "symlink",
+        paths: &[(None, 1)],
+    },
+    Syscall {
+        nr: legacy_syscall::UNLINK,
+        name: "unlink",
+        paths: &[(None, 0)],
+    },
+    Syscall {
+        nr: legacy_syscall::RMDIR,
+        name: "rmdir",
+        paths: &[(None, 0)],
+    },
+    Syscall {
+        nr: legacy_syscall::MKDIR,
+        name: "mkdir",
+        paths: &[(None, 0)],
+    },
+    Syscall {
+        nr: legacy_syscall::MKNOD,
+        name: "mknod",
+        paths: &[(None, 0)],
+    },
+    Syscall {
+        nr: legacy_syscall::CREAT,
+        name: "creat",
+        paths: &[(None, 0)],
+    },
+];
+
+fn handle_mutation(
+    policy: &AccessPolicy,
+    request: &libc::seccomp_notif,
+    denials: &mut Denials,
+) -> SysResult<NotificationResult> {
+    let syscall = i64::from(request.data.nr);
+    let Some(spec) = MUTATION_SYSCALLS.iter().find(|s| s.nr == Some(syscall)) else {
+        return Ok(NotificationResult::Continue);
+    };
+    let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
+
+    for (dirfd_arg, path_arg) in spec.paths {
+        let dirfd = match dirfd_arg {
+            // args[i] is an i32 dirfd (including AT_FDCWD=-100) stored as u64.
+            #[allow(clippy::cast_possible_truncation)]
+            Some(index) => request.data.args[*index] as i32,
+            None => libc::AT_FDCWD,
+        };
+        let path_ptr =
+            usize::try_from(request.data.args[*path_arg]).map_err(|_| BrokerError::BadAddress)?;
+        let Some(path) = read_child_path(pid, path_ptr)? else {
+            continue;
+        };
+        let resolved = resolve_child_path(pid, dirfd, &path)?;
+        if policy
+            .write_denied_roots
+            .iter()
+            .any(|root| resolved == *root || resolved.starts_with(root))
+        {
+            denials.record(Denial::Filesystem(
+                TrapOperation::Write,
+                resolved,
+                path,
+                spec.name,
+                Vec::new(),
+                "deny_match",
+                process_context(request.pid),
+            ));
+            return Err(BrokerError::PolicyDenied);
+        }
+    }
+
+    Ok(NotificationResult::Continue)
+}
+
 fn read_child_path(pid: Pid, path_ptr: usize) -> SysResult<Option<PathBuf>> {
     if path_ptr == 0 {
         return Ok(None);
@@ -1330,21 +1491,20 @@ fn check_fs_read(policy: &AccessPolicy, path: &Path) -> SysResult<()> {
 
 fn fs_write_denial_reason(policy: &AccessPolicy, path: &Path) -> Option<&'static str> {
     if policy
+        .write_denied_roots
+        .iter()
+        .any(|root| path == root || path.starts_with(root))
+    {
+        return Some("deny_match");
+    }
+    if policy
         .write_roots
         .iter()
         .any(|root| path == root || path.starts_with(root))
     {
         return None;
     }
-    if policy
-        .write_denied_roots
-        .iter()
-        .any(|root| path == root || path.starts_with(root))
-    {
-        Some("deny_match")
-    } else {
-        Some("allow_miss")
-    }
+    Some("allow_miss")
 }
 
 fn sockopt(fd: RawFd, level: libc::c_int, name: libc::c_int) -> SysResult<i32> {

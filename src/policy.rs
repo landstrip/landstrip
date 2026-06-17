@@ -99,7 +99,6 @@ pub(crate) fn resolve_policy(
 
     let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
     let write_deny = resolve_paths(&filesystem.deny_write, &policy_base, home)?;
-    let write_roots = subtract_denied_roots(write_allow, &write_deny)?;
 
     let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
     let read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
@@ -113,7 +112,7 @@ pub(crate) fn resolve_policy(
     };
 
     Ok(AccessPolicy {
-        write_roots,
+        write_roots: write_allow,
         write_denied_roots: write_deny,
         read_access,
         read_denied_roots: read_deny,

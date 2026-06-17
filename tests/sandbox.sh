@@ -372,9 +372,16 @@ policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"allowWrit
 test_fail "empty path is rejected" "$policy" "$sandbox_shell" -c 'printf ok\\n'
 
 mkdir -p "$tmp/allowed/keep" "$tmp/allowed/sub"
+: > "$tmp/allowed/sub/keep-me"
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%s/allowed"],"denyWrite":["%s/allowed/sub"],"denyRead":["/"],"allowRead":["/"]}}' "$tmp" "$tmp")
 test_ok "denyWrite permits sibling write" "$policy" "$sandbox_shell" -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ "$tmp/allowed/keep"
 test_fail "denyWrite denies subtree write" "$policy" "$sandbox_shell" -c ': > "$1/nope.txt"' _ "$tmp/allowed/sub"
+test_ok "denyWrite permits new entry beside denied path" "$policy" "$sandbox_shell" -c ': > "$1/fresh.txt"; test -f "$1/fresh.txt"' _ "$tmp/allowed"
+if [ "$os_name" = Linux ]; then
+    test_fail "denyWrite denies rename into denied subtree" "$policy" "$sandbox_shell" -c ': > "$1/mv-src.txt"; mv "$1/mv-src.txt" "$2/moved.txt"' _ "$tmp/allowed" "$tmp/allowed/sub"
+    test_fail "denyWrite denies symlink into denied subtree" "$policy" "$sandbox_shell" -c 'ln -s /etc/hostname "$1/link"' _ "$tmp/allowed/sub"
+    test_fail "denyWrite denies unlink in denied subtree" "$policy" "$sandbox_shell" -c 'rm -f "$1/keep-me"' _ "$tmp/allowed/sub"
+fi
 
 policy=$(write_policy '{"network":{"httpProxyPort":0},"filesystem":{"denyRead":["/"],"allowRead":["/"]}}')
 test_fail "httpProxyPort zero is rejected" "$policy" "$sandbox_shell" -c 'printf ok\\n'
