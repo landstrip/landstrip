@@ -64,7 +64,7 @@ function sandboxSummary(baseDirectory: string, optionOverrides: SandboxConfigOve
     `allow write: ${list(config.filesystem.allowWrite)}`,
     `deny write: ${list(config.filesystem.denyWrite)}`,
     '',
-    'esc or any key to close',
+    'Press esc or enter to close',
   ].join('\n');
 }
 
@@ -118,7 +118,10 @@ const tui: TuiPlugin = async (api, options, meta) => {
       activeId = undefined;
       api.ui.dialog.clear();
     }
-    pump();
+    // Defer: `clear()` above tears the dialog down by calling its `onClose`,
+    // and the host pops the stack asynchronously. Opening the next dialog
+    // synchronously here would race that teardown and get wiped.
+    queueMicrotask(pump);
   }
 
   async function replyPermission(
@@ -212,9 +215,11 @@ const tui: TuiPlugin = async (api, options, meta) => {
       () => {
         // Dialog dismissed (esc) without a choice: drop our hold so the next
         // pending permission can surface, but leave it unresolved upstream.
+        // The host pops the dialog itself; calling `clear()` here would re-enter
+        // this `onClose` (clear() invokes every entry's onClose) and loop until
+        // the stack overflows. Defer `pump()` so the pop settles first.
         if (activeId === permission.id) activeId = undefined;
-        api.ui.dialog.clear();
-        pump();
+        queueMicrotask(pump);
       },
     );
   }
@@ -233,14 +238,14 @@ const tui: TuiPlugin = async (api, options, meta) => {
     const directory = api.state.path.directory || process.cwd();
     const message = sandboxSummary(directory, optionOverrides);
 
-    api.ui.dialog.replace(
-      () =>
-        api.ui.DialogAlert({
-          title: 'Sandbox Configuration',
-          message,
-          onConfirm: () => api.ui.dialog.clear(),
-        }),
-      () => api.ui.dialog.clear(),
+    // No `onConfirm`/`onClose` that call `clear()`: the host already pops the
+    // dialog on enter/esc/click, and its `clear()` re-invokes every entry's
+    // `onClose`, so a `clear()` in there recurses forever and freezes the TUI.
+    api.ui.dialog.replace(() =>
+      api.ui.DialogAlert({
+        title: 'Sandbox Configuration',
+        message,
+      }),
     );
   };
 
