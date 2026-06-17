@@ -32,7 +32,7 @@ use seccompiler::{
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{IoSlice, IoSliceMut};
 use std::mem;
@@ -63,6 +63,12 @@ nix::ioctl_readwrite!(
     libc::seccomp_notif_resp
 );
 nix::ioctl_write_ptr!(seccomp_notif_id_valid, SECCOMP_IOC_MAGIC, 2, u64);
+nix::ioctl_write_ptr!(
+    seccomp_notif_addfd,
+    SECCOMP_IOC_MAGIC,
+    3,
+    libc::seccomp_notif_addfd
+);
 
 #[repr(C)]
 struct SockFilterProg {
@@ -250,7 +256,7 @@ fn supervise_child(
         query_enabled,
     };
     let trap_fd = trap_fd.fd().filter(|_| query_enabled);
-    let mut pending_queries: std::collections::HashMap<u64, libc::seccomp_notif> =
+    let mut pending_queries: std::collections::HashMap<u64, PendingQuery> =
         std::collections::HashMap::new();
     let mut next_query_id: u64 = 1;
     // SAFETY: notify_fd is the live seccomp notification fd owned by the parent.
@@ -338,8 +344,8 @@ fn supervise_child(
                     return Err(Trap::policy_stdin_source(source));
                 }
             }
-            HandleResult::Pending(query_id) => {
-                pending_queries.insert(query_id, request);
+            HandleResult::Pending(query_id, grant) => {
+                pending_queries.insert(query_id, PendingQuery { request, grant });
             }
         }
     }
@@ -423,7 +429,7 @@ impl Denials {
 
 enum HandleResult {
     Respond(libc::seccomp_notif_resp),
-    Pending(u64),
+    Pending(u64, Option<OpenGrant>),
 }
 
 /// Immutable context shared across notification handling for a supervised child.
@@ -475,9 +481,9 @@ fn handle_notification(
         Ok(NotificationResult::Continue) => {
             HandleResult::Respond(notification_continue(request.id))
         }
-        Ok(NotificationResult::Query(query_id, trap)) => {
-            denials.trap_fd.write(&trap);
-            HandleResult::Pending(query_id)
+        Ok(NotificationResult::Query(decision)) => {
+            denials.trap_fd.write(&decision.trap);
+            HandleResult::Pending(decision.query_id, decision.grant)
         }
         Err(error) => {
             let errno = error.errno();
@@ -1285,7 +1291,13 @@ fn handle_openat(
                 if query_enabled {
                     let qid = *next_query_id;
                     *next_query_id += 1;
-                    return Ok(NotificationResult::Query(
+                    // The 4th arg is the creation mode (used only with
+                    // O_CREAT/O_TMPFILE). Pin the parent now so an allow can
+                    // reopen it safely after the prompt.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let mode = request.data.args[3] as u32;
+                    let grant = grant_for_open(&resolved, flags, mode);
+                    return Ok(NotificationResult::query(
                         qid,
                         Trap::filesystem_query(
                             TrapOperation::Write,
@@ -1297,6 +1309,7 @@ fn handle_openat(
                             process_context(request.pid),
                             qid,
                         ),
+                        grant,
                     ));
                 }
                 denials.record(Denial::Filesystem(
@@ -1506,7 +1519,7 @@ fn handle_mutation(
             if query_enabled {
                 let qid = *next_query_id;
                 *next_query_id += 1;
-                return Ok(NotificationResult::Query(
+                return Ok(NotificationResult::query(
                     qid,
                     Trap::filesystem_query(
                         TrapOperation::Write,
@@ -1518,6 +1531,7 @@ fn handle_mutation(
                         process_context(request.pid),
                         qid,
                     ),
+                    None,
                 ));
             }
             denials.record(Denial::Filesystem(
@@ -1569,7 +1583,7 @@ fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>
 
 fn process_control_responses(
     control_fd: i32,
-    pending_queries: &mut std::collections::HashMap<u64, libc::seccomp_notif>,
+    pending_queries: &mut std::collections::HashMap<u64, PendingQuery>,
     notify_fd: RawFd,
 ) {
     let mut buf = [0u8; 4096];
@@ -1590,17 +1604,98 @@ fn process_control_responses(
         else {
             continue;
         };
-        if let Some(request_data) = pending_queries.remove(&response.query_id) {
-            let id = request_data.id;
-            if validate_notification_id(notify_fd, id).unwrap_or(false) {
-                let resp = match response.action {
-                    ControlAction::Allow => notification_continue(id),
-                    ControlAction::Deny => notification_error(id, libc::EACCES),
-                };
-                let _ = respond_notification(notify_fd, resp);
+        if let Some(pending) = pending_queries.remove(&response.query_id) {
+            let id = pending.request.id;
+            if !validate_notification_id(notify_fd, id).unwrap_or(false) {
+                continue;
+            }
+            match response.action {
+                ControlAction::Allow => match pending.grant {
+                    Some(grant) => grant_open(notify_fd, id, &grant),
+                    None => {
+                        let _ = respond_notification(notify_fd, notification_continue(id));
+                    }
+                },
+                ControlAction::Deny => {
+                    let _ = respond_notification(notify_fd, notification_error(id, -libc::EACCES));
+                }
             }
         }
     }
+}
+
+fn grant_open(notify_fd: RawFd, id: u64, grant: &OpenGrant) {
+    let opened = match broker_open(grant) {
+        Ok(fd) => fd,
+        Err(errno) => {
+            let _ = respond_notification(notify_fd, notification_error(id, -errno.abs()));
+            return;
+        }
+    };
+
+    let cloexec = (grant.flags & libc::O_CLOEXEC) != 0;
+    let addfd = libc::seccomp_notif_addfd {
+        id,
+        flags: u32::try_from(libc::SECCOMP_ADDFD_FLAG_SEND).unwrap_or(0),
+        srcfd: u32::try_from(opened.as_raw_fd()).unwrap_or(0),
+        newfd: 0,
+        newfd_flags: if cloexec {
+            u32::try_from(libc::O_CLOEXEC).unwrap_or(0)
+        } else {
+            0
+        },
+    };
+
+    // SAFETY: addfd points to an initialized struct and opened is a live fd; the
+    // SEND flag makes the ioctl complete the notification atomically.
+    if unsafe { seccomp_notif_addfd(notify_fd, ptr::addr_of!(addfd)) }.is_err() {
+        let _ = respond_notification(notify_fd, notification_error(id, -libc::EACCES));
+    }
+}
+
+fn pin_dir(path: &Path) -> Option<OwnedFd> {
+    let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: cpath is NUL-terminated; O_PATH|O_DIRECTORY pins the directory inode.
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: open returned a new owned descriptor.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn broker_open(grant: &OpenGrant) -> std::result::Result<OwnedFd, i32> {
+    let name = CString::new(grant.name.as_bytes()).map_err(|_| libc::EINVAL)?;
+    let flags = grant.flags | libc::O_CLOEXEC;
+    // SAFETY: name is NUL-terminated and resolved relative to the pinned parent fd.
+    let fd = unsafe {
+        libc::openat(
+            grant.parent.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            grant.mode as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(Errno::last() as i32);
+    }
+    // SAFETY: openat returned a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn grant_for_open(resolved: &Path, flags: i32, mode: u32) -> Option<OpenGrant> {
+    let parent = pin_dir(resolved.parent()?)?;
+    Some(OpenGrant {
+        parent,
+        name: resolved.file_name()?.to_os_string(),
+        flags,
+        mode,
+    })
 }
 
 fn resolve_child_path(pid: Pid, dirfd: i32, path: &Path) -> SysResult<PathBuf> {
@@ -1778,7 +1873,36 @@ struct TcpEndpoint {
 enum NotificationResult {
     Value(i64),
     Continue,
-    Query(u64, Trap),
+    Query(QueryDecision),
+}
+
+/// A held syscall awaiting a host allow/deny over the control socket.
+struct QueryDecision {
+    query_id: u64,
+    trap: Trap,
+    grant: Option<OpenGrant>,
+}
+
+impl NotificationResult {
+    fn query(query_id: u64, trap: Trap, grant: Option<OpenGrant>) -> Self {
+        NotificationResult::Query(QueryDecision {
+            query_id,
+            trap,
+            grant,
+        })
+    }
+}
+
+struct OpenGrant {
+    parent: OwnedFd,
+    name: OsString,
+    flags: i32,
+    mode: u32,
+}
+
+struct PendingQuery {
+    request: libc::seccomp_notif,
+    grant: Option<OpenGrant>,
 }
 
 struct NotificationSyscalls {
