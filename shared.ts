@@ -3,8 +3,9 @@
 
 import { binaryPath } from '@landstrip/landstrip';
 
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 export interface SandboxFilesystemConfig {
@@ -315,4 +316,188 @@ export function updateForPermission(
   }
 
   return null;
+}
+
+// Landstrip emits one JSON trap per line on its trap fd/file. The `state` field
+// (landstrip >= 0.15.4) distinguishes a terminal `info` trap from a `query`
+// trap that holds a syscall pending until the host answers with `queryId`. It
+// is absent on the static-profile platforms (macOS/Windows), so both fields are
+// optional. Parsing lives here so the server hook and the TUI socket handler
+// decode identically.
+export type LandstripTrapState = 'query' | 'info';
+
+export type LandstripTrap =
+  | {
+      kind: 'filesystem';
+      operation: 'read' | 'write';
+      path: string;
+      mechanism: string;
+      state?: LandstripTrapState;
+      queryId?: number;
+    }
+  | { kind: 'network'; operation: string; target: string; mechanism: string }
+  | { kind: 'launch'; program: string; message: string }
+  | { kind: 'usage'; message: string }
+  | { kind: 'internal'; detail: Record<string, string> };
+
+const LANDSTRIP_OPERATIONS = new Set<'read' | 'write'>(['read', 'write']);
+
+function isLandstripOperation(value: unknown): value is 'read' | 'write' {
+  return typeof value === 'string' && LANDSTRIP_OPERATIONS.has(value as 'read' | 'write');
+}
+
+function decodeTrapState(value: unknown): LandstripTrapState | undefined {
+  return value === 'query' || value === 'info' ? value : undefined;
+}
+
+export function decodeLandstripTrap(value: unknown): LandstripTrap | null {
+  if (!isRecord(value)) return null;
+  const mechanism = typeof value.mechanism === 'string' ? value.mechanism : '';
+
+  switch (value.kind) {
+    case 'filesystem': {
+      const { operation, path } = value;
+      if (!isLandstripOperation(operation) || typeof path !== 'string') return null;
+      const state = decodeTrapState(value.state);
+      const queryId = typeof value.query_id === 'number' ? value.query_id : undefined;
+      return { kind: 'filesystem', operation, path, mechanism, state, queryId };
+    }
+    case 'network': {
+      const { operation, target } = value;
+      if (typeof operation !== 'string' || typeof target !== 'string') return null;
+      return { kind: 'network', operation, target, mechanism };
+    }
+    case 'launch': {
+      const { program, message } = value;
+      if (typeof program !== 'string') return null;
+      return { kind: 'launch', program, message: typeof message === 'string' ? message : '' };
+    }
+    case 'usage': {
+      const { message } = value;
+      if (typeof message !== 'string') return null;
+      return { kind: 'usage', message };
+    }
+    case 'internal': {
+      const detail: Record<string, string> = {};
+      const payload = value.detail;
+      if (isRecord(payload)) {
+        for (const [key, val] of Object.entries(payload)) {
+          detail[key] = typeof val === 'string' ? val : JSON.stringify(val);
+        }
+      }
+      return { kind: 'internal', detail };
+    }
+    default:
+      return null;
+  }
+}
+
+export function parseLandstripTraps(output: string): LandstripTrap[] {
+  const traps: LandstripTrap[] = [];
+
+  for (const line of output.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed[0] !== '{') continue;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+
+    const trap = decodeLandstripTrap(parsed);
+    if (trap) traps.push(trap);
+  }
+
+  return traps;
+}
+
+export function formatLandstripTrap(trap: LandstripTrap): string {
+  switch (trap.kind) {
+    case 'filesystem':
+      return `landstrip: filesystem ${trap.operation} denied (${trap.path})${
+        trap.mechanism ? ` [${trap.mechanism}]` : ''
+      }`;
+    case 'network':
+      return `landstrip: network ${trap.operation} denied (${trap.target})${
+        trap.mechanism ? ` [${trap.mechanism}]` : ''
+      }`;
+    case 'launch':
+      return `landstrip: launch failed (${trap.program})${trap.message ? `: ${trap.message}` : ''}`;
+    case 'usage':
+      return `landstrip: usage error: ${trap.message}`;
+    case 'internal': {
+      const detail = Object.entries(trap.detail)
+        .map(([key, val]) => `${key}: ${val}`)
+        .join(', ');
+      return `landstrip: internal error${detail ? ` (${detail})` : ''}`;
+    }
+  }
+}
+
+export function formatLandstripTraps(traps: LandstripTrap[]): string {
+  return traps.map(formatLandstripTrap).join('\n');
+}
+
+// The TUI plugin runs the query-response socket server and publishes its port
+// to a per-directory discovery file; the server plugin reads it to inject the
+// fd-3 redirect. Namespacing by a hash of the realpath keeps concurrent
+// opencode instances in different projects from colliding.
+function discoveryDir(): string {
+  const base = process.env.XDG_RUNTIME_DIR || tmpdir();
+  return join(base, 'opencode-landstrip');
+}
+
+export function discoveryFilePath(baseDirectory: string): string {
+  let key = baseDirectory;
+  try {
+    key = realpathSync.native(baseDirectory);
+  } catch {
+    // Directory not resolvable — hash the raw path instead.
+  }
+  const hash = createHash('sha256').update(key).digest('hex').slice(0, 16);
+  return join(discoveryDir(), `port-${hash}.json`);
+}
+
+export function writeDiscoveryPort(baseDirectory: string, port: number): void {
+  const dir = discoveryDir();
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    discoveryFilePath(baseDirectory),
+    JSON.stringify({ port, pid: process.pid, ts: Date.now() }) + '\n',
+  );
+}
+
+export function removeDiscoveryFile(baseDirectory: string): void {
+  rmSync(discoveryFilePath(baseDirectory), { force: true });
+}
+
+// Returns the live query-response port, or null when no fresh server is
+// listening. A recorded writer pid that no longer exists marks the file stale.
+export function readDiscoveryPort(baseDirectory: string): number | null {
+  const path = discoveryFilePath(baseDirectory);
+  if (!existsSync(path)) return null;
+
+  try {
+    const data: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+    if (!isRecord(data)) return null;
+
+    const port = typeof data.port === 'number' ? data.port : NaN;
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+
+    if (typeof data.pid === 'number') {
+      try {
+        process.kill(data.pid, 0);
+      } catch (error) {
+        // ESRCH: the writer is gone, so the file is stale. EPERM: alive but
+        // owned by another user — still a live listener, so accept it.
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') return null;
+      }
+    }
+
+    return port;
+  } catch {
+    return null;
+  }
 }

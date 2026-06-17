@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { connect } from 'node:net';
+import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
@@ -42,8 +42,8 @@ async function withPlugin(options, run, mock = {}) {
     await writeFile(
       fakeLandstrip,
       process.platform === 'win32'
-        ? '@echo landstrip 0.15.1\r\n'
-        : '#!/bin/sh\nprintf "landstrip 0.15.1\\n"\n',
+        ? '@echo landstrip 0.15.8\r\n'
+        : '#!/bin/sh\nprintf "landstrip 0.15.8\\n"\n',
     );
     if (process.platform !== 'win32') await chmod(fakeLandstrip, 0o755);
 
@@ -439,6 +439,102 @@ test('deny overrides allow when a path matches both lists', async () => {
         ),
         /write access denied/,
       );
+    },
+  );
+});
+
+const linuxOnly = { skip: process.platform !== 'linux' };
+
+async function withQueryServer(tempDir, run) {
+  const shared = await import(pathToFileURL(join(tempDir, 'shared.js')).href);
+  const server = createServer();
+  await new Promise((res) => server.listen(0, '127.0.0.1', res));
+  const port = server.address().port;
+  shared.writeDiscoveryPort(tempDir, port);
+  try {
+    await run({ shared, port });
+  } finally {
+    shared.removeDiscoveryFile(tempDir);
+    server.close();
+  }
+}
+
+test('query-response: bash wrapping injects fd 3 and stays idempotent', linuxOnly, async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      network: { allowedDomains: ['*'], deniedDomains: [] },
+    },
+    async ({ hooks, tempDir }) => {
+      await withQueryServer(tempDir, async ({ port }) => {
+        const input = { callID: 'query-a', tool: 'bash' };
+        const output = { args: { command: 'git status --short', description: 'status' } };
+        try {
+          await hooks['tool.execute.before'](input, output);
+          const wrapped = output.args.command;
+
+          assert.match(wrapped, new RegExp(`/dev/tcp/127\\.0\\.0\\.1/${port}\\b`));
+          assert.match(wrapped, /'--trap-fd' '3'/);
+          assert.ok(wrapped.includes(' || '), 'has the plain fallback branch');
+          // One --trap-fd (socket branch only); two -p (socket + plain branches).
+          assert.equal(wrapped.match(/'--trap-fd'/g)?.length, 1);
+          assert.equal(wrapped.match(/'-p'/g)?.length, 2);
+          // The original command roundtrips cleanly into the socket branch.
+          assert.ok(wrapped.includes("'-lc' 'git status --short'"));
+
+          // Re-running the before hook must not double-wrap.
+          await hooks['tool.execute.before'](input, output);
+          assert.equal(output.args.command, wrapped);
+          assert.equal(wrapped.match(/\/dev\/tcp/g)?.length, 1);
+
+          // A fresh call receiving the wrapped command (policy dir still present)
+          // is recognized as already-generated and left intact.
+          const reuse = {
+            args: { command: wrapped, description: 'status again' },
+          };
+          await hooks['tool.execute.before']({ callID: 'query-b', tool: 'bash' }, reuse);
+          assert.equal(reuse.args.command, wrapped);
+          assert.equal(reuse.args.description, 'status again (landstrip)');
+        } finally {
+          await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+        }
+      });
+    },
+  );
+});
+
+test('query-response: recovery re-extracts the original command', linuxOnly, async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      network: { allowedDomains: ['*'], deniedDomains: [] },
+    },
+    async ({ hooks, tempDir }) => {
+      await withQueryServer(tempDir, async () => {
+        const inputA = { callID: 'recover-a', tool: 'bash' };
+        const outputA = { args: { command: 'git status --short', description: 'status' } };
+        await hooks['tool.execute.before'](inputA, outputA);
+        const wrapped = outputA.args.command;
+        // Drop the policy dir so the next pass must re-extract and re-wrap.
+        await hooks['tool.execute.after'](inputA, { title: '', output: '', metadata: {} });
+
+        const inputB = { callID: 'recover-b', tool: 'bash' };
+        const outputB = { args: { command: wrapped, description: 'status' } };
+        try {
+          await hooks['tool.execute.before'](inputB, outputB);
+          const rewrapped = outputB.args.command;
+
+          assert.notEqual(rewrapped, wrapped, 'a fresh policy dir is generated');
+          // Extraction stopped at `||`: the original command is recovered whole,
+          // not folded together with the old plain fallback branch.
+          assert.equal(rewrapped.match(/'--trap-fd'/g)?.length, 1);
+          assert.ok(rewrapped.includes("'-lc' 'git status --short'"));
+        } finally {
+          await hooks['tool.execute.after'](inputB, { title: '', output: '', metadata: {} });
+        }
+      });
     },
   );
 });

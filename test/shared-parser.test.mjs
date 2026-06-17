@@ -71,3 +71,55 @@ test('shared parser agrees across server and TUI permission shapes', async () =>
     await cleanup();
   }
 });
+
+// Landstrip >= 0.15.4 tags filesystem traps with `state` ("query" vs "info")
+// and a `query_id` for held writes; the static-profile platforms omit both.
+test('landstrip trap parser decodes state/query_id and the server filter', async () => {
+  const { mod, cleanup } = await loadShared();
+  try {
+    const { decodeLandstripTrap, parseLandstripTraps } = mod;
+
+    const query = decodeLandstripTrap({
+      kind: 'filesystem',
+      operation: 'write',
+      path: '/a',
+      state: 'query',
+      query_id: 7,
+    });
+    assert.equal(query.state, 'query');
+    assert.equal(query.queryId, 7);
+
+    const terminal = decodeLandstripTrap({ kind: 'filesystem', operation: 'write', path: '/a' });
+    assert.equal(terminal.state, undefined);
+    assert.equal(terminal.queryId, undefined);
+
+    const info = decodeLandstripTrap({
+      kind: 'filesystem',
+      operation: 'read',
+      path: '/b',
+      state: 'info',
+    });
+    assert.equal(info.state, 'info');
+
+    const lines = [
+      JSON.stringify({
+        kind: 'filesystem',
+        operation: 'write',
+        path: '/a',
+        state: 'query',
+        query_id: 1,
+      }),
+      JSON.stringify({ kind: 'filesystem', operation: 'write', path: '/b', state: 'info' }),
+      'not json',
+    ].join('\n');
+    const traps = parseLandstripTraps(lines);
+    assert.equal(traps.length, 2);
+
+    // The server toasts only terminal traps; query traps are answered live.
+    const terminalOnly = traps.filter((t) => !(t.kind === 'filesystem' && t.state === 'query'));
+    assert.equal(terminalOnly.length, 1);
+    assert.equal(terminalOnly[0].path, '/b');
+  } finally {
+    await cleanup();
+  }
+});

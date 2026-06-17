@@ -4,6 +4,7 @@
 import type { TuiPlugin, TuiSlotContext, TuiSlotPlugin } from '@opencode-ai/plugin/tui';
 
 import { existsSync } from 'node:fs';
+import { type AddressInfo, createServer, type Socket as NetSocket } from 'node:net';
 
 import {
   type SandboxConfigOverrides,
@@ -11,10 +12,13 @@ import {
   landstripBinaryPath,
   loadConfig,
   normalizeOptions,
+  parseLandstripTraps,
   permissionLabel,
   permissionResource,
+  removeDiscoveryFile,
   updateForPermission,
   writeConfigFile,
+  writeDiscoveryPort,
 } from './shared.js';
 
 // The shape shared by the `permission.asked` event payload and the entries
@@ -30,6 +34,27 @@ interface PendingPermission {
 }
 
 type PermissionChoice = 'once' | 'session' | 'project' | 'global' | 'reject';
+
+type WriteChoice = 'once' | 'session' | 'project' | 'global' | 'deny';
+
+// A landstrip write query held pending over the fd-3 socket. It shares the
+// dialog stack with permission prompts so the two never overlap, hence the
+// common `id`/`kind` shape.
+interface WriteQueryEntry {
+  kind: 'write-query';
+  id: string;
+  socket: NetSocket;
+  queryId: number;
+  path: string;
+}
+
+interface PermissionEntry {
+  kind: 'permission';
+  id: string;
+  permission: PendingPermission;
+}
+
+type QueueEntry = PermissionEntry | WriteQueryEntry;
 
 function list(values: string[]): string {
   return values.join(', ') || '(none)';
@@ -84,24 +109,42 @@ const tui: TuiPlugin = async (api, options, meta) => {
   // Permission requests can arrive twice (the live event and a reconnect replay
   // of `api.state`), so `resolved` tracks ids we have already answered and
   // `activeId` guards against stacking a second sandbox dialog on the first.
+  // Write queries share the same queue so a held-write prompt never stacks on a
+  // permission prompt.
   const resolved = new Set<string>();
-  const queue: PendingPermission[] = [];
+  const queue: QueueEntry[] = [];
   let activeId: string | undefined;
+
+  // Paths the user approved "for session": later queries for the same path are
+  // auto-allowed without a dialog. This lives only in the TUI process — the
+  // server regenerates the policy from on-disk config each run — so it affects
+  // only live socket decisions, not the static policy.
+  const sessionAllowedWritePaths = new Set<string>();
+
+  // Write queries still awaiting a response, so cleanup can release held
+  // syscalls instead of letting the child hang.
+  const liveQueries = new Set<WriteQueryEntry>();
 
   function pump(): void {
     if (activeId !== undefined) return;
     let next = queue.shift();
     while (next && resolved.has(next.id)) next = queue.shift();
     if (!next) return;
-    showPermission(next);
+    if (next.kind === 'permission') showPermission(next.permission);
+    else showWriteQuery(next);
+  }
+
+  function enqueueEntry(entry: QueueEntry): void {
+    if (!entry.id || resolved.has(entry.id)) return;
+    if (activeId === entry.id) return;
+    if (queue.some((item) => item.id === entry.id)) return;
+    queue.push(entry);
+    pump();
   }
 
   function enqueue(permission: PendingPermission): void {
-    if (!permission.id || resolved.has(permission.id)) return;
-    if (activeId === permission.id) return;
-    if (queue.some((item) => item.id === permission.id)) return;
-    queue.push(permission);
-    pump();
+    if (!permission.id) return;
+    enqueueEntry({ kind: 'permission', id: permission.id, permission });
   }
 
   // Safety net for missed/late events and reconnects: fold whatever the host
@@ -224,6 +267,107 @@ const tui: TuiPlugin = async (api, options, meta) => {
     );
   }
 
+  function respondWriteQuery(socket: NetSocket, queryId: number, action: 'allow' | 'deny'): void {
+    if (!socket.destroyed) socket.write(JSON.stringify({ query_id: queryId, action }) + '\n');
+  }
+
+  function resolveWriteQuery(entry: WriteQueryEntry, choice: WriteChoice): void {
+    if (resolved.has(entry.id)) return;
+    const action = choice === 'deny' ? 'deny' : 'allow';
+
+    try {
+      if (action === 'allow') {
+        if (choice === 'session') {
+          sessionAllowedWritePaths.add(entry.path);
+        } else if (choice === 'project' || choice === 'global') {
+          const directory = api.state.path.directory || process.cwd();
+          const { globalPath, projectPath } = getConfigPaths(directory);
+          const update = updateForPermission({
+            permission: 'write',
+            metadata: { filepath: entry.path },
+          });
+          if (update) writeConfigFile(choice === 'project' ? projectPath : globalPath, update);
+        }
+      }
+
+      respondWriteQuery(entry.socket, entry.queryId, action);
+      api.ui.toast({
+        title: 'Sandbox',
+        message: action === 'deny' ? `Write denied: ${entry.path}` : `Write allowed (${choice})`,
+        variant: action === 'deny' ? 'warning' : 'success',
+      });
+    } catch {
+      // Persisting failed — still release the held syscall by denying it.
+      respondWriteQuery(entry.socket, entry.queryId, 'deny');
+    } finally {
+      liveQueries.delete(entry);
+      finishActive(entry.id);
+    }
+  }
+
+  function showWriteQuery(entry: WriteQueryEntry): void {
+    activeId = entry.id;
+
+    void api.attention.notify({
+      title: 'Sandbox write blocked',
+      message: entry.path,
+      sound: { name: 'permission' },
+      notification: true,
+    });
+
+    // A selection pops the dialog (firing `onClose`); track it so the esc-path
+    // deny does not override the user's choice. A held syscall must always be
+    // answered, so esc/dismiss denies rather than leaving it unresolved.
+    let selectionMade = false;
+
+    api.ui.dialog.replace(
+      () =>
+        api.ui.DialogSelect<WriteChoice>({
+          title: 'Sandbox Write Blocked',
+          placeholder: `Write blocked: ${entry.path}`,
+          options: [
+            {
+              title: 'Allow once',
+              value: 'once',
+              category: 'This write',
+              description: 'Permit this write and continue',
+            },
+            {
+              title: 'Allow for session',
+              value: 'session',
+              category: 'This write',
+              description: 'Permit writes to this path for the rest of this session',
+            },
+            {
+              title: 'Allow for project',
+              value: 'project',
+              category: 'Persist to sandbox.json',
+              description: 'Add to .opencode/sandbox.json allowWrite and permit',
+            },
+            {
+              title: 'Allow globally',
+              value: 'global',
+              category: 'Persist to sandbox.json',
+              description: 'Add to ~/.config/opencode/sandbox.json allowWrite and permit',
+            },
+            {
+              title: 'Deny',
+              value: 'deny',
+              category: 'Deny',
+              description: 'Block this write',
+            },
+          ],
+          onSelect: (option) => {
+            selectionMade = true;
+            resolveWriteQuery(entry, option.value);
+          },
+        }),
+      () => {
+        if (!selectionMade) resolveWriteQuery(entry, 'deny');
+      },
+    );
+  }
+
   const unsubscribeAsked = api.event.on('permission.asked', (event) => {
     const pending = event.properties as PendingPermission;
     enqueue(pending);
@@ -233,6 +377,98 @@ const tui: TuiPlugin = async (api, options, meta) => {
   const unsubscribeReplied = api.event.on('permission.replied', (event) => {
     finishActive(event.properties.requestID);
   });
+
+  // Query-response socket server (Linux-only — landstrip's socket protocol lives
+  // in the seccomp broker). The server plugin connects each sandboxed run's
+  // fd 3 here via a /dev/tcp redirect and we answer held writes interactively.
+  const sockets = new Set<NetSocket>();
+  let socketServer: ReturnType<typeof createServer> | undefined;
+
+  if (process.platform === 'linux') {
+    const baseDirectory = api.state.path.directory || process.cwd();
+    let socketSeq = 0;
+
+    socketServer = createServer((socket) => {
+      sockets.add(socket);
+      socket.setEncoding('utf8');
+      const socketId = ++socketSeq;
+      const seen = new Set<number>();
+      let buffer = '';
+
+      socket.on('data', (chunk: string | Buffer) => {
+        buffer += chunk.toString();
+        if (buffer.length > 1024 * 1024) {
+          socket.destroy();
+          return;
+        }
+
+        let newline: number;
+        while ((newline = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+
+          for (const trap of parseLandstripTraps(line)) {
+            if (
+              trap.kind !== 'filesystem' ||
+              trap.state !== 'query' ||
+              trap.operation !== 'write'
+            ) {
+              continue;
+            }
+            if (typeof trap.queryId !== 'number' || seen.has(trap.queryId)) continue;
+            seen.add(trap.queryId);
+
+            if (sessionAllowedWritePaths.has(trap.path)) {
+              respondWriteQuery(socket, trap.queryId, 'allow');
+              continue;
+            }
+
+            const entry: WriteQueryEntry = {
+              kind: 'write-query',
+              id: `landstrip-write:${socketId}:${trap.queryId}`,
+              socket,
+              queryId: trap.queryId,
+              path: trap.path,
+            };
+            liveQueries.add(entry);
+            enqueueEntry(entry);
+          }
+        }
+      });
+
+      const cleanup = () => {
+        sockets.delete(socket);
+        // The child is gone; drop our holds for this socket so the queue moves on.
+        // Deleting the current entry mid-iteration is well-defined for a Set.
+        for (const entry of liveQueries) {
+          if (entry.socket !== socket) continue;
+          liveQueries.delete(entry);
+          finishActive(entry.id);
+        }
+      };
+      socket.on('error', cleanup);
+      socket.on('close', cleanup);
+    });
+
+    socketServer.on('error', () => {
+      try {
+        removeDiscoveryFile(baseDirectory);
+      } catch {
+        // best effort
+      }
+    });
+
+    socketServer.listen(0, '127.0.0.1', () => {
+      const address = socketServer?.address() as AddressInfo | null;
+      if (address && typeof address === 'object') {
+        try {
+          writeDiscoveryPort(baseDirectory, address.port);
+        } catch {
+          // best effort — falls back to the server's reset model
+        }
+      }
+    });
+  }
 
   const showSandbox = () => {
     const directory = api.state.path.directory || process.cwd();
@@ -335,6 +571,22 @@ const tui: TuiPlugin = async (api, options, meta) => {
   api.lifecycle.onDispose(() => {
     unsubscribeAsked();
     unsubscribeReplied();
+
+    // Deny any still-held writes so the sandboxed children don't hang, then
+    // tear down the socket server and drop the discovery file.
+    for (const entry of liveQueries) {
+      respondWriteQuery(entry.socket, entry.queryId, 'deny');
+      liveQueries.delete(entry);
+    }
+    for (const socket of sockets) socket.destroy();
+    if (socketServer) {
+      socketServer.close();
+      try {
+        removeDiscoveryFile(api.state.path.directory || process.cwd());
+      } catch {
+        // best effort
+      }
+    }
   });
 };
 

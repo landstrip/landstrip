@@ -11,14 +11,18 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { URL } from 'node:url';
 
 import {
+  type LandstripTrap,
   type SandboxConfig,
   type SandboxFilesystemConfig,
   extractDomainsFromCommand,
+  formatLandstripTraps,
   getConfigPaths,
   isRecord,
   landstripBinaryPath,
   loadConfig,
   normalizeOptions,
+  parseLandstripTraps,
+  readDiscoveryPort,
 } from './shared.js';
 
 interface LandstripPolicy {
@@ -31,13 +35,6 @@ interface LandstripPolicy {
   };
   filesystem: SandboxFilesystemConfig;
 }
-
-type LandstripTrap =
-  | { kind: 'filesystem'; operation: 'read' | 'write'; path: string; mechanism: string }
-  | { kind: 'network'; operation: string; target: string; mechanism: string }
-  | { kind: 'launch'; program: string; message: string }
-  | { kind: 'usage'; message: string }
-  | { kind: 'internal'; detail: Record<string, string> };
 
 interface BashSandboxState {
   originalCommand: string;
@@ -58,14 +55,9 @@ interface SandboxPermissionDecision {
 
 type ToastVariant = 'info' | 'success' | 'warning' | 'error';
 
-const LANDSTRIP_VERSION = [0, 15, 1] as const;
+const LANDSTRIP_VERSION = [0, 15, 8] as const;
 const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
-const LANDSTRIP_OPERATIONS = new Set<'read' | 'write'>(['read', 'write']);
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
-
-function isLandstripOperation(value: unknown): value is 'read' | 'write' {
-  return typeof value === 'string' && LANDSTRIP_OPERATIONS.has(value as 'read' | 'write');
-}
 
 function expandPath(filePath: string, baseDirectory: string): string {
   const expanded = filePath.replace(/^~(?=$|[/])/, homedir());
@@ -245,8 +237,8 @@ function extractBlockedPath(
   if (match) return normalizeBlockedPath(match[1], baseDirectory);
 
   // Landstrip structured trap format carrying a denied path
-  const landstripErrors = parseLandstripErrors(output);
-  for (const trap of landstripErrors) {
+  const landstripTraps = parseLandstripTraps(output);
+  for (const trap of landstripTraps) {
     if (trap.kind === 'filesystem') return normalizeBlockedPath(trap.path, baseDirectory);
     if (trap.kind === 'internal' && trap.detail.file) {
       return normalizeBlockedPath(trap.detail.file, baseDirectory);
@@ -255,7 +247,7 @@ function extractBlockedPath(
 
   // If landstrip reported a trap but without a path, try to
   // extract the blocked path from the command itself
-  if (landstripErrors.length > 0 && command) {
+  if (landstripTraps.length > 0 && command) {
     for (const candidate of extractCandidatePaths(command)) {
       const resolved = canonicalizePath(candidate, baseDirectory);
       return resolved;
@@ -403,95 +395,6 @@ function hasMinimumVersion(version: string, minimum: readonly [number, number, n
   }
 
   return true;
-}
-
-function decodeLandstripTrap(value: unknown): LandstripTrap | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  const mechanism = typeof record.mechanism === 'string' ? record.mechanism : '';
-
-  switch (record.kind) {
-    case 'filesystem': {
-      const { operation, path } = record;
-      if (!isLandstripOperation(operation) || typeof path !== 'string') return null;
-      return { kind: 'filesystem', operation, path, mechanism };
-    }
-    case 'network': {
-      const { operation, target } = record;
-      if (typeof operation !== 'string' || typeof target !== 'string') return null;
-      return { kind: 'network', operation, target, mechanism };
-    }
-    case 'launch': {
-      const { program, message } = record;
-      if (typeof program !== 'string') return null;
-      return { kind: 'launch', program, message: typeof message === 'string' ? message : '' };
-    }
-    case 'usage': {
-      const { message } = record;
-      if (typeof message !== 'string') return null;
-      return { kind: 'usage', message };
-    }
-    case 'internal': {
-      const detail: Record<string, string> = {};
-      const payload = record.detail;
-      if (typeof payload === 'object' && payload !== null && !Array.isArray(payload)) {
-        for (const [key, val] of Object.entries(payload as Record<string, unknown>)) {
-          detail[key] = typeof val === 'string' ? val : JSON.stringify(val);
-        }
-      }
-      return { kind: 'internal', detail };
-    }
-    default:
-      return null;
-  }
-}
-
-function parseLandstripErrors(output: string): LandstripTrap[] {
-  const traps: LandstripTrap[] = [];
-
-  for (const line of output.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0 || trimmed[0] !== '{') continue;
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-
-    const trap = decodeLandstripTrap(parsed);
-    if (trap) traps.push(trap);
-  }
-
-  return traps;
-}
-
-function formatLandstripTrap(trap: LandstripTrap): string {
-  switch (trap.kind) {
-    case 'filesystem':
-      return `landstrip: filesystem ${trap.operation} denied (${trap.path})${
-        trap.mechanism ? ` [${trap.mechanism}]` : ''
-      }`;
-    case 'network':
-      return `landstrip: network ${trap.operation} denied (${trap.target})${
-        trap.mechanism ? ` [${trap.mechanism}]` : ''
-      }`;
-    case 'launch':
-      return `landstrip: launch failed (${trap.program})${trap.message ? `: ${trap.message}` : ''}`;
-    case 'usage':
-      return `landstrip: usage error: ${trap.message}`;
-    case 'internal': {
-      const detail = Object.entries(trap.detail)
-        .map(([key, val]) => `${key}: ${val}`)
-        .join(', ');
-      return `landstrip: internal error${detail ? ` (${detail})` : ''}`;
-    }
-  }
-}
-
-function formatLandstripErrors(traps: LandstripTrap[]): string {
-  return traps.map(formatLandstripTrap).join('\n');
 }
 
 function splitHostPort(target: string, defaultPort: number): { host: string; port: number } | null {
@@ -727,15 +630,37 @@ function shellArgs(shell: string, command: string): string[] {
   return [shell, '-lc', command];
 }
 
-function buildWrappedCommand(policyPath: string, shell: string, command: string): string {
-  const args = ['-p', policyPath, ...shellArgs(shell, command)];
+// The query-response port is published by the TUI plugin and is Linux-only (the
+// socket protocol exists only in landstrip's seccomp broker).
+function socketQueryPort(baseDirectory: string): number | null {
+  if (process.platform !== 'linux') return null;
+  return readDiscoveryPort(baseDirectory);
+}
 
-  return [landstripBinaryPath(), ...args].map(shellQuote).join(' ');
+function buildWrappedCommand(
+  policyPath: string,
+  shell: string,
+  command: string,
+  trapPort: number | null,
+): string {
+  const baseArgs = ['-p', policyPath, ...shellArgs(shell, command)];
+  const plain = [landstripBinaryPath(), ...baseArgs].map(shellQuote).join(' ');
+  if (trapPort === null) return plain;
+
+  // Connect fd 3 to the TUI's query-response socket BEFORE landstrip applies the
+  // sandbox, so a denied write can be approved live instead of forcing a re-run.
+  // The `&&`/`||` guard falls back to the plain (no --trap-fd) invocation when the
+  // redirect fails — a dead port, a non-bash outer shell without /dev/tcp, or an
+  // outer `set -e` — so a failed connect never hands the broker a dead fd 3.
+  const trapped = [landstripBinaryPath(), '--trap-fd', '3', ...baseArgs].map(shellQuote).join(' ');
+  return `{ exec 3<>/dev/tcp/127.0.0.1/${trapPort} ; } 2>/dev/null && ${trapped} || ${plain}`;
 }
 
 function isGeneratedWrappedCommand(command: string): boolean {
   return (
-    command.startsWith(`${shellQuote(landstripBinaryPath())} `) &&
+    // `.includes` rather than `.startsWith`: the query-response form prefixes a
+    // `{ exec 3<>/dev/tcp/...; } && ` redirect before the landstrip invocation.
+    command.includes(`${shellQuote(landstripBinaryPath())} `) &&
     command.includes(` ${shellQuote('-p')} `) &&
     command.includes('opencode-landstrip-')
   );
@@ -779,7 +704,10 @@ function extractOriginalCommand(wrappedCommand: string): string | null {
   const flagIdx = pIdx + 3;
   const flag = args[flagIdx];
   if (flag !== '-lc' && flag !== '-c') return null;
-  return args.slice(flagIdx + 1).join(' ');
+  // The query-response form appends `|| <plain invocation>`; stop at that
+  // separator so the fallback branch is not folded into the recovered command.
+  const end = args.indexOf('||', flagIdx + 1);
+  return (end === -1 ? args.slice(flagIdx + 1) : args.slice(flagIdx + 1, end)).join(' ');
 }
 
 function getToolPath(args: Record<string, unknown>): string | undefined {
@@ -1151,6 +1079,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       policy.path,
       configuredShell ?? process.env.SHELL ?? '/bin/sh',
       originalCommand,
+      socketQueryPort(directory),
     );
 
     activeBash.set(callID, {
@@ -1316,9 +1245,13 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       }
 
       const outputText = output?.output ?? '';
-      const errors = parseLandstripErrors(outputText);
+      // Query traps were already resolved interactively over the socket by the
+      // TUI plugin; only terminal (info) traps belong in the after-the-fact toast.
+      const errors = parseLandstripTraps(outputText).filter(
+        (trap: LandstripTrap) => !(trap.kind === 'filesystem' && trap.state === 'query'),
+      );
       if (errors.length > 0) {
-        const message = formatLandstripErrors(errors);
+        const message = formatLandstripTraps(errors);
         await client.tui
           ?.showToast?.({
             body: { title: 'opencode-landstrip', message, variant: 'error' },
