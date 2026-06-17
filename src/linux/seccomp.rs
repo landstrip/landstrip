@@ -16,7 +16,7 @@ use super::fd::close_inherited_fds;
 use super::landlock::{LandlockFeatures, enforce_access_policy};
 use crate::paths::normalize_path;
 use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
-use crate::trap::{ProcessContext, Result, Trap, TrapOperation};
+use crate::trap::{NetworkOperation, ProcessContext, Result, Trap, TrapOperation};
 use crate::trap_fd::TrapFd;
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, fcntl};
@@ -297,21 +297,6 @@ fn supervise_child(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum NetworkOperation {
-    Connect,
-    Bind,
-}
-
-impl NetworkOperation {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Connect => "connect",
-            Self::Bind => "bind",
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum Denial {
     Filesystem(
@@ -347,9 +332,7 @@ impl Denial {
                     process,
                 )
             }
-            Self::Network(operation, target, process) => {
-                Trap::network(operation.as_str(), target, process)
-            }
+            Self::Network(operation, target, process) => Trap::network(operation, target, process),
         }
     }
 }

@@ -129,9 +129,9 @@ The trap kinds are:
   the tool when available; `syscall`, `errno`, `flags`, `reason`,
   `suggested_grant`, and `process` provide machine-readable routing context.
 - `Network`: a denied TCP connect or bind object. The stable `code` is
-  `NET_CONNECT_DENIED`, `NET_BIND_DENIED`, or `NET_DENIED`; `operation` is
-  `connect` or `bind`; `target` is `address:port`; `syscall`, `errno`, and
-  `process` provide routing context.
+  `NET_CONNECT_DENIED` or `NET_BIND_DENIED`; `operation` is `connect` or `bind`;
+  `target` is `address:port`; `syscall`, `errno`, and `process` provide routing
+  context.
 - `Launch`: the tool could not be started, as `[program, message]`.
 - `Usage`: a command-line usage error, as a message string. Usage errors exit
   with status 2.

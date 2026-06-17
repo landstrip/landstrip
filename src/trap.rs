@@ -18,6 +18,29 @@ pub(crate) enum TrapOperation {
     Write,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum NetworkOperation {
+    Connect,
+    Bind,
+}
+
+impl NetworkOperation {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Connect => "NET_CONNECT_DENIED",
+            Self::Bind => "NET_BIND_DENIED",
+        }
+    }
+
+    fn syscall(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Bind => "bind",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct ProcessContext {
     pub(crate) pid: u32,
@@ -103,20 +126,15 @@ impl Trap {
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn network(
-        operation: &'static str,
+        operation: NetworkOperation,
         target: String,
         process: ProcessContext,
     ) -> Self {
-        let code = match operation {
-            "connect" => "NET_CONNECT_DENIED",
-            "bind" => "NET_BIND_DENIED",
-            _ => "NET_DENIED",
-        };
         Self::Network(Box::new(NetworkTrap {
-            code,
-            operation,
+            code: operation.code(),
+            operation: operation.syscall(),
             target,
-            syscall: operation,
+            syscall: operation.syscall(),
             errno: "EACCES",
             mechanism: "seccomp",
             process,
