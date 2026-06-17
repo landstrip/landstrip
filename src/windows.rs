@@ -3,7 +3,7 @@
 
 //! Windows sandbox platform using LPAC `AppContainer`.
 
-use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
+use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess, WindowsPolicy};
 use crate::trap::{Result, Trap};
 use crate::trap_fd::TrapFd;
 use std::collections::hash_map::DefaultHasher;
@@ -19,11 +19,12 @@ use windows_sys::Win32::Foundation::{
     WAIT_FAILED,
 };
 use windows_sys::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetEntriesInAclW,
-    SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ACCESS_MODE, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, REVOKE_ACCESS,
+    SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
     ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, FreeSid, PSID, SECURITY_CAPABILITIES,
@@ -34,12 +35,16 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
+use windows_sys::Win32::System::JobObjects::{
+    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectExtendedLimitInformation, SetInformationJobObject,
+};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
     GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTUPINFOEXW,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_INFORMATION, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
@@ -62,10 +67,11 @@ pub(crate) fn execute(
 
     let moniker = appcontainer_moniker(tool, policy);
     let profile = AppContainerProfile::new(&moniker)?;
-    grant_policy_access(policy, profile.sid())?;
+    let _grants = grant_policy_access(policy, profile.sid())?;
 
     let grant_network = policy.network_access.is_unrestricted();
-    let exit_code = create_process_in_appcontainer(profile.sid(), tool, args, grant_network)?;
+    let exit_code =
+        create_process_in_appcontainer(profile.sid(), tool, args, grant_network, &policy.windows)?;
     std::process::exit(i32::from_ne_bytes(exit_code.to_ne_bytes()));
 }
 
@@ -96,11 +102,16 @@ fn appcontainer_moniker(tool: &OsStr, policy: &AccessPolicy) -> String {
     let mut hasher = DefaultHasher::new();
     PathBuf::from(tool).hash(&mut hasher);
     policy.hash(&mut hasher);
-    format!("landstrip.{:016x}", hasher.finish())
+    format!(
+        "landstrip.{:016x}.{:x}",
+        hasher.finish(),
+        std::process::id()
+    )
 }
 
 struct AppContainerProfile {
     sid: PSID,
+    moniker: Vec<u16>,
 }
 
 impl AppContainerProfile {
@@ -121,7 +132,7 @@ impl AppContainerProfile {
         };
 
         if hr == 0 {
-            return Ok(Self { sid });
+            return Ok(Self { sid, moniker });
         }
 
         if hresult_value(hr) & 0xffff != ERROR_ALREADY_EXISTS {
@@ -139,7 +150,7 @@ impl AppContainerProfile {
                 .with_detail("code", code.to_string()));
         }
 
-        Ok(Self { sid })
+        Ok(Self { sid, moniker })
     }
 
     fn sid(&self) -> PSID {
@@ -149,22 +160,30 @@ impl AppContainerProfile {
 
 impl Drop for AppContainerProfile {
     fn drop(&mut self) {
+        if !self.moniker.is_empty() {
+            unsafe { DeleteAppContainerProfile(self.moniker.as_ptr()) };
+        }
         if !self.sid.is_null() {
             unsafe { FreeSid(self.sid) };
         }
     }
 }
 
-fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<()> {
+fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess> {
     let read_roots = match &policy.read_access {
         ReadAccess::AllowRoots(read_roots) => read_roots,
         ReadAccess::Unrestricted => {
             return Err(Trap::internal().with_detail("feature", "read access"));
         }
     };
+    let mut granted = GrantedAccess {
+        sid,
+        paths: Vec::with_capacity(read_roots.len() + policy.write_roots.len()),
+    };
 
     for path in read_roots {
         grant_path_access(path, sid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
+        granted.paths.push(path.clone());
     }
 
     for path in &policy.write_roots {
@@ -173,12 +192,34 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<()> {
             sid,
             FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
         )?;
+        granted.paths.push(path.clone());
     }
 
-    Ok(())
+    Ok(granted)
+}
+
+struct GrantedAccess {
+    sid: PSID,
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for GrantedAccess {
+    fn drop(&mut self) {
+        for path in self.paths.iter().rev() {
+            let _ = revoke_path_access(path, self.sid);
+        }
+    }
 }
 
 fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
+    set_path_access(path, sid, access, GRANT_ACCESS)
+}
+
+fn revoke_path_access(path: &Path, sid: PSID) -> Result<()> {
+    set_path_access(path, sid, 0, REVOKE_ACCESS)
+}
+
+fn set_path_access(path: &Path, sid: PSID, access: u32, mode: ACCESS_MODE) -> Result<()> {
     let path = path
         .as_os_str()
         .encode_wide()
@@ -207,7 +248,7 @@ fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
 
     let explicit_access = EXPLICIT_ACCESS_W {
         grfAccessPermissions: access,
-        grfAccessMode: GRANT_ACCESS,
+        grfAccessMode: mode,
         grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: ptr::null_mut(),
@@ -253,11 +294,55 @@ fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
     Ok(())
 }
 
+struct SandboxJob {
+    handle: Handle,
+}
+
+impl SandboxJob {
+    fn new() -> Result<Self> {
+        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if handle.is_null() {
+            let code = unsafe { GetLastError() };
+            return Err(Trap::internal()
+                .with_detail("api", "CreateJobObjectW")
+                .with_detail("code", code.to_string()));
+        }
+
+        let job = Self {
+            handle: Handle(handle),
+        };
+        let mut limits = unsafe { mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.handle.0,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                u32::try_from(mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .map_err(|_| Trap::internal())?,
+            )
+        };
+        if ok == 0 {
+            let code = unsafe { GetLastError() };
+            return Err(Trap::internal()
+                .with_detail("api", "SetInformationJobObject")
+                .with_detail("code", code.to_string()));
+        }
+
+        Ok(job)
+    }
+
+    fn as_raw(&self) -> HANDLE {
+        self.handle.0
+    }
+}
+
 fn create_process_in_appcontainer(
     sid: PSID,
     tool: &OsStr,
     args: &[OsString],
     grant_network: bool,
+    windows_policy: &WindowsPolicy,
 ) -> Result<u32> {
     let command_line = command_line(tool, args)?;
     let mut command_line = wide_string(&command_line);
@@ -265,7 +350,11 @@ fn create_process_in_appcontainer(
     startup_info.StartupInfo.cb =
         u32::try_from(mem::size_of::<STARTUPINFOEXW>()).map_err(|_| Trap::internal())?;
 
-    let mut attribute_list = ProcThreadAttributeList::new(2)?;
+    let job = SandboxJob::new()?;
+    let mut job_handle = job.as_raw();
+    let mut mitigation_policy = windows_policy.mitigation_policy;
+    let attribute_count = if mitigation_policy == 0 { 3 } else { 4 };
+    let mut attribute_list = ProcThreadAttributeList::new(attribute_count)?;
     let mut network_capabilities = NetworkCapabilities::new(grant_network)?;
     let mut capabilities = SECURITY_CAPABILITIES {
         AppContainerSid: sid,
@@ -287,6 +376,20 @@ fn create_process_in_appcontainer(
         (&raw mut all_packages_policy).cast(),
         mem::size_of::<u32>(),
     )?;
+    update_attribute(
+        attribute_list.as_mut_ptr(),
+        PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+        (&raw mut job_handle).cast(),
+        mem::size_of::<HANDLE>(),
+    )?;
+    if mitigation_policy != 0 {
+        update_attribute(
+            attribute_list.as_mut_ptr(),
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
+            (&raw mut mitigation_policy).cast(),
+            mem::size_of::<u64>(),
+        )?;
+    }
 
     startup_info.lpAttributeList = attribute_list.as_mut_ptr();
     let mut process_info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };

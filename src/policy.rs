@@ -11,7 +11,7 @@
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
 //! while lowering the policy.
 
-use crate::config::{SandboxFilesystem, SandboxNetwork};
+use crate::config::{SandboxFilesystem, SandboxNetwork, SandboxWindows};
 use crate::paths::normalize_path_lexically;
 #[cfg(target_os = "macos")]
 use crate::paths::normalize_roots_lexically;
@@ -31,6 +31,7 @@ pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
     pub(crate) read_access: ReadAccess,
     pub(crate) network_access: NetworkAccess,
+    pub(crate) windows: WindowsPolicy,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -74,9 +75,15 @@ pub(crate) enum UnixSocketAccess {
     AllowPaths(Vec<PathBuf>),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct WindowsPolicy {
+    pub(crate) mitigation_policy: u64,
+}
+
 pub(crate) fn resolve_policy(
     filesystem: &SandboxFilesystem,
     network: &SandboxNetwork,
+    windows: &SandboxWindows,
     policy_base: &Path,
 ) -> Result<AccessPolicy> {
     let home_dir = dirs::home_dir();
@@ -107,9 +114,33 @@ pub(crate) fn resolve_policy(
         write_roots,
         read_access,
         network_access: lower_network_policy(network, &policy_base, home)?,
+        windows: lower_windows_policy(windows),
     })
 }
 
+fn lower_windows_policy(windows: &SandboxWindows) -> WindowsPolicy {
+    let mut mitigation_policy = 0;
+    if windows.disable_win32k {
+        mitigation_policy |= 0x1 << 28;
+    }
+    if windows.disable_extension_points {
+        mitigation_policy |= 0x1_u64 << 32;
+    }
+    if windows.strict_handle_checks {
+        mitigation_policy |= 0x1 << 24;
+    }
+    if windows.image_load_no_remote {
+        mitigation_policy |= 0x1_u64 << 52;
+    }
+    if windows.image_load_no_low_label {
+        mitigation_policy |= 0x1_u64 << 56;
+    }
+    if windows.image_load_prefer_system32 {
+        mitigation_policy |= 0x1_u64 << 60;
+    }
+
+    WindowsPolicy { mitigation_policy }
+}
 fn lower_network_policy(
     network: &SandboxNetwork,
     policy_base: &Path,

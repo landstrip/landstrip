@@ -16,6 +16,7 @@ use std::path::PathBuf;
 pub(crate) struct Settings {
     pub(crate) filesystem: SandboxFilesystem,
     pub(crate) network: SandboxNetwork,
+    pub(crate) windows: SandboxWindows,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -41,6 +42,18 @@ pub(crate) struct SandboxNetwork {
     pub(crate) allow_unix_sockets: Vec<String>,
     pub(crate) http_proxy_port: Option<u16>,
     pub(crate) socks_proxy_port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct SandboxWindows {
+    pub(crate) disable_win32k: bool,
+    pub(crate) disable_extension_points: bool,
+    pub(crate) strict_handle_checks: bool,
+    pub(crate) image_load_no_remote: bool,
+    pub(crate) image_load_no_low_label: bool,
+    pub(crate) image_load_prefer_system32: bool,
 }
 
 pub(crate) fn load_settings(policy_paths: &[PathBuf], format: PolicyFormat) -> Result<Settings> {

@@ -51,7 +51,12 @@ fn run_with_cli(cli: &Cli) -> Result<()> {
 
     log::debug!("cli: cwd: {}", cwd.display());
     let settings = load_settings(&cli.policy_paths, cli.format)?;
-    let policy = resolve_policy(&settings.filesystem, &settings.network, &cwd)?;
+    let policy = resolve_policy(
+        &settings.filesystem,
+        &settings.network,
+        &settings.windows,
+        &cwd,
+    )?;
 
     let trap_fd = TrapFd::from_fd(cli.trap_fd);
     platform::execute(&policy, &cli.tool, &cli.tool_args, trap_fd)?;

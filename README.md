@@ -23,25 +23,30 @@ binary package.
 
 | Area         | macOS                    | Linux                        | Windows                         |
 | ------------ | ------------------------ | ---------------------------- | ------------------------------- |
-| Policy       | path based rules         | file based rules             | access control list (ACL)       |
-| Timing       | dynamic subset of paths  | file based static ruleset    | persistent ACLs                 |
+| Policy       | path based rules         | file based rules             | per-run AppContainer ACLs       |
+| Timing       | dynamic subset of paths  | file based static ruleset    | per-run ACL grants              |
 | TCP          | localhost proxy ports    | loopback proxy ports         | allow all or deny all           |
 | Unix sockets | allowlist                | allowlist via seccomp broker | allow all or deny all           |
 
 ### Windows AppContainer
 
 Win32 API provides AppContainer for application level sandboxing. The platform
-grants the generated AppContainer SID access to the lowered read and write
-roots, so Windows policies must use explicit read allowlists.
+creates a per-run LPAC AppContainer profile, grants its SID access to the lowered
+read and write roots, and removes those grants after the sandboxed process tree
+exits. Windows policies must use explicit read allowlists.
 
-With the current knowledge, the network access is gated by the AppContainer
-capabilities. That said, this might also be due my limited knowledge of Win32
-API.
+Landstrip assigns the sandboxed process to a Job Object with
+`KILL_ON_JOB_CLOSE`, so child processes are kept in the sandbox process tree and
+are terminated when the launcher exits.
 
-`allowNetwork` grants the internet and private-network capabilities, while the
-default container holds none and denies all network access. Fine-grained TCP and
-Unix socket policies are rejected because the container cannot enforce them in
-the process granularity.
+`allowNetwork` grants the internet and private-network AppContainer
+capabilities, while the default container holds none and denies all network
+access.
+
+AppContainer capabilities are coarse: fine-grained TCP policies by host or port
+require Windows Filtering Platform rules keyed by the AppContainer SID. I.e.,
+this would require elevated privileges, which is not sustainable for a agent
+sandbox runtime, which should rely on unprivileged tools and techniques.
 
 ## Policy Format
 
@@ -65,6 +70,22 @@ filesystem:
     ~/.ssh/config
 network:
   allowNetwork: true
+```
+
+Windows-only hardening options live under `windows`. They are optional because
+some tools, shells, JITs, and GUI helpers may rely on the blocked behaviors:
+
+```json
+{
+  "windows": {
+    "disableWin32k": true,
+    "disableExtensionPoints": true,
+    "strictHandleChecks": true,
+    "imageLoadNoRemote": true,
+    "imageLoadNoLowLabel": true,
+    "imageLoadPreferSystem32": true
+  }
+}
 ```
 
 ## Network Policy
