@@ -123,11 +123,15 @@ kind name as the single top-level key.
 
 The trap kinds are:
 
-- `Filesystem`: a filesystem access denial, as `[operation, path, mechanism]`
-  where the operation is `read` or `write` and the mechanism is the kernel
-  enforcement layer that detected the denial.
-- `Network`: a denied TCP connect or bind, as `[operation, target, mechanism]`
-  where the operation is `connect` or `bind` and the target is `address:port`.
+- `Filesystem`: a filesystem access denial object. The stable `code` is
+  `FS_READ_DENIED` or `FS_WRITE_DENIED`; `operation` is `read` or `write`;
+  `path` is the resolved path; `requested_path` is the original path supplied by
+  the tool when available; `syscall`, `errno`, `flags`, `reason`,
+  `suggested_grant`, and `process` provide machine-readable routing context.
+- `Network`: a denied TCP connect or bind object. The stable `code` is
+  `NET_CONNECT_DENIED`, `NET_BIND_DENIED`, or `NET_DENIED`; `operation` is
+  `connect` or `bind`; `target` is `address:port`; `syscall`, `errno`, and
+  `process` provide routing context.
 - `Launch`: the tool could not be started, as `[program, message]`.
 - `Usage`: a command-line usage error, as a message string. Usage errors exit
   with status 2.
@@ -135,10 +139,40 @@ The trap kinds are:
   diagnostic key/value pairs (for example `source`, `file`, or platform API
   details).
 
+Example of a filesystem denial:
+
+```json
+{
+  "Filesystem": {
+    "code": "FS_WRITE_DENIED",
+    "operation": "write",
+    "path": "/repo/out",
+    "requested_path": "out",
+    "syscall": "openat",
+    "errno": "EACCES",
+    "flags": [
+      "O_WRONLY",
+      "O_CREAT",
+      "O_TRUNC"
+    ],
+    "reason": "not_in_allow_write",
+    "suggested_grant": {
+      "allowWrite": "/repo/out"
+    },
+    "mechanism": "seccomp",
+    "process": {
+      "pid": 1234,
+      "exe": "/usr/bin/sh",
+      "cwd": "/repo"
+    }
+  }
+}
+```
+
 Logs and sandboxed tool output are not part of the response. Normal successful
 tool execution does not print a landstrip response unless a write denial was
-observed (`{"Filesystem":["write","/repo/out","seccomp"]}`), because standard error
-belongs to landstrip; standard output belongs to the sandboxed tool.
+observed, because standard error belongs to landstrip; standard output belongs
+to the sandboxed tool.
 
 ## Trap FD
 
@@ -151,15 +185,53 @@ landstrip --trap-fd 3 -p policy.json cargo test 3>landstrip-traps.txt
 ```
 
 Linux filesystem and network denials observed by the seccomp broker are
-emitted with the same shapes as standard error:
+emitted with the same object shapes as standard error:
 
 ```json
-{"Filesystem":["write","/repo/out","seccomp"]}
-{"Network":["connect","127.0.0.1:9999","seccomp"]}
+{
+  "Filesystem": {
+    "code": "FS_WRITE_DENIED",
+    "operation": "write",
+    "path": "/repo/out",
+    "requested_path": "out",
+    "syscall": "openat",
+    "errno": "EACCES",
+    "flags": [
+      "O_WRONLY",
+      "O_CREAT",
+      "O_TRUNC"
+    ],
+    "reason": "not_in_allow_write",
+    "suggested_grant": {
+      "allowWrite": "/repo/out"
+    },
+    "mechanism": "seccomp",
+    "process": {
+      "pid": 1234,
+      "exe": "/usr/bin/sh",
+      "cwd": "/repo"
+    }
+  }
+}
+{
+  "Network": {
+    "code": "NET_CONNECT_DENIED",
+    "operation": "connect",
+    "target": "127.0.0.1:9999",
+    "syscall": "connect",
+    "errno": "EACCES",
+    "mechanism": "seccomp",
+    "process": {
+      "pid": 1234,
+      "exe": "/usr/bin/nc",
+      "cwd": "/repo"
+    }
+  }
+}
 ```
 
-The mechanism element records the kernel enforcement layer that detected
-the denial (e.g. `seccomp` or `landlock`).
+The `mechanism` field records the kernel enforcement layer that detected the
+denial (e.g. `seccomp` or `landlock`).
 
 This stream is separate from the sandboxed tool's output. If the option is
 omitted, landstrip is quiet unless it has to report a policy, launch, or
