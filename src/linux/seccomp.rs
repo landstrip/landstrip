@@ -1296,6 +1296,7 @@ impl Open {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_openat(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
@@ -1385,6 +1386,25 @@ fn handle_openat(
                 return Err(BrokerError::SystemCall {
                     errno: libc::ENOENT,
                 });
+            }
+            if query_enabled {
+                let qid = *next_query_id;
+                *next_query_id += 1;
+                let grant = Grant::open(&resolved, flags, mode);
+                return Ok(NotificationResult::query(
+                    qid,
+                    Trap::filesystem_query(
+                        TrapOperation::Read,
+                        resolved,
+                        path,
+                        syscall_name,
+                        open_flags(flags),
+                        reason,
+                        process_context(request.pid),
+                        qid,
+                    ),
+                    grant,
+                ));
             }
             denials.record(Denial::Filesystem(
                 TrapOperation::Read,
