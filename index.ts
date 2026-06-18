@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) Jarkko Sakkinen 2026
 
-/// <reference path="./landstrip.d.ts" />
-
 import type {
   AgentToolResult,
   AgentToolUpdateCallback,
@@ -68,6 +66,15 @@ interface SandboxConfig {
   enabled: boolean;
   network: SandboxNetworkConfig;
   filesystem: SandboxFilesystemConfig;
+}
+
+type SandboxFilesystemConfigFile = Partial<SandboxFilesystemConfig>;
+type SandboxNetworkConfigFile = Partial<SandboxNetworkConfig>;
+
+interface SandboxConfigFile {
+  enabled?: boolean;
+  network?: SandboxNetworkConfigFile;
+  filesystem?: SandboxFilesystemConfigFile;
 }
 
 type SandboxConfigScope = 'global' | 'project';
@@ -155,8 +162,8 @@ function loadConfig(cwd: string): SandboxConfig {
   const projectConfigPath = join(cwd, '.pi', 'sandbox.json');
   const globalConfigPath = join(getAgentDir(), 'sandbox.json');
 
-  let globalConfig: Partial<SandboxConfig> = {};
-  let projectConfig: Partial<SandboxConfig> = {};
+  let globalConfig: SandboxConfigFile = {};
+  let projectConfig: SandboxConfigFile = {};
 
   if (existsSync(globalConfigPath)) {
     try {
@@ -182,7 +189,7 @@ function mergeArray(base: string[], override?: string[]): string[] {
   return [...new Set([...base, ...override])];
 }
 
-function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): SandboxConfig {
+function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxConfig {
   const network = overrides.network;
   const filesystem = overrides.filesystem;
 
@@ -212,7 +219,7 @@ function getConfigPaths(cwd: string): { globalPath: string; projectPath: string 
   };
 }
 
-function readOrEmptyConfig(configPath: string): Partial<SandboxConfig> {
+function readOrEmptyConfig(configPath: string): SandboxConfigFile {
   if (!existsSync(configPath)) return {};
   try {
     return JSON.parse(readFileSync(configPath, 'utf-8'));
@@ -221,7 +228,7 @@ function readOrEmptyConfig(configPath: string): Partial<SandboxConfig> {
   }
 }
 
-function writeConfigFile(configPath: string, config: Partial<SandboxConfig>): void {
+function writeConfigFile(configPath: string, config: SandboxConfigFile): void {
   mkdirSync(dirname(configPath), { recursive: true });
   writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
 }
@@ -255,7 +262,7 @@ async function addDomainToConfig(configPath: string, domain: string): Promise<vo
       ...config.network,
       allowedDomains: [...existing, domain],
       deniedDomains: config.network?.deniedDomains ?? [],
-    } as SandboxNetworkConfig;
+    };
     writeConfigFile(configPath, config);
   });
 }
@@ -269,7 +276,7 @@ async function addReadPathToConfig(configPath: string, pathToAdd: string): Promi
     config.filesystem = {
       ...config.filesystem,
       allowRead: [...existing, pathToAdd],
-    } as SandboxFilesystemConfig;
+    };
     writeConfigFile(configPath, config);
   });
 }
@@ -283,7 +290,7 @@ async function addWritePathToConfig(configPath: string, pathToAdd: string): Prom
     config.filesystem = {
       ...config.filesystem,
       allowWrite: [...existing, pathToAdd],
-    } as SandboxFilesystemConfig;
+    };
     writeConfigFile(configPath, config);
   });
 }
@@ -816,21 +823,25 @@ function proxyEnv(env: NodeJS.ProcessEnv | undefined, port: number): NodeJS.Proc
   };
 }
 
+function parseProxyPort(value: string | undefined, defaultPort: number): number | null {
+  const rawPort = value ?? String(defaultPort);
+  if (!/^\d+$/.test(rawPort)) return null;
+
+  const port = Number(rawPort);
+  return port >= 1 && port <= 65535 ? port : null;
+}
+
 function splitHostPort(target: string, defaultPort: number): { host: string; port: number } | null {
-  const bracketMatch = target.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  const bracketMatch = target.match(/^\[([^\]]+)\](?::(.*))?$/);
   if (bracketMatch) {
-    return {
-      host: bracketMatch[1],
-      port: bracketMatch[2] ? Number(bracketMatch[2]) : defaultPort,
-    };
+    const port = parseProxyPort(bracketMatch[2], defaultPort);
+    return port === null ? null : { host: bracketMatch[1], port };
   }
 
   const lastColon = target.lastIndexOf(':');
   if (lastColon > -1 && target.indexOf(':') === lastColon) {
-    return {
-      host: target.slice(0, lastColon),
-      port: Number(target.slice(lastColon + 1)),
-    };
+    const port = parseProxyPort(target.slice(lastColon + 1), defaultPort);
+    return port === null ? null : { host: target.slice(0, lastColon), port };
   }
 
   return { host: target, port: defaultPort };
@@ -853,20 +864,28 @@ function pipeSockets(client: Socket, upstream: Socket, initialData?: Buffer): vo
 
 type LandstripBashTool = ReturnType<typeof createBashToolDefinition>;
 
+/** Options for creating a landstrip sandbox integration. */
 export interface LandstripIntegrationOptions {
+  /** Register a sandboxed bash tool when the integration is registered. */
   registerBashTool?: boolean;
+  /** Working directory used when registering the default bash tool. */
   cwd?: string;
 }
 
+/** Landstrip sandbox integration hooks for Pi. */
 export interface LandstripIntegration {
+  /** Create a bash tool definition that runs commands through landstrip when enabled. */
   createBashTool(cwd: string, ctx?: ExtensionContext): LandstripBashTool;
+  /** Register the integration's tools, events, flags, and commands with Pi. */
   register(pi: ExtensionAPI): void;
 }
 
+/** Register the landstrip extension with Pi. */
 export default function (pi: ExtensionAPI) {
   createLandstripIntegration().register(pi);
 }
 
+/** Create a landstrip integration for registration or custom embedding. */
 export function createLandstripIntegration(
   options: LandstripIntegrationOptions = {},
 ): LandstripIntegration {
@@ -1037,7 +1056,13 @@ export function createLandstripIntegration(
           denyProxyRequest(client, '400 Bad Request');
           return;
         }
-        url = new URL(`http://${host}${rawTarget}`);
+
+        try {
+          url = new URL(`http://${host}${rawTarget}`);
+        } catch {
+          denyProxyRequest(client, '400 Bad Request');
+          return;
+        }
       }
 
       if (!(await ensureDomainAllowed(ctx, url.hostname, cwd))) {
@@ -1045,7 +1070,12 @@ export function createLandstripIntegration(
         return;
       }
 
-      const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+      const defaultPort = url.protocol === 'https:' ? 443 : 80;
+      const port = parseProxyPort(url.port || undefined, defaultPort);
+      if (port === null) {
+        denyProxyRequest(client, '400 Bad Request');
+        return;
+      }
       const path = `${url.pathname}${url.search}` || '/';
       lines[0] = `${method} ${path} ${version}`;
 
