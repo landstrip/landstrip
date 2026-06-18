@@ -10,6 +10,7 @@ import type {
   BashToolInput,
   ExtensionAPI,
   ExtensionContext,
+  Theme,
 } from '@earendil-works/pi-coding-agent';
 
 import { binaryPath } from '@landstrip/landstrip';
@@ -580,6 +581,25 @@ function setTuiStatus(ctx: ExtensionContext, key: string, value: string | undefi
   ctx.ui.setStatus(key, value);
 }
 
+function boxTop(theme: Theme, width: number, title: string): string {
+  const label = theme.fg('accent', ` ${title} `);
+  const fill = theme.fg('border', '─'.repeat(Math.max(0, width - 4 - visibleWidth(label))));
+  return `${theme.fg('border', '╭─')}${label}${fill}${theme.fg('border', '─╮')}`;
+}
+
+function boxRow(theme: Theme, width: number, content = ''): string {
+  const innerW = Math.max(1, width - 4);
+  const border = theme.fg('border', '│');
+  const line = truncateToWidth(content, innerW);
+  const pad = Math.max(0, innerW - visibleWidth(line));
+  return `${border} ${line}${' '.repeat(pad)} ${border}`;
+}
+
+function boxBottom(theme: Theme, width: number): string {
+  const border = (s: string) => theme.fg('border', s);
+  return `${border('╰')}${border('─'.repeat(Math.max(0, width - 2)))}${border('╯')}`;
+}
+
 async function showPermissionPrompt(
   ctx: ExtensionContext,
   title: string,
@@ -598,28 +618,14 @@ async function showPermissionPrompt(
 
       return {
         render(width: number): string[] {
-          const innerW = width - 4;
+          const innerW = Math.max(1, width - 4);
           const lines: string[] = [];
-          const border = theme.fg('border', '│');
           const dim = (s: string) => theme.fg('dim', s);
-          const borderFg = (s: string) => theme.fg('border', s);
 
-          // Top border with title
-          const label = ' Sandbox ';
-          const topLeft = borderFg('╭─');
-          const topRight = borderFg('─╮');
-          const topFill = borderFg('─'.repeat(Math.max(0, width - 4 - visibleWidth(label))));
-          lines.push(`${topLeft}${theme.fg('accent', label)}${topFill}${topRight}`);
-
-          // Blank spacing
-          lines.push(`${border} ${' '.repeat(innerW)} ${border}`);
-
-          // Title line
-          const titleText = truncateToWidth(theme.fg('warning', title), innerW);
-          const titlePad = Math.max(0, innerW - visibleWidth(titleText));
-          lines.push(`${border} ${titleText}${' '.repeat(titlePad)} ${border}`);
-
-          lines.push(`${border} ${' '.repeat(innerW)} ${border}`);
+          lines.push(boxTop(theme, width, 'Sandbox'));
+          lines.push(boxRow(theme, width));
+          lines.push(boxRow(theme, width, theme.fg('warning', title)));
+          lines.push(boxRow(theme, width));
 
           // Options
           for (let i = 0; i < options.length; i++) {
@@ -629,11 +635,11 @@ async function showPermissionPrompt(
 
             // Section divider before the permanent options (index 2 and 3)
             if (i === 2) {
-              lines.push(`${border} ${' '.repeat(innerW)} ${border}`);
+              lines.push(boxRow(theme, width));
               const secLabel = ' Permanent ';
               const secDash = '─'.repeat(Math.max(0, innerW - visibleWidth(secLabel)));
-              lines.push(`${border} ${dim(secDash + secLabel)} ${border}`);
-              lines.push(`${border} ${' '.repeat(innerW)} ${border}`);
+              lines.push(boxRow(theme, width, dim(secDash + secLabel)));
+              lines.push(boxRow(theme, width));
             }
 
             // Key badge
@@ -668,25 +674,16 @@ async function showPermissionPrompt(
             }
 
             const fullLine = ` ${cursor} ${keyBadge} ${label}${hint}`;
-            const line = truncateToWidth(fullLine, innerW);
-            const pad = Math.max(0, innerW - visibleWidth(line));
-            lines.push(`${border} ${line}${' '.repeat(pad)} ${border}`);
+            lines.push(boxRow(theme, width, fullLine));
           }
 
           // Footer
-          lines.push(`${border} ${' '.repeat(innerW)} ${border}`);
+          lines.push(boxRow(theme, width));
           const footerText = pendingAction
             ? '↑↓ navigate  enter confirm  esc cancel'
             : '↑↓ navigate  enter select  esc dismiss';
-          const footerLine = dim(footerText);
-          const footerPad = Math.max(0, innerW - visibleWidth(footerLine));
-          lines.push(`${border} ${footerLine}${' '.repeat(footerPad)} ${border}`);
-
-          // Bottom border
-          const botLeft = borderFg('╰');
-          const botRight = borderFg('╯');
-          const botFill = borderFg('─'.repeat(width - 2));
-          lines.push(`${botLeft}${botFill}${botRight}`);
+          lines.push(boxRow(theme, width, dim(footerText)));
+          lines.push(boxBottom(theme, width));
 
           return lines;
         },
@@ -1694,7 +1691,6 @@ export function createLandstripIntegration(
             const muted = (s: string) => theme.fg('muted', s);
             const accent = (s: string) => theme.fg('accent', s);
             const text = (s: string) => theme.fg('text', s);
-            const borderFg = (s: string) => theme.fg('border', s);
 
             function sandboxStatus(): { color: 'success' | 'warning'; label: string } {
               if (noSandboxFlag) return { color: 'warning', label: 'Disabled (--no-sandbox)' };
@@ -1707,28 +1703,15 @@ export function createLandstripIntegration(
               return v ? theme.fg('warning', 'yes') : theme.fg('success', 'no');
             }
 
-            function makeRow(content: string, innerW: number, border: string): string {
-              const line = truncateToWidth(content, innerW);
-              const pad = Math.max(0, innerW - visibleWidth(line));
-              return `${border} ${line}${' '.repeat(pad)} ${border}`;
-            }
-
             return {
               render(width: number): string[] {
                 const innerW = Math.max(1, width - 4);
-                const border = borderFg('│');
-                const row = (content: string) => makeRow(content, innerW, border);
+                const row = (content = '') => boxRow(theme, width, content);
                 const lines: string[] = [];
                 const status = sandboxStatus();
                 const toggleValue = config.enabled
                   ? theme.fg('success', 'enabled')
                   : theme.fg('warning', 'disabled');
-
-                function topBorder(titleText: string): string {
-                  const title = accent(` ${titleText} `);
-                  const fill = borderFg('─'.repeat(Math.max(0, width - 4 - visibleWidth(title))));
-                  return `${borderFg('╭─')}${title}${fill}${borderFg('─╮')}`;
-                }
 
                 function section(titleText: string, detail?: string): void {
                   lines.push(row(''));
@@ -1744,7 +1727,7 @@ export function createLandstripIntegration(
                   return text(truncateToWidth(value, Math.max(10, maxWidth)));
                 }
 
-                lines.push(topBorder('Sandbox'));
+                lines.push(boxTop(theme, width, 'Sandbox'));
 
                 const statusDot = theme.fg(status.color, '●');
                 const pathSnippet = text(truncateToWidth(binaryPath(), Math.max(20, innerW - 28)));
@@ -1786,9 +1769,7 @@ export function createLandstripIntegration(
                     `${dim('t')} ${muted('toggle persisted setting')}  ${dim('esc')} ${muted('close')}`,
                   ),
                 );
-                lines.push(
-                  `${borderFg('╰')}${borderFg('─'.repeat(Math.max(0, width - 2)))}${borderFg('╯')}`,
-                );
+                lines.push(boxBottom(theme, width));
 
                 return lines;
               },
