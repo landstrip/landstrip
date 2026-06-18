@@ -896,18 +896,15 @@ export function createLandstripIntegration(
     sessionAllowedWritePaths.length = 0;
   }
 
-  function getEffectiveAllowedDomains(cwd: string): string[] {
-    const config = loadConfig(cwd);
+  function getEffectiveAllowedDomains(config: SandboxConfig): string[] {
     return [...config.network.allowedDomains, ...sessionAllowedDomains];
   }
 
-  function getEffectiveAllowRead(cwd: string): string[] {
-    const config = loadConfig(cwd);
+  function getEffectiveAllowRead(config: SandboxConfig): string[] {
     return [...config.filesystem.allowRead, ...sessionAllowedReadPaths];
   }
 
-  function getEffectiveAllowWrite(cwd: string): string[] {
-    const config = loadConfig(cwd);
+  function getEffectiveAllowWrite(config: SandboxConfig): string[] {
     return [...config.filesystem.allowWrite, ...sessionAllowedWritePaths];
   }
 
@@ -952,7 +949,7 @@ export function createLandstripIntegration(
     const config = loadConfig(cwd);
 
     if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
-    if (domainMatchesAny(domain, getEffectiveAllowedDomains(cwd))) return true;
+    if (domainMatchesAny(domain, getEffectiveAllowedDomains(config))) return true;
 
     const choice = await promptDomainBlock(ctx, domain);
     if (choice === 'abort') return false;
@@ -974,8 +971,8 @@ export function createLandstripIntegration(
       },
       filesystem: {
         denyRead: config.filesystem.denyRead,
-        allowRead: getEffectiveAllowRead(cwd),
-        allowWrite: getEffectiveAllowWrite(cwd),
+        allowRead: getEffectiveAllowRead(config),
+        allowWrite: getEffectiveAllowWrite(config),
         denyWrite: config.filesystem.denyWrite,
       },
     };
@@ -1260,10 +1257,10 @@ export function createLandstripIntegration(
               if (blockedPath && ctx.hasUI) {
                 const config = loadConfig(cwd);
                 const isDeniedByDenyRead = matchesPattern(blockedPath, config.filesystem.denyRead);
-                const isReadAllowed = matchesPattern(blockedPath, getEffectiveAllowRead(cwd));
+                const isReadAllowed = matchesPattern(blockedPath, getEffectiveAllowRead(config));
                 const isWriteAllowed = !shouldPromptForWrite(
                   blockedPath,
-                  getEffectiveAllowWrite(cwd),
+                  getEffectiveAllowWrite(config),
                   matchesPattern,
                 );
 
@@ -1335,7 +1332,7 @@ export function createLandstripIntegration(
         return null;
       }
 
-      if (shouldPromptForWrite(blockedPath, getEffectiveAllowWrite(ctx.cwd), matchesPattern)) {
+      if (shouldPromptForWrite(blockedPath, getEffectiveAllowWrite(config), matchesPattern)) {
         const choice = await promptWriteBlock(ctx, blockedPath);
         if (choice === 'abort') return null;
         await applyWriteChoice(choice, blockedPath, ctx.cwd);
@@ -1367,8 +1364,8 @@ export function createLandstripIntegration(
     ): Promise<AgentToolResult<BashToolDetails | undefined> | null> => {
       if (!ctx.hasUI) return null;
 
-      if (!matchesPattern(blockedPath, getEffectiveAllowRead(ctx.cwd))) {
-        const config = loadConfig(ctx.cwd);
+      const config = loadConfig(ctx.cwd);
+      if (!matchesPattern(blockedPath, getEffectiveAllowRead(config))) {
         const choice = await promptReadBlock(
           ctx,
           blockedPath,
@@ -1627,7 +1624,7 @@ export function createLandstripIntegration(
 
       if (isToolCallEventType('read', event)) {
         const filePath = canonicalizePath(event.input.path);
-        if (!matchesPattern(filePath, getEffectiveAllowRead(ctx.cwd))) {
+        if (!matchesPattern(filePath, getEffectiveAllowRead(config))) {
           const choice = await promptReadBlock(ctx, filePath);
           if (choice === 'abort') {
             return {
@@ -1651,7 +1648,7 @@ export function createLandstripIntegration(
           };
         }
 
-        if (shouldPromptForWrite(filePath, getEffectiveAllowWrite(ctx.cwd), matchesPattern)) {
+        if (shouldPromptForWrite(filePath, getEffectiveAllowWrite(config), matchesPattern)) {
           const choice = await promptWriteBlock(ctx, filePath);
           if (choice === 'abort') {
             return {
