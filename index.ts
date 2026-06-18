@@ -739,26 +739,11 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
   const optionOverrides = normalizeOptions(options);
   const activeBash = new Map<string, BashSandboxState>();
   const notified = new Set<string>();
-  const sessionAllowedReadPaths: string[] = [];
-  const sessionAllowedWritePaths: string[] = [];
-  const sessionAllowedDomains: string[] = [];
   const callAllowances = new Set<string>();
   let enabledNotified = false;
   let sandboxDisabled = false;
   let configuredShell: string | undefined;
   let landstripCheck: { ok: true; version: string } | { ok: false; reason: string } | undefined;
-
-  function getEffectiveAllowRead(config: SandboxConfig): string[] {
-    return [...config.filesystem.allowRead, ...sessionAllowedReadPaths];
-  }
-
-  function getEffectiveAllowWrite(config: SandboxConfig): string[] {
-    return [...config.filesystem.allowWrite, ...sessionAllowedWritePaths];
-  }
-
-  function getEffectiveAllowedDomains(config: SandboxConfig): string[] {
-    return [...config.network.allowedDomains, ...sessionAllowedDomains];
-  }
 
   function allowanceKey(callID: string, kind: SandboxPermissionKind, resource: string): string {
     return `${callID}:${kind}:${resource}`;
@@ -811,11 +796,11 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
   function sandboxSummary(config: SandboxConfig): string {
     const { globalPath, projectPath } = getConfigPaths(directory);
     const networkMode = config.network.allowNetwork ? 'unrestricted' : 'proxied';
-    const allowed = getEffectiveAllowedDomains(config).join(', ') || '(none)';
+    const allowed = config.network.allowedDomains.join(', ') || '(none)';
     const denied = config.network.deniedDomains.join(', ') || '(none)';
     const denyRead = config.filesystem.denyRead.join(', ') || '(none)';
-    const allowRead = getEffectiveAllowRead(config).join(', ') || '(none)';
-    const allowWrite = getEffectiveAllowWrite(config).join(', ') || '(none)';
+    const allowRead = config.filesystem.allowRead.join(', ') || '(none)';
+    const allowWrite = config.filesystem.allowWrite.join(', ') || '(none)';
     const denyWrite = config.filesystem.denyWrite.join(', ') || '(none)';
 
     return [
@@ -1039,7 +1024,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     const callAllowedDomains: string[] = [];
     const effectiveConfig = {
       ...config,
-      network: { ...config.network, allowedDomains: getEffectiveAllowedDomains(config) },
+      network: { ...config.network },
     };
 
     if (!allowNetwork) {
@@ -1115,8 +1100,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       const patterns = permissionPatterns(request);
 
       const decisions: SandboxPermissionDecision[] = [];
-      const effectiveAllowRead = getEffectiveAllowRead(config);
-      const effectiveAllowWrite = getEffectiveAllowWrite(config);
+      const effectiveAllowRead = config.filesystem.allowRead;
+      const effectiveAllowWrite = config.filesystem.allowWrite;
 
       if (permission === 'read') {
         for (const pattern of patterns) {
@@ -1165,8 +1150,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       const config = await activeConfig();
       if (!config) return;
 
-      const effectiveAllowRead = getEffectiveAllowRead(config);
-      const effectiveAllowWrite = getEffectiveAllowWrite(config);
+      const effectiveAllowRead = config.filesystem.allowRead;
+      const effectiveAllowWrite = config.filesystem.allowWrite;
 
       if (input.tool === 'bash') {
         await prepareBash(input.callID, output.args, config);
@@ -1349,8 +1334,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
         const config = await activeConfig();
         if (!config) return;
 
-        const effectiveAllowRead = getEffectiveAllowRead(config);
-        const effectiveAllowWrite = getEffectiveAllowWrite(config);
+        const effectiveAllowRead = config.filesystem.allowRead;
+        const effectiveAllowWrite = config.filesystem.allowWrite;
 
         for (const path of extractCandidatePaths(shellCommand)) {
           const readDecision = evaluateReadPermission(path, config, directory, effectiveAllowRead);
@@ -1366,12 +1351,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
         }
 
         if (!config.network.allowNetwork) {
-          const effectiveConfig = {
-            ...config,
-            network: { ...config.network, allowedDomains: getEffectiveAllowedDomains(config) },
-          };
           for (const domain of extractDomainsFromCommand(shellCommand)) {
-            const decision = evaluateDomainPermission(domain, effectiveConfig);
+            const decision = evaluateDomainPermission(domain, config);
             if (decision.status !== 'allow') reportBlocked(decision);
           }
         }
