@@ -271,23 +271,6 @@ function isBlockedByDenyRead(path: string, config: SandboxConfig, baseDirectory:
   return matchesPattern(path, config.filesystem.denyRead, baseDirectory);
 }
 
-function firstBlockedDomain(
-  command: string,
-  config: SandboxConfig,
-): { domain: string; reason: 'allowedDomains' | 'deniedDomains' } | null {
-  for (const domain of extractDomainsFromCommand(command)) {
-    if (domainMatchesAny(domain, config.network.deniedDomains)) {
-      return { domain, reason: 'deniedDomains' };
-    }
-
-    if (!domainMatchesAny(domain, config.network.allowedDomains)) {
-      return { domain, reason: 'allowedDomains' };
-    }
-  }
-
-  return null;
-}
-
 function evaluateReadPermission(
   path: string,
   config: SandboxConfig,
@@ -793,8 +776,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     return callAllowances.has(allowanceKey(callID, decision.kind, decision.resource));
   }
 
-  function enforcePermission(callID: string, decision: SandboxPermissionDecision): void {
-    if (decision.status === 'allow' || hasCallAllowance(callID, decision)) return;
+  function reportBlocked(decision: SandboxPermissionDecision): never {
     client.tui
       ?.showToast?.({
         body: {
@@ -805,6 +787,11 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       })
       ?.catch?.(() => undefined);
     throw errorWithConfigPaths(directory, decision.message);
+  }
+
+  function enforcePermission(callID: string, decision: SandboxPermissionDecision): void {
+    if (decision.status === 'allow' || hasCallAllowance(callID, decision)) return;
+    reportBlocked(decision);
   }
 
   function pushCommandText(
@@ -1367,18 +1354,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
         for (const path of extractCandidatePaths(shellCommand)) {
           const readDecision = evaluateReadPermission(path, config, directory, effectiveAllowRead);
-          if (readDecision.status === 'deny') {
-            client.tui
-              ?.showToast?.({
-                body: {
-                  title: 'Sandbox blocked',
-                  message: readDecision.message.slice(0, 120),
-                  variant: 'error',
-                },
-              })
-              ?.catch?.(() => undefined);
-            throw errorWithConfigPaths(directory, readDecision.message);
-          }
+          if (readDecision.status === 'deny') reportBlocked(readDecision);
 
           const writeDecision = evaluateWritePermission(
             path,
@@ -1386,18 +1362,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
             directory,
             effectiveAllowWrite,
           );
-          if (writeDecision.status === 'deny') {
-            client.tui
-              ?.showToast?.({
-                body: {
-                  title: 'Sandbox blocked',
-                  message: writeDecision.message.slice(0, 120),
-                  variant: 'error',
-                },
-              })
-              ?.catch?.(() => undefined);
-            throw errorWithConfigPaths(directory, writeDecision.message);
-          }
+          if (writeDecision.status === 'deny') reportBlocked(writeDecision);
         }
 
         if (!config.network.allowNetwork) {
@@ -1405,25 +1370,9 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
             ...config,
             network: { ...config.network, allowedDomains: getEffectiveAllowedDomains(config) },
           };
-          const blockedDomain = firstBlockedDomain(shellCommand, effectiveConfig);
-          if (blockedDomain) {
-            const reason =
-              blockedDomain.reason === 'deniedDomains'
-                ? 'is blocked by network.deniedDomains'
-                : 'is not in network.allowedDomains';
-            client.tui
-              ?.showToast?.({
-                body: {
-                  title: 'Sandbox blocked',
-                  message: `Network access denied for "${blockedDomain.domain}"`,
-                  variant: 'error',
-                },
-              })
-              ?.catch?.(() => undefined);
-            throw errorWithConfigPaths(
-              directory,
-              `Sandbox: network access denied for "${blockedDomain.domain}" (${reason}).`,
-            );
+          for (const domain of extractDomainsFromCommand(shellCommand)) {
+            const decision = evaluateDomainPermission(domain, effectiveConfig);
+            if (decision.status !== 'allow') reportBlocked(decision);
           }
         }
       }
