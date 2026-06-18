@@ -22,6 +22,8 @@ import {
   loadConfig,
   normalizeOptions,
   parseLandstripTraps,
+  permissionPatterns,
+  permissionType,
   readDiscoveryPort,
 } from './shared.js';
 
@@ -1114,14 +1116,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       if (!config) return;
 
       const request = input as Record<string, unknown>;
-      const permission =
-        typeof request.type === 'string'
-          ? request.type
-          : typeof request.permission === 'string'
-            ? request.permission
-            : typeof request.action === 'string'
-              ? request.action
-              : '';
+      const permission = permissionType(request);
       const metadata = isRecord(request.metadata) ? request.metadata : {};
       const tool = isRecord(request.tool) ? request.tool : undefined;
       const callID =
@@ -1130,13 +1125,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
           : typeof tool?.callID === 'string'
             ? tool.callID
             : undefined;
-      const patterns = Array.isArray(request.patterns)
-        ? request.patterns.filter((item): item is string => typeof item === 'string')
-        : typeof request.pattern === 'string'
-          ? [request.pattern]
-          : Array.isArray(request.resources)
-            ? request.resources.filter((item): item is string => typeof item === 'string')
-            : [];
+      const patterns = permissionPatterns(request);
 
       const decisions: SandboxPermissionDecision[] = [];
       const effectiveAllowRead = getEffectiveAllowRead(config);

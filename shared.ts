@@ -267,6 +267,28 @@ export function permissionPattern(permission: Record<string, unknown>): string |
   return undefined;
 }
 
+/**
+ * Every string pattern a permission carries, in declaration order, read from
+ * `patterns`, `pattern`, or `resources`. The plural complement to
+ * {@link permissionPattern} for callers that must inspect all patterns.
+ */
+export function permissionPatterns(permission: Record<string, unknown>): string[] {
+  const patterns = permission.patterns;
+  if (Array.isArray(patterns))
+    return patterns.filter((item): item is string => typeof item === 'string');
+
+  const pattern = permission.pattern;
+  if (typeof pattern === 'string') return [pattern];
+  if (Array.isArray(pattern))
+    return pattern.filter((item): item is string => typeof item === 'string');
+
+  const resources = permission.resources;
+  if (Array.isArray(resources))
+    return resources.filter((item): item is string => typeof item === 'string');
+
+  return [];
+}
+
 export function permissionLabel(permission: Record<string, unknown>): string {
   const type = permissionType(permission, 'permission');
   const title = typeof permission.title === 'string' ? permission.title : type;
