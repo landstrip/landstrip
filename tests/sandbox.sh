@@ -414,6 +414,25 @@ if [ "$os_name" = Linux ]; then
     test_fail "reading a denyRead file is still blocked" "$policy" "$sandbox_shell" -c 'cat "$1"' _ "$tmp/secret/file"
 fi
 
+# Where an allowRead and a denyRead overlap, the most specific rule wins: an
+# allowRead path carves back out of a broader denyRead, and a denyRead nested
+# inside an allowRead root still wins.
+if [ "$os_name" = Linux ]; then
+    mkdir -p "$tmp/vault"
+    printf 'public\n' > "$tmp/vault/ok"
+    printf 'private\n' > "$tmp/vault/hidden"
+    policy=$(write_policy '{"filesystem":{"denyRead":["%s/vault"],"allowRead":["%s/vault/ok"],"allowWrite":["/dev/null"]}}' "$tmp" "$tmp")
+    test_ok "allowRead carves a file back out of denyRead" "$policy" "$sandbox_shell" -c 'cat "$1"' _ "$tmp/vault/ok"
+    test_fail "denyRead blocks the rest of the carved directory" "$policy" "$sandbox_shell" -c 'cat "$1"' _ "$tmp/vault/hidden"
+
+    mkdir -p "$tmp/proj/sub"
+    printf 'code\n' > "$tmp/proj/sub/main"
+    printf 'token\n' > "$tmp/proj/sub/.env"
+    policy=$(write_policy '{"filesystem":{"denyRead":["%s/proj/sub/.env"],"allowRead":["%s/proj"],"allowWrite":["/dev/null"]}}' "$tmp" "$tmp")
+    test_ok "broad allowRead permits a file beside a nested denyRead" "$policy" "$sandbox_shell" -c 'cat "$1"' _ "$tmp/proj/sub/main"
+    test_fail "nested denyRead wins over a broader allowRead" "$policy" "$sandbox_shell" -c 'cat "$1"' _ "$tmp/proj/sub/.env"
+fi
+
 # A denyWrite path that traverses a symlink must not be bypassable by swapping
 # the symlink for a real directory, nor may the symlink itself be removed.
 if [ "$os_name" = Linux ]; then

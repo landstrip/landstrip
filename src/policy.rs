@@ -5,7 +5,8 @@
 //!
 //! Filesystem policy follows the Seatbelt-compatible shape. Writes start
 //! denied; `allowWrite` grants roots and `denyWrite` subtracts from them. Reads
-//! stay unrestricted unless `denyRead` is set; `allowRead` then adds paths back.
+//! stay unrestricted unless `denyRead` is set; `allowRead` then adds paths back,
+//! with the most specific rule winning where an allow and a deny overlap.
 //!
 //! Paths accept absolute names, names relative to the policy base, `~`, and the
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
@@ -149,7 +150,23 @@ pub(crate) fn resolve_policy(
         ReadAccess::Unrestricted
     } else {
         let mut read_roots = subtract_denied_roots(vec![PathBuf::from("/")], &read_deny)?;
-        read_roots.extend(read_allow);
+        // Re-add each allowRead root, but keep any denyRead strictly nested
+        // under it carved out so the most specific rule wins: an allowRead path
+        // overrides a broader or equal denyRead, while a denyRead nested inside
+        // an allowRead root still wins. A deeper allowRead re-adds itself on its
+        // own iteration.
+        for allow in &read_allow {
+            let nested: Vec<PathBuf> = read_deny
+                .iter()
+                .filter(|deny| deny.as_path() != allow.as_path() && deny.starts_with(allow))
+                .cloned()
+                .collect();
+            if nested.is_empty() {
+                read_roots.push(allow.clone());
+            } else {
+                read_roots.extend(subtract_denied_roots(vec![allow.clone()], &nested)?);
+            }
+        }
         normalize_policy_roots(&mut read_roots);
         ReadAccess::AllowRoots(read_roots)
     };
