@@ -363,7 +363,9 @@ function matchesPattern(filePath: string, patterns: string[]): boolean {
     const absPattern = pattern.includes('*') ? expandPath(pattern) : canonicalizePath(pattern);
 
     if (pattern.includes('*')) {
-      const escaped = absPattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+      const escaped = absPattern
+        .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*\*\/|\*\*|\*/g, (token) => (token === '**/' ? '(?:.*/)?' : '.*'));
       return new RegExp(`^${escaped}$`).test(abs);
     }
 
