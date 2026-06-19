@@ -49,7 +49,7 @@
     "ci:test": "npm test"
   },
   "dependencies": {
-    "@landstrip/landstrip": "^0.15.14"
+    "@landstrip/landstrip": "^0.15.15"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.17.7",
