@@ -1,6 +1,6 @@
 {
   "name": "@landstrip/landstrip-win32-x64",
-  "version": "0.15.17",
+  "version": "0.16.0",
   "description": "Windows x64 binary for landstrip",
   "license": "Apache-2.0 AND LGPL-2.1-or-later",
   "homepage": "https://github.com/landstrip/landstrip#readme",
