@@ -173,6 +173,27 @@ expect_trap_fd_write_denied() {
     fi
 }
 
+expect_inherited_fd_closed() {
+    name=$1
+    policy=$2
+    denied_file=$3
+    rm -f "$denied_file"
+    set +e
+    output=$("$bin" -p "$policy" "$sandbox_shell" -c \
+        'if test -e /dev/fd/3; then echo fd3-inherited >&2; fi; echo bypass >&3' \
+        3>"$denied_file" 2>&1)
+    status=$?
+    set -e
+
+    if [ "$status" -ne 0 ] && [ ! -s "$denied_file" ] && \
+        ! printf '%s\n' "$output" | grep -F -q 'fd3-inherited'; then
+        pass "$name"
+    else
+        denied_output=$(cat "$denied_file" 2>/dev/null || true)
+        fail "$name" "status=$status output=$output denied=$denied_output"
+    fi
+}
+
 expect_failure_access_denied() {
     name=$1
     expected_file=$2
@@ -325,6 +346,10 @@ test_fail "allowWrite denies other root" "$policy" "$sandbox_shell" -c ': > "$1/
 
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}}')
 test_ok "dev null read and write are permitted" "$policy" "$sandbox_shell" -c 'cat /dev/null >/dev/null'
+if [ "$os_name" = Darwin ]; then
+    expect_inherited_fd_closed "inherited fd cannot bypass write policy" \
+        "$policy" "$tmp/denied/preopened.txt"
+fi
 if [ "$os_name" = Darwin ]; then
     policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"]}}')
     test_fail "denyRead root blocks directory listing" "$policy" /bin/ls /

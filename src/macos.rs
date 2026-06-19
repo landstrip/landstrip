@@ -8,12 +8,16 @@ use crate::trap::{Result, Trap};
 use crate::trap_fd::TrapFd;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};
+use std::fs;
+use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 
 const SBPL_PROFILE_FLAGS: u64 = 0;
+const FIRST_INHERITED_FD: RawFd = 3;
+const FALLBACK_FD_LIMIT: RawFd = 1_048_576;
 
 pub(crate) fn execute(
     policy: &AccessPolicy,
@@ -25,6 +29,7 @@ pub(crate) fn execute(
     let profile = render_profile(policy).map_err(Trap::policy_stdin_source)?;
     apply_profile(&profile)?;
     trap_fd.close();
+    close_inherited_fds();
     let error = Command::new(tool).args(args).exec();
     Err(Trap::tool_exec(Some(tool.to_os_string()), &error))
 }
@@ -39,6 +44,50 @@ fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
     }
 
     Err(Trap::internal().with_detail("feature", "partial read access"))
+}
+
+fn close_inherited_fds() {
+    if let Ok(mut entries) = fs::read_dir("/dev/fd") {
+        let mut fds = Vec::new();
+        for entry in entries.by_ref().flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Ok(fd) = name.parse::<RawFd>() else {
+                continue;
+            };
+            if fd >= FIRST_INHERITED_FD {
+                fds.push(fd);
+            }
+        }
+
+        drop(entries);
+
+        fds.sort_unstable();
+        fds.dedup();
+        for fd in fds {
+            close_fd(fd);
+        }
+        return;
+    }
+
+    for fd in FIRST_INHERITED_FD..open_fd_limit() {
+        close_fd(fd);
+    }
+}
+
+fn open_fd_limit() -> RawFd {
+    let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    RawFd::try_from(limit).map_or(FALLBACK_FD_LIMIT, |limit| {
+        limit.clamp(FIRST_INHERITED_FD, FALLBACK_FD_LIMIT)
+    })
+}
+
+fn close_fd(fd: RawFd) {
+    if fd >= FIRST_INHERITED_FD {
+        unsafe { libc::close(fd) };
+    }
 }
 
 fn apply_profile(profile: &str) -> Result<()> {
