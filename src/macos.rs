@@ -9,7 +9,7 @@ use crate::trap_fd::TrapFd;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
 
@@ -30,11 +30,15 @@ pub(crate) fn execute(
 }
 
 fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
-    if matches!(&policy.read_access, ReadAccess::AllowRoots(roots) if roots.is_empty()) {
-        return Err(Trap::internal().with_detail("feature", "empty read access"));
+    let ReadAccess::AllowRoots(roots) = &policy.read_access else {
+        return Ok(());
+    };
+
+    if roots.iter().any(|root| root == Path::new("/")) {
+        return Ok(());
     }
 
-    Ok(())
+    Err(Trap::internal().with_detail("feature", "partial read access"))
 }
 
 fn apply_profile(profile: &str) -> Result<()> {

@@ -475,20 +475,29 @@ mkdir -p "$tmp/read-ok" "$tmp/read-no"
 printf 'ok\n' >"$tmp/read-ok/data.txt"
 printf 'no\n' >"$tmp/read-no/data.txt"
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["%s/read-ok","/usr","/lib","/lib64","/bin","/sbin","/etc"]}}' "$tmp")
-cwd=$(pwd)
-cd "$tmp/read-ok"
-test_ok "allowRead permits read in allowed path" "$policy" "$sandbox_shell" -c 'cat "$1/data.txt"' _ "$tmp/read-ok"
-expect_failure_access_denied "allowRead denies other root" "$tmp/read-no/data.txt" "$bin" -p "$policy" "$sandbox_shell" -c 'cat "$1/data.txt"' _ "$tmp/read-no"
-cd "$cwd"
+if [ "$os_name" = Darwin ]; then
+    test_fail "partial allowRead policy is rejected" "$policy" /bin/cat "$tmp/read-ok/data.txt"
+else
+    cwd=$(pwd)
+    cd "$tmp/read-ok"
+    test_ok "allowRead permits read in allowed path" "$policy" "$sandbox_shell" -c 'cat "$1/data.txt"' _ "$tmp/read-ok"
+    expect_failure_access_denied "allowRead denies other root" "$tmp/read-no/data.txt" "$bin" -p "$policy" "$sandbox_shell" -c 'cat "$1/data.txt"' _ "$tmp/read-no"
+    cd "$cwd"
+fi
 
-mkdir -p "$tmp/probe-denied/bin"
-policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"denyRead":["%s/probe-denied"]}}' "$tmp")
-expect_success_no_access_denied "successful PATH probe hides nonfatal denials" \
-    "$bin" -p "$policy" "$sandbox_shell" -c 'PATH="$1/probe-denied/bin:/bin:/usr/bin" ls /bin/sh' _ "$tmp"
+if [ "$os_name" = Darwin ]; then
+    policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"denyRead":["%s/probe-denied"]}}' "$tmp")
+    test_fail "denyRead without root allow is rejected" "$policy" "$sandbox_shell" -c 'printf ok\n'
+else
+    mkdir -p "$tmp/probe-denied/bin"
+    policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"denyRead":["%s/probe-denied"]}}' "$tmp")
+    expect_success_no_access_denied "successful PATH probe hides nonfatal denials" \
+        "$bin" -p "$policy" "$sandbox_shell" -c 'PATH="$1/probe-denied/bin:/bin:/usr/bin" ls /bin/sh' _ "$tmp"
 
-policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"denyRead":["/home"],"allowRead":["/usr","/lib","/lib64","/bin","/sbin","/etc"]}}')
-expect_success_no_access_denied "missing denied read returns absent" \
-    "$bin" -p "$policy" "$sandbox_shell" -c 'test ! -e "/home/landstrip-missing-$$"'
+    policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"denyRead":["/home"],"allowRead":["/usr","/lib","/lib64","/bin","/sbin","/etc"]}}')
+    expect_success_no_access_denied "missing denied read returns absent" \
+        "$bin" -p "$policy" "$sandbox_shell" -c 'test ! -e "/home/landstrip-missing-$$"'
+fi
 
 policy_fs=$(write_policy '{"filesystem":{"allowWrite":["%s/allowed"],"denyRead":["/"],"allowRead":["/"]}}' "$tmp")
 policy_net="$tmp/policy-net.json"
