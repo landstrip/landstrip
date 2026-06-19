@@ -211,14 +211,8 @@ fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result
         UnixSocketAccess::AllowPaths(paths) => {
             for path in paths {
                 let escaped = escape_sbpl_literal(&path.to_string_lossy());
-                writeln!(
-                    sb,
-                    "(allow network-outbound (remote unix-socket (path-literal \"{escaped}\")))"
-                )?;
-                writeln!(
-                    sb,
-                    "(allow network-bind (local unix-socket (path-literal \"{escaped}\")))"
-                )?;
+                writeln!(sb, "(allow network-outbound (literal \"{escaped}\"))")?;
+                writeln!(sb, "(allow network-bind (literal \"{escaped}\"))")?;
             }
         }
     }
