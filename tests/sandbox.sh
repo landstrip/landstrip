@@ -343,6 +343,12 @@ test_ok "sysctl read permits uname" "$policy" "$sandbox_shell" -c 'uname -s'
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%s/allowed"],"denyRead":["/"],"allowRead":["/"]}}' "$tmp")
 test_ok "allowWrite permits configured root" "$policy" "$sandbox_shell" -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ "$tmp/allowed"
 test_fail "allowWrite denies other root" "$policy" "$sandbox_shell" -c ': > "$1/nope.txt"' _ "$tmp/denied"
+if [ "$os_name" = Darwin ]; then
+    paren_dir="$tmp/allowed (paren)"
+    mkdir -p "$paren_dir"
+    policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%s"]}}' "$paren_dir")
+    test_ok "allowWrite permits path with parentheses" "$policy" "$sandbox_shell" -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ "$paren_dir"
+fi
 
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}}')
 test_ok "dev null read and write are permitted" "$policy" "$sandbox_shell" -c 'cat /dev/null >/dev/null'

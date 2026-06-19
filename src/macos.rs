@@ -264,13 +264,28 @@ fn escape_sbpl_literal(path: &str) -> String {
         match ch {
             '"' => escaped.push_str("\\\""),
             '\\' => escaped.push_str("\\\\"),
-            '(' => escaped.push_str("\\("),
-            ')' => escaped.push_str("\\)"),
             '\n' => escaped.push_str("\\n"),
             _ => escaped.push(ch),
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_sbpl_literal;
+
+    #[test]
+    fn escape_sbpl_literal_preserves_parentheses() {
+        assert_eq!(escape_sbpl_literal("/tmp/App (Beta)"), "/tmp/App (Beta)");
+    }
+
+    #[test]
+    fn escape_sbpl_literal_escapes_string_delimiters() {
+        assert_eq!(escape_sbpl_literal("/tmp/a\"b"), "/tmp/a\\\"b");
+        assert_eq!(escape_sbpl_literal("/tmp/a\\b"), "/tmp/a\\\\b");
+        assert_eq!(escape_sbpl_literal("/tmp/a\nb"), "/tmp/a\\nb");
+    }
 }
 
 fn take_sandbox_error(errorbuf: *mut libc::c_char) -> String {
