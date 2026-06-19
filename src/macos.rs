@@ -37,6 +37,7 @@ pub(crate) fn execute(
 fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
     reject_unsupported_read_policy(policy)?;
     reject_unsupported_unix_socket_policy(policy)?;
+    reject_unsupported_symlink_write_policy(policy)?;
 
     Ok(())
 }
@@ -60,6 +61,20 @@ fn reject_unsupported_unix_socket_policy(policy: &AccessPolicy) -> Result<()> {
 
     if paths.iter().any(|path| path.is_dir()) {
         return Err(Trap::internal().with_detail("feature", "Unix socket directory access"));
+    }
+
+    Ok(())
+}
+
+fn reject_unsupported_symlink_write_policy(policy: &AccessPolicy) -> Result<()> {
+    let has_writable_symlink_ancestor = policy.write_denied_links.iter().any(|link| {
+        policy
+            .write_roots
+            .iter()
+            .any(|root| link == root || link.starts_with(root))
+    });
+    if has_writable_symlink_ancestor {
+        return Err(Trap::internal().with_detail("feature", "denyWrite symlink ancestor"));
     }
 
     Ok(())
