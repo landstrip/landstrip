@@ -35,6 +35,13 @@ pub(crate) fn execute(
 }
 
 fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
+    reject_unsupported_read_policy(policy)?;
+    reject_unsupported_unix_socket_policy(policy)?;
+
+    Ok(())
+}
+
+fn reject_unsupported_read_policy(policy: &AccessPolicy) -> Result<()> {
     let ReadAccess::AllowRoots(roots) = &policy.read_access else {
         return Ok(());
     };
@@ -44,6 +51,18 @@ fn reject_unsupported_policy(policy: &AccessPolicy) -> Result<()> {
     }
 
     Err(Trap::internal().with_detail("feature", "partial read access"))
+}
+
+fn reject_unsupported_unix_socket_policy(policy: &AccessPolicy) -> Result<()> {
+    let UnixSocketAccess::AllowPaths(paths) = &policy.network_access.unix_socket_access else {
+        return Ok(());
+    };
+
+    if paths.iter().any(|path| path.is_dir()) {
+        return Err(Trap::internal().with_detail("feature", "Unix socket directory access"));
+    }
+
+    Ok(())
 }
 
 fn close_inherited_fds() {

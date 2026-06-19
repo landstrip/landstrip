@@ -391,6 +391,22 @@ expect_listener_allowed "allowLocalBinding permits localhost listener" "$policy"
 
 policy=$(write_policy '{"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}}')
 expect_listener_allowed "allowNetwork permits localhost listener" "$policy"
+if [ "$os_name" = Darwin ]; then
+    unix_dir="$tmp/unix-sockets"
+    unix_sock="$unix_dir/allowed.sock"
+    mkdir -p "$unix_dir"
+    rm -f "$unix_sock"
+    (printf 'ok\n' | "$nc_cmd" -l -U "$unix_sock" >"$tmp/unix-server.out" 2>&1) &
+    unix_pid=$!
+    sleep 1
+    policy=$(write_policy '{"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%s"]}}' "$unix_sock")
+    test_ok "allowUnixSockets permits exact socket path" "$policy" "$nc_path" -U "$unix_sock"
+    kill "$unix_pid" 2>/dev/null || true
+    wait "$unix_pid" 2>/dev/null || true
+
+    policy=$(write_policy '{"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%s"]}}' "$unix_dir")
+    test_fail "allowUnixSockets rejects directory path" "$policy" "$sandbox_shell" -c 'printf ok\n'
+fi
 
 if [ "$os_name" = Linux ]; then
     policy=$(write_policy '{"network":{"httpProxyPort":1},"filesystem":{"denyRead":["/home"],"allowRead":["/usr","/lib","/lib64","/bin","/sbin","/etc"]}}')
