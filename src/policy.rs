@@ -477,7 +477,7 @@ fn collect_glob_matches(
     const LIMIT: u32 = 40;
 
     if depth >= LIMIT {
-        return Ok(());
+        return Err(AccessPolicyError::TraversalDepth.into());
     }
 
     let candidate = normalize_path_lexically(path);
