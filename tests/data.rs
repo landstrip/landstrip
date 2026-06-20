@@ -7,10 +7,13 @@
 //! status plus captured output are matched against the expectations.
 
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::{Duration, Instant};
 
 const DATA: &str = include_str!("data.txt");
 
@@ -66,7 +69,7 @@ struct Context {
 
 impl Context {
     fn new() -> Self {
-        let tmp_root = std::env::temp_dir().join(format!("landstrip-data-{}", std::process::id()));
+        let tmp_root = test_tmp_root();
         let _ = robust_remove(&tmp_root);
         std::fs::create_dir_all(&tmp_root).expect("create tmp root");
         Self {
@@ -79,6 +82,16 @@ impl Context {
             pid: std::process::id(),
         }
     }
+}
+
+#[cfg(unix)]
+fn test_tmp_root() -> PathBuf {
+    PathBuf::from(format!("/tmp/ls-data-{}", std::process::id()))
+}
+
+#[cfg(not(unix))]
+fn test_tmp_root() -> PathBuf {
+    std::env::temp_dir().join(format!("landstrip-data-{}", std::process::id()))
 }
 
 fn home_dir() -> PathBuf {
@@ -653,7 +666,7 @@ fn run_unix_allowed(
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn unix server: {e}"))?;
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    wait_for_unix_socket(&mut server, sock)?;
 
     let output = landstrip_net(ctx, format, policies)
         .arg(&ctx.nc)
@@ -673,6 +686,42 @@ fn run_unix_allowed(
         )),
         Err(error) => Err(format!("unix connect spawn: {error}")),
     }
+}
+
+fn wait_for_unix_socket(server: &mut Child, sock: &Path) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if is_unix_socket(sock) {
+            return Ok(());
+        }
+
+        if let Some(status) = server
+            .try_wait()
+            .map_err(|e| format!("poll unix server: {e}"))?
+        {
+            return Err(format!(
+                "unix server exited before socket was ready status={status:?}"
+            ));
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!("unix socket was not ready: {}", sock.display()));
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+fn is_unix_socket(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_unix_socket(path: &Path) -> bool {
+    path.exists()
 }
 
 fn stop(child: &mut Child) {
