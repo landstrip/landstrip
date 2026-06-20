@@ -129,7 +129,9 @@ impl AccessPolicy {
 #[cfg(target_os = "windows")]
 impl AccessPolicy {
     /// Reject policies the Windows `AppContainer` cannot enforce: unrestricted
-    /// read, per-host/port TCP rules, or a non-empty Unix socket allowlist.
+    /// read, a local TCP bind, or a non-empty Unix socket allowlist. Connect
+    /// proxy ports are accepted but unenforceable, so the container then runs
+    /// with no network access.
     pub(crate) fn validate(&self) -> std::result::Result<(), AccessPolicyError> {
         if matches!(self.read_access, ReadAccess::Unrestricted) {
             return Err(AccessPolicyError::UnrestrictedRead);
@@ -140,7 +142,7 @@ impl AccessPolicy {
             return Ok(());
         }
 
-        if network.local_tcp_bind || !network.connect_tcp_ports.is_empty() {
+        if network.local_tcp_bind {
             return Err(AccessPolicyError::TcpPolicy);
         }
 

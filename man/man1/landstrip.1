@@ -150,9 +150,10 @@ those when needed. Domain filtering is likewise a caller/runtime responsibility.
 Direct TCP remains denied except for configured proxy ports.
 Other settings are ignored.
 .Pp
-On Windows, TCP proxy-port filtering is not yet implemented. Policies that
-request proxy ports or local binding are rejected before launch. The Windows
-backend runs without network capabilities when no TCP access is requested.
+On Windows, per-port TCP filtering is not implemented. A policy that requests
+proxy ports is accepted but unenforceable, so the AppContainer runs without
+network capabilities and all network access is blocked. A policy that requests
+local binding is rejected before launch.
 .Pp
 .Va allowUnixSockets
 permits pathname Unix socket

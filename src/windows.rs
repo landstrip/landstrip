@@ -70,6 +70,11 @@ pub(crate) fn execute(
     let _grants = grant_policy_access(policy, profile.sid())?;
 
     let grant_network = policy.network_access.is_unrestricted();
+    if !grant_network && !policy.network_access.connect_tcp_ports.is_empty() {
+        log::warn!(
+            "windows: per-port TCP filtering is unavailable; running with no network access"
+        );
+    }
     let exit_code =
         create_process_in_appcontainer(profile.sid(), tool, args, grant_network, &policy.windows)?;
     std::process::exit(i32::from_ne_bytes(exit_code.to_ne_bytes()));
