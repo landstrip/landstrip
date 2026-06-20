@@ -9,7 +9,7 @@ repository = "https://github.com/landstrip/landstrip"
 name = "landstrip"
 readme = "README.md"
 rust-version = "1.85"
-version = "0.16.4"
+version = "0.16.5"
 autotests = false
 
 [[test]]
