@@ -21,9 +21,9 @@ use windows_sys::Win32::Foundation::{
     WAIT_FAILED,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-    REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ACCESS_MODE, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, REVOKE_ACCESS,
+    SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -154,9 +154,7 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess
     };
     let mut granted = GrantedAccess {
         sid,
-        paths: Vec::with_capacity(
-            read_roots.len() + policy.write_roots.len() + policy.write_denied_roots.len(),
-        ),
+        paths: Vec::with_capacity(read_roots.len() + policy.write_roots.len()),
     };
 
     for path in read_roots {
@@ -170,18 +168,6 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess
             sid,
             FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
         )?;
-        granted.paths.push(path.clone());
-    }
-
-    for path in &policy.write_denied_roots {
-        if std::fs::symlink_metadata(path).is_err() {
-            log::debug!(
-                "windows: denyWrite path absent, skipping {}",
-                path.display()
-            );
-            continue;
-        }
-        deny_path_access(path, sid)?;
         granted.paths.push(path.clone());
     }
 
@@ -203,10 +189,6 @@ impl Drop for GrantedAccess {
 
 fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
     set_path_access(path, sid, access, GRANT_ACCESS)
-}
-
-fn deny_path_access(path: &Path, sid: PSID) -> Result<()> {
-    set_path_access(path, sid, FILE_GENERIC_WRITE, DENY_ACCESS)
 }
 
 fn revoke_path_access(path: &Path, sid: PSID) -> Result<()> {

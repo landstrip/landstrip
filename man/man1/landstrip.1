@@ -188,9 +188,7 @@ On Windows,
 .Nm
 uses a Less-Privileged AppContainer. The backend creates or reuses a
 deterministic AppContainer profile and grants that AppContainer SID access to
-the lowered read and write roots with Windows ACL entries.
-.Va denyWrite
-roots receive deny ACL entries that override the write grant. Because LPAC has no
+the lowered read and write roots with Windows ACL entries. Because LPAC has no
 broad filesystem read capability, Windows policies must use explicit read
 allowlists; unrestricted read policy is rejected. AppContainer profiles and ACL
 grants can persist after the sandboxed process exits.
