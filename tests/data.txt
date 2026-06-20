@@ -103,13 +103,13 @@ name=home tilde permits configured root | os=linux,macos | setup=homedir:landstr
 
 # --- allowRead roots ---
 
-name=partial allowRead policy is rejected | os=macos | setup=mkdir:read-ok;write:read-ok/data.txt:ok\n | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%/read-ok","/usr","/lib","/lib64","/bin","/sbin","/etc"]}} | cmd=/bin/cat %TMP%/read-ok/data.txt | status=!0
+name=allowRead carves a file back out of denyRead (macos) | os=macos | setup=mkdir:vault;write:vault/ok:public\n;write:vault/hidden:private\n | policy={"filesystem":{"denyRead":["%TMP%/vault"],"allowRead":["%TMP%/vault/ok"],"allowWrite":["/dev/null"]}} | cmd=/bin/cat %TMP%/vault/ok | status=0
 name=allowRead permits read in allowed path | os=linux | setup=mkdir:read-ok;write:read-ok/data.txt:ok\n | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%/read-ok","/usr","/lib","/lib64","/bin","/sbin","/etc"]}} | cwd=read-ok | cmd=%SHELL% -c 'cat "$1/data.txt"' _ %TMP%/read-ok | status=0
 name=allowRead denies other root | os=linux | setup=mkdir:read-ok;mkdir:read-no;write:read-ok/data.txt:ok\n;write:read-no/data.txt:no\n | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%/read-ok","/usr","/lib","/lib64","/bin","/sbin","/etc"]}} | cwd=read-ok | cmd=%SHELL% -c 'cat "$1/data.txt"' _ %TMP%/read-no | status=!0 | out="kind":"filesystem" | out=read-no/data.txt
 
 # --- nonfatal denials stay hidden on success ---
 
-name=denyRead without root allow is rejected | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["%TMP%/probe-denied"]}} | cmd=%SHELL% -c 'printf ok' | status=!0
+name=denyRead without root allow runs tool | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["%TMP%/probe-denied"]}} | cmd=%SHELL% -c 'printf ok' | status=0
 name=successful PATH probe hides nonfatal denials | os=linux | setup=mkdir:probe-denied/bin | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["%TMP%/probe-denied"]}} | cmd=%SHELL% -c 'PATH="$1/probe-denied/bin:/bin:/usr/bin" ls /bin/sh' _ %TMP% | status=0 | out!="kind":"filesystem"
 name=missing denied read returns absent | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/home"],"allowRead":["/usr","/lib","/lib64","/bin","/sbin","/etc"]}} | cmd=%SHELL% -c 'test ! -e "/home/landstrip-missing-%PID%"' | status=0 | out!="kind":"filesystem"
 

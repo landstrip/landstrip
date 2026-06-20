@@ -86,7 +86,6 @@ impl AccessPolicy {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[allow(dead_code)]
 pub(crate) enum AccessPolicyError {
-    PartialRead,
     UnrestrictedRead,
     TcpPolicy,
     UnixSocketPolicy,
@@ -102,15 +101,9 @@ impl std::error::Error for AccessPolicyError {}
 
 #[cfg(target_os = "macos")]
 impl AccessPolicy {
-    /// Reject policies macOS Seatbelt cannot enforce: partial read allowlists, a
-    /// non-socket `allowUnixSockets` path, or a `denyWrite` symlink ancestor.
+    /// Reject policies macOS Seatbelt cannot enforce: a non-socket
+    /// `allowUnixSockets` path or a `denyWrite` symlink ancestor.
     pub(crate) fn validate(&self) -> std::result::Result<(), AccessPolicyError> {
-        if let ReadAccess::AllowRoots(roots) = &self.read_access {
-            if !roots.iter().any(|root| root == Path::new("/")) {
-                return Err(AccessPolicyError::PartialRead);
-            }
-        }
-
         if let UnixSocketAccess::AllowPaths(paths) = &self.network_access.unix_socket_access {
             for path in paths {
                 match fs::symlink_metadata(path) {
