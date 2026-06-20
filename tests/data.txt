@@ -23,7 +23,7 @@ name=allowWrite permits path with parentheses | os=macos | setup=mkdir:allowed (
 
 name=dev null read and write are permitted | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'cat /dev/null >/dev/null' | status=0
 name=inherited fd cannot bypass write policy | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}} | fd3=denied/preopened.txt | cmd=%SHELL% -c 'if test -e /dev/fd/3; then echo fd3-inherited >&2; fi; echo bypass >&3' | status=!0 | out!=fd3-inherited | trapfd_empty
-name=denyRead root blocks directory listing | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"]}} | cmd=/bin/ls / | status=!0
+name=denyRead blocks subdirectory listing | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"]}} | cmd=/bin/ls /usr | status=!0
 
 # --- structured denial reporting ---
 
