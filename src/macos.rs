@@ -170,9 +170,6 @@ fn render_parent_dir_rules(sb: &mut String, roots: &[PathBuf]) -> fmt::Result {
                 break;
             }
             ancestors.push(parent.to_path_buf());
-            if let Ok(real) = std::fs::canonicalize(parent) {
-                ancestors.push(real);
-            }
             current = parent;
         }
     }
