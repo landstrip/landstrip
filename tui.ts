@@ -528,6 +528,36 @@ const tui: TuiPlugin = async (api, options, meta) => {
     ],
   });
 
+  api.command?.register(() => [
+    {
+      title: 'Sandbox',
+      value: 'sandbox',
+      description: 'Show sandbox configuration',
+      category: 'Sandbox',
+      suggested: true,
+      slash: { name: 'sandbox' },
+      onSelect: showSandbox,
+    },
+    {
+      title: 'Disable sandbox',
+      value: 'sandbox-disable',
+      description: 'Disable sandbox for this session',
+      category: 'Sandbox',
+      suggested: true,
+      slash: { name: 'sandbox-disable' },
+      onSelect: () => executeServerCommand('sandbox-disable'),
+    },
+    {
+      title: 'Enable sandbox',
+      value: 'sandbox-enable',
+      description: 'Re-enable sandbox for this session',
+      category: 'Sandbox',
+      suggested: true,
+      slash: { name: 'sandbox-enable' },
+      onSelect: () => executeServerCommand('sandbox-enable'),
+    },
+  ]);
+
   // Persistent status badge in the prompt area. It needs the host's Solid
   // runtime, imported defensively so a host that resolves plugin imports
   // differently still loads the plugin — the badge just stays absent there.
