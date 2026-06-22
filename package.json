@@ -31,7 +31,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-tui": "^0.78.0",
-    "@landstrip/landstrip": "^0.16.6"
+    "@landstrip/landstrip": "^0.16.7"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.2",
