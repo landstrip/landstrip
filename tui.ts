@@ -2,21 +2,17 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import type { TuiPlugin, TuiSlotContext, TuiSlotPlugin } from '@opencode-ai/plugin/tui';
-
-import { existsSync } from 'node:fs';
 import { type AddressInfo, createServer, type Socket as NetSocket } from 'node:net';
 
 import {
-  list,
-  type SandboxConfigOverrides,
   getConfigPaths,
-  landstripBinaryPath,
   loadConfig,
   normalizeOptions,
   parseLandstripTraps,
   permissionLabel,
   permissionResource,
   removeDiscoveryFile,
+  sandboxSummary,
   updateForPermission,
   writeConfigFile,
   writeDiscoveryPort,
@@ -57,39 +53,6 @@ interface PermissionEntry {
 }
 
 type QueueEntry = PermissionEntry | FsQueryEntry;
-
-function configPathLine(label: string, filePath: string): string {
-  return `${label}: ${filePath} ${existsSync(filePath) ? '(found)' : '(missing)'}`;
-}
-
-function sandboxSummary(baseDirectory: string, optionOverrides: SandboxConfigOverrides): string {
-  const config = loadConfig(baseDirectory, optionOverrides);
-  const { globalPath, projectPath } = getConfigPaths(baseDirectory);
-  const networkMode = config.network.allowNetwork ? 'unrestricted' : 'proxied';
-
-  return [
-    `Status: ${config.enabled ? 'active' : 'disabled by config'}`,
-    `landstrip package binary: ${landstripBinaryPath()}`,
-    '',
-    'Config files',
-    configPathLine('project', projectPath),
-    configPathLine('global', globalPath),
-    '',
-    `Network: ${networkMode}`,
-    `allow network: ${config.network.allowNetwork ? 'yes' : 'no'}`,
-    `allowed: ${list(config.network.allowedDomains)}`,
-    `denied: ${list(config.network.deniedDomains)}`,
-    `unix sockets: ${config.network.allowAllUnixSockets ? 'all' : list(config.network.allowUnixSockets)}`,
-    '',
-    'Filesystem',
-    `deny read: ${list(config.filesystem.denyRead)}`,
-    `allow read: ${list(config.filesystem.allowRead)}`,
-    `allow write: ${list(config.filesystem.allowWrite)}`,
-    `deny write: ${list(config.filesystem.denyWrite)}`,
-    '',
-    'Press esc or enter to close',
-  ].join('\n');
-}
 
 function asRecord(permission: PendingPermission): Record<string, unknown> {
   return permission as unknown as Record<string, unknown>;
@@ -475,7 +438,10 @@ const tui: TuiPlugin = async (api, options, meta) => {
 
   const showSandbox = () => {
     const directory = api.state.path.directory || process.cwd();
-    const message = sandboxSummary(directory, optionOverrides);
+    const config = loadConfig(directory, optionOverrides);
+    const { globalPath, projectPath } = getConfigPaths(directory);
+    const message = sandboxSummary(config, globalPath, projectPath) +
+      '\n\nPress esc or enter to close';
 
     // No `onConfirm`/`onClose` that call `clear()`: the host already pops the
     // dialog on enter/esc/click, and its `clear()` re-invokes every entry's

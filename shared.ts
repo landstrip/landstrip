@@ -529,3 +529,48 @@ export function readDiscoveryPort(baseDirectory: string): number | null {
     return null;
   }
 }
+
+/**
+ * Human-readable sandbox configuration report consumed by both the server
+ * command and the TUI inspector dialog.
+ */
+export function sandboxSummary(
+  config: SandboxConfig,
+  globalPath: string,
+  projectPath: string,
+  statusOverride?: string,
+): string {
+  const networkMode = config.network.allowNetwork ? 'unrestricted' : 'proxied';
+  const allowed = list(config.network.allowedDomains);
+  const denied = list(config.network.deniedDomains);
+  const unixSockets = config.network.allowAllUnixSockets
+    ? 'all'
+    : list(config.network.allowUnixSockets);
+  const denyRead = list(config.filesystem.denyRead);
+  const allowRead = list(config.filesystem.allowRead);
+  const allowWrite = list(config.filesystem.allowWrite);
+  const denyWrite = list(config.filesystem.denyWrite);
+
+  const status = statusOverride ?? (config.enabled ? 'active' : 'disabled by config');
+
+  return [
+    `Status: ${status}`,
+    `landstrip package binary: ${landstripBinaryPath()}`,
+    '',
+    'Config files',
+    `${projectPath} ${existsSync(projectPath) ? '(found)' : '(missing)'}`,
+    `${globalPath} ${existsSync(globalPath) ? '(found)' : '(missing)'}`,
+    '',
+    `Network: ${networkMode}`,
+    `allow network: ${config.network.allowNetwork ? 'yes' : 'no'}`,
+    `allowed: ${allowed}`,
+    `denied: ${denied}`,
+    `unix sockets: ${unixSockets}`,
+    '',
+    'Filesystem',
+    `deny read: ${denyRead}`,
+    `allow read: ${allowRead}`,
+    `allow write: ${allowWrite}`,
+    `deny write: ${denyWrite}`,
+  ].join('\n');
+}

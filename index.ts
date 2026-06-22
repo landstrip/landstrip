@@ -11,7 +11,6 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { URL } from 'node:url';
 
 import {
-  list,
   type LandstripTrap,
   type SandboxConfig,
   type SandboxFilesystemConfig,
@@ -26,6 +25,7 @@ import {
   permissionPatterns,
   permissionType,
   readDiscoveryPort,
+  sandboxSummary,
 } from './shared.js';
 
 interface LandstripPolicy {
@@ -807,37 +807,11 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     });
   }
 
-  function sandboxSummary(config: SandboxConfig): string {
+  function buildSandboxSummary(config: SandboxConfig): string {
     const { globalPath, projectPath } = getConfigPaths(directory);
-    const networkMode = config.network.allowNetwork ? 'unrestricted' : 'proxied';
-    const allowed = list(config.network.allowedDomains);
-    const denied = list(config.network.deniedDomains);
-    const denyRead = list(config.filesystem.denyRead);
-    const allowRead = list(config.filesystem.allowRead);
-    const allowWrite = list(config.filesystem.allowWrite);
-    const denyWrite = list(config.filesystem.denyWrite);
-
-    return [
-      '# Sandbox Configuration',
-      '',
-      `Status: ${sandboxDisabled ? 'disabled for this session' : 'active'}`,
-      `landstrip package binary: ${landstripBinaryPath()}`,
-      '',
-      'Config files:',
-      `- project: ${projectPath}`,
-      `- global: ${globalPath}`,
-      '',
-      `Network (${networkMode}):`,
-      `- allow network: ${config.network.allowNetwork ? 'yes' : 'no'}`,
-      `- allowed: ${allowed}`,
-      `- denied: ${denied}`,
-      '',
-      'Filesystem:',
-      `- deny read: ${denyRead}`,
-      `- allow read: ${allowRead}`,
-      `- allow write: ${allowWrite}`,
-      `- deny write: ${denyWrite}`,
-    ].join('\n');
+    const statusText = sandboxDisabled ? 'disabled for this session' : undefined;
+    const report = sandboxSummary(config, globalPath, projectPath, statusText);
+    return ['# Sandbox Configuration', '', report].join('\n');
   }
 
   client.app
@@ -1275,7 +1249,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     'command.execute.before': async (input, output) => {
       if (input.command.trim() === '/sandbox') {
         const config = loadConfig(directory, optionOverrides);
-        pushCommandText(input, output, sandboxSummary(config));
+        pushCommandText(input, output, buildSandboxSummary(config));
         await client.tui
           ?.showToast?.({
             body: { title: 'Sandbox', message: `Config loaded for ${directory}`, variant: 'info' },
