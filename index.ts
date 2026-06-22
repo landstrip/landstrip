@@ -1218,7 +1218,7 @@ export function createLandstripIntegration(
             childEnd.destroy();
 
             function killChild(): void {
-              if (!child.pid) return;
+              if (child.pid === undefined) return;
               try {
                 process.kill(-child.pid, 'SIGKILL');
               } catch {
