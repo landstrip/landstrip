@@ -1,3 +1,6 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Copyright (C) Jarkko Sakkinen 2026 -->
+
 # landstrip
 
 `landstrip` runs a tool in an OS-level sandbox using Landlock LSM on Linux,
@@ -28,7 +31,21 @@ binary package.
 | TCP          | localhost proxy ports    | loopback proxy ports         | allow all or deny all           |
 | Unix sockets | allowlist                | allowlist via seccomp broker | allow all or deny all           |
 
-### Windows AppContainer
+### Linux
+
+Landlock carves the denied subtrees out of the allowed roots, and then grants
+`PATH_BENEATH` rules only for the surviving fragments. The denied path is never
+added to the ruleset, and the kernel enforces the path in-process.
+
+Seccomp is applied when a policy needs more than Landlock can express
+statically, e.g. for many filesystem mutator syscalls, or when denials must be
+reported back to the launcher. The broker intercepts `openat`/`openat2` via
+seccomp user-notifications, resolves the real path, and validates it
+
+Finally there's some logic to deduce that Landlock and Seccomp (mostly for
+mutator syscall, which take fd) are fairly disjoint entities.
+
+### Windows
 
 Win32 API provides AppContainer for application level sandboxing. The platform
 creates a per-run LPAC AppContainer profile, grants its SID access to the lowered
