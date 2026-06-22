@@ -863,9 +863,9 @@ type LandstripBashTool = ReturnType<typeof createBashToolDefinition>;
 /** Options for creating a landstrip sandbox integration. */
 export interface LandstripIntegrationOptions {
   /** Register a sandboxed bash tool when the integration is registered. */
-  registerBashTool?: boolean;
+  readonly registerBashTool?: boolean;
   /** Working directory used when registering the default bash tool. */
-  cwd?: string;
+  readonly cwd?: string;
 }
 
 /** Landstrip sandbox integration hooks for Pi. */
