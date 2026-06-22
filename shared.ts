@@ -66,6 +66,10 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+export function list(values: string[]): string {
+  return values.join(', ') || '(none)';
+}
+
 function stringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value.every((item) => typeof item === 'string') ? [...value] : undefined;

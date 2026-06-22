@@ -7,6 +7,7 @@ import { existsSync } from 'node:fs';
 import { type AddressInfo, createServer, type Socket as NetSocket } from 'node:net';
 
 import {
+  list,
   type SandboxConfigOverrides,
   getConfigPaths,
   landstripBinaryPath,
@@ -56,10 +57,6 @@ interface PermissionEntry {
 }
 
 type QueueEntry = PermissionEntry | FsQueryEntry;
-
-function list(values: string[]): string {
-  return values.join(', ') || '(none)';
-}
 
 function configPathLine(label: string, filePath: string): string {
   return `${label}: ${filePath} ${existsSync(filePath) ? '(found)' : '(missing)'}`;

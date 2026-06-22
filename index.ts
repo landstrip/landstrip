@@ -11,6 +11,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { URL } from 'node:url';
 
 import {
+  list,
   type LandstripTrap,
   type SandboxConfig,
   type SandboxFilesystemConfig,
@@ -809,12 +810,12 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
   function sandboxSummary(config: SandboxConfig): string {
     const { globalPath, projectPath } = getConfigPaths(directory);
     const networkMode = config.network.allowNetwork ? 'unrestricted' : 'proxied';
-    const allowed = config.network.allowedDomains.join(', ') || '(none)';
-    const denied = config.network.deniedDomains.join(', ') || '(none)';
-    const denyRead = config.filesystem.denyRead.join(', ') || '(none)';
-    const allowRead = config.filesystem.allowRead.join(', ') || '(none)';
-    const allowWrite = config.filesystem.allowWrite.join(', ') || '(none)';
-    const denyWrite = config.filesystem.denyWrite.join(', ') || '(none)';
+    const allowed = list(config.network.allowedDomains);
+    const denied = list(config.network.deniedDomains);
+    const denyRead = list(config.filesystem.denyRead);
+    const allowRead = list(config.filesystem.allowRead);
+    const allowWrite = list(config.filesystem.allowWrite);
+    const denyWrite = list(config.filesystem.denyWrite);
 
     return [
       '# Sandbox Configuration',
@@ -1012,7 +1013,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     if (typeof args.command !== 'string') return;
 
     const rewriteDescription = (): void => {
-      if (typeof args.description === 'string') args.description = landstripDescription(args.description);
+      if (typeof args.description === 'string')
+        args.description = landstripDescription(args.description);
     };
 
     const existing = activeBash.get(callID);
