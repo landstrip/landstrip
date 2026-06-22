@@ -96,12 +96,17 @@ function canonicalizePath(filePath: string, baseDirectory: string): string {
   }
 }
 
+const globRegExpCache = new Map<string, RegExp>();
+
 /**
  * Translates an absolute glob pattern to a regular expression using standard
  * path semantics: `**` crosses directory boundaries (and `**​/` may match zero
  * segments), while a single `*` is confined to one path segment.
  */
 function globToRegExp(globPattern: string): RegExp {
+  const cached = globRegExpCache.get(globPattern);
+  if (cached) return cached;
+
   let regex = '';
 
   for (let i = 0; i < globPattern.length; i++) {
@@ -125,7 +130,9 @@ function globToRegExp(globPattern: string): RegExp {
     }
   }
 
-  return new RegExp(`^${regex}$`);
+  const result = new RegExp(`^${regex}$`);
+  globRegExpCache.set(globPattern, result);
+  return result;
 }
 
 // Component count of an absolute path; "/" is 0. Used to rank how specific a
