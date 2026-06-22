@@ -715,10 +715,8 @@ function splitShellQuotedArgs(command: string): string[] {
 function extractOriginalCommand(wrappedCommand: string): string | null {
   const args = splitShellQuotedArgs(wrappedCommand);
   const pIdx = args.indexOf('-p');
-  if (pIdx === -1 || pIdx + 3 >= args.length) return null;
-  const flagIdx = pIdx + 3;
-  const flag = args[flagIdx];
-  if (flag !== '-lc' && flag !== '-c') return null;
+  const flagIdx = args.findIndex((arg, i) => i > pIdx && (arg === '-lc' || arg === '-c'));
+  if (flagIdx === -1) return null;
   // The query-response form appends `|| <plain invocation>`; stop at that
   // separator so the fallback branch is not folded into the recovered command.
   const end = args.indexOf('||', flagIdx + 1);

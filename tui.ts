@@ -440,8 +440,8 @@ const tui: TuiPlugin = async (api, options, meta) => {
     const directory = api.state.path.directory || process.cwd();
     const config = loadConfig(directory, optionOverrides);
     const { globalPath, projectPath } = getConfigPaths(directory);
-    const message = sandboxSummary(config, globalPath, projectPath) +
-      '\n\nPress esc or enter to close';
+    const message =
+      sandboxSummary(config, globalPath, projectPath) + '\n\nPress esc or enter to close';
 
     // No `onConfirm`/`onClose` that call `clear()`: the host already pops the
     // dialog on enter/esc/click, and its `clear()` re-invokes every entry's
