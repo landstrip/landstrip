@@ -692,6 +692,8 @@ function landstripDescription(description: string): string {
 }
 
 function splitShellQuotedArgs(command: string): string[] {
+  const args: string[] = [];
+  let i = 0;
   while (i < command.length) {
     while (i < command.length && command[i] === ' ') i++;
     if (i >= command.length) break;
