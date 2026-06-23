@@ -188,7 +188,6 @@ function resolveFilesystemConfig(
   };
 }
 
-
 function domainMatchesPattern(domain: string, pattern: string): boolean {
   const normalizedDomain = domain.toLowerCase();
   const normalizedPattern = pattern.toLowerCase();
@@ -702,11 +701,7 @@ function splitShellQuotedArgs(command: string): string[] {
       let arg = '';
       while (i < command.length) {
         if (command[i] === "'") {
-          if (
-            command[i + 1] === '\\' &&
-            command[i + 2] === "'" &&
-            command[i + 3] === "'"
-          ) {
+          if (command[i + 1] === '\\' && command[i + 2] === "'" && command[i + 3] === "'") {
             arg += "'";
             i += 4;
             continue;
@@ -728,6 +723,7 @@ function splitShellQuotedArgs(command: string): string[] {
     }
   }
   return args;
+}
 
 function extractOriginalCommand(wrappedCommand: string): string | null {
   const args = splitShellQuotedArgs(wrappedCommand);
