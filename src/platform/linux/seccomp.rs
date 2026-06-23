@@ -122,7 +122,7 @@ pub(super) fn run_broker(
     ensure_notification_supported()?;
 
     let syscalls = NotificationSyscalls::new();
-    let errno = filter::build_errno_filter(&syscalls, needs_network, unix_sockets)?;
+    let errno = build_errno_filter(&syscalls, needs_network, unix_sockets)?;
 
     let mut notify_syscalls: Vec<i64> = Vec::new();
     if notify_bind {
