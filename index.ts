@@ -164,10 +164,6 @@ function matchDepth(filePath: string, patterns: string[], baseDirectory: string)
   return depth;
 }
 
-function matchesPattern(filePath: string, patterns: string[], baseDirectory: string): boolean {
-  return matchDepth(filePath, patterns, baseDirectory) >= 0;
-}
-
 function resolveFilesystemPatterns(patterns: string[], baseDirectory: string): string[] {
   return patterns.map((pattern) =>
     pattern.includes('*')
