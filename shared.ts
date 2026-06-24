@@ -6,6 +6,7 @@ import { binaryPath } from '@landstrip/landstrip';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 export interface SandboxFilesystemConfig {
@@ -36,30 +37,7 @@ export interface SandboxConfigOverrides {
   filesystem?: Partial<SandboxFilesystemConfig>;
 }
 
-export const DEFAULT_CONFIG: SandboxConfig = {
-  enabled: true,
-  network: {
-    allowNetwork: false,
-    allowLocalBinding: false,
-    allowAllUnixSockets: false,
-    allowUnixSockets: [],
-    allowedDomains: [],
-    deniedDomains: [],
-  },
-  filesystem: {
-    denyRead: ['/Users', '/home'],
-    allowRead: ['.', '~/.gitconfig', '~/.config/git/config', '/dev/null'],
-    allowWrite: ['.', '/dev/null'],
-    denyWrite: [
-      '**/.env',
-      '**/.env.*',
-      '**/*.pem',
-      '**/*.key',
-      '.opencode/sandbox.json',
-      '~/.config/opencode/sandbox.json',
-    ],
-  },
-};
+const packageDir = dirname(fileURLToPath(import.meta.url));
 
 const LANDSTRIP_PACKAGE_NAMES = new Set([
   '@landstrip/landstrip',
@@ -195,22 +173,18 @@ export function loadConfig(
   optionOverrides: SandboxConfigOverrides,
 ): SandboxConfig {
   const { globalPath, projectPath } = getConfigPaths(baseDirectory);
+  const templatePath = join(packageDir, 'sandbox.json');
 
   if (!existsSync(globalPath)) {
     mkdirSync(dirname(globalPath), { recursive: true });
-    writeFileSync(
-      globalPath,
-      JSON.stringify(DEFAULT_CONFIG, null, 2) + '\n',
-      'utf-8',
-    );
+    writeFileSync(globalPath, readFileSync(templatePath, 'utf-8'), 'utf-8');
   }
 
-  const globalConfig = readConfigFile(globalPath) ?? {};
+  const templateConfig: SandboxConfig = JSON.parse(readFileSync(templatePath, 'utf-8'));
+  const globalOverrides = readConfigFile(globalPath) ?? {};
+  const baseConfig = deepMerge(templateConfig, globalOverrides);
 
-  return deepMerge(
-    deepMerge(globalConfig, readConfigFile(projectPath) ?? {}),
-    optionOverrides,
-  );
+  return deepMerge(deepMerge(baseConfig, readConfigFile(projectPath) ?? {}), optionOverrides);
 }
 
 export function writeConfigFile(configPath: string, update: SandboxConfigOverrides): void {
@@ -219,7 +193,10 @@ export function writeConfigFile(configPath: string, update: SandboxConfigOverrid
     throw new Error(`Config file ${configPath} is corrupted; refusing to overwrite`);
   }
 
-  const next = deepMerge(current, update);
+  const templateConfig: SandboxConfig = JSON.parse(
+    readFileSync(join(packageDir, 'sandbox.json'), 'utf-8'),
+  );
+  const next = deepMerge(deepMerge(templateConfig, current), update);
 
   mkdirSync(dirname(configPath), { recursive: true });
   writeFileSync(configPath, JSON.stringify(next, null, 2) + '\n');
