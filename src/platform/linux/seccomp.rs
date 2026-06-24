@@ -2080,7 +2080,6 @@ pub(super) struct NotificationSyscalls {
     pub(super) bind: i64,
     pub(super) connect: i64,
     pub(super) socket: i64,
-    pub(super) socketpair: i64,
     openat: i64,
     openat2: i64,
 }
@@ -2091,7 +2090,6 @@ impl NotificationSyscalls {
             bind: libc::SYS_bind,
             connect: libc::SYS_connect,
             socket: libc::SYS_socket,
-            socketpair: libc::SYS_socketpair,
             openat: libc::SYS_openat,
             openat2: libc::SYS_openat2,
         }

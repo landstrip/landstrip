@@ -44,12 +44,7 @@ pub(super) fn build_errno_filter(
     let mut errno_rules = RuleMap::new();
     if needs_network {
         add_socket_family_filter(&mut errno_rules, syscalls.socket)?;
-        add_unix_socket_filters(
-            &mut errno_rules,
-            syscalls.socket,
-            syscalls.socketpair,
-            unix_sockets,
-        )?;
+        add_unix_socket_filters(&mut errno_rules, syscalls.socket, unix_sockets)?;
     }
     if errno_rules.is_empty() {
         return Ok(None);
@@ -239,17 +234,16 @@ fn add_conditional_rule(
 pub(super) fn add_unix_socket_filters(
     rules: &mut RuleMap,
     socket: i64,
-    socketpair: i64,
     policy: UnixSocketFilter,
 ) -> Result<()> {
     match policy {
-        UnixSocketFilter::Unrestricted => {}
-        UnixSocketFilter::PathMediated => {
-            add_socket_domain_filter(rules, socketpair, libc::AF_UNIX)?;
-        }
+        // socketpair creates unnamed connected sockets for parent-child IPC
+        // (Node.js spawn, etc.) — it has no path, no remote address, and is
+        // never a network attack surface. Always allow it regardless of the
+        // unix-socket policy.
+        UnixSocketFilter::Unrestricted | UnixSocketFilter::PathMediated => {}
         UnixSocketFilter::DenyAll => {
             add_socket_domain_filter(rules, socket, libc::AF_UNIX)?;
-            add_socket_domain_filter(rules, socketpair, libc::AF_UNIX)?;
         }
     }
 
