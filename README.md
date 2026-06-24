@@ -1,9 +1,31 @@
 # opencode-landstrip
 
-Landlock-based sandboxing for [opencode](https://opencode.ai/) using
-[`landstrip`](https://github.com/landstrip/landstrip).
+`opencode-landstrip` is a plugin for [OpenCode](https://opencode.ai/) providing
+a sandbox defined with a policy compatible with Anthropic's JSON format. It uses
+[`landstrip`](https://github.com/landstrip/landstrip) to implement the sandbox.
 
-## Install
+`opencode-landstrip` has a default policy [sandbox.json](./sandbox.json), and
+allows the define either or both global or project specific policies.
+
+## Installing the plugin
+
+### Automatic install
+
+Project specific install:
+
+```
+opencode plugin install opencode-landstrip
+```
+
+Global install:
+
+```
+opencode plugin install opencode-landstrip --global
+```
+
+### Manual install
+
+These changes are applied to OpenCode's configuration directories
 
 Add the plugin to `opencode.json`:
 
@@ -14,8 +36,7 @@ Add the plugin to `opencode.json`:
 }
 ```
 
-Add the TUI entrypoint to `tui.json` if you install or configure the plugin
-manually:
+Add TUI entry point to `tui.json`:
 
 ```json
 {
@@ -24,51 +45,7 @@ manually:
 }
 ```
 
-`opencode plugin install opencode-landstrip` configures both entrypoints.
-
-This installs `opencode-landstrip` and its `@landstrip/landstrip` dependency, which
-includes platform-specific native binaries for Linux, macOS, and Windows.
-
-Requires OpenCode `1.17.7` or newer.
-
-On unsupported platforms the plugin loads but leaves sandboxing disabled.
-
-## Configure
-
-Create `.opencode/sandbox.json` in a project or
-`~/.config/opencode/sandbox.json` globally. Project config takes precedence and
-array fields are merged with global/default values.
-
-See [`sandbox.json`](./sandbox.json) for a starter config.
-
-## Behavior
-
-The plugin wraps opencode's AI `bash` tool in `landstrip`, routes proxy-aware
-network traffic through an allowlist proxy, and blocks read/write tool access
-outside configured filesystem allowlists. The default policy is strict: network
-access is off unless domains are allowed, reads are limited to the project,
-`~/.gitconfig`, and `/dev/null`, and writes are limited to the project and
-`/dev/null`.
-
-Run `/sandbox` in the TUI to inspect the active sandbox configuration. A compact
-status badge in the prompt area shows whether the sandbox is active and whether
-network is proxied or open.
-
-When OpenCode asks for a sandboxed permission, the TUI plugin plays the host's
-permission sound and desktop notification, then opens a single dialog with
-choices to allow once, allow for the session, persist for the project, persist
-globally, or reject. The dialog shows the exact path or domain being approved.
-Project approvals are written to `.opencode/sandbox.json`; global approvals are
-written to `~/.config/opencode/sandbox.json`.
-
-OpenCode's current plugin API allows wrapping AI `bash` tool calls, but does not
-allow a plugin to replace manually typed shell-mode commands with a landstrip
-wrapper. Those commands can still receive the proxy environment from OpenCode,
-but they are not process-sandboxed by this plugin.
-
-## Disable
-
-Set `enabled` to `false` in `sandbox.json`, or pass plugin options:
+The plugin can be later on disabled as follows:
 
 ```json
 {
@@ -76,6 +53,22 @@ Set `enabled` to `false` in `sandbox.json`, or pass plugin options:
   "plugin": [["opencode-landstrip", { "enabled": false }]]
 }
 ```
+
+## Behavior
+
+When OpenCode asks for a sandboxed permission, the plugin emits a host
+notification. After that the plugin opens a dialog with the choices to allow
+once, allow for the session, persist for the project, persist globally, or
+reject. The dialog shows the exact path or domain being approved.
+
+Project approvals are written to `.opencode/sandbox.json`; global approvals are
+written to `~/.config/opencode/sandbox.json`. When the global configuration is
+initially written it acquires the copy of the default sandbox configuration.
+
+OpenCode's current plugin API allows wrapping AI `bash` tool calls, but does not
+allow a plugin to replace manually typed shell-mode commands with a landstrip
+wrapper. Those commands can still receive the proxy environment from OpenCode,
+but they are not process-sandboxed by this plugin.
 
 ## License
 

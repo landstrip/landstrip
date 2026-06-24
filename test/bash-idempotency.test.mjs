@@ -443,6 +443,42 @@ test('deny overrides allow when a path matches both lists', async () => {
   );
 });
 
+test('sandbox config files are write-protected by default', async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      network: { allowedDomains: ['*'], deniedDomains: [] },
+    },
+    async ({ hooks, tempDir }) => {
+      const home = join(tempDir, 'home');
+      const projectConfig = join(tempDir, '.opencode', 'sandbox.json');
+      const globalConfig = join(home, '.config', 'opencode', 'sandbox.json');
+
+      // The default denyWrite (merged in even with an empty override) keeps the
+      // model from rewriting its own sandbox config through the write tool.
+      for (const path of [projectConfig, globalConfig]) {
+        await assert.rejects(
+          hooks['tool.execute.before'](
+            { callID: `write-${path}`, tool: 'write' },
+            { args: { path } },
+          ),
+          /write access denied/,
+          path,
+        );
+      }
+
+      // Ordinary project files remain writable.
+      await assert.doesNotReject(
+        hooks['tool.execute.before'](
+          { callID: 'write-notes', tool: 'write' },
+          { args: { path: join(tempDir, 'notes.txt') } },
+        ),
+      );
+    },
+  );
+});
+
 test('a broad denyRead does not block reads inside an allowed project', async () => {
   await withPlugin(
     {

@@ -50,7 +50,14 @@ export const DEFAULT_CONFIG: SandboxConfig = {
     denyRead: ['/Users', '/home'],
     allowRead: ['.', '~/.gitconfig', '~/.config/git/config', '/dev/null'],
     allowWrite: ['.', '/dev/null'],
-    denyWrite: ['**/.env', '**/.env.*', '**/*.pem', '**/*.key'],
+    denyWrite: [
+      '**/.env',
+      '**/.env.*',
+      '**/*.pem',
+      '**/*.key',
+      '.opencode/sandbox.json',
+      '~/.config/opencode/sandbox.json',
+    ],
   },
 };
 
