@@ -247,22 +247,12 @@ pub(crate) fn resolve_policy(
         ReadAccess::AllowRoots(vec![PathBuf::from("/")])
     } else {
         let mut read_roots = subtract_denied_roots(vec![PathBuf::from("/")], &read_deny)?;
-        // Re-add each allowRead root, but keep any denyRead strictly nested
-        // under it carved out so the most specific rule wins: an allowRead path
-        // overrides a broader or equal denyRead, while a denyRead nested inside
-        // an allowRead root still wins. A deeper allowRead re-adds itself on its
-        // own iteration.
+        // Push each allowRead root as-is; nested denyRead entries are
+        // enforced by the seccomp broker (deny_match) without snapshot-
+        // enumerating the parent directory. Landlock path_beneath on the
+        // parent covers all descendants including runtime-created ones.
         for allow in &read_allow {
-            let nested: Vec<PathBuf> = read_deny
-                .iter()
-                .filter(|deny| deny.as_path() != allow.as_path() && deny.starts_with(allow))
-                .cloned()
-                .collect();
-            if nested.is_empty() {
-                read_roots.push(allow.clone());
-            } else {
-                read_roots.extend(subtract_denied_roots(vec![allow.clone()], &nested)?);
-            }
+            read_roots.push(allow.clone());
         }
         normalize_roots(&mut read_roots);
         ReadAccess::AllowRoots(read_roots)
