@@ -413,11 +413,16 @@ fn scan_allowed_root(
             .iter()
             .any(|denied_root| denied_root.starts_with(&current));
 
+        // A transient EIO (e.g. an autofs automount such as macOS `/home`) is
+        // treated as an opaque boundary alongside a missing or denied path: keep
+        // the path and stop descending rather than abort. A path landstrip cannot
+        // stat is also unreadable to the sandboxed child.
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound
-                    || error.kind() == io::ErrorKind::PermissionDenied =>
+                    || error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(libc::EIO) =>
             {
                 results.push(current);
                 continue;
@@ -436,14 +441,21 @@ fn scan_allowed_root(
 
         let entries = match fs::read_dir(&current) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(libc::EIO) =>
+            {
                 results.push(current);
                 continue;
             }
             Err(source) => return Err(source.into()),
         };
         for entry in entries {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => continue,
+                Err(source) => return Err(source.into()),
+            };
             let child = entry.path();
             stack.push((child, false, depth + 1));
         }
@@ -596,7 +608,8 @@ fn collect_glob_matches(
         Ok(metadata) => metadata,
         Err(error)
             if error.kind() == io::ErrorKind::NotFound
-                || error.kind() == io::ErrorKind::PermissionDenied =>
+                || error.kind() == io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(libc::EIO) =>
         {
             return Ok(());
         }
@@ -608,11 +621,21 @@ fn collect_glob_matches(
 
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(libc::EIO) =>
+        {
+            return Ok(());
+        }
         Err(source) => return Err(source.into()),
     };
     for entry in entries {
-        collect_glob_matches(&entry?.path(), pattern, matches, depth + 1)?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => continue,
+            Err(source) => return Err(source.into()),
+        };
+        collect_glob_matches(&entry.path(), pattern, matches, depth + 1)?;
     }
 
     Ok(())
