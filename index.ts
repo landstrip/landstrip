@@ -18,7 +18,6 @@ import {
   formatLandstripTraps,
   getConfigPaths,
   isRecord,
-  isSandboxDisabled,
   landstripBinaryPath,
   loadConfig,
   normalizeOptions,
@@ -27,7 +26,6 @@ import {
   permissionType,
   sandboxSummary,
   sessionScopeFor,
-  setSandboxDisabled,
 } from './shared.js';
 
 interface LandstripPolicy {
@@ -840,10 +838,6 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     return [...config.filesystem.allowWrite, ...sessionAllowedWritePaths];
   }
   let enabledNotified = false;
-  let sandboxDisabled = false;
-  // A previous session may have left a disable flag for this directory; start
-  // enabled so /sandbox-disable stays scoped to the current session.
-  setSandboxDisabled(directory, false);
   let configuredShell: string | undefined;
   let landstripCheck: { ok: true; version: string } | { ok: false; reason: string } | undefined;
 
@@ -897,9 +891,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
   function buildSandboxSummary(config: SandboxConfig): string {
     const { globalPath, projectPath } = getConfigPaths(directory);
-    const statusText =
-      sandboxDisabled || isSandboxDisabled(directory) ? 'disabled for this session' : undefined;
-    const report = sandboxSummary(config, globalPath, projectPath, statusText);
+    const report = sandboxSummary(config, globalPath, projectPath);
     return ['# Sandbox Configuration', '', report].join('\n');
   }
 
@@ -1003,10 +995,6 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
   }
 
   async function activeConfig(): Promise<SandboxConfig | null> {
-    // The flag file lets the TUI plugin pause the sandbox cross-process; the
-    // in-memory bool covers the server's own command path.
-    if (sandboxDisabled || isSandboxDisabled(directory)) return null;
-
     const config = loadConfig(directory, optionOverrides);
     if (!config.enabled) {
       await notifyOnce(
@@ -1389,72 +1377,6 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
             body: { title: 'Sandbox', message: `Config loaded for ${directory}`, variant: 'info' },
           })
           ?.catch?.(() => undefined);
-        return;
-      }
-
-      if (command === 'sandbox-disable') {
-        if (sandboxDisabled || isSandboxDisabled(directory)) {
-          pushCommandText(
-            input,
-            output,
-            'Sandbox is already disabled. Use /sandbox-enable to re-enable.',
-          );
-          return;
-        }
-        sandboxDisabled = true;
-        setSandboxDisabled(directory, true);
-        pushCommandText(
-          input,
-          output,
-          'Sandbox disabled for this session. Use /sandbox-enable to re-enable.',
-        );
-        await client.tui
-          ?.showToast?.({
-            body: {
-              title: 'Sandbox',
-              message: 'Sandbox disabled for this session. Use /sandbox-enable to re-enable.',
-              variant: 'warning',
-            },
-          })
-          ?.catch?.(() => undefined);
-        return;
-      }
-
-      if (command === 'sandbox-enable') {
-        if (!sandboxDisabled && !isSandboxDisabled(directory)) {
-          pushCommandText(
-            input,
-            output,
-            'Sandbox is already enabled. Use /sandbox-disable to pause.',
-          );
-          return;
-        }
-        sandboxDisabled = false;
-        setSandboxDisabled(directory, false);
-        const config = await activeConfig();
-        if (!config) {
-          pushCommandText(
-            input,
-            output,
-            'Sandbox re-enabled but no sandbox.json5 found — no rules active.\nCreate sandbox.json5 to enforce sandboxing.',
-          );
-          await client.tui
-            ?.showToast?.({
-              body: {
-                title: 'Sandbox',
-                message: 'Sandbox re-enabled but no sandbox.json5 found — no rules active.',
-                variant: 'warning',
-              },
-            })
-            ?.catch?.(() => undefined);
-        } else {
-          pushCommandText(input, output, 'Sandbox re-enabled.');
-          await client.tui
-            ?.showToast?.({
-              body: { title: 'Sandbox', message: 'Sandbox re-enabled.', variant: 'success' },
-            })
-            ?.catch?.(() => undefined);
-        }
         return;
       }
 

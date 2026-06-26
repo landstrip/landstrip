@@ -126,49 +126,10 @@ test('bash wrapping is idempotent for repeated before hooks', async () => {
   );
 });
 
-test('sandbox-disable stops wrapping and sandbox-enable resumes it', async () => {
+test('setSandboxConfigEnabled toggles persisted enabled and the server honors it', async () => {
   await withPlugin(
     {
-      enabled: true,
-      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
-      network: { allowedDomains: ['*'], deniedDomains: [] },
-    },
-    async ({ hooks, messages }) => {
-      const wrap = async (callID) => {
-        const output = { args: { command: 'git status --short', description: 'd' } };
-        await hooks['tool.execute.before']({ callID, tool: 'bash' }, output);
-        await hooks['tool.execute.after'](
-          { callID, tool: 'bash', args: output.args },
-          { title: '', output: '', metadata: {} },
-        );
-        return output.args.command;
-      };
-
-      assert.notEqual(await wrap('enabled'), 'git status --short', messages.join('\n'));
-
-      await hooks['command.execute.before'](
-        { command: 'sandbox-disable', sessionID: 's', arguments: '' },
-        { parts: [] },
-      );
-      assert.equal(await wrap('disabled'), 'git status --short', 'disable must skip wrapping');
-
-      await hooks['command.execute.before'](
-        { command: 'sandbox-enable', sessionID: 's', arguments: '' },
-        { parts: [] },
-      );
-      assert.notEqual(
-        await wrap('re-enabled'),
-        'git status --short',
-        'enable must resume wrapping',
-      );
-    },
-  );
-});
-
-test('disable flag file pauses wrapping cross-process (no command hook)', async () => {
-  await withPlugin(
-    {
-      enabled: true,
+      // No `enabled` here: the persisted sandbox.json drives it.
       filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
       network: { allowedDomains: ['*'], deniedDomains: [] },
     },
@@ -184,19 +145,16 @@ test('disable flag file pauses wrapping cross-process (no command hook)', async 
         return output.args.command;
       };
 
-      try {
-        assert.notEqual(await wrap('on'), 'git status --short');
+      // The template defaults enabled: true, so wrapping is active.
+      assert.notEqual(await wrap('on'), 'git status --short');
 
-        // Simulate the TUI process writing the flag without the server's
-        // command hook ever firing.
-        shared.setSandboxDisabled(tempDir, true);
-        assert.equal(await wrap('off'), 'git status --short', 'flag must pause wrapping');
+      // /sandbox toggle off: persists enabled:false (no project config -> global).
+      assert.equal(shared.setSandboxConfigEnabled(tempDir, false), 'global');
+      assert.equal(await wrap('off'), 'git status --short', 'disabled config skips wrapping');
 
-        shared.setSandboxDisabled(tempDir, false);
-        assert.notEqual(await wrap('on-again'), 'git status --short');
-      } finally {
-        shared.setSandboxDisabled(tempDir, false);
-      }
+      // /sandbox toggle back on.
+      assert.equal(shared.setSandboxConfigEnabled(tempDir, true), 'global');
+      assert.notEqual(await wrap('on-again'), 'git status --short');
     },
   );
 });

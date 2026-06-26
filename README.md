@@ -54,6 +54,10 @@ The plugin can be later on disabled as follows:
 }
 ```
 
+The `/sandbox` command shows the current configuration and toggles the sandbox
+on or off. The toggle persists `enabled` to the project config when it already
+sets it, otherwise to the global config.
+
 ## Behavior
 
 When OpenCode asks for a sandboxed permission, the plugin emits a host

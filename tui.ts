@@ -15,7 +15,7 @@ import {
   sessionAllows,
   sandboxSummary,
   sessionScopeFor,
-  setSandboxDisabled,
+  setSandboxConfigEnabled,
   updateForPermission,
   writeConfigFile,
   writeDiscoveryPort,
@@ -447,37 +447,34 @@ const tui: TuiPlugin = async (api, options, meta) => {
     });
   }
 
+  // /sandbox shows the config and toggles the persisted `enabled` flag. The
+  // server reads sandbox.json on every tool call, so the toggle takes effect on
+  // the next command without any cross-process signalling.
   const showSandbox = () => {
     const directory = api.state.path.directory || process.cwd();
     const config = loadConfig(directory, optionOverrides);
     const { globalPath, projectPath } = getConfigPaths(directory);
+    const next = !config.enabled;
     const message =
-      sandboxSummary(config, globalPath, projectPath) + '\n\nPress esc or enter to close';
+      sandboxSummary(config, globalPath, projectPath) +
+      `\n\n${next ? 'Enable' : 'Disable'} the sandbox?  (enter = ${next ? 'enable' : 'disable'}, esc = close)`;
 
-    // No `onConfirm`/`onClose` that call `clear()`: the host already pops the
-    // dialog on enter/esc/click, and its `clear()` re-invokes every entry's
-    // `onClose`, so a `clear()` in there recurses forever and freezes the TUI.
+    // No `clear()` in onConfirm: the host pops the dialog itself, and its
+    // `clear()` re-invokes onClose, which would recurse and freeze the TUI.
     api.ui.dialog.replace(() =>
-      api.ui.DialogAlert({
-        title: 'Sandbox Configuration',
+      api.ui.DialogConfirm({
+        title: 'Sandbox',
         message,
+        onConfirm: () => {
+          const scope = setSandboxConfigEnabled(directory, next);
+          api.ui.toast({
+            title: 'Sandbox',
+            message: `Sandbox ${next ? 'enabled' : 'disabled'} (${scope} config)`,
+            variant: next ? 'success' : 'warning',
+          });
+        },
       }),
     );
-  };
-
-  // Toggle the per-directory disable flag directly. The server plugin gates
-  // wrapping on this flag, so disabling works without depending on a command
-  // round-trip reaching the server's command hook.
-  const setSandbox = (disabled: boolean): boolean => {
-    setSandboxDisabled(api.state.path.directory || process.cwd(), disabled);
-    api.ui.toast({
-      title: 'Sandbox',
-      message: disabled
-        ? 'Sandbox disabled for this session. Use /sandbox-enable to re-enable.'
-        : 'Sandbox re-enabled.',
-      variant: disabled ? 'warning' : 'success',
-    });
-    return true;
   };
 
   api.keymap.registerLayer({
@@ -486,34 +483,12 @@ const tui: TuiPlugin = async (api, options, meta) => {
         namespace: 'palette',
         name: 'sandbox',
         title: 'Sandbox',
-        desc: 'Show sandbox configuration',
+        desc: 'Show config and toggle the sandbox',
         category: 'Sandbox',
         suggested: true,
         slash: { name: 'sandbox' },
         slashName: 'sandbox',
         run: showSandbox,
-      },
-      {
-        namespace: 'palette',
-        name: 'sandbox-disable',
-        title: 'Disable sandbox',
-        desc: 'Disable sandbox for this session',
-        category: 'Sandbox',
-        suggested: true,
-        slash: { name: 'sandbox-disable' },
-        slashName: 'sandbox-disable',
-        run: () => setSandbox(true),
-      },
-      {
-        namespace: 'palette',
-        name: 'sandbox-enable',
-        title: 'Enable sandbox',
-        desc: 'Re-enable sandbox for this session',
-        category: 'Sandbox',
-        suggested: true,
-        slash: { name: 'sandbox-enable' },
-        slashName: 'sandbox-enable',
-        run: () => setSandbox(false),
       },
     ],
   });
@@ -522,29 +497,11 @@ const tui: TuiPlugin = async (api, options, meta) => {
     {
       title: 'Sandbox',
       value: 'sandbox',
-      description: 'Show sandbox configuration',
+      description: 'Show config and toggle the sandbox',
       category: 'Sandbox',
       suggested: true,
       slash: { name: 'sandbox' },
       onSelect: showSandbox,
-    },
-    {
-      title: 'Disable sandbox',
-      value: 'sandbox-disable',
-      description: 'Disable sandbox for this session',
-      category: 'Sandbox',
-      suggested: true,
-      slash: { name: 'sandbox-disable' },
-      onSelect: () => setSandbox(true),
-    },
-    {
-      title: 'Enable sandbox',
-      value: 'sandbox-enable',
-      description: 'Re-enable sandbox for this session',
-      category: 'Sandbox',
-      suggested: true,
-      slash: { name: 'sandbox-enable' },
-      onSelect: () => setSandbox(false),
     },
   ]);
 

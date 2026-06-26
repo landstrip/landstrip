@@ -542,24 +542,19 @@ export function discoveryFilePath(baseDirectory: string): string {
   return join(discoveryDir(), `port-${directoryHash(baseDirectory)}.json`);
 }
 
-// /sandbox-disable pauses the sandbox per-directory. The flag lives beside the
-// discovery file so the TUI plugin (which runs the command) and the server
-// plugin (which gates wrapping) agree even though they are separate processes.
-export function disableFlagPath(baseDirectory: string): string {
-  return join(discoveryDir(), `disabled-${directoryHash(baseDirectory)}`);
-}
-
-export function setSandboxDisabled(baseDirectory: string, disabled: boolean): void {
-  if (disabled) {
-    mkdirSync(discoveryDir(), { recursive: true, mode: 0o700 });
-    writeFileSync(disableFlagPath(baseDirectory), `${process.pid}\n`);
-  } else {
-    rmSync(disableFlagPath(baseDirectory), { force: true });
-  }
-}
-
-export function isSandboxDisabled(baseDirectory: string): boolean {
-  return existsSync(disableFlagPath(baseDirectory));
+// /sandbox toggles the persisted `enabled` flag. Write it where the setting
+// already lives — the project config if it sets `enabled`, otherwise the global
+// config — and return the scope written so the UI can report it.
+export function setSandboxConfigEnabled(
+  baseDirectory: string,
+  enabled: boolean,
+): 'project' | 'global' {
+  const { globalPath, projectPath } = getConfigPaths(baseDirectory);
+  const projectConfig = readConfigFile(projectPath);
+  const useProject = projectConfig !== null && projectConfig.enabled !== undefined;
+  const target = useProject ? projectPath : globalPath;
+  writeConfigFile(target, { enabled });
+  return useProject ? 'project' : 'global';
 }
 
 export function writeDiscoveryPort(baseDirectory: string, port: number): void {
