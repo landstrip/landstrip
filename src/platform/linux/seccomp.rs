@@ -234,6 +234,7 @@ fn supervise_child(
     let trap_fd = trap_fd.fd().filter(|_| query_enabled);
     let mut pending_queries: std::collections::HashMap<u64, PendingQuery> =
         std::collections::HashMap::new();
+    let mut control_buffer: Vec<u8> = Vec::new();
     let mut next_query_id: u64 = 1;
     // SAFETY: notify_fd is the live seccomp notification fd owned by the parent.
     let notify = unsafe { BorrowedFd::borrow_raw(notify_fd) };
@@ -290,7 +291,12 @@ fn supervise_child(
 
         if let Some(cfd) = trap_fd {
             if revents[1].intersects(PollFlags::POLLIN) {
-                process_control_responses(cfd, &mut pending_queries, notify_fd);
+                process_control_responses(
+                    cfd,
+                    &mut control_buffer,
+                    &mut pending_queries,
+                    notify_fd,
+                );
             }
         }
 
@@ -1601,20 +1607,31 @@ fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>
 
 fn process_control_responses(
     control_fd: i32,
+    buffer: &mut Vec<u8>,
     pending_queries: &mut std::collections::HashMap<u64, PendingQuery>,
     notify_fd: RawFd,
 ) {
-    let mut buf = [0u8; 4096];
+    let mut chunk = [0u8; 4096];
     // SAFETY: read(2) copies bytes from the live buffer.
-    let n = unsafe { libc::read(control_fd, buf.as_mut_ptr().cast(), buf.len()) };
+    let n = unsafe { libc::read(control_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
     if n <= 0 {
         return;
     }
     let Ok(n) = usize::try_from(n) else {
         return;
     };
-    let text = &buf[..n];
-    for line in text.split(|b| *b == b'\n') {
+    buffer.extend_from_slice(&chunk[..n]);
+
+    // The trap fd is a stream socket, so a read may split a response across
+    // boundaries. Only consume complete newline-terminated lines and keep any
+    // trailing partial line for the next read; otherwise a fragmented response
+    // would be dropped, leaving the child's syscall suspended forever.
+    let Some(last_newline) = buffer.iter().rposition(|b| *b == b'\n') else {
+        return;
+    };
+    let complete: Vec<u8> = buffer.drain(..=last_newline).collect();
+
+    for line in complete.split(|b| *b == b'\n') {
         if line.is_empty() {
             continue;
         }
