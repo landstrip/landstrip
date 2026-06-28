@@ -350,7 +350,9 @@ impl Denial {
     fn into_trap(self) -> Trap {
         match self {
             Self::Filesystem(denial) => Trap::filesystem(denial, None),
-            Self::Network(operation, target, process) => Trap::network(operation, target, process),
+            Self::Network(operation, target, process) => {
+                Trap::network(operation, target, process, None)
+            }
         }
     }
 }
@@ -413,9 +415,22 @@ fn handle_notification(
 ) -> HandleResult {
     let syscall = i64::from(request.data.nr);
     let result = if syscall == ctx.syscalls.bind {
-        handle_bind(ctx.policy, request, denials)
+        handle_bind(
+            ctx.policy,
+            request,
+            denials,
+            ctx.query_enabled,
+            next_query_id,
+        )
     } else if syscall == ctx.syscalls.connect {
-        handle_connect(ctx.policy, ctx.landlock_features, request, denials)
+        handle_connect(
+            ctx.policy,
+            ctx.landlock_features,
+            request,
+            denials,
+            ctx.query_enabled,
+            next_query_id,
+        )
     } else if ctx.notify_filesystem
         && (syscall == ctx.syscalls.openat || syscall == ctx.syscalls.openat2)
     {
@@ -558,10 +573,30 @@ fn process_context(pid: u32) -> ProcessContext {
     }
 }
 
+// Defer a denied network operation to an interactive permission query. The
+// duplicated child socket fd is held in the grant so the broker can re-issue the
+// connect or bind itself once the launcher approves the query.
+fn network_query(
+    operation: NetworkOperation,
+    target: String,
+    pid: u32,
+    socket: TargetSocket,
+    call: SocketAddrCall,
+    next_query_id: &mut u64,
+) -> NotificationResult {
+    let qid = *next_query_id;
+    *next_query_id += 1;
+    let trap = Trap::network(operation, target, process_context(pid), Some(qid));
+    let grant = Grant::socket(socket.sock, socket.addr, call);
+    NotificationResult::query(qid, trap, Some(grant))
+}
+
 fn handle_bind(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
     denials: &mut Denials,
+    query_enabled: bool,
+    next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
     let mut socket = target_socket(request)?;
 
@@ -569,6 +604,16 @@ fn handle_bind(
         SocketKind::Tcp => {
             if !policy.network_access.local_tcp_bind {
                 if let Ok(endpoint) = tcp_endpoint(&socket.addr, socket.info.domain) {
+                    if query_enabled {
+                        return Ok(network_query(
+                            NetworkOperation::Bind,
+                            endpoint.addr.to_string(),
+                            request.pid,
+                            socket,
+                            libc::bind,
+                            next_query_id,
+                        ));
+                    }
                     denials.record(Denial::Network(
                         NetworkOperation::Bind,
                         endpoint.addr.to_string(),
@@ -579,6 +624,16 @@ fn handle_bind(
             }
             let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
             if !endpoint.loopback {
+                if query_enabled {
+                    return Ok(network_query(
+                        NetworkOperation::Bind,
+                        endpoint.addr.to_string(),
+                        request.pid,
+                        socket,
+                        libc::bind,
+                        next_query_id,
+                    ));
+                }
                 denials.record(Denial::Network(
                     NetworkOperation::Bind,
                     endpoint.addr.to_string(),
@@ -601,6 +656,8 @@ fn handle_connect(
     landlock_features: LandlockFeatures,
     request: &libc::seccomp_notif,
     denials: &mut Denials,
+    query_enabled: bool,
+    next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
     let socket = target_socket(request)?;
 
@@ -613,6 +670,16 @@ fn handle_connect(
                     .connect_tcp_ports
                     .contains(&endpoint.port)
             {
+                if query_enabled {
+                    return Ok(network_query(
+                        NetworkOperation::Connect,
+                        endpoint.addr.to_string(),
+                        request.pid,
+                        socket,
+                        libc::connect,
+                        next_query_id,
+                    ));
+                }
                 denials.record(Denial::Network(
                     NetworkOperation::Connect,
                     endpoint.addr.to_string(),
@@ -1390,6 +1457,10 @@ fn handle_mutation(
 }
 
 impl Grant {
+    fn socket(sock: OwnedFd, addr: Vec<u8>, call: SocketAddrCall) -> Grant {
+        Grant::Socket(SocketGrant { sock, addr, call })
+    }
+
     fn open(resolved: &Path, flags: i32, mode: u32) -> Option<Grant> {
         let kind = if let Some(handle) =
             open_path(resolved, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -1651,6 +1722,7 @@ fn process_control_responses(
                     // for paths Landlock forbids.
                     Some(Grant::Open(grant)) => grant_open(notify_fd, id, &grant),
                     Some(Grant::Mutation(grant)) => grant_mutation(notify_fd, id, &grant),
+                    Some(Grant::Socket(grant)) => grant_socket(notify_fd, id, &grant),
                     // No grant to satisfy: let the kernel run the syscall, still
                     // subject to the child's Landlock.
                     None => {
@@ -1698,6 +1770,17 @@ fn grant_mutation(notify_fd: RawFd, id: u64, grant: &MutationGrant) {
     let rc = match run_mutation(grant) {
         Ok(()) => notification_value(id, 0),
         Err(errno) => notification_error(id, -errno.abs()),
+    };
+    let _ = respond_notification(notify_fd, rc);
+}
+
+// The broker re-issues the approved connect or bind on the duplicated child
+// socket, which shares the child's open file description, so the call takes
+// effect on the child's socket while running outside its seccomp filter.
+fn grant_socket(notify_fd: RawFd, id: u64, grant: &SocketGrant) {
+    let rc = match broker_addr_call(grant.sock.as_raw_fd(), &grant.addr, grant.call) {
+        Ok(value) => notification_value(id, value),
+        Err(error) => notification_error(id, -error.errno().abs()),
     };
     let _ = respond_notification(notify_fd, rc);
 }
@@ -2057,6 +2140,15 @@ impl NotificationResult {
 enum Grant {
     Open(OpenGrant),
     Mutation(MutationGrant),
+    Socket(SocketGrant),
+}
+
+// A duplicated child socket and the resolved target address for a connect or
+// bind the broker re-issues itself when a network query is approved.
+struct SocketGrant {
+    sock: OwnedFd,
+    addr: Vec<u8>,
+    call: SocketAddrCall,
 }
 
 struct Anchor {

@@ -65,6 +65,8 @@ pub(crate) struct FilesystemDenial {
 #[derive(Debug, Serialize)]
 pub(crate) struct NetworkTrap {
     pub(crate) code: Error,
+    pub(crate) state: &'static str,
+    pub(crate) query_id: u64,
     pub(crate) operation: &'static str,
     pub(crate) target: String,
     pub(crate) syscall: &'static str,
@@ -118,10 +120,13 @@ impl Trap {
         operation: NetworkOperation,
         target: String,
         process: ProcessContext,
+        query_id: Option<u64>,
     ) -> Self {
         let syscall = operation.syscall();
         Self::Network(Box::new(NetworkTrap {
             code: Error::NetworkDenied,
+            state: if query_id.is_some() { "query" } else { "info" },
+            query_id: query_id.unwrap_or(0),
             operation: syscall,
             target,
             syscall,
