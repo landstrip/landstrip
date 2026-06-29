@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
     pub(crate) write_denied_roots: Vec<PathBuf>,
+    pub(crate) write_denied_patterns: Vec<String>,
     pub(crate) write_denied_links: Vec<PathBuf>,
     pub(crate) read_access: ReadAccess,
     pub(crate) read_denied_roots: Vec<PathBuf>,
@@ -40,7 +41,9 @@ pub(crate) struct AccessPolicy {
 #[cfg(target_os = "linux")]
 impl AccessPolicy {
     /// Whether a write to `canonical` (with lexical form `lexical`, used for the
-    /// symlink-ancestor deny-list) lands in the `denyWrite` deny-list.
+    /// symlink-ancestor deny-list) lands in the `denyWrite` deny-list. Glob
+    /// patterns in `write_denied_patterns` are evaluated dynamically against the
+    /// lexical path so files created after sandbox startup are also blocked.
     pub(crate) fn is_write_denied(&self, canonical: &Path, lexical: &Path) -> bool {
         self.write_denied_roots
             .iter()
@@ -49,6 +52,10 @@ impl AccessPolicy {
                 .write_denied_links
                 .iter()
                 .any(|root| lexical == root || lexical.starts_with(root))
+            || self
+                .write_denied_patterns
+                .iter()
+                .any(|pattern| path_matches_glob_str(lexical, pattern))
     }
 
     /// Why a write to `canonical` is mediated, or `None` when the policy permits
@@ -232,7 +239,8 @@ pub(crate) fn resolve_policy(
     let policy_base = normalize_path_lexically(&policy_base);
 
     let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
-    let write_deny = resolve_paths(&filesystem.deny_write, &policy_base, home)?;
+    let (write_deny, write_denied_patterns) =
+        resolve_deny_paths(&filesystem.deny_write, &policy_base, home)?;
     let write_denied_links = collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
 
     let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
@@ -274,6 +282,7 @@ pub(crate) fn resolve_policy(
     let policy = AccessPolicy {
         write_roots: write_allow,
         write_denied_roots: write_deny,
+        write_denied_patterns,
         write_denied_links,
         read_access,
         read_denied_roots,
@@ -384,6 +393,31 @@ fn resolve_paths(
     normalize_roots(&mut resolved);
 
     Ok(resolved)
+}
+
+fn resolve_deny_paths(
+    paths: &[String],
+    policy_base: &Path,
+    home: Option<&Path>,
+) -> Result<(Vec<PathBuf>, Vec<String>)> {
+    let mut concrete: Vec<PathBuf> = Vec::new();
+    let mut patterns: Vec<String> = Vec::new();
+
+    for path in paths {
+        let resolved = resolve_sandbox_path(path, policy_base, home)?;
+        let resolved_str = resolved.to_string_lossy();
+        if resolved_str.bytes().any(is_glob_byte) {
+            patterns.push(resolved_str.into_owned());
+        } else {
+            let mut variants = Vec::new();
+            push_path_variants(&mut variants, &resolved);
+            concrete.extend(variants);
+        }
+    }
+
+    normalize_roots(&mut concrete);
+
+    Ok((concrete, patterns))
 }
 
 const MAX_TRAVERSAL_DEPTH: u32 = 40;
@@ -547,7 +581,16 @@ fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<
     Ok(normalize_path_lexically(&resolved))
 }
 
-fn expand_glob_path(pattern: &Path) -> Result<Vec<PathBuf>> {
+fn path_matches_glob_str(path: &Path, pattern: &str) -> bool {
+    let path_bytes = path.to_string_lossy();
+    let pattern_bytes = pattern.as_bytes();
+    let path_len = path_bytes.len();
+    let pattern_len = pattern_bytes.len();
+    let mut memo = vec![vec![None; path_len + 1]; pattern_len + 1];
+    glob_matches_at(pattern_bytes, path_bytes.as_bytes(), 0, 0, &mut memo)
+}
+
+pub(crate) fn expand_glob_path(pattern: &Path) -> Result<Vec<PathBuf>> {
     let pattern = pattern.to_string_lossy();
     let base = glob_base(&pattern);
     let mut matches = Vec::new();

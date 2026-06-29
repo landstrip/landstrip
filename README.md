@@ -105,6 +105,33 @@ some tools, shells, JITs, and GUI helpers may rely on the blocked behaviors:
 }
 ```
 
+## Filesystem Policy
+
+Write access is denied by default.  `allowWrite` paths grant write access and
+`denyWrite` paths subtract from them, with the most specific rule winning where
+an allow and a deny overlap. Read access is unrestricted by default; setting
+`denyRead` lowers it to an allowlist, and `allowRead` adds paths back.
+
+### Write Denial Semantics
+
+Concrete (non-glob) `denyWrite` paths are canonicalized and enforced
+eagerly on all platforms.
+
+Glob `denyWrite` patterns (`**/.env`, `**/*.pem`, etc.) behave differently
+by platform:
+
+- **Linux**: Globs are evaluated dynamically by the seccomp broker at each write
+  attempt. Files created after sandbox startup that match a denyWrite glob are
+  blocked. The glob is never walked at startup, so large trees do not cause
+  startup latency.
+- **macOS**: Globs are snapshot-expanded when the Seatbelt profile is compiled.
+  Files created after `sandbox_init` are not protected by glob denies — use
+  concrete paths for those. A warning is logged when glob deny patterns are
+  used.
+- **Windows**: Glob denyWrite entries are not enforced by the AppContainer
+  backend.
+
+
 ## Network Policy
 
 Sandbox mode denies direct network access by default. Proxy ports, local binding,

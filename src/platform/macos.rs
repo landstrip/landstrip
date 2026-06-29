@@ -111,7 +111,12 @@ fn render_profile(policy: &AccessPolicy) -> std::result::Result<String, fmt::Err
     writeln!(sb, "(deny default)")?;
 
     render_process_rules(&mut sb)?;
-    render_write_rules(&mut sb, &policy.write_roots, &policy.write_denied_roots)?;
+    render_write_rules(
+        &mut sb,
+        &policy.write_roots,
+        &policy.write_denied_roots,
+        &policy.write_denied_patterns,
+    )?;
     render_read_rules(&mut sb, &policy.read_access, &policy.read_denied_roots)?;
     render_network_rules(&mut sb, &policy.network_access)?;
 
@@ -128,7 +133,10 @@ fn render_write_rules(
     sb: &mut String,
     write_roots: &[PathBuf],
     write_denied_roots: &[PathBuf],
+    write_denied_patterns: &[String],
 ) -> fmt::Result {
+    use crate::engine::policy::expand_glob_path;
+
     for root in write_roots {
         let escaped = escape_sbpl_literal(&root.to_string_lossy());
         writeln!(sb, "(allow file-write* (subpath \"{escaped}\"))")?;
@@ -139,6 +147,28 @@ fn render_write_rules(
     for root in write_denied_roots {
         let escaped = escape_sbpl_literal(&root.to_string_lossy());
         writeln!(sb, "(deny file-write* (subpath \"{escaped}\"))")?;
+    }
+
+    // Expand glob patterns into concrete paths. macOS Seatbelt cannot enforce
+    // patterns dynamically, so only files that exist at sandbox_init are protected.
+    if !write_denied_patterns.is_empty() {
+        log::warn!(
+            "macos: denyWrite glob patterns are snapshot-expanded; files created after sandbox_init will not be blocked"
+        );
+        for pattern in write_denied_patterns {
+            let pattern_path = std::path::Path::new(pattern);
+            match expand_glob_path(pattern_path) {
+                Ok(matches) => {
+                    for m in &matches {
+                        let escaped = escape_sbpl_literal(&m.to_string_lossy());
+                        writeln!(sb, "(deny file-write* (subpath \"{escaped}\"))")?;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("macos: failed to expand denyWrite glob {}: {e}", pattern);
+                }
+            }
+        }
     }
 
     Ok(())

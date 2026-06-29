@@ -113,15 +113,24 @@ relative paths, and gitignore-style
 .Sq * ,
 .Sq ** ,
 .Sq ? ,
-and character-class globs. Glob patterns are resolved when the sandbox is
-created and therefore follow the same snapshot semantics as other paths.
+and character-class globs.
+Concrete (non-glob) paths are resolved when the sandbox is created.
+On Linux,
+.Va denyWrite
+glob patterns are evaluated dynamically by the seccomp broker at each write
+attempt, so files created after sandbox startup are also blocked.
+On macOS, glob patterns are snapshot-expanded when the Seatbelt profile is
+compiled and do not protect future matching files; a warning is logged.
+compiled and do not protect future matching files; a warning is logged.
 .Pp
 Write access is denied by default. The
 .Va allowWrite
 paths are granted. The
 .Va denyWrite
-paths are subtracted by traversing the current directory tree and allowing only
-the remaining roots.
+paths are subtracted: on Linux, the seccomp broker checks each write
+against both concrete deny paths and glob patterns dynamically; on macOS,
+denied subtrees are carved out of the allowed roots at sandbox creation time.
+Non-glob deny paths are canonicalized and enforced on all platforms.
 .Pp
 Read access remains unrestricted when
 .Va denyRead
@@ -132,6 +141,7 @@ contains entries, read access is lowered to an allowlist by traversing from
 and subtracting denied paths. Entries in
 .Va allowRead
 are then added back to the read allowlist.
+.Pp
 .Pp
 For TCP port rules,
 .Nm
