@@ -422,7 +422,8 @@ fn scan_allowed_root(
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound
                     || error.kind() == io::ErrorKind::PermissionDenied
-                    || error.raw_os_error() == Some(libc::EIO) =>
+                    || error.raw_os_error() == Some(libc::EIO)
+                    || error.raw_os_error() == Some(libc::ENOTCONN) =>
             {
                 results.push(current);
                 continue;
@@ -443,7 +444,8 @@ fn scan_allowed_root(
             Ok(entries) => entries,
             Err(error)
                 if error.kind() == io::ErrorKind::PermissionDenied
-                    || error.raw_os_error() == Some(libc::EIO) =>
+                    || error.raw_os_error() == Some(libc::EIO)
+                    || error.raw_os_error() == Some(libc::ENOTCONN) =>
             {
                 results.push(current);
                 continue;
@@ -453,7 +455,12 @@ fn scan_allowed_root(
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => continue,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::EIO)
+                        || error.raw_os_error() == Some(libc::ENOTCONN) =>
+                {
+                    continue;
+                }
                 Err(source) => return Err(source.into()),
             };
             let child = entry.path();
@@ -549,7 +556,9 @@ fn expand_glob_path(pattern: &Path) -> Result<Vec<PathBuf>> {
         Ok(_) => collect_glob_matches(&base, &pattern, &mut matches, 0)?,
         Err(error)
             if error.kind() == io::ErrorKind::NotFound
-                || error.kind() == io::ErrorKind::PermissionDenied => {}
+                || error.kind() == io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(libc::EIO)
+                || error.raw_os_error() == Some(libc::ENOTCONN) => {}
         Err(source) => return Err(source.into()),
     }
 
@@ -609,7 +618,8 @@ fn collect_glob_matches(
         Err(error)
             if error.kind() == io::ErrorKind::NotFound
                 || error.kind() == io::ErrorKind::PermissionDenied
-                || error.raw_os_error() == Some(libc::EIO) =>
+                || error.raw_os_error() == Some(libc::EIO)
+                || error.raw_os_error() == Some(libc::ENOTCONN) =>
         {
             return Ok(());
         }
@@ -623,7 +633,8 @@ fn collect_glob_matches(
         Ok(entries) => entries,
         Err(error)
             if error.kind() == io::ErrorKind::PermissionDenied
-                || error.raw_os_error() == Some(libc::EIO) =>
+                || error.raw_os_error() == Some(libc::EIO)
+                || error.raw_os_error() == Some(libc::ENOTCONN) =>
         {
             return Ok(());
         }
@@ -632,7 +643,12 @@ fn collect_glob_matches(
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => continue,
+            Err(error)
+                if error.raw_os_error() == Some(libc::EIO)
+                    || error.raw_os_error() == Some(libc::ENOTCONN) =>
+            {
+                continue;
+            }
             Err(source) => return Err(source.into()),
         };
         collect_glob_matches(&entry.path(), pattern, matches, depth + 1)?;

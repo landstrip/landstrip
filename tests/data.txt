@@ -16,6 +16,7 @@ name=internal error is plain stderr only | os=linux,macos | policy={bad | trap=t
 name=unrestricted read policy runs tool | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"]}} | cmd=%SHELL% -c 'printf ok' | status=0
 name=sysctl read permits uname | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"]}} | cmd=%SHELL% -c 'uname -s' | status=0
 name=allowWrite permits configured root | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ %TMP%/allowed | status=0
+name=allowWrite non-existent file permits creation in parent dir | os=linux | setup=mkdir:allowed | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed/nonexistent.txt"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/nonexistent.txt"; test -f "$1/nonexistent.txt"' _ %TMP%/allowed | status=0
 name=allowWrite denies other root | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/nope.txt"' _ %TMP%/denied | status=!0
 name=allowWrite permits path with parentheses | os=macos | setup=mkdir:allowed (paren) | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed (paren)"]}} | cmd=%SHELL% -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ '%TMP%/allowed (paren)' | status=0
 

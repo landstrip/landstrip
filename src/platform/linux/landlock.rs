@@ -144,15 +144,50 @@ fn unix_socket_path_access(policy: &AccessPolicy) -> bool {
 }
 
 fn add_path_rules(ruleset: &OwnedFd, paths: &[PathBuf], access: u64, label: &str) -> Result<()> {
+    let mut seen_ancestors: Vec<PathBuf> = Vec::new();
+
     for path in paths {
         let fd = match open_path(path) {
             Ok(fd) => fd,
             Err(error)
                 if error.kind() == io::ErrorKind::NotFound
-                    || error.kind() == io::ErrorKind::PermissionDenied =>
+                    || error.kind() == io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(libc::EIO)
+                    || error.raw_os_error() == Some(libc::ENOTCONN) =>
             {
-                log::debug!("landlock: {label} path missing: {}", path.display());
-                continue;
+                // Walk up to the nearest existing ancestor directory so that
+                // allowWrite rules for files that do not exist yet (e.g. a
+                // .git/index.lock) still grant MAKE_REG access on the parent.
+                let mut ancestor = path.clone();
+                loop {
+                    match ancestor.parent() {
+                        Some(parent) if !parent.as_os_str().is_empty() => {
+                            match std::fs::symlink_metadata(parent) {
+                                Ok(metadata) if metadata.is_dir() => {
+                                    ancestor = parent.to_path_buf();
+                                    break;
+                                }
+                                _ => ancestor = parent.to_path_buf(),
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                if seen_ancestors.iter().any(|seen| seen == &ancestor) {
+                    continue;
+                }
+                let fd = match open_path(&ancestor) {
+                    Ok(fd) => fd,
+                    Err(error) => {
+                        log::debug!(
+                            "landlock: {label} ancestor {} unreachable: {error}",
+                            ancestor.display()
+                        );
+                        continue;
+                    }
+                };
+                seen_ancestors.push(ancestor);
+                fd
             }
             Err(error) => return Err(Error::IoFailed(error).into()),
         };
@@ -280,7 +315,11 @@ fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {
     // SAFETY: fd is valid and stat points to writable storage.
     let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
     if rc != 0 {
-        return Err(Error::IoFailed(io::Error::last_os_error()).into());
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EIO) || error.raw_os_error() == Some(libc::ENOTCONN) {
+            return Ok(false);
+        }
+        return Err(Error::IoFailed(error).into());
     }
 
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFDIR)
