@@ -782,88 +782,40 @@ function landstripAvailable(): boolean {
   }
 }
 
-// Essential environment variables to forward to the sandboxed process.
-// Only these names (plus their lowercase variants) are passed through.
-// Filtering prevents E2BIG (Argument list too long) when pi's own
-// process environment grows large over a long-running session.
-const FORWARD_ENV_NAMES = new Set([
-  'PATH',
-  'HOME',
-  'USER',
-  'LOGNAME',
-  'SHELL',
-  'LANG',
-  'LC_ALL',
-  'LC_CTYPE',
-  'TERM',
-  'COLORTERM',
-  'TMPDIR',
-  'TMP',
-  'TEMP',
-  'DISPLAY',
-  'WAYLAND_DISPLAY',
-  'SSH_AUTH_SOCK',
-  'SSH_AGENT_PID',
-  'XDG_CACHE_HOME',
-  'XDG_CONFIG_HOME',
-  'XDG_DATA_HOME',
-  'XDG_STATE_HOME',
-  'XDG_RUNTIME_DIR',
-  'DBUS_SESSION_BUS_ADDRESS',
-  'NVM_DIR',
-  'NVM_INC',
-  'NVM_CD_FLAGS',
-  'GIT_ASKPASS',
-  'GIT_TERMINAL_PROMPT',
-  'EDITOR',
-  'VISUAL',
-  'PAGER',
-  'BROWSER',
-  'MANPATH',
-  'INFOPATH',
-  'PKG_CONFIG_PATH',
-  'LD_LIBRARY_PATH',
-  'JAVA_HOME',
-  'GOPATH',
-  'GOROOT',
-  'CARGO_HOME',
-  'RUSTUP_HOME',
-  'PYTHONPATH',
-  'VIRTUAL_ENV',
-  'CONDA_PREFIX',
-  'NODE_PATH',
-  'npm_config_cache',
-  'npm_config_userconfig',
-  'DENO_DIR',
-  'BUN_INSTALL',
-]);
-
-function forwardEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const filtered: NodeJS.ProcessEnv = {};
-  for (const name of Object.keys(baseEnv)) {
-    if (FORWARD_ENV_NAMES.has(name) || FORWARD_ENV_NAMES.has(name.toUpperCase())) {
-      const value = baseEnv[name];
-      if (value !== undefined) filtered[name] = value;
-    }
+// Write the full environment to a temporary shell file.
+//
+// Sandboxed process reaches environment through the filesystem instead of the
+// execve() argument buffer, which has a ~128 KiB cap.
+export function writeEnvFile(
+  env: NodeJS.ProcessEnv,
+  proxyPort: number | null,
+): { dir: string; path: string } {
+  const lines: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) continue;
+    // Escape single quotes: ' -> '\''
+    const escaped = value.replace(/'/g, "'\\''");
+    lines.push(`export ${key}='${escaped}'`);
   }
-  return filtered;
-}
-
-function proxyEnv(env: NodeJS.ProcessEnv | undefined, port: number): NodeJS.ProcessEnv {
-  const url = `http://127.0.0.1:${port}`;
-
-  return {
-    ...forwardEnv(process.env),
-    ...env,
-    HTTP_PROXY: url,
-    HTTPS_PROXY: url,
-    ALL_PROXY: url,
-    http_proxy: url,
-    https_proxy: url,
-    all_proxy: url,
-    NO_PROXY: '',
-    no_proxy: '',
-  };
+  if (proxyPort !== null) {
+    const url = `http://127.0.0.1:${proxyPort}`;
+    for (const v of [
+      'HTTP_PROXY',
+      'HTTPS_PROXY',
+      'ALL_PROXY',
+      'http_proxy',
+      'https_proxy',
+      'all_proxy',
+    ]) {
+      lines.push(`export ${v}='${url}'`);
+    }
+    lines.push("export NO_PROXY=''");
+    lines.push("export no_proxy=''");
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'pi-landstrip-env-'));
+  const path = join(dir, 'env.sh');
+  writeFileSync(path, lines.join('\n'), 'utf-8');
+  return { dir, path };
 }
 
 function parseProxyPort(value: string | undefined, defaultPort: number): number | null {
@@ -1234,7 +1186,9 @@ export function createLandstripIntegration(
         const allowNetwork = config.network.allowNetwork;
         const proxy = allowNetwork ? null : await startProxy(cwd);
         const policy = writePolicyFile(cwd, proxy?.port ?? null);
-        const landstripArgs = ['--trap-fd', '3', '-p', policy.path, shell, ...args, command];
+        const envFile = writeEnvFile({ ...process.env, ...env }, proxy?.port ?? null);
+        const wrappedCommand = `source '${envFile.path}' && ${command}`;
+        const landstripArgs = ['--trap-fd', '3', '-p', policy.path, shell, ...args, wrappedCommand];
 
         return new Promise((resolvePromise, reject) => {
           (async () => {
@@ -1252,13 +1206,12 @@ export function createLandstripIntegration(
               void proxy?.stop();
               trapSocket.destroy();
               rmSync(policy.dir, { recursive: true, force: true });
+              rmSync(envFile.dir, { recursive: true, force: true });
             };
 
             const child = spawn(binaryPath(), landstripArgs, {
               cwd,
-              env: allowNetwork
-                ? { ...forwardEnv(process.env), ...env }
-                : proxyEnv(env, proxy!.port),
+              env: { PATH: process.env.PATH, HOME: process.env.HOME },
               detached: true,
               stdio: ['ignore', 'pipe', 'pipe', childEnd],
             });

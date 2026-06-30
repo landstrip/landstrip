@@ -65,3 +65,56 @@ describe('shouldPromptForWrite', () => {
     expect(shouldPromptForWrite(`${PROJECT}/out.txt`, [], PROJECT)).toBe(true);
   });
 });
+
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { writeEnvFile } from './index.ts';
+
+describe('writeEnvFile', () => {
+  it('writes export statements for each env var', () => {
+    const { dir, path } = writeEnvFile({ FOO: 'bar', BAZ: 'qux' }, null);
+    const content = readFileSync(path, 'utf-8');
+    rmSync(dir, { recursive: true, force: true });
+    expect(content).toContain("export FOO='bar'");
+    expect(content).toContain("export BAZ='qux'");
+  });
+
+  it('skips undefined values', () => {
+    const env: NodeJS.ProcessEnv = { FOO: 'bar', SKIP: undefined };
+    const { dir, path } = writeEnvFile(env, null);
+    const content = readFileSync(path, 'utf-8');
+    rmSync(dir, { recursive: true, force: true });
+    expect(content).toContain("export FOO='bar'");
+    expect(content).not.toContain('SKIP');
+  });
+
+  it('escapes single quotes in values', () => {
+    const { dir, path } = writeEnvFile({ QUOTED: "it's a test" }, null);
+    const content = readFileSync(path, 'utf-8');
+    rmSync(dir, { recursive: true, force: true });
+    expect(content).toContain("export QUOTED='it'\\''s a test'");
+  });
+
+  it('adds proxy vars when proxyPort is provided', () => {
+    const { dir, path } = writeEnvFile({ FOO: 'bar' }, 8080);
+    const content = readFileSync(path, 'utf-8');
+    rmSync(dir, { recursive: true, force: true });
+    expect(content).toContain("export FOO='bar'");
+    expect(content).toContain("export HTTP_PROXY='http://127.0.0.1:8080'");
+    expect(content).toContain("export NO_PROXY=''");
+  });
+
+  it('does not add proxy vars when proxyPort is null', () => {
+    const { dir, path } = writeEnvFile({ FOO: 'bar' }, null);
+    const content = readFileSync(path, 'utf-8');
+    rmSync(dir, { recursive: true, force: true });
+    expect(content).not.toContain('HTTP_PROXY');
+  });
+
+  it('creates the file under tmpdir', () => {
+    const { dir, path } = writeEnvFile({}, null);
+    expect(dir).toContain(tmpdir());
+    expect(existsSync(path)).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
