@@ -1,6 +1,6 @@
 {
   "name": "opencode-landstrip",
-  "version": "0.16.23",
+  "version": "0.16.24",
   "description": "Landlock-based sandboxing for opencode with landstrip",
   "keywords": [
     "landlock",
