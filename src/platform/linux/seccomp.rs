@@ -17,7 +17,7 @@ use super::filter::{
     NetworkFilters, build_errno_filter, build_notify_filter, needs_unix_socket_broker,
     unix_socket_filter,
 };
-use super::landlock::{LandlockFeatures, enforce_access_policy};
+use super::landlock::enforce_access_policy;
 use crate::engine::error::Error as LandstripError;
 use crate::engine::paths::{normalize_path, normalize_path_lexically, normalize_path_nofollow};
 use crate::engine::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
@@ -104,7 +104,6 @@ impl BrokerError {
 #[allow(clippy::too_many_lines)]
 pub(super) fn run_broker(
     policy: &AccessPolicy,
-    landlock_features: LandlockFeatures,
     tool: &OsStr,
     args: &[OsString],
     needs_network: bool,
@@ -149,7 +148,7 @@ pub(super) fn run_broker(
             drop(parent);
 
             let result = (|| -> Result<()> {
-                enforce_access_policy(policy, landlock_features)?;
+                enforce_access_policy(policy)?;
 
                 {
                     let child_sock = child_sock;
@@ -188,7 +187,6 @@ pub(super) fn run_broker(
 
             supervise_child(
                 policy,
-                landlock_features,
                 child,
                 notify_fd,
                 &syscalls,
@@ -215,7 +213,6 @@ struct ControlResponse {
 
 fn supervise_child(
     policy: &AccessPolicy,
-    landlock_features: LandlockFeatures,
     child: Pid,
     notify_fd: RawFd,
     syscalls: &NotificationSyscalls,
@@ -226,7 +223,6 @@ fn supervise_child(
     let query_enabled = trap_fd.is_socket();
     let ctx = NotificationContext {
         policy,
-        landlock_features,
         syscalls,
         notify_filesystem,
         query_enabled,
@@ -401,7 +397,6 @@ enum HandleResult {
 /// Immutable context shared across notification handling for a supervised child.
 struct NotificationContext<'a> {
     policy: &'a AccessPolicy,
-    landlock_features: LandlockFeatures,
     syscalls: &'a NotificationSyscalls,
     notify_filesystem: bool,
     query_enabled: bool,
@@ -425,7 +420,6 @@ fn handle_notification(
     } else if syscall == ctx.syscalls.connect {
         handle_connect(
             ctx.policy,
-            ctx.landlock_features,
             request,
             denials,
             ctx.query_enabled,
@@ -653,7 +647,6 @@ fn handle_bind(
 
 fn handle_connect(
     policy: &AccessPolicy,
-    landlock_features: LandlockFeatures,
     request: &libc::seccomp_notif,
     denials: &mut Denials,
     query_enabled: bool,
@@ -691,7 +684,7 @@ fn handle_connect(
             broker_addr_call(socket.sock.as_raw_fd(), &socket.addr, libc::connect)
                 .map(NotificationResult::Value)
         }
-        SocketKind::Unix => handle_unix_connect(policy, landlock_features, request.pid, &socket),
+        SocketKind::Unix => handle_unix_connect(policy, request.pid, &socket),
         SocketKind::Other => Ok(NotificationResult::Continue),
         SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
     }
@@ -699,7 +692,6 @@ fn handle_connect(
 
 fn handle_unix_connect(
     policy: &AccessPolicy,
-    landlock_features: LandlockFeatures,
     pid: u32,
     socket: &TargetSocket,
 ) -> SysResult<NotificationResult> {
@@ -707,10 +699,6 @@ fn handle_unix_connect(
         return Err(BrokerError::PolicyDenied);
     };
     authorize_unix_path(policy, &target)?;
-
-    if landlock_features.resolve_unix {
-        return Ok(NotificationResult::Continue);
-    }
 
     let mut addr = socket.addr.clone();
     if relative {

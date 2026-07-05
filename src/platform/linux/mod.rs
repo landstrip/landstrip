@@ -14,7 +14,7 @@ use crate::engine::trap_fd::TrapFd;
 use anyhow::Result;
 use fd::close_inherited_fds;
 use filter::NetworkFilter;
-use landlock::{enforce_access_policy, landlock_features};
+use landlock::enforce_access_policy;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::process::{self, Command};
@@ -28,14 +28,8 @@ pub(crate) fn execute(
 ) -> Result<()> {
     let network = &policy.network_access;
     let unrestricted_network = network.is_unrestricted();
-    let landlock_features = landlock_features()?;
     if filter::needs_unix_socket_broker(&network.unix_socket_access) {
-        let engine = if landlock_features.resolve_unix {
-            "landlock"
-        } else {
-            "seccomp"
-        };
-        log::debug!("linux: unix socket policy with {engine} enabled");
+        log::debug!("linux: unix socket policy with seccomp enabled");
     }
 
     let needs_fs_broker = filter::needs_filesystem_broker(policy) || trap_fd.is_enabled();
@@ -47,7 +41,6 @@ pub(crate) fn execute(
     if needs_network_broker || needs_fs_broker {
         let status = seccomp::run_broker(
             policy,
-            landlock_features,
             tool,
             args,
             needs_network_broker,
@@ -58,7 +51,7 @@ pub(crate) fn execute(
         process::exit(status);
     }
 
-    enforce_access_policy(policy, landlock_features)?;
+    enforce_access_policy(policy)?;
 
     if !unrestricted_network {
         let filters = filter::network_filter(
