@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { matchesPattern, shouldPromptForWrite } from './index.ts';
+import { matchesPattern, sessionScopeFor, shouldPromptForWrite } from './index.ts';
 
 // The broker resolves relative policy entries (notably ".") against the command
 // `cwd` that landstrip uses as its policy base. Regression guard: before the fix
@@ -63,6 +63,35 @@ describe('shouldPromptForWrite', () => {
 
   it('prompts when allowWrite is empty', () => {
     expect(shouldPromptForWrite(`${PROJECT}/out.txt`, [], PROJECT)).toBe(true);
+  });
+});
+
+describe('sessionScopeFor', () => {
+  const HOME = homedir();
+  const PROJECT = join(HOME, 'work', 'proj');
+
+  it('widens a home file to the immediate child of $HOME', () => {
+    expect(sessionScopeFor(join(HOME, '.cargo', 'registry', 'foo.rs'), PROJECT)).toBe(
+      join(HOME, '.cargo'),
+    );
+  });
+
+  it('widens deep home paths to the same top-level directory', () => {
+    const scope = sessionScopeFor(join(HOME, '.cargo', 'a', 'b', 'c.rs'), PROJECT);
+    expect(scope).toBe(join(HOME, '.cargo'));
+  });
+
+  it('does not widen a file sitting directly in $HOME (would over-broaden)', () => {
+    const file = join(HOME, '.netrc');
+    expect(sessionScopeFor(file, PROJECT)).toBe(file);
+  });
+
+  it('widens a path outside $HOME to its containing directory', () => {
+    expect(sessionScopeFor('/etc/ssl/certs/ca.pem', '/srv/app')).toBe('/etc/ssl/certs');
+  });
+
+  it('widens a project path (outside home) to the project root', () => {
+    expect(sessionScopeFor('/srv/app/src/deep/mod.ts', '/srv/app')).toBe('/srv/app');
   });
 });
 

@@ -375,6 +375,47 @@ function normalizeBlockedPath(path: string, cwd: string): string {
   return canonicalizePath(isAbsolute(path) ? path : join(cwd, path), cwd);
 }
 
+// Breadth-first filesystem approval: when the user allows a blocked read/write,
+// approve the broadest reasonable ancestor (e.g. `~/.cargo`, not each subcrate
+// file) so a single scan does not spawn one prompt per file. matchesPattern
+// already treats a bare directory entry as covering everything beneath it, so
+// storing the scope is enough for sibling files to auto-allow.
+function pathUnderDirectory(filePath: string, dir: string): boolean {
+  if (filePath === dir) return true;
+  const sep = dir.endsWith('/') ? '' : '/';
+  return filePath.startsWith(dir + sep);
+}
+
+// The broadest ancestor worth approving in one action: the immediate child of
+// `$HOME` (e.g. `~/.cargo`) for paths under the user's home, the project root
+// for paths under it, otherwise the containing directory. When the file sits
+// directly on a boundary (so the only ancestor is `$HOME` itself, which would
+// over-broaden), fall back to the exact file so nothing widens silently.
+export function sessionScopeFor(filePath: string, baseDirectory: string): string {
+  const dir = dirname(filePath);
+  const home = homedir();
+  const boundaries = new Set<string>();
+  if (home) boundaries.add(home);
+  try {
+    const realHome = realpathSync.native(home);
+    if (realHome) boundaries.add(realHome);
+  } catch {
+    // $HOME not resolvable — fall back to the raw value only.
+  }
+
+  for (const boundary of boundaries) {
+    if (pathUnderDirectory(dir, boundary)) {
+      const rest = dir.slice(boundary.length).replace(/^\/+/, '');
+      const first = rest.split('/')[0];
+      if (!first) return filePath;
+      return boundary.endsWith('/') ? boundary + first : `${boundary}/${first}`;
+    }
+  }
+
+  if (pathUnderDirectory(dir, baseDirectory)) return baseDirectory;
+  return dir;
+}
+
 function isPathLike(value: string): boolean {
   const trimmed = value.trim();
   return (
@@ -933,26 +974,46 @@ export function createLandstripIntegration(
     if (choice === 'global') await addDomainToConfig(globalPath, domain);
   }
 
+  // Breadth-first: approve the broadest reasonable ancestor of the blocked file
+  // (see sessionScopeFor) instead of the exact path, so the still-running
+  // command stops prompting for sibling files under the same tree. When the
+  // scope widens beyond the file, tell the user what was actually granted.
+  function noteScope(
+    ctx: ExtensionContext,
+    verb: string,
+    choice: Exclude<PermissionChoice, 'abort'>,
+    filePath: string,
+    scope: string,
+  ): void {
+    if (scope !== filePath) notify(ctx, `${verb} allowed (${choice}): ${scope}`, 'info');
+  }
+
   async function applyReadChoice(
+    ctx: ExtensionContext,
     choice: Exclude<PermissionChoice, 'abort'>,
     filePath: string,
     cwd: string,
   ): Promise<void> {
     const { globalPath, projectPath } = getConfigPaths(cwd);
-    if (!sessionAllowedReadPaths.includes(filePath)) sessionAllowedReadPaths.push(filePath);
-    if (choice === 'project') await addReadPathToConfig(projectPath, filePath);
-    if (choice === 'global') await addReadPathToConfig(globalPath, filePath);
+    const scope = sessionScopeFor(filePath, cwd);
+    if (!sessionAllowedReadPaths.includes(scope)) sessionAllowedReadPaths.push(scope);
+    if (choice === 'project') await addReadPathToConfig(projectPath, scope);
+    if (choice === 'global') await addReadPathToConfig(globalPath, scope);
+    noteScope(ctx, 'Read', choice, filePath, scope);
   }
 
   async function applyWriteChoice(
+    ctx: ExtensionContext,
     choice: Exclude<PermissionChoice, 'abort'>,
     filePath: string,
     cwd: string,
   ): Promise<void> {
     const { globalPath, projectPath } = getConfigPaths(cwd);
-    if (!sessionAllowedWritePaths.includes(filePath)) sessionAllowedWritePaths.push(filePath);
-    if (choice === 'project') await addWritePathToConfig(projectPath, filePath);
-    if (choice === 'global') await addWritePathToConfig(globalPath, filePath);
+    const scope = sessionScopeFor(filePath, cwd);
+    if (!sessionAllowedWritePaths.includes(scope)) sessionAllowedWritePaths.push(scope);
+    if (choice === 'project') await addWritePathToConfig(projectPath, scope);
+    if (choice === 'global') await addWritePathToConfig(globalPath, scope);
+    noteScope(ctx, 'Write', choice, filePath, scope);
   }
 
   async function ensureDomainAllowed(
@@ -1325,8 +1386,8 @@ export function createLandstripIntegration(
                     respondQuery(queryId, 'deny');
                     return;
                   }
-                  if (operation === 'read') await applyReadChoice(choice, path, cwd);
-                  else await applyWriteChoice(choice, path, cwd);
+                  if (operation === 'read') await applyReadChoice(ctx, choice, path, cwd);
+                  else await applyWriteChoice(ctx, choice, path, cwd);
                   respondQuery(queryId, 'allow');
                 })
                 .catch(() => respondQuery(queryId, 'deny'));
@@ -1447,7 +1508,7 @@ export function createLandstripIntegration(
       if (shouldPromptForWrite(blockedPath, getEffectiveAllowWrite(config), ctx.cwd)) {
         const choice = await promptWriteBlock(ctx, blockedPath);
         if (choice === 'abort') return null;
-        await applyWriteChoice(choice, blockedPath, ctx.cwd);
+        await applyWriteChoice(ctx, choice, blockedPath, ctx.cwd);
       }
 
       config = loadConfig(ctx.cwd);
@@ -1486,7 +1547,7 @@ export function createLandstripIntegration(
             : undefined,
         );
         if (choice === 'abort') return null;
-        await applyReadChoice(choice, blockedPath, ctx.cwd);
+        await applyReadChoice(ctx, choice, blockedPath, ctx.cwd);
       }
 
       onUpdate?.({
@@ -1732,7 +1793,7 @@ export function createLandstripIntegration(
               reason: `Sandbox: read access denied for "${filePath}"`,
             };
           }
-          await applyReadChoice(choice, filePath, ctx.cwd);
+          await applyReadChoice(ctx, choice, filePath, ctx.cwd);
         }
       }
 
@@ -1756,7 +1817,7 @@ export function createLandstripIntegration(
               reason: `Sandbox: write access denied for "${filePath}" (not in allowWrite)`,
             };
           }
-          await applyWriteChoice(choice, filePath, ctx.cwd);
+          await applyWriteChoice(ctx, choice, filePath, ctx.cwd);
         }
       }
     });
