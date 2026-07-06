@@ -272,6 +272,9 @@ fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result
         return Ok(());
     }
 
+    // AF_UNIX socket creation stays allowed regardless of the socket policy.
+    sb.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
+
     if network.restrict_connect_tcp {
         sb.push_str("(deny network-outbound)\n");
         for port in &network.connect_tcp_ports {
@@ -289,12 +292,10 @@ fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result
 
     match &network.unix_socket_access {
         UnixSocketAccess::Unrestricted => {
-            sb.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
             sb.push_str("(allow network-outbound (remote unix-socket))\n");
             sb.push_str("(allow network-bind (local unix-socket))\n");
         }
         UnixSocketAccess::AllowPaths(paths) if !paths.is_empty() => {
-            sb.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
             for path in paths {
                 let escaped = escape_sbpl_literal(&path.to_string_lossy());
                 writeln!(
