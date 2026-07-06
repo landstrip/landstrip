@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { matchesPattern, sessionScopeFor, shouldPromptForWrite } from './index.ts';
+import { matchesPattern, readAllowed, sessionScopeFor, shouldPromptForWrite } from './index.ts';
 
 // The broker resolves relative policy entries (notably ".") against the command
 // `cwd` that landstrip uses as its policy base. Regression guard: before the fix
@@ -92,6 +92,36 @@ describe('sessionScopeFor', () => {
 
   it('widens a project path (outside home) to the project root', () => {
     expect(sessionScopeFor('/srv/app/src/deep/mod.ts', '/srv/app')).toBe('/srv/app');
+  });
+});
+
+describe('readAllowed', () => {
+  const HOME = homedir();
+  const cwd = join(HOME, 'work', 'proj');
+  const DENY = ['/Users', '/home'];
+
+  it('blocks a home path that is not in allowRead (broad deny wins)', () => {
+    expect(readAllowed(join(HOME, '.cache', 'x'), ['.'], DENY, cwd)).toBe(false);
+  });
+
+  it('allows a granted home scope even though denyRead lists /home', () => {
+    const allow = ['.', join(HOME, '.cache')];
+    expect(readAllowed(join(HOME, '.cache', 'puu', 'd', 'f'), allow, DENY, cwd)).toBe(true);
+  });
+
+  it('keeps a narrow deny carve-out beating a broad allow', () => {
+    expect(readAllowed(join(HOME, '.ssh', 'id'), [HOME], [join(HOME, '.ssh')], cwd)).toBe(false);
+  });
+
+  it('lets the most specific grant override a narrow deny', () => {
+    const deny = [join(HOME, '.ssh')];
+    expect(
+      readAllowed(join(HOME, '.ssh', 'config'), [join(HOME, '.ssh', 'config')], deny, cwd),
+    ).toBe(true);
+  });
+
+  it('denies when nothing in allowRead matches', () => {
+    expect(readAllowed('/etc/passwd', ['.'], DENY, cwd)).toBe(false);
   });
 });
 

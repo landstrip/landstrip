@@ -416,6 +416,36 @@ export function sessionScopeFor(filePath: string, baseDirectory: string): string
   return dir;
 }
 
+// Length of the longest entry in `patterns` that matches `path`, or -1 for no
+// match. Canonicalized so the value reflects how specific the rule is.
+function longestPrefixMatch(path: string, patterns: string[], cwd: string): number {
+  let best = -1;
+  for (const pattern of patterns) {
+    if (!matchesPattern(path, [pattern], cwd)) continue;
+    const canonical = pattern.includes('*')
+      ? expandPath(pattern, cwd)
+      : canonicalizePath(pattern, cwd);
+    if (canonical.length > best) best = canonical.length;
+  }
+  return best;
+}
+
+// Most-specific-match wins: a read is allowed when its longest matching
+// allowRead entry is at least as specific as its longest matching denyRead
+// entry. So an explicit allow (e.g. a granted `~/.cache`) overrides the broad
+// `denyRead` gate (`/home`), while a narrow denyRead carve-out still beats a
+// broad allow. Ties favor allow. denyWrite stays an absolute block elsewhere.
+export function readAllowed(
+  path: string,
+  allowRead: string[],
+  denyRead: string[],
+  cwd: string,
+): boolean {
+  const allow = longestPrefixMatch(path, allowRead, cwd);
+  if (allow < 0) return false;
+  return allow >= longestPrefixMatch(path, denyRead, cwd);
+}
+
 function isPathLike(value: string): boolean {
   const trimmed = value.trim();
   return (
@@ -1343,8 +1373,7 @@ export function createLandstripIntegration(
               const config = loadConfig(cwd);
               const isAllowed = (cfg: SandboxConfig): boolean =>
                 operation === 'read'
-                  ? !matchesPattern(path, cfg.filesystem.denyRead, cwd) &&
-                    matchesPattern(path, getEffectiveAllowRead(cfg), cwd)
+                  ? readAllowed(path, getEffectiveAllowRead(cfg), cfg.filesystem.denyRead, cwd)
                   : !matchesPattern(path, cfg.filesystem.denyWrite, cwd) &&
                     !shouldPromptForWrite(path, getEffectiveAllowWrite(cfg), cwd);
 
