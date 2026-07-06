@@ -28,11 +28,19 @@ use std::path::{Path, PathBuf};
 const TARGET_ABI: ABI = ABI::V7;
 
 pub(super) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
+    enforce_access_policy_with(policy, true)
+}
+
+pub(super) fn enforce_broker_access_policy(policy: &AccessPolicy) -> Result<()> {
+    enforce_access_policy_with(policy, false)
+}
+
+fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Result<()> {
     let handled_access_fs = match &policy.read_access {
-        ReadAccess::Unrestricted => AccessFs::from_write(TARGET_ABI),
-        ReadAccess::AllowRoots(_) => {
-            AccessFs::from_write(TARGET_ABI) | AccessFs::from_read(TARGET_ABI)
+        ReadAccess::AllowRoots(_) if restrict_read => {
+            AccessFs::from_write(TARGET_ABI) | read_access_fs()
         }
+        ReadAccess::AllowRoots(_) | ReadAccess::Unrestricted => AccessFs::from_write(TARGET_ABI),
     };
 
     let mut handled_access_net = BitFlags::<AccessNet>::empty();
@@ -56,8 +64,10 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
         "write",
     )?;
 
-    if let ReadAccess::AllowRoots(read_roots) = &policy.read_access {
-        created = add_path_rules(created, read_roots, AccessFs::from_read(TARGET_ABI), "read")?;
+    if restrict_read {
+        if let ReadAccess::AllowRoots(read_roots) = &policy.read_access {
+            created = add_path_rules(created, read_roots, read_access_fs(), "read")?;
+        }
     }
 
     if !handled_access_net.is_empty() {
@@ -82,6 +92,10 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn read_access_fs() -> BitFlags<AccessFs> {
+    AccessFs::from_read(TARGET_ABI) & !AccessFs::Execute
 }
 
 fn add_path_rules(

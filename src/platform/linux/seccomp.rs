@@ -17,7 +17,7 @@ use super::filter::{
     NetworkFilters, build_errno_filter, build_notify_filter, needs_unix_socket_broker,
     unix_socket_filter,
 };
-use super::landlock::enforce_access_policy;
+use super::landlock::enforce_broker_access_policy;
 use crate::engine::error::Error as LandstripError;
 use crate::engine::paths::{normalize_path, normalize_path_lexically, normalize_path_nofollow};
 use crate::engine::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
@@ -148,7 +148,7 @@ pub(super) fn run_broker(
             drop(parent);
 
             let result = (|| -> Result<()> {
-                enforce_access_policy(policy)?;
+                enforce_broker_access_policy(policy)?;
 
                 {
                     let child_sock = child_sock;
