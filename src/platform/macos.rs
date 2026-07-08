@@ -118,7 +118,12 @@ fn render_profile(policy: &AccessPolicy) -> std::result::Result<String, fmt::Err
         &policy.write_denied_roots,
         &policy.write_denied_patterns,
     )?;
-    render_read_rules(&mut sb, &policy.read_access, &policy.read_denied_roots)?;
+    render_read_rules(
+        &mut sb,
+        &policy.read_access,
+        &policy.read_denied_roots,
+        &policy.read_symlinks,
+    )?;
     render_network_rules(&mut sb, &policy.network_access)?;
 
     Ok(sb)
@@ -250,6 +255,7 @@ fn render_read_rules(
     sb: &mut String,
     read_access: &ReadAccess,
     read_denied_roots: &[PathBuf],
+    read_symlinks: &[PathBuf],
 ) -> fmt::Result {
     match read_access {
         ReadAccess::Unrestricted => sb.push_str("(allow file-read*)\n"),
@@ -261,6 +267,8 @@ fn render_read_rules(
                 writeln!(sb, "(allow file-read* (subpath \"{escaped}\"))")?;
             }
             render_parent_dir_rules(sb, roots)?;
+
+            render_symlink_metadata_rules(sb, read_symlinks)?;
 
             // Deny rules follow the allow rules so SBPL's last-match-wins
             // precedence subtracts the denied subtrees from the read roots.
@@ -292,6 +300,24 @@ fn render_parent_dir_rules(sb: &mut String, roots: &[PathBuf]) -> fmt::Result {
         let escaped = escape_sbpl_literal(&ancestor.to_string_lossy());
         writeln!(sb, "(allow file-read* (literal \"{escaped}\"))")?;
     }
+    Ok(())
+}
+
+/// Allow `readlink` on the lexical symlink inodes the read scan skipped.
+///
+/// Mirrors Apple's system.sb: `readlink` only permits resolution; the target
+/// is still gated by the existing allow/deny rules, so this grants no new read
+/// access.
+fn render_symlink_metadata_rules(sb: &mut String, symlinks: &[PathBuf]) -> fmt::Result {
+    if symlinks.is_empty() {
+        return Ok(());
+    }
+    sb.push_str("(allow file-read-metadata");
+    for sym in symlinks {
+        let escaped = escape_sbpl_literal(&sym.to_string_lossy());
+        write!(sb, "\n  (literal \"{escaped}\")")?;
+    }
+    sb.push_str(")\n");
     Ok(())
 }
 

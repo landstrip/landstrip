@@ -33,6 +33,8 @@ pub(crate) struct AccessPolicy {
     pub(crate) write_denied_links: Vec<PathBuf>,
     pub(crate) read_access: ReadAccess,
     pub(crate) read_denied_roots: Vec<PathBuf>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) read_symlinks: Vec<PathBuf>,
     pub(crate) network_access: NetworkAccess,
 }
 
@@ -239,27 +241,31 @@ pub(crate) fn resolve_policy(
     let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
     let read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
     let read_denied_roots = effective_denied_roots(&read_deny, &read_allow);
-    let read_access = if read_deny.is_empty() {
-        ReadAccess::Unrestricted
+    let (read_access, read_symlinks) = if read_deny.is_empty() {
+        (ReadAccess::Unrestricted, Vec::new())
     } else if read_allow.iter().any(|root| root == Path::new("/")) {
         // A `/` allowRead grants the whole tree; the surviving denyRead roots are
         // layered back as deny rules rather than by carving the live filesystem.
-        ReadAccess::AllowRoots(vec![PathBuf::from("/")])
+        (ReadAccess::AllowRoots(vec![PathBuf::from("/")]), Vec::new())
     } else {
-        let mut read_roots = {
+        let (mut read_roots, read_symlinks) = {
             let mut allowed = vec![PathBuf::from("/")];
             normalize_roots(&mut allowed);
             let mut denied = read_deny.clone();
             normalize_roots(&mut denied);
-            let mut roots: Vec<PathBuf> = allowed
+            let scanned = allowed
                 .par_iter()
                 .map(|root| scan_allowed_root(root, &denied, true, 0))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect();
+                .collect::<Result<Vec<RootScan>>>()?;
+            let mut roots: Vec<PathBuf> = Vec::new();
+            let mut syms: Vec<PathBuf> = Vec::new();
+            for scan in scanned {
+                roots.extend(scan.roots);
+                syms.extend(scan.symlinks);
+            }
             normalize_roots(&mut roots);
-            roots
+            normalize_roots(&mut syms);
+            (roots, syms)
         };
         // Push each allowRead root as-is; nested denyRead entries are
         // enforced by the seccomp broker (deny_match) without snapshot-
@@ -269,9 +275,8 @@ pub(crate) fn resolve_policy(
             read_roots.push(allow.clone());
         }
         normalize_roots(&mut read_roots);
-        ReadAccess::AllowRoots(read_roots)
+        (ReadAccess::AllowRoots(read_roots), read_symlinks)
     };
-
     let policy = AccessPolicy {
         write_roots: write_allow,
         write_denied_roots: write_deny,
@@ -279,6 +284,7 @@ pub(crate) fn resolve_policy(
         write_denied_links,
         read_access,
         read_denied_roots,
+        read_symlinks,
         network_access: lower_network_policy(network, &policy_base, home)?,
     };
     policy.validate()?;
@@ -391,13 +397,20 @@ fn resolve_deny_paths(
 
 const MAX_TRAVERSAL_DEPTH: u32 = 40;
 
+/// Roots and skipped symlinks collected from a single `scan_allowed_root` traversal.
+struct RootScan {
+    roots: Vec<PathBuf>,
+    symlinks: Vec<PathBuf>,
+}
+
 fn scan_allowed_root(
     root: &Path,
     denied: &[PathBuf],
     is_explicit_root: bool,
     depth: u32,
-) -> Result<Vec<PathBuf>> {
+) -> Result<RootScan> {
     let mut results = Vec::new();
+    let mut symlinks = Vec::new();
     let mut stack = vec![(root.to_path_buf(), is_explicit_root, depth)];
 
     while let Some((current, is_explicit, depth)) = stack.pop() {
@@ -436,6 +449,7 @@ fn scan_allowed_root(
         let file_type = metadata.file_type();
 
         if file_type.is_symlink() && !is_explicit {
+            symlinks.push(normalize_path_lexically(&current));
             continue;
         }
         if !has_denied_descendant || !file_type.is_dir() {
@@ -471,7 +485,10 @@ fn scan_allowed_root(
         }
     }
 
-    Ok(results)
+    Ok(RootScan {
+        roots: results,
+        symlinks,
+    })
 }
 
 /// The `denyRead` roots that survive `allowRead` overrides.
