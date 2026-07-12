@@ -334,6 +334,13 @@ fn supervise_child(
             HandleResult::Pending(query_id, grant) => {
                 pending_queries.insert(query_id, PendingQuery { request, grant });
             }
+            HandleResult::AddFd(grant) => {
+                // grant_open opens the path in the broker and completes the
+                // notification atomically via SECCOMP_ADDFD_FLAG_SEND; the child
+                // receives the broker's fd, eliminating the CONTINUE re-exec
+                // window. On failure grant_open responds with an errno itself.
+                grant_open(notify_fd, request.id, &grant);
+            }
         }
     }
 }
@@ -400,6 +407,12 @@ impl Denials {
 
 enum HandleResult {
     Respond(libc::seccomp_notif_resp),
+    // Broker-mediated open: inject a broker-opened fd via SECCOMP_IOCTL_NOTIF_ADDFD
+    // instead of letting the kernel re-run openat in the child. Used for reads,
+    // which are not Landlock-backed in the brokered child, so CONTINUE would be
+    // TOCTOU-bypassable (a sibling thread could swap the path between the
+    // broker's process_vm_readv check and the kernel's re-execution).
+    AddFd(OpenGrant),
     Pending(u64, Option<Grant>),
 }
 
@@ -463,6 +476,7 @@ fn handle_notification(
         Ok(NotificationResult::Continue) => {
             HandleResult::Respond(notification_continue(request.id))
         }
+        Ok(NotificationResult::Open(grant)) => HandleResult::AddFd(grant),
         Ok(NotificationResult::Query(decision)) => {
             denials.trap_fd.write(&decision.trap);
             HandleResult::Pending(decision.query_id, decision.grant)
@@ -1146,6 +1160,18 @@ fn handle_openat(
                 process: process_context(request.pid),
             }));
             return Err(BrokerError::PolicyDenied);
+        }
+    }
+
+    // Reads are not Landlock-backed in the brokered child (f3f2105 dropped read
+    // handling so execve of denyRead binaries works). Re-running openat in the
+    // child via CONTINUE would reopen the classic seccomp-user-notification
+    // TOCTOU, so have the broker open the allowed file itself and inject the fd.
+    // Pure writes skip this: the brokered child still enforces Landlock write
+    // rules, which catch a swapped write target.
+    if wants_read {
+        if let Some(Grant::Open(grant)) = Grant::open(&resolved, flags, mode) {
+            return Ok(NotificationResult::Open(grant));
         }
     }
 
@@ -2141,6 +2167,7 @@ enum NotificationResult {
     Value(i64),
     Continue,
     Query(QueryDecision),
+    Open(OpenGrant),
 }
 
 struct QueryDecision {
