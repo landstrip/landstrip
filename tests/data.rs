@@ -157,6 +157,7 @@ enum Net {
     ConnectDenied,
     ConnectAllowed,
     UnixAllowed,
+    UnixDenied,
 }
 
 struct Case {
@@ -515,6 +516,7 @@ fn parse_net(value: &str) -> Net {
         "connect-denied" => Net::ConnectDenied,
         "connect-allowed" => Net::ConnectAllowed,
         "unix-allowed" => Net::UnixAllowed,
+        "unix-denied" => Net::UnixDenied,
         other => panic!("unknown net kind `{other}`"),
     }
 }
@@ -580,6 +582,7 @@ fn run_net(
                 .ok_or_else(|| "unix-allowed needs unixsock".to_owned())?;
             run_unix_allowed(ctx, format, policies, &dir.join(resolver.subst(rel)))
         }
+        Net::UnixDenied => run_unix_denied(ctx, format, policies, dir),
     }
 }
 
@@ -741,6 +744,51 @@ fn run_unix_allowed(
             merge(&output.stdout, &output.stderr).trim()
         )),
         Err(error) => Err(format!("unix connect spawn: {error}")),
+    }
+}
+
+/// Denies socket(AF_UNIX) at connect/bind, not creation. Under a default-deny
+/// unix-socket policy the connect must fail with EACCES ("Permission denied")
+/// rather than EAFNOSUPPORT ("Address family not supported by protocol").
+fn run_unix_denied(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+    dir: &Path,
+) -> Result<(), String> {
+    let sock = dir.join("denied.sock");
+    let _ = std::fs::remove_file(&sock);
+    let mut server = Command::new(&ctx.nc)
+        .args(["-l", "-U"])
+        .arg(&sock)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn unix server: {e}"))?;
+    wait_for_unix_socket(&mut server, &sock)?;
+
+    let output = landstrip_net(ctx, format, policies)
+        .arg(&ctx.nc)
+        .arg("-U")
+        .arg(&sock)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    stop(&mut server);
+    let output = output.map_err(|e| format!("unix connect spawn: {e}"))?;
+    let merged = merge(&output.stdout, &output.stderr);
+
+    let denied = !output.status.success()
+        && merged.contains("Permission denied")
+        && !merged.contains("Address family not supported");
+    if denied {
+        Ok(())
+    } else {
+        Err(format!(
+            "unix connect not denied with EACCES; status={:?} output={}",
+            output.status,
+            merged.trim()
+        ))
     }
 }
 

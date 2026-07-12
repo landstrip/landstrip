@@ -231,27 +231,24 @@ fn add_conditional_rule(
     Ok(())
 }
 
+#[allow(clippy::unnecessary_wraps)]
 pub(super) fn add_unix_socket_filters(
-    rules: &mut RuleMap,
-    socket: i64,
+    _rules: &mut RuleMap,
+    _socket: i64,
     policy: UnixSocketFilter,
 ) -> Result<()> {
-    match policy {
-        // socketpair creates unnamed connected sockets for parent-child IPC
-        // (Node.js spawn, etc.) — it has no path, no remote address, and is
-        // never a network attack surface. Always allow it regardless of the
-        // unix-socket policy.
-        UnixSocketFilter::Unrestricted | UnixSocketFilter::PathMediated => {}
-        UnixSocketFilter::DenyAll => {
-            add_socket_domain_filter(rules, socket, libc::AF_UNIX)?;
-        }
-    }
-
+    // socket(AF_UNIX) creation is always allowed; denials happen at connect/bind
+    // in the broker with EACCES. This unifies the DenyAll and PathMediated
+    // paths and mirrors the macOS backend, which also allows creation.
+    //
+    // socketpair is unaffected: it carries no path and no remote address, so it
+    // never reaches the broker's path authorization.
+    let _ = policy;
     Ok(())
 }
 
 pub(super) fn needs_unix_socket_broker(access: &UnixSocketAccess) -> bool {
-    matches!(access, UnixSocketAccess::AllowPaths(paths) if !paths.is_empty())
+    matches!(access, UnixSocketAccess::AllowPaths(_))
 }
 
 pub(super) fn needs_filesystem_broker(policy: &AccessPolicy) -> bool {

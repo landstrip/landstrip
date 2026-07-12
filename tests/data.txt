@@ -52,6 +52,7 @@ name=allowUnixSockets rejects symlink path | os=macos | setup=mkdir:unix-sockets
 name=allowUnixSockets rejects directory path | os=macos | setup=mkdir:unix-sockets | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%TMP%/unix-sockets"]}} | cmd=%SHELL% -c 'printf ok' | status=!0
 name=allowUnixSockets rejects regular file path | os=macos | setup=mkdir:unix-sockets;write:unix-sockets/not-a-socket: | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%TMP%/unix-sockets/not-a-socket"]}} | cmd=%SHELL% -c 'printf ok' | status=!0
 name=allowUnixSockets permits missing path | os=macos | setup=mkdir:unix-sockets | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%TMP%/unix-sockets/missing.sock"]}} | cmd=%SHELL% -c 'printf ok' | status=0
+name=denied unix connect reports EACCES not EAFNOSUPPORT | os=linux | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{}} | net=unix-denied
 
 # --- TCP connect policy ---
 
