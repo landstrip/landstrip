@@ -231,19 +231,34 @@ fn add_conditional_rule(
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
 pub(super) fn add_unix_socket_filters(
-    _rules: &mut RuleMap,
-    _socket: i64,
+    rules: &mut RuleMap,
+    socket: i64,
     policy: UnixSocketFilter,
 ) -> Result<()> {
-    // socket(AF_UNIX) creation is always allowed; denials happen at connect/bind
-    // in the broker with EACCES. This unifies the DenyAll and PathMediated
-    // paths and mirrors the macOS backend, which also allows creation.
+    // AF_UNIX SOCK_STREAM and SOCK_SEQPACKET sockets must connect or bind to a
+    // path before they carry data, so the broker mediates them there with
+    // EACCES. SOCK_DGRAM has no such gate: sendto/sendmsg deliver to a path or
+    // abstract address without connect/bind, and those syscalls are not brokered.
+    // Under a deny-all unix-socket policy, deny datagram creation at the errno
+    // filter so a sandboxed child cannot exfil via an unconnected datagram
+    // socket. This restores the pre-cf119cf gate that the unification removed.
     //
     // socketpair is unaffected: it carries no path and no remote address, so it
     // never reaches the broker's path authorization.
-    let _ = policy;
+    if matches!(policy, UnixSocketFilter::DenyAll) {
+        let domain = u64::try_from(libc::AF_UNIX).map_err(|_| LandstripError::IntegerTooLarge)?;
+        let dgram = u64::try_from(libc::SOCK_DGRAM).map_err(|_| LandstripError::IntegerTooLarge)?;
+        add_conditional_rule(
+            rules,
+            socket,
+            vec![
+                seccomp_condition(0, SeccompCmpOp::Eq, domain)?,
+                seccomp_condition(1, SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK), dgram)?,
+            ],
+        )?;
+    }
+
     Ok(())
 }
 
