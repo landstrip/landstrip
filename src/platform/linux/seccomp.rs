@@ -1699,6 +1699,12 @@ fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>
     Ok(buf)
 }
 
+/// Upper bound on the trap-fd control buffer. A well-formed launcher sends
+/// newline-terminated JSON responses, each far smaller than this; exceeding it
+/// without a newline means a broken or hostile peer and the partial run-on
+/// data is discarded rather than grown without limit.
+const CONTROL_BUFFER_MAX: usize = 64 * 1024;
+
 fn process_control_responses(
     control_fd: i32,
     buffer: &mut Vec<u8>,
@@ -1707,22 +1713,38 @@ fn process_control_responses(
 ) -> bool {
     let mut chunk = [0u8; 4096];
     // SAFETY: read(2) copies bytes from the live buffer.
-    let n = unsafe { libc::read(control_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+    let n = loop {
+        let n = unsafe { libc::read(control_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break n;
+    };
     if n == 0 {
         // read(2) returning 0 means the launcher closed the trap fd. Signal EOF
         // so the caller denies any pending queries and stops polling.
         return true;
     }
     if n < 0 {
-        // A transient read error (e.g. EINTR before the retry loop lands); leave
-        // the fd alone and let the next poll retry. Permanent fd death is
-        // observed via POLLHUP/POLLERR on the control fd.
+        // Permanent read error; leave the fd alone and let the next poll retry.
+        // Fd death is observed via POLLHUP/POLLERR on the control fd.
         return false;
     }
     let Ok(n) = usize::try_from(n) else {
         return false;
     };
     buffer.extend_from_slice(&chunk[..n]);
+
+    // Bound memory against a misbehaving or hostile launcher that never sends a
+    // newline: drop a run-on partial response and keep going rather than grow
+    // without limit. Well-formed responses are newline-terminated and small.
+    if buffer.len() > CONTROL_BUFFER_MAX {
+        log::warn!(
+            "linux: control buffer exceeded {CONTROL_BUFFER_MAX} bytes with no newline; dropping"
+        );
+        buffer.clear();
+        return false;
+    }
 
     // The trap fd is a stream socket, so a read may split a response across
     // boundaries. Only consume complete newline-terminated lines and keep any
@@ -2064,29 +2086,38 @@ fn send_fd(socket: &UnixStream, fd: RawFd) -> Result<()> {
     let byte = [0_u8];
     let iov = [IoSlice::new(&byte)];
     let fds = [fd];
-
-    sendmsg::<()>(
-        socket.as_raw_fd(),
-        &iov,
-        &[ControlMessage::ScmRights(&fds)],
-        MsgFlags::empty(),
-        None,
-    )
-    .map(|_| ())
-    .map_err(|error| LandstripError::from(error).into())
+    loop {
+        match sendmsg::<()>(
+            socket.as_raw_fd(),
+            &iov,
+            &[ControlMessage::ScmRights(&fds)],
+            MsgFlags::empty(),
+            None,
+        ) {
+            Ok(_) => return Ok(()),
+            // A signal during the fd transfer must not abort the broker setup.
+            Err(Errno::EINTR) => continue,
+            Err(error) => return Err(LandstripError::from(error).into()),
+        }
+    }
 }
 
 fn get_notify_fd(socket: &UnixStream) -> Result<OwnedFd> {
     let mut byte = [0_u8];
     let mut iov = [IoSliceMut::new(&mut byte)];
     let mut control = nix::cmsg_space!([RawFd; 1]);
-    let message = recvmsg::<()>(
-        socket.as_raw_fd(),
-        &mut iov,
-        Some(&mut control),
-        MsgFlags::empty(),
-    )
-    .map_err(LandstripError::from)?;
+    let message = loop {
+        match recvmsg::<()>(
+            socket.as_raw_fd(),
+            &mut iov,
+            Some(&mut control),
+            MsgFlags::empty(),
+        ) {
+            Ok(message) => break message,
+            Err(Errno::EINTR) => continue,
+            Err(error) => return Err(LandstripError::from(error).into()),
+        }
+    };
 
     if message.bytes == 0 {
         return Err(
