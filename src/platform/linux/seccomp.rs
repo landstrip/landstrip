@@ -211,6 +211,7 @@ struct ControlResponse {
     action: ControlAction,
 }
 
+#[allow(clippy::too_many_lines)]
 fn supervise_child(
     policy: &AccessPolicy,
     child: Pid,
@@ -227,15 +228,13 @@ fn supervise_child(
         notify_filesystem,
         query_enabled,
     };
-    let trap_fd = trap_fd.fd().filter(|_| query_enabled);
+    let mut trap_fd = trap_fd.fd().filter(|_| query_enabled);
     let mut pending_queries: std::collections::HashMap<u64, PendingQuery> =
         std::collections::HashMap::new();
     let mut control_buffer: Vec<u8> = Vec::new();
     let mut next_query_id: u64 = 1;
     // SAFETY: notify_fd is the live seccomp notification fd owned by the parent.
     let notify = unsafe { BorrowedFd::borrow_raw(notify_fd) };
-    // SAFETY: trap fd, when present, is a live socket owned by the parent.
-    let control = trap_fd.map(|cfd| unsafe { BorrowedFd::borrow_raw(cfd) });
     loop {
         loop {
             match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -248,6 +247,7 @@ fn supervise_child(
             }
         }
 
+        let control = trap_fd.map(|cfd| unsafe { BorrowedFd::borrow_raw(cfd) });
         let mut poll_fds = [
             PollFd::new(notify, PollFlags::POLLIN),
             PollFd::new(control.unwrap_or(notify), PollFlags::POLLIN),
@@ -286,13 +286,22 @@ fn supervise_child(
         }
 
         if let Some(cfd) = trap_fd {
-            if revents[1].intersects(PollFlags::POLLIN) {
-                process_control_responses(
-                    cfd,
-                    &mut control_buffer,
-                    &mut pending_queries,
-                    notify_fd,
-                );
+            let dead = revents[1]
+                .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+                || (revents[1].intersects(PollFlags::POLLIN)
+                    && process_control_responses(
+                        cfd,
+                        &mut control_buffer,
+                        &mut pending_queries,
+                        notify_fd,
+                    ));
+            if dead {
+                // The launcher closed or errored the trap fd. Any deferred query
+                // is unanswerable: deny it with EACCES so the child's syscall
+                // resumes instead of hanging, and stop polling the fd so the loop
+                // does not spin on a dead socket.
+                deny_all_pending(&mut pending_queries, notify_fd);
+                trap_fd = None;
             }
         }
 
@@ -1669,15 +1678,23 @@ fn process_control_responses(
     buffer: &mut Vec<u8>,
     pending_queries: &mut std::collections::HashMap<u64, PendingQuery>,
     notify_fd: RawFd,
-) {
+) -> bool {
     let mut chunk = [0u8; 4096];
     // SAFETY: read(2) copies bytes from the live buffer.
     let n = unsafe { libc::read(control_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
-    if n <= 0 {
-        return;
+    if n == 0 {
+        // read(2) returning 0 means the launcher closed the trap fd. Signal EOF
+        // so the caller denies any pending queries and stops polling.
+        return true;
+    }
+    if n < 0 {
+        // A transient read error (e.g. EINTR before the retry loop lands); leave
+        // the fd alone and let the next poll retry. Permanent fd death is
+        // observed via POLLHUP/POLLERR on the control fd.
+        return false;
     }
     let Ok(n) = usize::try_from(n) else {
-        return;
+        return false;
     };
     buffer.extend_from_slice(&chunk[..n]);
 
@@ -1686,7 +1703,7 @@ fn process_control_responses(
     // trailing partial line for the next read; otherwise a fragmented response
     // would be dropped, leaving the child's syscall suspended forever.
     let Some(last_newline) = buffer.iter().rposition(|b| *b == b'\n') else {
-        return;
+        return false;
     };
     let complete: Vec<u8> = buffer.drain(..=last_newline).collect();
 
@@ -1721,6 +1738,23 @@ fn process_control_responses(
                     let _ = respond_notification(notify_fd, notification_error(id, -libc::EACCES));
                 }
             }
+        }
+    }
+    false
+}
+
+// Deny every deferred query with EACCES and clear the map. Used when the
+// control channel is gone (launcher closed or errored the trap fd) so the
+// child's suspended syscalls resume instead of hanging forever. Expired
+// notification ids are skipped, matching the per-response path.
+fn deny_all_pending(
+    pending_queries: &mut std::collections::HashMap<u64, PendingQuery>,
+    notify_fd: RawFd,
+) {
+    for (_id, pending) in pending_queries.drain() {
+        let id = pending.request.id;
+        if validate_notification_id(notify_fd, id).unwrap_or(false) {
+            let _ = respond_notification(notify_fd, notification_error(id, -libc::EACCES));
         }
     }
 }
