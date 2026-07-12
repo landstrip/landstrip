@@ -1225,10 +1225,15 @@ impl Syscall {
         // u64 register slot the same way the dirfd arguments are read.
         #[allow(clippy::cast_possible_truncation)]
         let flag = |index: usize| args[index] as i32 & libc::AT_SYMLINK_NOFOLLOW != 0;
+        #[allow(clippy::cast_possible_truncation)]
+        let follow = |index: usize| args[index] as i32 & libc::AT_SYMLINK_FOLLOW != 0;
         match self.name {
-            "lchown" | "lsetxattr" | "lremovexattr" => true,
+            "lchown" | "lsetxattr" | "lremovexattr" | "link" => true,
             "fchownat" => flag(4),
             "fchmodat" | "utimensat" => flag(3),
+            // linkat(2) links the symlink itself unless AT_SYMLINK_FOLLOW is set;
+            // link(2) has no flags and never dereferences.
+            "linkat" => !follow(4),
             _ => false,
         }
     }
