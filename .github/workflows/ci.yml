@@ -33,3 +33,40 @@ jobs:
 
       - name: Run tests
         run: cargo test --all
+
+
+  extensions:
+    name: Test ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [pi-landstrip, opencode-landstrip]
+    defaults:
+      run:
+        working-directory: packages/${{ matrix.package }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/${{ matrix.package }}/package-lock.json
+
+      - name: Install dependencies
+        run: npm install --package-lock=false --ignore-scripts
+
+      - name: Format check
+        run: npm run ci:fmt
+
+      - name: Lint
+        run: npm run ci:lint
+
+      - name: Type check
+        run: npm run ci:check
+
+      - name: Test
+        run: npm run ci:test

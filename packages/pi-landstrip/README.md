@@ -72,7 +72,7 @@ Use `/sandbox` inside pi to show the active config and toggle sandboxing.
 
 ## License
 
-`pi-landstrip` is licensed under `MIT`. See [LICENSE](LICENSE) for more
+`pi-landstrip` is licensed under `Apache-2.0`. See [LICENSE](LICENSE) for more
 information.
 
 The bundled `@landstrip/landstrip` package is licensed separately as

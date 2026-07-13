@@ -1,0 +1,74 @@
+{
+  "name": "opencode-landstrip",
+  "version": "0.16.29",
+  "description": "Landlock-based sandboxing for opencode with landstrip",
+  "keywords": [
+    "landlock",
+    "landstrip",
+    "opencode-plugin",
+    "sandbox"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/landstrip/landstrip.git"
+  },
+  "files": [
+    "index.ts",
+    "tui.ts",
+    "shared.ts",
+    "README.md",
+    "sandbox.json"
+  ],
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": {
+      "import": "./index.ts",
+      "types": "./index.ts"
+    },
+    "./server": {
+      "import": "./index.ts",
+      "types": "./index.ts"
+    },
+    "./tui": {
+      "import": "./tui.ts",
+      "types": "./tui.ts"
+    }
+  },
+  "scripts": {
+    "fmt": "oxfmt index.ts tui.ts shared.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md test/*.test.mjs",
+    "lint": "oxlint index.ts tui.ts shared.ts",
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "all": "npm run fmt && npm run lint && npm run check && npm test",
+    "ci:fmt": "oxfmt --check index.ts tui.ts shared.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md test/*.test.mjs",
+    "ci:lint": "npm run lint",
+    "ci:check": "npm run check",
+    "ci:test": "npm test"
+  },
+  "dependencies": {
+    "@landstrip/landstrip": "^0.17.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.17.7",
+    "@opentui/core": ">=0.3.4",
+    "@opentui/keymap": ">=0.3.4",
+    "@opentui/solid": ">=0.3.4",
+    "@types/node": "^24.0.0",
+    "oxfmt": "^0.53.0",
+    "oxlint": "^1.68.0",
+    "typescript": "^5.8.2"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.17.7"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "opencode": ">=1.17.7"
+  }
+}

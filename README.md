@@ -22,6 +22,20 @@ npx landstrip -p policy.json cargo test
 The npm package installs a small Node.js wrapper and a platform-specific native
 binary package.
 
+
+### Agent extensions
+
+The bundled extensions integrate Landstrip with Pi and OpenCode:
+
+```sh
+pi install npm:pi-landstrip
+opencode plugin install opencode-landstrip
+```
+
+See [pi-landstrip](packages/pi-landstrip/README.md) and
+[opencode-landstrip](packages/opencode-landstrip/README.md) for configuration
+details.
+
 ## Platforms
 
 | Area         | macOS                    | Linux                        | Windows                         |

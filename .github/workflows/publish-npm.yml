@@ -87,6 +87,8 @@ jobs:
               'npm/darwin-x64/package.json',
               'npm/linux-x64/package.json',
               'npm/win32-x64/package.json',
+              'packages/pi-landstrip/package.json',
+              'packages/opencode-landstrip/package.json',
             ].every((file) => tagHasFile(tag, file));
           }
 
@@ -134,6 +136,8 @@ jobs:
             'npm/darwin-x64/package.json',
             'npm/linux-x64/package.json',
             'npm/win32-x64/package.json',
+            'packages/pi-landstrip/package.json',
+            'packages/opencode-landstrip/package.json',
           ];
           const packages = packageFiles.map((file) => JSON.parse(readTagFile(latest.tag, file)));
           const missingPackages = packages.filter((data) =>
@@ -200,6 +204,17 @@ jobs:
 
             if (root.optionalDependencies?.[data.name] !== root.version) {
               throw new Error(`package.json optional dependency ${data.name} does not match ${root.version}`);
+            }
+          }
+
+          for (const packageName of ['pi-landstrip', 'opencode-landstrip']) {
+            const packagePath = `packages/${packageName}/package.json`;
+            const data = JSON.parse(readTagFile(packagePath));
+            if (data.version !== root.version) {
+              throw new Error(`${packagePath} version ${data.version} does not match ${root.version}`);
+            }
+            if (data.dependencies?.['@landstrip/landstrip'] !== `^${root.version}`) {
+              throw new Error(`${packagePath} must depend on the synchronized landstrip version`);
             }
           }
 
@@ -356,7 +371,7 @@ jobs:
           chmod 755 npm/linux-x64/bin/landstrip
           test -f npm/win32-x64/bin/landstrip.exe
 
-      - name: Publish npm packages
+      - name: Publish Landstrip npm packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -379,9 +394,37 @@ jobs:
           publish_if_missing npm/win32-x64
           publish_if_missing .
 
+
+      - name: Test extensions
+        run: |
+          for package_dir in packages/pi-landstrip packages/opencode-landstrip; do
+            npm install --prefix "$package_dir" --package-lock=false --ignore-scripts
+            npm --prefix "$package_dir" run ci:fmt
+            npm --prefix "$package_dir" run ci:lint
+            npm --prefix "$package_dir" run ci:check
+            npm --prefix "$package_dir" run ci:test
+          done
+
+      - name: Publish extensions
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          publish_if_missing() {
+            package_dir="$1"
+            package_name="$(node -p \"require('./${package_dir}/package.json').name\")"
+            package_version="$(node -p \"require('./${package_dir}/package.json').version\")"
+            if npm view "${package_name}@${package_version}" version >/dev/null 2>&1; then
+              echo "${package_name}@${package_version} is already published"
+              return 0
+            fi
+            npm publish "./${package_dir}" --access public --provenance
+          }
+          publish_if_missing packages/pi-landstrip
+          publish_if_missing packages/opencode-landstrip
+
   github-release:
     name: Create GitHub Release
-    needs: [metadata, build]
+    needs: [metadata, build, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write

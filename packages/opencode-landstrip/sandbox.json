@@ -1,0 +1,24 @@
+{
+  "enabled": true,
+  "network": {
+    "allowNetwork": false,
+    "allowLocalBinding": false,
+    "allowAllUnixSockets": false,
+    "allowUnixSockets": [],
+    "allowedDomains": [],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "denyRead": ["/Users", "/home"],
+    "allowRead": [".", "~/.gitconfig", "~/.config/git/config", "/dev/null"],
+    "allowWrite": [".", "/dev/null"],
+    "denyWrite": [
+      "**/.env",
+      "**/.env.*",
+      "**/*.pem",
+      "**/*.key",
+      ".opencode/sandbox.json",
+      "~/.config/opencode/sandbox.json"
+    ]
+  }
+}

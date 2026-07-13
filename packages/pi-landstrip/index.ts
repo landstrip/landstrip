@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { spawn, spawnSync } from 'node:child_process';

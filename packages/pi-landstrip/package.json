@@ -8,10 +8,10 @@
     "pi-package",
     "sandbox"
   ],
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/landstrip/pi-landstrip.git"
+    "url": "git+https://github.com/landstrip/landstrip.git"
   },
   "files": [
     "index.ts",
