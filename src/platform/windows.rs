@@ -88,7 +88,7 @@ fn hresult_win32(hr: i32) -> Option<u16> {
 /// error nobody reported. Unwrap the Win32 error where the `HRESULT` wraps one,
 /// and report the raw value where it does not.
 fn hresult_cause(hr: i32) -> Cause {
-    match hresult_win32(hr).map(|code| io::Error::from_raw_os_error(i32::from(code as u16))) {
+    match hresult_win32(hr).map(|code| io::Error::from_raw_os_error(i32::from(code))) {
         Some(error) => error.into(),
         None => format!("HRESULT 0x{:08x}", hresult_value(hr)).into(),
     }
@@ -160,7 +160,7 @@ impl AppContainerProfile {
             return Ok(Self { sid, moniker });
         }
 
-        if hresult_win32(hr) != Some(ERROR_ALREADY_EXISTS) {
+        if hresult_win32(hr).map(u32::from) != Some(ERROR_ALREADY_EXISTS) {
             return Err(setup_failed(hresult_cause(hr)).into());
         }
 
