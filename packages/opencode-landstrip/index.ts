@@ -684,7 +684,7 @@ function startTrapServer(
               const scope = sessionScopeFor(path, baseDirectory);
               if (operation === 'read') sessionAllowedReadPaths.add(scope);
               else sessionAllowedWritePaths.add(scope);
-              trapSocket.write(controlResponseLine(queryId, 'allow'));
+              trapSocket.write(controlResponseLine(queryId, 'deny'));
               trapLines.push(line);
             }
           } else if (

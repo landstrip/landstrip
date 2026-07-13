@@ -716,7 +716,7 @@ test(
             );
             assert.deepEqual(JSON.parse(await readLine(socket)), {
               query_id: '42',
-              action: 'allow',
+              action: 'deny',
             });
 
             // Network connect/bind queries were previously unhandled entirely
