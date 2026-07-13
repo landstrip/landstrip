@@ -159,6 +159,7 @@ git add -- "${release_files[@]}"
 git commit -s -m "Bump the version to $next_ver"
 committed=1
 
+sob="Signed-off-by: $(git config user.name) <$(git config user.email)>"
 cat >".git/landstrip-$next_ver-tag-message.txt" <<EOF
 Landstrip $next_ver
 
@@ -170,12 +171,10 @@ $pi_log
 
 opencode-landstrip:
 $opencode_log
+
+$sob
 EOF
 
-echo "Created $(git rev-parse --short HEAD). Create the signed tag with:"
-echo
-echo "git tag -s $next_ver -F .git/landstrip-$next_ver-tag-message.txt"
-echo
-echo "Tag message:"
-echo
-echo "$(cat ".git/landstrip-$next_ver-tag-message.txt")"
+git tag -s "$next_ver" -F ".git/landstrip-$next_ver-tag-message.txt"
+
+echo "tagged $next_ver"
