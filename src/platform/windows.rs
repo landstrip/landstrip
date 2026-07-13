@@ -76,10 +76,10 @@ fn win32_error(status: u32) -> io::Error {
 }
 
 /// The Win32 error an `HRESULT` carries, when it carries one at all.
-fn hresult_win32(hr: i32) -> Option<u32> {
+fn hresult_win32(hr: i32) -> Option<u16> {
     let hresult = hresult_value(hr);
 
-    ((hresult >> 16) & 0x7ff == FACILITY_WIN32).then_some(hresult & 0xffff)
+    ((hresult >> 16) & 0x7ff == FACILITY_WIN32).then_some((hresult & 0xffff) as u16)
 }
 
 /// What an `HRESULT` failure means. The profile APIs report an `HRESULT`, not a
