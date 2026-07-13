@@ -265,7 +265,7 @@ fn supervise_child(
 ) -> Result<i32> {
     let mut denials = Denials::new(trap_fd.clone());
     let query_enabled = trap_fd.is_socket();
-    let ctx = NotificationContext {
+    let mut ctx = NotificationContext {
         policy,
         syscalls,
         notify_filesystem,
@@ -345,6 +345,7 @@ fn supervise_child(
                 // does not spin on a dead socket.
                 deny_all_pending(&mut pending_queries, notify_fd);
                 trap_fd = None;
+                ctx.query_enabled = false;
             }
         }
 
