@@ -143,5 +143,5 @@ name=explicit read/write policy permits configured root | os=windows | policy={"
 name=explicit read/write policy denies other root | os=windows | policy={"filesystem":{"allowWrite":["%TMP%\\allowed"],"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C echo nope> %TMP%\denied\nope.txt | status=!0
 name=unrestricted read policy is rejected | os=windows | policy={"filesystem":{"allowWrite":["%TMP%\\allowed"]}} | cmd=%SHELL% /C exit 0 | status=!0 | out=UNRESTRICTED_READ
 name=unrestricted network policy permits tool | os=windows | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=0
-name=TCP local binding policy is rejected | os=windows | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=!0 | out=TCP_POLICY
+name=TCP local binding policy is rejected | os=windows | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=!0 | out=TCP_BIND_UNSUPPORTED
 name=proxy port policy runs with network blocked | os=windows | policy={"network":{"httpProxyPort":8080},"filesystem":{"denyRead":["/"],"allowRead":["%TMP%","%REPO%"]}} | cmd=%SHELL% /C exit 0 | status=0
