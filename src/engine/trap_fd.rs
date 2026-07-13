@@ -53,7 +53,13 @@ impl TrapFd {
         line.push('\n');
 
         if let Some(fd) = self.fd {
-            write_trap_fd(fd, line.as_bytes());
+            #[cfg(target_os = "linux")]
+            if self.is_socket() {
+                write_socket_trap_fd(fd, line.as_bytes());
+                return;
+            }
+
+            write_nonblocking_trap_fd(fd, line.as_bytes());
         }
     }
 
@@ -64,32 +70,111 @@ impl TrapFd {
     pub(crate) fn write(&self, _trap: &Trap) {}
 }
 
+#[cfg(target_os = "linux")]
+fn write_socket_trap_fd(fd: i32, line: &[u8]) {
+    // SAFETY: send(2) reads the live slice pointer and does not retain it.
+    let written = unsafe {
+        libc::send(
+            fd,
+            line.as_ptr().cast(),
+            line.len(),
+            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+        )
+    };
+    log_short_write(fd, line.len(), written);
+}
+
 #[cfg(unix)]
-fn write_trap_fd(fd: i32, line: &[u8]) {
-    let mut remaining = line;
-    while !remaining.is_empty() {
-        // SAFETY: write(2) copies bytes from the live slice pointer.
-        let written = unsafe { libc::write(fd, remaining.as_ptr().cast(), remaining.len()) };
-        if written == 0 {
+fn write_nonblocking_trap_fd(fd: i32, line: &[u8]) {
+    if line.len() > libc::PIPE_BUF {
+        log::debug!("trap: dropping fd={fd} record larger than PIPE_BUF");
+        return;
+    }
+
+    // SAFETY: fcntl(2) only reads the scalar file descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        log_fd_error("get flags", fd);
+        return;
+    }
+
+    let restore_flags = flags & libc::O_NONBLOCK == 0;
+    if restore_flags {
+        // SAFETY: fcntl(2) only reads scalar arguments.
+        let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if result < 0 {
+            log_fd_error("set nonblocking", fd);
             return;
         }
-        if written < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            log::debug!(
-                "trap: write fd={fd} errno={}",
-                error.raw_os_error().unwrap_or(0)
-            );
-            return;
+    }
+
+    // SAFETY: write(2) reads the live slice pointer and does not retain it.
+    let written = write_without_sigpipe(fd, line);
+    log_short_write(fd, line.len(), written);
+
+    if restore_flags {
+        // SAFETY: fcntl(2) only reads scalar arguments.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+            log_fd_error("restore flags", fd);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_without_sigpipe(fd: i32, line: &[u8]) -> isize {
+    // SAFETY: the signal set pointers point to initialized local storage.
+    unsafe {
+        let mut sigpipe = std::mem::zeroed::<libc::sigset_t>();
+        if libc::sigemptyset(&mut sigpipe) != 0 || libc::sigaddset(&mut sigpipe, libc::SIGPIPE) != 0
+        {
+            return -1;
         }
 
-        let Ok(written) = usize::try_from(written) else {
-            return;
-        };
-        remaining = &remaining[written..];
+        let mut pending = std::mem::zeroed::<libc::sigset_t>();
+        let was_pending =
+            libc::sigpending(&mut pending) == 0 && libc::sigismember(&pending, libc::SIGPIPE) == 1;
+        let mut old_mask = std::mem::zeroed::<libc::sigset_t>();
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &sigpipe, &mut old_mask) != 0 {
+            return -1;
+        }
+
+        // SAFETY: write(2) reads the live slice pointer and does not retain it.
+        let written = libc::write(fd, line.as_ptr().cast(), line.len());
+        let broken_pipe =
+            written < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE);
+        if broken_pipe && !was_pending {
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            libc::sigtimedwait(&sigpipe, std::ptr::null_mut(), &timeout);
+        }
+
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut());
+        written
     }
+}
+
+#[cfg(unix)]
+fn log_short_write(fd: i32, expected: usize, written: isize) {
+    if written == isize::try_from(expected).unwrap_or(-1) {
+        return;
+    }
+
+    let error = std::io::Error::last_os_error();
+    log::debug!(
+        "trap: write fd={fd} bytes={written} errno={}",
+        error.raw_os_error().unwrap_or(0)
+    );
+}
+
+#[cfg(unix)]
+fn log_fd_error(operation: &str, fd: i32) {
+    let error = std::io::Error::last_os_error();
+    log::debug!(
+        "trap: {operation} fd={fd} errno={}",
+        error.raw_os_error().unwrap_or(0)
+    );
 }
 
 #[cfg(target_os = "linux")]
