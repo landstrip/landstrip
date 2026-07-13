@@ -43,7 +43,13 @@ import {
   withFileMutationQueue,
 } from '@earendil-works/pi-coding-agent';
 import { Key, matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
-import { binaryPath } from '@landstrip/landstrip';
+import {
+  binaryPath,
+  type LandstripControlResponse,
+  type LandstripFilesystemTrap,
+  type LandstripNetworkTrap,
+  type LandstripTrap,
+} from '@landstrip/landstrip';
 
 interface SandboxFilesystemConfig {
   denyRead: string[];
@@ -92,12 +98,7 @@ interface LandstripPolicy {
 
 type LandstripOperation = 'read' | 'write';
 
-type LandstripTrap =
-  | { kind: 'filesystem'; operation: LandstripOperation; file: string; mechanism: string }
-  | { kind: 'network'; operation: string; target: string; mechanism: string }
-  | { kind: 'launch'; program: string; source: string }
-  | { kind: 'usage'; message: string }
-  | { kind: 'internal'; detail: Record<string, string> };
+type LandstripDenialTrap = LandstripFilesystemTrap | LandstripNetworkTrap;
 
 interface LandstripBashCallbacks {
   onStderr?: (data: Buffer) => void;
@@ -106,6 +107,10 @@ interface LandstripBashCallbacks {
 }
 
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
+
+// Grace period after the child exits for its stdio to drain before we stop
+// waiting; matches pi's own bash backend so a backgrounded process cannot hang us.
+const EXIT_STDIO_GRACE_MS = 100;
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 type PermissionChoice = 'abort' | 'session' | 'project' | 'global';
@@ -136,6 +141,11 @@ const PERMISSION_OPTIONS: PromptOption[] = [
     confirm: true,
     hint: '-> ~/.pi/agent/sandbox.json',
   },
+];
+
+const NETWORK_PERMISSION_OPTIONS: PromptOption[] = [
+  { label: 'Allow for this session only', key: 's', action: 'session' },
+  { label: 'Abort (keep blocked)', key: 'esc', action: 'abort' },
 ];
 
 function loadConfig(cwd: string): SandboxConfig {
@@ -294,8 +304,10 @@ function extractDomainsFromCommand(command: string): string[] {
 }
 
 function domainMatchesPattern(domain: string, pattern: string): boolean {
-  const normalizedDomain = domain.toLowerCase();
-  const normalizedPattern = pattern.toLowerCase();
+  // A trailing dot ("pastebin.com.") is the same host to DNS but would slip past
+  // a literal deny entry; strip it from both sides before matching.
+  const normalizedDomain = domain.toLowerCase().replace(/\.+$/, '');
+  const normalizedPattern = pattern.toLowerCase().replace(/\.+$/, '');
 
   if (normalizedPattern === '*') return true;
   if (normalizedPattern.startsWith('*.')) {
@@ -306,7 +318,7 @@ function domainMatchesPattern(domain: string, pattern: string): boolean {
   return normalizedDomain === normalizedPattern;
 }
 
-function domainMatchesAny(domain: string, patterns: string[]): boolean {
+export function domainMatchesAny(domain: string, patterns: string[]): boolean {
   return patterns.some((pattern) => domainMatchesPattern(domain, pattern));
 }
 
@@ -360,9 +372,14 @@ export function matchesPattern(filePath: string, patterns: string[], cwd: string
       : canonicalizePath(pattern, cwd);
 
     if (pattern.includes('*')) {
+      // Mirror landstrip's matcher: `**/` spans directories, `**` spans any run,
+      // but a single `*` stops at `/` — so `/srv/*/pub` cannot reach
+      // `/srv/a/secret/pub`. Compiling `*` to `.*` would over-match across `/`.
       const escaped = absPattern
         .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-        .replace(/\*\*\/|\*\*|\*/g, (token) => (token === '**/' ? '(?:.*/)?' : '.*'));
+        .replace(/\*\*\/|\*\*|\*/g, (token) =>
+          token === '**/' ? '(?:.*/)?' : token === '**' ? '.*' : '[^/]*',
+        );
       return new RegExp(`^${escaped}$`).test(abs);
     }
 
@@ -463,19 +480,34 @@ function normalizePathMatch(value: string, cwd: string): string | null {
   return isPathLike(value) ? normalizeBlockedPath(value, cwd) : null;
 }
 
-type LandstripFilesystemTrap = Extract<LandstripTrap, { kind: 'filesystem' }>;
-
 function isFilesystemTrap(trap: LandstripTrap): trap is LandstripFilesystemTrap {
   return trap.kind === 'filesystem';
 }
 
-function extractBlockedPath(output: string, cwd: string): string | null {
-  const landstripErrors = parseLandstripTraps(output).filter(isFilesystemTrap);
+// filesystem and network traps report an access the policy denied; launch, usage
+// and internal traps report that landstrip itself failed.
+function isDenialTrap(trap: LandstripTrap): trap is LandstripDenialTrap {
+  return trap.kind === 'filesystem' || trap.kind === 'network';
+}
+
+// A `state: "query"` trap suspends the child's syscall until we answer it on the
+// trap socket. An `info` trap is terminal and carries a `query_id` of "0".
+export function isQueryTrap(trap: LandstripTrap): trap is LandstripDenialTrap {
+  return isDenialTrap(trap) && trap.state === 'query';
+}
+
+// Structured traps come only from the trap socket (fd 3); the sandboxed command
+// controls its own stderr and could forge a trap line, so these `extractBlocked*`
+// helpers must be fed only that trusted channel. Agent-controlled stderr is read
+// with the `extractNative*` regexes instead, which match a real kernel-denial
+// message rather than a JSON record.
+function extractBlockedPath(trapOutput: string, cwd: string): string | null {
+  const landstripErrors = parseLandstripTraps(trapOutput).filter(isFilesystemTrap);
   if (landstripErrors.length > 0) {
-    return normalizeBlockedPath(landstripErrors[0].file, cwd);
+    return normalizeBlockedPath(landstripErrors[0].path, cwd);
   }
 
-  return extractNativeDeniedPath(output, cwd);
+  return null;
 }
 
 function extractNativeDeniedPath(output: string, cwd: string): string | null {
@@ -522,75 +554,66 @@ function extractNativeWriteDeniedPath(output: string, cwd: string): string | nul
   return null;
 }
 
-function extractBlockedWritePath(output: string, cwd: string): string | null {
-  for (const error of parseLandstripTraps(output).filter(isFilesystemTrap)) {
+function extractBlockedWritePath(trapOutput: string, cwd: string): string | null {
+  for (const error of parseLandstripTraps(trapOutput).filter(isFilesystemTrap)) {
     if (error.operation === 'write') {
-      return normalizeBlockedPath(error.file, cwd);
+      return normalizeBlockedPath(error.path, cwd);
     }
   }
 
-  return extractNativeWriteDeniedPath(output, cwd);
+  return null;
 }
 
-function extractBlockedReadPath(output: string, cwd: string): string | null {
-  for (const error of parseLandstripTraps(output).filter(isFilesystemTrap)) {
+function extractBlockedReadPath(trapOutput: string, cwd: string): string | null {
+  for (const error of parseLandstripTraps(trapOutput).filter(isFilesystemTrap)) {
     if (error.operation === 'read') {
-      return normalizeBlockedPath(error.file, cwd);
+      return normalizeBlockedPath(error.path, cwd);
     }
   }
 
-  return extractNativeDeniedPath(output, cwd);
+  return null;
 }
 
-function asString(value: unknown): string | null {
-  return typeof value === 'string' ? value : null;
-}
+// landstrip emits each trap as a flat JSON record tagged by a `kind` discriminant
+// (`filesystem`, `network`, `launch`, `usage`, `internal`) alongside a stable
+// `code` and variant-specific fields. The declarations it ships are erased at
+// compile time, so validate the fields this extension reads before trusting a
+// decoded line.
+function isLandstripTrap(value: unknown): value is LandstripTrap {
+  if (typeof value !== 'object' || value === null) return false;
 
-// landstrip emits each trap as a flat JSON record tagged by a `kind`
-// discriminant (`filesystem`, `network`, `launch`, `usage`, `internal`)
-// alongside a stable `code` and variant-specific fields.
-function parseLandstripTrap(obj: Record<string, unknown>): LandstripTrap | null {
+  const obj = value as Record<string, unknown>;
   switch (obj.kind) {
-    case 'filesystem': {
-      const operation = obj.operation;
-      const file = asString(obj.path);
-      if ((operation === 'read' || operation === 'write') && file !== null) {
-        return { kind: 'filesystem', operation, file, mechanism: asString(obj.mechanism) ?? '' };
-      }
-      return null;
-    }
-    case 'network': {
-      const operation = asString(obj.operation);
-      const target = asString(obj.target);
-      if (operation !== null && target !== null) {
-        return { kind: 'network', operation, target, mechanism: asString(obj.mechanism) ?? '' };
-      }
-      return null;
-    }
-    case 'launch': {
-      const program = asString(obj.program);
-      const source = asString(obj.message);
-      if (program !== null && source !== null) {
-        return { kind: 'launch', program, source };
-      }
-      return null;
-    }
-    case 'usage': {
-      const message = asString(obj.message);
-      return message !== null ? { kind: 'usage', message } : null;
-    }
-    case 'internal': {
-      const detail: Record<string, string> = {};
-      const raw = obj.detail;
-      if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
-        for (const [key, value] of Object.entries(raw)) {
-          if (typeof value === 'string') detail[key] = value;
-        }
-      }
-      return { kind: 'internal', detail };
-    }
+    case 'filesystem':
+      return (
+        (obj.operation === 'read' || obj.operation === 'write') &&
+        typeof obj.path === 'string' &&
+        typeof obj.query_id === 'string'
+      );
+    case 'network':
+      return (
+        typeof obj.operation === 'string' &&
+        typeof obj.target === 'string' &&
+        typeof obj.query_id === 'string'
+      );
+    case 'launch':
+      return typeof obj.program === 'string' && typeof obj.message === 'string';
+    case 'usage':
+      return typeof obj.message === 'string';
+    case 'internal':
+      return typeof obj.code === 'string' && typeof obj.message === 'string';
     default:
-      return null;
+      return false;
+  }
+}
+
+export function parseTrapLine(line: string): LandstripTrap | null {
+  try {
+    const parsed: unknown = JSON.parse(line);
+    return isLandstripTrap(parsed) ? parsed : null;
+  } catch {
+    // Ignore non-JSON lines (e.g. stderr from child processes)
+    return null;
   }
 }
 
@@ -598,42 +621,43 @@ function parseLandstripTraps(output: string): LandstripTrap[] {
   const traps: LandstripTrap[] = [];
 
   for (const line of output.trim().split('\n')) {
-    if (line.length === 0) continue;
-
-    try {
-      const parsed: unknown = JSON.parse(line);
-      if (typeof parsed !== 'object' || parsed === null) continue;
-      const trap = parseLandstripTrap(parsed as Record<string, unknown>);
-      if (trap) traps.push(trap);
-    } catch {
-      // Ignore non-JSON lines (e.g. stderr from child processes)
-    }
+    const trap = parseTrapLine(line);
+    if (trap) traps.push(trap);
   }
 
   return traps;
 }
 
-function formatLandstripTraps(traps: LandstripTrap[]): string {
+export function formatLandstripTraps(traps: LandstripTrap[]): string {
   return traps
     .map((trap) => {
       switch (trap.kind) {
         case 'filesystem':
-          return `landstrip: filesystem ${trap.operation} denied: ${trap.file} (${trap.mechanism})`;
+          return `landstrip: filesystem ${trap.operation} denied: ${trap.path} (${trap.mechanism})`;
         case 'network':
           return `landstrip: network ${trap.operation} denied: ${trap.target} (${trap.mechanism})`;
         case 'launch':
-          return `landstrip: launch failed: ${trap.program}: ${trap.source}`;
+          return `landstrip: launch failed: ${trap.program}: ${trap.message}`;
         case 'usage':
           return `landstrip: usage error: ${trap.message}`;
         case 'internal': {
-          const detail = Object.entries(trap.detail)
-            .map(([key, value]) => `${key}=${value}`)
-            .join(', ');
-          return detail ? `landstrip: internal error: ${detail}` : 'landstrip: internal error';
+          const mechanism = trap.mechanism ? ` (${trap.mechanism})` : '';
+          return `landstrip: ${trap.code}${mechanism}: ${trap.message}`;
         }
       }
     })
     .join('\n');
+}
+
+// The broker matches an answer to its query by the exact decimal `query_id`
+// string the trap carried. A numeric id fails its deserializer, the line is
+// dropped, and the child's syscall stays suspended.
+export function controlResponseLine(
+  queryId: string,
+  action: LandstripControlResponse['action'],
+): string {
+  const response: LandstripControlResponse = { query_id: queryId, action };
+  return JSON.stringify(response) + '\n';
 }
 
 function notify(ctx: ExtensionContext, message: string, level: NotificationLevel): void {
@@ -787,11 +811,8 @@ async function showPermissionPrompt(
           for (let i = 0; i < options.length; i++) {
             const option = options[i];
 
-            if (data === option.key) {
-              resolveChoice(option.action);
-              return;
-            }
-
+            // Match case-insensitively so a `confirm` option always arms its
+            // two-step gate; an exact-key shortcut here would skip it.
             if (data.toLowerCase() === option.key.toLowerCase()) {
               if (option.confirm) {
                 pendingAction = option.action;
@@ -848,6 +869,22 @@ function promptWriteBlock(ctx: ExtensionContext, filePath: string): Promise<Perm
   );
 }
 
+// The broker knows only address:port, and no sandbox.json field can express a
+// grant for one: allowedDomains is a hostname list enforced by the proxy, and the
+// landstrip network policy is all-or-nothing (allowNetwork, allowLocalBinding).
+// So a connection is granted for the session or not at all.
+function promptNetworkBlock(
+  ctx: ExtensionContext,
+  operation: string,
+  target: string,
+): Promise<PermissionChoice> {
+  return showPermissionPrompt(
+    ctx,
+    `Network blocked: ${operation} to "${target}"`,
+    NETWORK_PERMISSION_OPTIONS,
+  );
+}
+
 // The binary is bundled and version-locked to @landstrip/landstrip via npm, so
 // compatibility is settled at install time; only confirm it is runnable here.
 function landstripAvailable(): boolean {
@@ -869,6 +906,11 @@ export function writeEnvFile(
   const lines: string[] = [];
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) continue;
+    // bash exports non-identifier names (e.g. a `BASH_FUNC_foo%%` function
+    // export) that `export NAME=...` rejects; emitting one makes `source` exit
+    // non-zero and the `&&`-chained command never runs. Skip what the shell
+    // itself cannot set.
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     // Escape single quotes: ' -> '\''
     const escaped = value.replace(/'/g, "'\\''");
     lines.push(`export ${key}='${escaped}'`);
@@ -974,11 +1016,13 @@ export function createLandstripIntegration(
   const sessionAllowedDomains: string[] = [];
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
+  const sessionAllowedTargets: string[] = [];
 
   function resetSessionAllowances(): void {
     sessionAllowedDomains.length = 0;
     sessionAllowedReadPaths.length = 0;
     sessionAllowedWritePaths.length = 0;
+    sessionAllowedTargets.length = 0;
   }
 
   function getEffectiveAllowedDomains(config: SandboxConfig): string[] {
@@ -1030,6 +1074,31 @@ export function createLandstripIntegration(
     if (choice === 'project') await addReadPathToConfig(projectPath, scope);
     if (choice === 'global') await addReadPathToConfig(globalPath, scope);
     noteScope(ctx, 'Read', choice, filePath, scope);
+  }
+
+  // Gate a read of `filePath` against allowRead/denyRead, prompting when blocked.
+  // Returns a block result when the user aborts, otherwise undefined once access
+  // is settled. Shared by the read, grep, ls and find tools.
+  async function gateReadAccess(
+    ctx: ExtensionContext,
+    config: SandboxConfig,
+    filePath: string,
+  ): Promise<{ block: true; reason: string } | undefined> {
+    if (readAllowed(filePath, getEffectiveAllowRead(config), config.filesystem.denyRead, ctx.cwd)) {
+      return undefined;
+    }
+    const choice = await promptReadBlock(
+      ctx,
+      filePath,
+      matchesPattern(filePath, config.filesystem.denyRead, ctx.cwd)
+        ? 'granting allowRead will override it'
+        : undefined,
+    );
+    if (choice === 'abort') {
+      return { block: true, reason: `Sandbox: read access denied for "${filePath}"` };
+    }
+    await applyReadChoice(ctx, choice, filePath, ctx.cwd);
+    return undefined;
   }
 
   async function applyWriteChoice(
@@ -1104,6 +1173,17 @@ export function createLandstripIntegration(
       return domainMatchesAny(domain, getEffectiveAllowedDomains(config));
     }
 
+    // Track the upstream socket so stop() tears it down, and abandon a still-
+    // connecting upstream when its client goes away — otherwise a connect to a
+    // black-holed host lingers in SYN-retry (~2 min), leaking an fd per request.
+    function trackUpstream(upstream: Socket, client: Socket, settled: () => boolean): void {
+      sockets.add(upstream);
+      upstream.once('close', () => sockets.delete(upstream));
+      client.once('close', () => {
+        if (!settled()) upstream.destroy();
+      });
+    }
+
     async function handleConnect(client: Socket, target: string, rest: Buffer): Promise<void> {
       const endpoint = splitHostPort(target, 443);
       if (!endpoint || !Number.isFinite(endpoint.port)) {
@@ -1122,6 +1202,7 @@ export function createLandstripIntegration(
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         pipeSockets(client, upstream, rest);
       });
+      trackUpstream(upstream, client, () => settled);
       upstream.once('error', () => {
         if (settled) return;
         settled = true;
@@ -1182,6 +1263,7 @@ export function createLandstripIntegration(
         upstream.write(`${rewrittenHeader}\r\n\r\n`);
         pipeSockets(client, upstream, rest);
       });
+      trackUpstream(upstream, client, () => settled);
       upstream.once('error', () => {
         if (settled) return;
         settled = true;
@@ -1281,10 +1363,28 @@ export function createLandstripIntegration(
         const config = loadConfig(cwd);
         const allowNetwork = config.network.allowNetwork;
         const proxy = allowNetwork ? null : await startProxy(cwd);
-        const policy = writePolicyFile(cwd, proxy?.port ?? null);
-        const envFile = writeEnvFile({ ...process.env, ...env }, proxy?.port ?? null);
-        const wrappedCommand = `source '${envFile.path}' && ${command}`;
-        const landstripArgs = ['--trap-fd', '3', '-p', policy.path, shell, ...args, wrappedCommand];
+
+        // Started/created before the child exists, so tear them down on any early
+        // failure too — the env file holds a copy of the environment (secrets),
+        // and the proxy keeps a listening socket. Idempotent: safe to call twice.
+        let policy: ReturnType<typeof writePolicyFile> | undefined;
+        let envFile: ReturnType<typeof writeEnvFile> | undefined;
+        const teardownResources = () => {
+          void proxy?.stop();
+          if (policy) rmSync(policy.dir, { recursive: true, force: true });
+          if (envFile) rmSync(envFile.dir, { recursive: true, force: true });
+        };
+
+        let landstripArgs: string[];
+        try {
+          policy = writePolicyFile(cwd, proxy?.port ?? null);
+          envFile = writeEnvFile({ ...process.env, ...env }, proxy?.port ?? null);
+          const wrappedCommand = `source '${envFile.path}' && ${command}`;
+          landstripArgs = ['--trap-fd', '3', '-p', policy.path, shell, ...args, wrappedCommand];
+        } catch (error) {
+          teardownResources();
+          throw error;
+        }
 
         return new Promise((resolvePromise, reject) => {
           (async () => {
@@ -1299,10 +1399,8 @@ export function createLandstripIntegration(
               cleaned = true;
               if (timeoutHandle) clearTimeout(timeoutHandle);
               signal?.removeEventListener('abort', onAbort);
-              void proxy?.stop();
+              teardownResources();
               trapSocket.destroy();
-              rmSync(policy.dir, { recursive: true, force: true });
-              rmSync(envFile.dir, { recursive: true, force: true });
             };
 
             const child = spawn(binaryPath(), landstripArgs, {
@@ -1339,18 +1437,85 @@ export function createLandstripIntegration(
             let stderrAcc = '';
             let errorFdAcc = '';
 
+            let execSettled = false;
+            let childExited = false;
+            let childExitCode: number | null = null;
+            let postExitTimer: NodeJS.Timeout | undefined;
+            let stdoutEnded = child.stdout === null;
+            let stderrEnded = child.stderr === null;
+
+            const finalizeExec = (code: number | null): void => {
+              if (execSettled) return;
+              execSettled = true;
+              if (postExitTimer) clearTimeout(postExitTimer);
+              // Stop tracking the inherited pipes: a backgrounded grandchild can
+              // hold them open after the command itself exits, so 'close' would
+              // otherwise never arrive.
+              child.stdout?.destroy();
+              child.stderr?.destroy();
+              void (async () => {
+                cleanup();
+                if (signal?.aborted) {
+                  reject(new Error('aborted'));
+                  return;
+                }
+                if (timedOut) {
+                  reject(new Error(`timeout:${timeout}`));
+                  return;
+                }
+
+                // Structured traps are trusted only from the trap socket (fd 3);
+                // the command's own stderr is read with the native regexes, which
+                // reflect a real kernel denial rather than a forgeable JSON line.
+                const blockedPath =
+                  extractBlockedPath(errorFdAcc, cwd) ?? extractNativeDeniedPath(stderrAcc, cwd);
+                if (!blockedPath && ctx.hasUI) {
+                  const traps = parseLandstripTraps(errorFdAcc);
+                  const denials = traps.filter(isDenialTrap);
+                  if (denials.length > 0) {
+                    const formatted = formatLandstripTraps(denials);
+                    notify(ctx, `Sandbox blocked an operation: ${formatted}`, 'warning');
+                  }
+
+                  const failures = traps.filter((trap) => !isDenialTrap(trap));
+                  if (failures.length > 0) {
+                    notify(ctx, `Sandbox failed: ${formatLandstripTraps(failures)}`, 'error');
+                  }
+                }
+
+                resolvePromise({ exitCode: code });
+              })().catch(reject);
+            };
+
+            const maybeFinalizeAfterExit = (): void => {
+              if (childExited && !execSettled && stdoutEnded && stderrEnded) {
+                finalizeExec(childExitCode);
+              }
+            };
+
             child.stdout?.on('data', onData);
             child.stderr?.on('data', (data: Buffer) => {
               stderrAcc += data.toString('utf8');
               callbacks.onStderr?.(data);
               onData(data);
             });
+            child.stdout?.once('end', () => {
+              stdoutEnded = true;
+              maybeFinalizeAfterExit();
+            });
+            child.stderr?.once('end', () => {
+              stderrEnded = true;
+              maybeFinalizeAfterExit();
+            });
             let trapBuffer = '';
             let queryChain: Promise<void> = Promise.resolve();
 
-            const respondQuery = (queryId: number, action: 'allow' | 'deny'): void => {
+            const respondQuery = (
+              queryId: string,
+              action: LandstripControlResponse['action'],
+            ): void => {
               if (trapSocket.destroyed) return;
-              trapSocket.write(JSON.stringify({ query_id: queryId, action }) + '\n');
+              trapSocket.write(controlResponseLine(queryId, action));
             };
 
             // Surface a denial through the error-fd accumulator so the post-close
@@ -1364,7 +1529,7 @@ export function createLandstripIntegration(
             // Answer a landstrip query (state:"query"). The broker suspends the
             // child's syscall until we respond allow/deny on the trap socket.
             const handleQuery = (
-              queryId: number,
+              queryId: string,
               operation: LandstripOperation,
               rawPath: string,
               rawLine: string,
@@ -1422,6 +1587,42 @@ export function createLandstripIntegration(
                 .catch(() => respondQuery(queryId, 'deny'));
             };
 
+            // A denied connect or bind is a query too, and the broker re-issues it
+            // itself once we allow. The target is address:port, so a grant only
+            // lasts for the session (see promptNetworkBlock).
+            const handleNetworkQuery = (
+              queryId: string,
+              operation: string,
+              target: string,
+              rawLine: string,
+            ): void => {
+              if (sessionAllowedTargets.includes(target)) {
+                respondQuery(queryId, 'allow');
+                return;
+              }
+              if (!ctx.hasUI || !callbacks.promptOnBlock) {
+                appendErrorLine(rawLine);
+                respondQuery(queryId, 'deny');
+                return;
+              }
+              queryChain = queryChain
+                .then(async () => {
+                  if (sessionAllowedTargets.includes(target)) {
+                    respondQuery(queryId, 'allow');
+                    return;
+                  }
+                  const choice = await promptNetworkBlock(ctx, operation, target);
+                  if (choice === 'abort') {
+                    appendErrorLine(rawLine);
+                    respondQuery(queryId, 'deny');
+                    return;
+                  }
+                  sessionAllowedTargets.push(target);
+                  respondQuery(queryId, 'allow');
+                })
+                .catch(() => respondQuery(queryId, 'deny'));
+            };
+
             trapSocket.on('data', (data: Buffer) => {
               trapBuffer += data.toString('utf8');
               let nl = trapBuffer.indexOf('\n');
@@ -1430,66 +1631,49 @@ export function createLandstripIntegration(
                 trapBuffer = trapBuffer.slice(nl + 1);
                 nl = trapBuffer.indexOf('\n');
                 if (line.length === 0) continue;
-                let obj: Record<string, unknown> | null = null;
-                try {
-                  const parsed: unknown = JSON.parse(line);
-                  if (typeof parsed === 'object' && parsed !== null) {
-                    obj = parsed as Record<string, unknown>;
+                const trap = parseTrapLine(line);
+                // An unanswered query holds the child's syscall, so every query
+                // gets an answer; anything else is informational and kept for
+                // post-close handling.
+                if (trap && isQueryTrap(trap)) {
+                  if (isFilesystemTrap(trap)) {
+                    handleQuery(trap.query_id, trap.operation, trap.path, line);
+                  } else {
+                    handleNetworkQuery(trap.query_id, trap.operation, trap.target, line);
                   }
-                } catch {
-                  obj = null;
-                }
-                if (
-                  obj &&
-                  obj.state === 'query' &&
-                  typeof obj.query_id === 'number' &&
-                  (obj.operation === 'read' || obj.operation === 'write') &&
-                  typeof obj.path === 'string'
-                ) {
-                  handleQuery(obj.query_id, obj.operation, obj.path, line);
                 } else {
-                  // Informational trap (network denials, etc.): keep for post-close handling.
                   appendErrorLine(line);
                 }
               }
             });
 
             child.on('error', (error) => {
+              if (execSettled) return;
+              execSettled = true;
+              if (postExitTimer) clearTimeout(postExitTimer);
               cleanup();
               reject(error);
             });
 
-            child.on('close', (code) => {
-              void (async () => {
-                cleanup();
-                if (signal?.aborted) {
-                  reject(new Error('aborted'));
-                  return;
-                }
-                if (timedOut) {
-                  reject(new Error(`timeout:${timeout}`));
-                  return;
-                }
-
-                const errorOutput = errorFdAcc || stderrAcc;
-
-                // Filesystem denials are now answered live during execution; only
-                // informational traps (network, etc.) remain to surface here.
-                const blockedPath =
-                  extractBlockedPath(errorOutput, cwd) ??
-                  (errorFdAcc ? extractBlockedPath(stderrAcc, cwd) : null);
-                if (!blockedPath && ctx.hasUI) {
-                  const landstripErrors = parseLandstripTraps(errorOutput);
-                  if (landstripErrors.length > 0) {
-                    const formatted = formatLandstripTraps(landstripErrors);
-                    notify(ctx, `Sandbox blocked an operation: ${formatted}`, 'warning');
-                  }
-                }
-
-                resolvePromise({ exitCode: code });
-              })().catch(reject);
+            // Settle on 'exit' — the command itself has ended — rather than
+            // waiting for 'close', which only fires once every inherited stdio
+            // pipe is closed. A backgrounded process holding one open would
+            // otherwise block us indefinitely.
+            child.once('exit', (code) => {
+              childExited = true;
+              childExitCode = code;
+              maybeFinalizeAfterExit();
+              if (!execSettled) {
+                postExitTimer = setTimeout(() => finalizeExec(code), EXIT_STDIO_GRACE_MS);
+              }
             });
-          })().catch(reject);
+            child.once('close', (code) => finalizeExec(code));
+          })().catch((error: unknown) => {
+            // A failure before the child is wired (e.g. createSocketPair) never
+            // reaches cleanup(); free the proxy and temp dirs here too.
+            teardownResources();
+            reject(error);
+          });
         });
       },
     };
@@ -1598,7 +1782,7 @@ export function createLandstripIntegration(
       const fallbackOutput = `${stderrOutput}\n${errorText}`;
       const blockedWritePath =
         extractBlockedWritePath(landstripErrorOutput, ctx.cwd) ??
-        extractBlockedWritePath(fallbackOutput, ctx.cwd);
+        extractNativeWriteDeniedPath(fallbackOutput, ctx.cwd);
       if (blockedWritePath) {
         const retryResult = await retryWithWriteAccess(blockedWritePath);
         if (retryResult) return retryResult;
@@ -1606,13 +1790,13 @@ export function createLandstripIntegration(
 
       const blockedReadPath =
         extractBlockedReadPath(landstripErrorOutput, ctx.cwd) ??
-        extractBlockedReadPath(fallbackOutput, ctx.cwd);
+        extractNativeDeniedPath(fallbackOutput, ctx.cwd);
       if (blockedReadPath) {
         const retryResult = await retryWithReadAccess(blockedReadPath);
         if (retryResult) return retryResult;
       }
 
-      const landstripErrors = parseLandstripTraps(landstripErrorOutput || errorText);
+      const landstripErrors = parseLandstripTraps(landstripErrorOutput);
       if (landstripErrors.length > 0) {
         throw new Error(formatLandstripTraps(landstripErrors));
       }
@@ -1625,7 +1809,7 @@ export function createLandstripIntegration(
     }
     const blockedWritePath =
       extractBlockedWritePath(landstripErrorOutput, ctx.cwd) ??
-      extractBlockedWritePath(stderrOutput, ctx.cwd);
+      extractNativeWriteDeniedPath(stderrOutput, ctx.cwd);
     if (blockedWritePath) {
       const retryResult = await retryWithWriteAccess(blockedWritePath);
       if (retryResult) return retryResult;
@@ -1633,7 +1817,7 @@ export function createLandstripIntegration(
 
     const blockedReadPath =
       extractBlockedReadPath(landstripErrorOutput, ctx.cwd) ??
-      extractBlockedReadPath(stderrOutput, ctx.cwd);
+      extractNativeDeniedPath(stderrOutput, ctx.cwd);
     if (!blockedReadPath) return result;
 
     const retryResult = await retryWithReadAccess(blockedReadPath);
@@ -1690,20 +1874,37 @@ export function createLandstripIntegration(
     setTuiStatus(ctx, 'sandbox', `${dot} ${label}  ${sep}  ${net}  ${sep}  ${write}`);
   }
 
+  const headlessWarnings = new Set<string>();
+
+  // When sandboxing cannot be applied, bash falls back to running unsandboxed.
+  // notify() is a no-op without a UI, so in headless/RPC mode also print to
+  // stderr (once per message) rather than failing open silently.
+  function warnUnsandboxed(ctx: ExtensionContext, message: string, level: NotificationLevel): void {
+    notify(ctx, message, level);
+    if (!ctx.hasUI && !headlessWarnings.has(message)) {
+      headlessWarnings.add(message);
+      console.error(`pi-landstrip: ${message}`);
+    }
+  }
+
   function enableSandbox(ctx: ExtensionContext): boolean {
     const config = loadConfig(ctx.cwd);
 
     if (!SUPPORTED_PLATFORMS.has(process.platform)) {
       sandboxEnabled = false;
       sandboxReady = false;
-      notify(ctx, `landstrip sandboxing is not supported on ${process.platform}`, 'warning');
+      warnUnsandboxed(
+        ctx,
+        `landstrip sandboxing is not supported on ${process.platform}`,
+        'warning',
+      );
       return false;
     }
 
     if (!landstripAvailable()) {
       sandboxEnabled = false;
       sandboxReady = false;
-      notify(
+      warnUnsandboxed(
         ctx,
         `landstrip was not found. Reinstall with: npm install @landstrip/landstrip`,
         'error',
@@ -1813,17 +2014,28 @@ export function createLandstripIntegration(
       }
 
       if (isToolCallEventType('read', event)) {
-        const filePath = canonicalizePath(event.input.path, ctx.cwd);
-        if (!matchesPattern(filePath, getEffectiveAllowRead(config), ctx.cwd)) {
-          const choice = await promptReadBlock(ctx, filePath);
-          if (choice === 'abort') {
-            return {
-              block: true,
-              reason: `Sandbox: read access denied for "${filePath}"`,
-            };
-          }
-          await applyReadChoice(ctx, choice, filePath, ctx.cwd);
-        }
+        const result = await gateReadAccess(
+          ctx,
+          config,
+          canonicalizePath(event.input.path, ctx.cwd),
+        );
+        if (result) return result;
+      }
+
+      // grep, ls and find read their target path (default: the cwd) and recurse
+      // into it, so gate them against allowRead/denyRead like the read tool —
+      // otherwise they run in-process, unsandboxed, and defeat denyRead.
+      if (
+        isToolCallEventType('grep', event) ||
+        isToolCallEventType('ls', event) ||
+        isToolCallEventType('find', event)
+      ) {
+        const result = await gateReadAccess(
+          ctx,
+          config,
+          canonicalizePath(event.input.path ?? '.', ctx.cwd),
+        );
+        if (result) return result;
       }
 
       if (isToolCallEventType('write', event) || isToolCallEventType('edit', event)) {

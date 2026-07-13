@@ -15,7 +15,6 @@
   },
   "files": [
     "index.ts",
-    "landstrip.d.ts",
     "README.md",
     "sandbox.json"
   ],
@@ -33,7 +32,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-tui": "^0.78.0",
-    "@landstrip/landstrip": "^0.16.23"
+    "@landstrip/landstrip": "^0.17.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.2",

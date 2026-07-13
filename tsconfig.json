@@ -9,5 +9,5 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "index.test.ts", "landstrip.d.ts"]
+  "include": ["index.ts", "index.test.ts"]
 }

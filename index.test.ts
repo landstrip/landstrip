@@ -50,6 +50,19 @@ describe('matchesPattern other entry shapes', () => {
     expect(matchesPattern(`${PROJECT}/a/b/key.pem`, ['**/*.pem'], PROJECT)).toBe(true);
     expect(matchesPattern(`${PROJECT}/a/b/file.ts`, ['**/.env'], PROJECT)).toBe(false);
   });
+
+  // A single '*' must stop at '/', like landstrip's own matcher, so an
+  // allow-glob cannot reach a deeper path the operator did not intend.
+  it('a single * does not cross a directory separator', () => {
+    expect(matchesPattern(`${PROJECT}/srv/a/pub`, [`${PROJECT}/srv/*/pub`], PROJECT)).toBe(true);
+    expect(matchesPattern(`${PROJECT}/srv/a/deep/pub`, [`${PROJECT}/srv/*/pub`], PROJECT)).toBe(
+      false,
+    );
+    // '**' still spans directories.
+    expect(matchesPattern(`${PROJECT}/srv/a/deep/pub`, [`${PROJECT}/srv/**/pub`], PROJECT)).toBe(
+      true,
+    );
+  });
 });
 
 describe('shouldPromptForWrite', () => {
@@ -154,6 +167,15 @@ describe('writeEnvFile', () => {
     expect(content).toContain("export QUOTED='it'\\''s a test'");
   });
 
+  it('skips names the shell cannot export', () => {
+    const env: NodeJS.ProcessEnv = { FOO: 'bar', 'BASH_FUNC_greet%%': '() { echo hi; }' };
+    const { dir, path } = writeEnvFile(env, null);
+    const content = readFileSync(path, 'utf-8');
+    rmSync(dir, { recursive: true, force: true });
+    expect(content).toContain("export FOO='bar'");
+    expect(content).not.toContain('BASH_FUNC_greet');
+  });
+
   it('adds proxy vars when proxyPort is provided', () => {
     const { dir, path } = writeEnvFile({ FOO: 'bar' }, 8080);
     const content = readFileSync(path, 'utf-8');
@@ -175,5 +197,154 @@ describe('writeEnvFile', () => {
     expect(dir).toContain(tmpdir());
     expect(existsSync(path)).toBe(true);
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+import {
+  controlResponseLine,
+  domainMatchesAny,
+  formatLandstripTraps,
+  isQueryTrap,
+  parseTrapLine,
+} from './index.ts';
+
+describe('domainMatchesAny', () => {
+  it('matches exact and wildcard patterns', () => {
+    expect(domainMatchesAny('github.com', ['github.com'])).toBe(true);
+    expect(domainMatchesAny('api.github.com', ['*.github.com'])).toBe(true);
+    expect(domainMatchesAny('evil.com', ['github.com'])).toBe(false);
+  });
+
+  // A trailing-dot FQDN resolves to the same host, so it must not slip past a
+  // deny entry written without the dot.
+  it('normalizes a trailing dot before matching', () => {
+    expect(domainMatchesAny('pastebin.com.', ['pastebin.com'])).toBe(true);
+    expect(domainMatchesAny('api.github.com.', ['*.github.com'])).toBe(true);
+  });
+});
+
+const FS_TRAP = {
+  kind: 'filesystem',
+  code: 'FILESYSTEM_DENIED',
+  state: 'query',
+  query_id: '7',
+  operation: 'read',
+  path: '/etc/passwd',
+  requested_path: '/etc/passwd',
+  syscall: 'openat',
+  errno: 'EACCES',
+  flags: ['O_RDONLY'],
+  reason: 'allow_miss',
+  suggested_grant: { allowRead: '/etc/passwd' },
+  process: { pid: 42, exe: '/bin/cat', cwd: '/proj' },
+  mechanism: 'seccomp',
+};
+
+const NET_TRAP = {
+  kind: 'network',
+  code: 'NETWORK_DENIED',
+  state: 'query',
+  query_id: '9',
+  operation: 'connect',
+  target: '140.82.121.4:22',
+  syscall: 'connect',
+  errno: 'EACCES',
+  mechanism: 'seccomp',
+  process: { pid: 42, exe: '/usr/bin/ssh', cwd: '/proj' },
+};
+
+const line = (trap: object): string => JSON.stringify(trap);
+
+describe('parseTrapLine', () => {
+  it('parses a filesystem query trap', () => {
+    const trap = parseTrapLine(line(FS_TRAP));
+    expect(trap).toMatchObject({ kind: 'filesystem', operation: 'read', path: '/etc/passwd' });
+    expect(trap?.kind === 'filesystem' && trap.query_id).toBe('7');
+  });
+
+  // landstrip 0.16 sent query_id as a JSON number. Answering such a trap with a
+  // numeric id leaves the child's syscall suspended, so a numeric id must not
+  // parse at all rather than reach the handshake.
+  it('rejects a numeric query_id', () => {
+    expect(parseTrapLine(line({ ...FS_TRAP, query_id: 7 }))).toBeNull();
+    expect(parseTrapLine(line({ ...NET_TRAP, query_id: 9 }))).toBeNull();
+  });
+
+  it('parses launch, usage and internal traps', () => {
+    expect(
+      parseTrapLine(
+        line({ kind: 'launch', code: 'LAUNCH_FAILED', program: 'nope', message: 'not found' }),
+      ),
+    ).toMatchObject({ kind: 'launch', program: 'nope', message: 'not found' });
+    expect(
+      parseTrapLine(line({ kind: 'usage', code: 'USAGE_ERROR', message: 'bad flag' })),
+    ).toMatchObject({ kind: 'usage', message: 'bad flag' });
+    expect(
+      parseTrapLine(line({ kind: 'internal', code: 'POLICY_PARSE_FAILED', message: 'bad json' })),
+    ).toMatchObject({ kind: 'internal', code: 'POLICY_PARSE_FAILED' });
+  });
+
+  it('ignores non-JSON lines and unknown kinds', () => {
+    expect(parseTrapLine('cat: /etc/passwd: Permission denied')).toBeNull();
+    expect(parseTrapLine('')).toBeNull();
+    expect(parseTrapLine(line({ kind: 'future', message: 'x' }))).toBeNull();
+  });
+});
+
+describe('isQueryTrap', () => {
+  it('holds for a pending filesystem or network query', () => {
+    expect(isQueryTrap(parseTrapLine(line(FS_TRAP))!)).toBe(true);
+    expect(isQueryTrap(parseTrapLine(line(NET_TRAP))!)).toBe(true);
+  });
+
+  it('does not hold for a terminal info trap', () => {
+    const info = { ...FS_TRAP, state: 'info', query_id: '0' };
+    expect(isQueryTrap(parseTrapLine(line(info))!)).toBe(false);
+  });
+
+  it('does not hold for a failure trap', () => {
+    const usage = parseTrapLine(line({ kind: 'usage', code: 'USAGE_ERROR', message: 'bad flag' }));
+    expect(isQueryTrap(usage!)).toBe(false);
+  });
+});
+
+describe('controlResponseLine', () => {
+  it('serializes query_id as a string', () => {
+    expect(controlResponseLine('7', 'allow')).toBe('{"query_id":"7","action":"allow"}\n');
+    expect(controlResponseLine('7', 'deny')).toBe('{"query_id":"7","action":"deny"}\n');
+  });
+});
+
+describe('formatLandstripTraps', () => {
+  it('renders a filesystem denial with its resolved path', () => {
+    expect(formatLandstripTraps([parseTrapLine(line(FS_TRAP))!])).toBe(
+      'landstrip: filesystem read denied: /etc/passwd (seccomp)',
+    );
+  });
+
+  it('renders a launch failure with its message', () => {
+    const trap = parseTrapLine(
+      line({ kind: 'launch', code: 'LAUNCH_FAILED', program: 'nope', message: 'not found' }),
+    );
+    expect(formatLandstripTraps([trap!])).toBe('landstrip: launch failed: nope: not found');
+  });
+
+  it('renders an internal failure by its code, with the mechanism when present', () => {
+    const policy = parseTrapLine(
+      line({ kind: 'internal', code: 'POLICY_PARSE_FAILED', message: 'bad json' }),
+    );
+    expect(formatLandstripTraps([policy!])).toBe('landstrip: POLICY_PARSE_FAILED: bad json');
+
+    const setup = parseTrapLine(
+      line({
+        kind: 'internal',
+        code: 'SANDBOX_SETUP_FAILED',
+        mechanism: 'landlock',
+        message: 'no ABI',
+      }),
+    );
+    expect(formatLandstripTraps([setup!])).toBe(
+      'landstrip: SANDBOX_SETUP_FAILED (landlock): no ABI',
+    );
   });
 });
