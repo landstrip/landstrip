@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
+use crate::engine::error::Error;
 use argh::FromArgs;
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -64,7 +65,7 @@ enum CliAction {
     Exit(String),
 }
 
-pub(crate) fn parse_cli() -> Result<Cli> {
+pub(crate) fn parse_cli() -> std::result::Result<Cli, Error> {
     let mut env_args = env::args_os();
     let program = env_args.next().unwrap_or(OsString::from(PROGRAM_NAME));
 
@@ -74,7 +75,7 @@ pub(crate) fn parse_cli() -> Result<Cli> {
             print!("{output}");
             process::exit(0);
         }
-        Err(error) => Err(error),
+        Err(message) => Err(Error::Usage { message }),
     }
 }
 

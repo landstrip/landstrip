@@ -13,6 +13,7 @@
 //! while lowering the policy.
 
 use crate::config::{SandboxFilesystem, SandboxNetwork};
+use crate::engine::error::Error;
 #[cfg(not(target_os = "macos"))]
 use crate::engine::paths::normalize_path;
 use crate::engine::paths::{normalize_path_lexically, normalize_roots};
@@ -85,32 +86,11 @@ impl AccessPolicy {
     }
 }
 
-/// A policy that cannot be resolved or is unsupported on the current platform.
-///
-/// `Display` renders a stable `SCREAMING_SNAKE_CASE` code so callers can route
-/// on the specific rejection.
-#[derive(Debug, strum_macros::Display)]
-#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
-#[allow(dead_code)]
-pub(crate) enum AccessPolicyError {
-    UnrestrictedRead,
-    TcpPolicy,
-    UnixSocketPolicy,
-    UnixSocketPath,
-    DenyWriteSymlinkAncestor,
-    InvalidPort,
-    EmptyPath,
-    HomeUnavailable,
-    TraversalDepth,
-}
-
-impl std::error::Error for AccessPolicyError {}
-
 #[cfg(target_os = "macos")]
 impl AccessPolicy {
     /// Reject policies macOS Seatbelt cannot enforce: an existing non-socket
     /// `allowUnixSockets` path or a `denyWrite` symlink ancestor.
-    pub(crate) fn validate(&self) -> std::result::Result<(), AccessPolicyError> {
+    pub(crate) fn validate(&self) -> std::result::Result<(), Error> {
         if let UnixSocketAccess::AllowPaths(paths) = &self.network_access.unix_socket_access {
             for path in paths {
                 match fs::symlink_metadata(path) {
@@ -121,7 +101,7 @@ impl AccessPolicy {
                             path.display()
                         );
                     }
-                    _ => return Err(AccessPolicyError::UnixSocketPath),
+                    _ => return Err(Error::PolicyUnixSocketPath),
                 }
             }
         }
@@ -132,7 +112,7 @@ impl AccessPolicy {
                 .any(|root| link == root || link.starts_with(root))
         });
         if has_writable_symlink_ancestor {
-            return Err(AccessPolicyError::DenyWriteSymlinkAncestor);
+            return Err(Error::PolicyDenyWriteSymlinkAncestor);
         }
 
         Ok(())
@@ -145,9 +125,9 @@ impl AccessPolicy {
     /// read, a local TCP bind, or a non-empty Unix socket allowlist. Connect
     /// proxy ports are accepted but unenforceable, so the container then runs
     /// with no network access.
-    pub(crate) fn validate(&self) -> std::result::Result<(), AccessPolicyError> {
+    pub(crate) fn validate(&self) -> std::result::Result<(), Error> {
         if matches!(self.read_access, ReadAccess::Unrestricted) {
-            return Err(AccessPolicyError::UnrestrictedRead);
+            return Err(Error::PolicyUnrestrictedRead);
         }
 
         let network = &self.network_access;
@@ -156,12 +136,12 @@ impl AccessPolicy {
         }
 
         if network.local_tcp_bind {
-            return Err(AccessPolicyError::TcpPolicy);
+            return Err(Error::PolicyTcpBindUnsupported);
         }
 
         if !matches!(&network.unix_socket_access, UnixSocketAccess::AllowPaths(paths) if paths.is_empty())
         {
-            return Err(AccessPolicyError::UnixSocketPolicy);
+            return Err(Error::PolicyUnixSocketUnsupported);
         }
 
         Ok(())
@@ -173,7 +153,7 @@ impl AccessPolicy {
     /// The Linux broker enforces every supported policy shape, so nothing is
     /// rejected ahead of time.
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
-    pub(crate) fn validate(&self) -> std::result::Result<(), AccessPolicyError> {
+    pub(crate) fn validate(&self) -> std::result::Result<(), Error> {
         Ok(())
     }
 }
@@ -229,7 +209,9 @@ pub(crate) fn resolve_policy(
     let policy_base = if policy_base.is_absolute() {
         policy_base.to_path_buf()
     } else {
-        env::current_dir()?.join(policy_base)
+        env::current_dir()
+            .map_err(|source| Error::PolicyIoFailed { source })?
+            .join(policy_base)
     };
     let policy_base = normalize_path_lexically(&policy_base);
 
@@ -328,7 +310,7 @@ fn push_proxy_port(ports: &mut Vec<u16>, port: Option<u16>) -> Result<()> {
     };
 
     if port == 0 {
-        return Err(AccessPolicyError::InvalidPort.into());
+        return Err(Error::PolicyInvalidPort.into());
     }
 
     ports.push(port);
@@ -415,7 +397,7 @@ fn scan_allowed_root(
 
     while let Some((current, is_explicit, depth)) = stack.pop() {
         if depth >= MAX_TRAVERSAL_DEPTH {
-            return Err(AccessPolicyError::TraversalDepth.into());
+            return Err(Error::PolicyTraversalDepth.into());
         }
 
         if denied
@@ -444,7 +426,7 @@ fn scan_allowed_root(
                 results.push(current);
                 continue;
             }
-            Err(source) => return Err(source.into()),
+            Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
         };
         let file_type = metadata.file_type();
 
@@ -467,7 +449,7 @@ fn scan_allowed_root(
                 results.push(current);
                 continue;
             }
-            Err(source) => return Err(source.into()),
+            Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
         };
         for entry in entries {
             let entry = match entry {
@@ -478,7 +460,7 @@ fn scan_allowed_root(
                 {
                     continue;
                 }
-                Err(source) => return Err(source.into()),
+                Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
             };
             let child = entry.path();
             stack.push((child, false, depth + 1));
@@ -548,7 +530,7 @@ fn push_path_variants(paths: &mut Vec<PathBuf>, path: &Path) {
 
 fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<PathBuf> {
     if path.is_empty() {
-        return Err(AccessPolicyError::EmptyPath.into());
+        return Err(Error::PolicyEmptyPath.into());
     }
 
     let raw = Path::new(path);
@@ -556,10 +538,10 @@ fn resolve_sandbox_path(path: &str, base: &Path, home: Option<&Path>) -> Result<
         raw.to_path_buf()
     } else if path == "~" {
         home.map(Path::to_path_buf)
-            .ok_or(AccessPolicyError::HomeUnavailable)?
+            .ok_or(Error::PolicyHomeUnavailable)?
     } else if let Some(rest) = path.strip_prefix("~/") {
         home.map(|home| home.join(rest))
-            .ok_or(AccessPolicyError::HomeUnavailable)?
+            .ok_or(Error::PolicyHomeUnavailable)?
     } else {
         base.join(raw)
     };
@@ -589,7 +571,7 @@ pub(crate) fn expand_glob_path(pattern: &Path) -> Result<Vec<PathBuf>> {
                 || error.kind() == io::ErrorKind::PermissionDenied
                 || error.raw_os_error() == Some(libc::EIO)
                 || error.raw_os_error() == Some(libc::ENOTCONN) => {}
-        Err(source) => return Err(source.into()),
+        Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
     }
 
     Ok(matches)
@@ -626,7 +608,7 @@ fn collect_glob_matches(
     const LIMIT: u32 = 40;
 
     if depth >= LIMIT {
-        return Err(AccessPolicyError::TraversalDepth.into());
+        return Err(Error::PolicyTraversalDepth.into());
     }
 
     let candidate = normalize_path_lexically(path);
@@ -653,7 +635,7 @@ fn collect_glob_matches(
         {
             return Ok(());
         }
-        Err(source) => return Err(source.into()),
+        Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
     };
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Ok(());
@@ -668,7 +650,7 @@ fn collect_glob_matches(
         {
             return Ok(());
         }
-        Err(source) => return Err(source.into()),
+        Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
     };
     for entry in entries {
         let entry = match entry {
@@ -679,7 +661,7 @@ fn collect_glob_matches(
             {
                 continue;
             }
-            Err(source) => return Err(source.into()),
+            Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
         };
         collect_glob_matches(&entry.path(), pattern, matches, depth + 1)?;
     }

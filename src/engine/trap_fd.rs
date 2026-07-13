@@ -3,14 +3,13 @@
 
 //! Separate file descriptor for landstrip trap response blocks.
 
-#[cfg(target_os = "linux")]
 use crate::engine::trap::Trap;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TrapFd {
-    // A raw descriptor is a `--trap-fd` concept only the Linux broker acts on;
-    // other platforms accept the flag but ignore the descriptor.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // Denial traps are a `--trap-fd` concept only the Linux broker produces;
+    // Windows accepts the flag but has no descriptor to write to.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fd: Option<i32>,
 }
 
@@ -38,25 +37,34 @@ impl TrapFd {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn fd(&self) -> Option<i32> {
         self.fd
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub(crate) fn write(&self, trap: &Trap) {
-        let Ok(line) = serde_json::to_string(trap) else {
-            return;
-        };
-        let line = format!("{line}\n");
+        self.write_json(&trap.json_line());
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn write_json(&self, json: &str) {
+        let mut line = json.to_owned();
+        line.push('\n');
 
         if let Some(fd) = self.fd {
             write_trap_fd(fd, line.as_bytes());
         }
     }
+
+    /// Windows has no inherited landstrip descriptor: traps reach the launcher
+    /// on stderr only.
+    #[cfg(not(unix))]
+    #[allow(clippy::unused_self)]
+    pub(crate) fn write(&self, _trap: &Trap) {}
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn write_trap_fd(fd: i32, line: &[u8]) {
     let mut remaining = line;
     while !remaining.is_empty() {

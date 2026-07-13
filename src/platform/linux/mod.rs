@@ -17,6 +17,7 @@ use filter::NetworkFilter;
 use landlock::enforce_access_policy;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{self, Command};
 
 #[allow(clippy::needless_pass_by_value)]
@@ -65,7 +66,13 @@ pub(crate) fn execute(
         )?;
         filters.load()?;
     }
-    close_inherited_fds();
+    close_inherited_fds(&[]).map_err(|source| Error::SuperviseFailed {
+        source: source.into(),
+    })?;
     let error = Command::new(tool).args(args).exec();
-    Err(Error::IoFailed(error).into())
+    Err(Error::LaunchFailed {
+        tool: PathBuf::from(tool),
+        source: error.into(),
+    }
+    .into())
 }

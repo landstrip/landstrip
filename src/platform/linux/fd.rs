@@ -8,29 +8,37 @@
 
 use nix::errno::Errno;
 use std::fs;
+use std::io;
 use std::os::fd::RawFd;
 
 const FIRST_INHERITED_FD: RawFd = 3;
 const FIRST_INHERITED_FD_U32: u32 = 3;
 const FALLBACK_FD_LIMIT: RawFd = 1_048_576;
 
-pub(super) fn close_inherited_fds() {
-    // SAFETY: close_range(2) copies scalar arguments and closes descriptors in this process.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_close_range,
-            FIRST_INHERITED_FD_U32,
-            u32::MAX,
-            0_u32,
-        )
-    };
-    if rc == 0 {
-        return;
+pub(super) fn close_inherited_fds(excluded: &[RawFd]) -> io::Result<()> {
+    for &fd in excluded {
+        set_cloexec(fd)?;
     }
 
-    match Errno::last() {
-        Errno::ENOSYS | Errno::EINVAL => {}
-        error => log::debug!("fd: close_range errno={}", error as i32),
+    if excluded.is_empty() {
+        // SAFETY: close_range(2) copies scalar arguments only and closes
+        // descriptors in this process.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                FIRST_INHERITED_FD_U32,
+                u32::MAX,
+                0_u32,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+
+        match Errno::last() {
+            Errno::ENOSYS | Errno::EINVAL => {}
+            error => log::debug!("fd: close_range errno={}", error as i32),
+        }
     }
 
     match fs::read_dir("/proc/self/fd") {
@@ -56,7 +64,7 @@ pub(super) fn close_inherited_fds() {
                     continue;
                 };
 
-                if fd >= FIRST_INHERITED_FD {
+                if fd >= FIRST_INHERITED_FD && !excluded.contains(&fd) {
                     fds.push(fd);
                 }
             }
@@ -66,12 +74,10 @@ pub(super) fn close_inherited_fds() {
             if !fds.is_empty() {
                 fds.sort_unstable();
                 fds.dedup();
-
                 for fd in fds {
                     close_fd(fd);
                 }
-
-                return;
+                return Ok(());
             }
         }
         Err(error) => log::debug!("fd: open /proc/self/fd: {error}"),
@@ -94,8 +100,25 @@ pub(super) fn close_inherited_fds() {
     }
 
     for fd in FIRST_INHERITED_FD..limit {
-        close_fd(fd);
+        if !excluded.contains(&fd) {
+            close_fd(fd);
+        }
     }
+    Ok(())
+}
+
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl(2) copies scalar arguments only.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: fcntl(2) copies scalar arguments only.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Reads an integer-valued socket option via `getsockopt(2)`.

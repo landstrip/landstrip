@@ -135,18 +135,20 @@ For a filesystem-only sandbox with unrestricted direct network access, set:
 policy enforcement in place. On Windows this grants the AppContainer its network
 capabilities; without it the container denies all network access.
 
-## Denial Traps
+## Traps
 
-Sandbox denials are reported as JSON objects, one per line, each with a fixed
-`kind` discriminant and a stable `code`. Consumers route on `kind` for coarse
-grouping and on `code` for the policy denial class. Traps go to standard error
-by default; `--trap-fd FD` writes them to an already-open descriptor instead.
+Every landstrip event — a sandbox denial, and every failure that keeps the tool
+from running — is reported as a JSON object, one per line, with a fixed `kind`
+discriminant and a stable `code`. Consumers route on `kind` for the shape of the
+record and on `code` for what happened. Failure traps and completed denial traps
+go to standard error by default. On Linux, pending query traps go only to
+`--trap-fd FD`, which writes them to an already-open descriptor.
 
 ```sh
 landstrip --trap-fd 3 -p policy.json cargo test 3>landstrip-traps.txt
 ```
 
-The two trap kinds are:
+The trap kinds are:
 
 - `filesystem` (`code` `FILESYSTEM_DENIED`): `operation` is `read` or `write`,
   `path` is the resolved path, `requested_path` is the tool's original path when
@@ -154,16 +156,36 @@ The two trap kinds are:
   `process` carry routing context.
 - `network` (`code` `NETWORK_DENIED`): `operation` is `connect` or `bind` and
   `target` is `address:port`, with `syscall`, `errno`, and `process` context.
+- `launch` (`code` `LAUNCH_FAILED`): the sandbox was installed but the tool did
+  not start. `program` is the tool, `errno` its symbolic errno where the platform
+  has one, and `message` the system's text.
+- `usage` (`code` `USAGE_ERROR`): the command line was rejected. Exits with
+  status 2, and reaches standard error only — the trap descriptor is part of the
+  arguments that failed to parse.
+- `internal`: everything that fails before the tool runs. `code` names the stage:
+  `POLICY_PARSE_FAILED`, `POLICY_IO_FAILED`, `SANDBOX_SETUP_FAILED`,
+  `SUPERVISE_FAILED`, `PLATFORM_UNSUPPORTED`, `INTEGER_TOO_LARGE`, a
+  `POLICY_*` validation rejection (`POLICY_UNRESTRICTED_READ`,
+  `POLICY_TCP_BIND_UNSUPPORTED`, `POLICY_UNIX_SOCKET_UNSUPPORTED`,
+  `POLICY_UNIX_SOCKET_PATH`, `POLICY_DENY_WRITE_SYMLINK_ANCESTOR`,
+  `POLICY_INVALID_PORT`, `POLICY_EMPTY_PATH`, `POLICY_HOME_UNAVAILABLE`,
+  `POLICY_TRAVERSAL_DEPTH`), or `INTERNAL_ERROR` for a failure the code space
+  does not name.
 
-`reason` is a platform-independent classification of the decision, derived from
-the policy and the requested path:
+A code names the stage that failed, not the operating system that reported it:
+the same `LAUNCH_FAILED` or `SANDBOX_SETUP_FAILED` is raised by every backend
+that has that stage. The platform detail rides along in the record instead.
+
+`mechanism` records the kernel layer an event is attributed to: `landlock`,
+`seccomp`, `seatbelt`, or `appcontainer`. Per-denial traps are always `seccomp`,
+the only layer with a per-denial callback; Landlock enforces in-kernel without
+one. `SANDBOX_SETUP_FAILED` carries the mechanism that could not be installed.
+
+`reason` is a platform-independent classification of a filesystem decision,
+derived from the policy and the requested path:
 
 - `allow_miss`: the path matched no allow root and was denied by default.
 - `deny_match`: the path matched an explicit deny root that overrides an allow.
-
-`mechanism` records the kernel layer that detected the denial. Per-denial traps
-are always `seccomp`, the only layer with a per-denial callback; Landlock
-enforces in-kernel without one.
 
 ```json
 {
@@ -190,15 +212,32 @@ enforces in-kernel without one.
   "mechanism": "seccomp",
   "process": { "pid": 1234, "exe": "/usr/bin/nc", "cwd": "/repo" }
 }
+{
+  "kind": "launch",
+  "code": "LAUNCH_FAILED",
+  "program": "/usr/bin/cargo",
+  "errno": "ENOENT",
+  "message": "No such file or directory (os error 2)"
+}
+{
+  "kind": "internal",
+  "code": "SANDBOX_SETUP_FAILED",
+  "mechanism": "landlock",
+  "message": "not enforced by the kernel (Linux 5.13+ with CONFIG_SECURITY_LANDLOCK required, and not disabled via the lsm= boot parameter)"
+}
 ```
 
-Traps are informational; the configured policy always applies. landstrip is
-otherwise quiet on success — standard error belongs to landstrip, standard
-output to the sandboxed tool. Usage, policy, launch, and platform errors are
-printed as plain text; usage errors exit with status 2. Writing to `--trap-fd`
-is best-effort: it needs an already-open descriptor (3 or greater; 0-2 are
-reserved), and if the write fails the denial is dropped while the policy stays
-in effect.
+Denial traps are informational; the configured policy always applies. landstrip
+is otherwise quiet on success — standard error belongs to landstrip, standard
+output to the sandboxed tool. Failure traps are accompanied by a human-readable
+log line; the JSON is what machines should read. Usage errors exit with status 2,
+every other landstrip failure with 1; the tool's own status is passed through
+otherwise.
+
+Writing to `--trap-fd` is best-effort: it needs an already-open descriptor (3 or
+greater; 0-2 are reserved), and if the write fails the trap is dropped while the
+policy stays in effect. A launch failure inside the Linux broker reaches standard
+error only, since the descriptor is already closed by then.
 
 ## Development
 

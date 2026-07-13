@@ -9,9 +9,9 @@
 //! policy-to-program translation; it does not run the notification loop.
 
 use super::seccomp::NotificationSyscalls;
-use crate::engine::error::Error as LandstripError;
+use crate::engine::error::{Cause, Error as LandstripError, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
     SeccompRule, TargetArch,
@@ -20,6 +20,14 @@ use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::ptr;
+
+/// A seccomp filter landstrip could not build, load, or probe for.
+pub(super) fn setup_failed(source: impl Into<Cause>) -> LandstripError {
+    LandstripError::SandboxSetupFailed {
+        mechanism: Mechanism::Seccomp,
+        source: source.into(),
+    }
+}
 
 const SOCK_TYPE_MASK: u64 = 0x0f;
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
@@ -101,12 +109,13 @@ impl NetworkFilters {
         if let Some(errno) = &self.errno {
             load_program(errno, 0)?;
         }
-        let notify = self.notify.as_ref().ok_or_else(|| {
-            LandstripError::IoFailed(io::Error::other("linux: notify filter missing"))
-        })?;
+        let notify = self
+            .notify
+            .as_ref()
+            .ok_or_else(|| setup_failed("notify filter missing"))?;
 
         let listener = load_program(notify, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)?
-            .ok_or_else(|| LandstripError::IoFailed(io::Error::other("linux: listener missing")))?;
+            .ok_or_else(|| setup_failed("listener missing"))?;
         Ok(listener)
     }
 }
@@ -116,13 +125,12 @@ pub(super) fn build_filter(rules: RuleMap, match_action: SeccompAction) -> Resul
         "x86_64" => Ok(TargetArch::x86_64),
         "aarch64" => Ok(TargetArch::aarch64),
         "riscv64" => Ok(TargetArch::riscv64),
-        arch => Err(anyhow!("linux: unsupported target arch: {arch}")),
+        arch => Err(setup_failed(format!("unsupported target arch: {arch}"))),
     }?;
 
     let filter = SeccompFilter::new(rules, SeccompAction::Allow, match_action, arch)
-        .map_err(|source| anyhow!("linux: {source}"))?;
-    let program = <BpfProgram as TryFrom<SeccompFilter>>::try_from(filter)
-        .map_err(|source| anyhow!("linux: {source}"))?;
+        .map_err(setup_failed)?;
+    let program = <BpfProgram as TryFrom<SeccompFilter>>::try_from(filter).map_err(setup_failed)?;
 
     Ok(program)
 }
@@ -137,7 +145,7 @@ pub(super) fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
         "x86_64" => Ok(AUDIT_ARCH_X86_64),
         "aarch64" => Ok(AUDIT_ARCH_AARCH64),
         "riscv64" => Ok(AUDIT_ARCH_RISCV64),
-        arch => Err(anyhow!("linux: unsupported audit arch: {arch}")),
+        arch => Err(setup_failed(format!("unsupported audit arch: {arch}"))),
     }?;
 
     program.push(bpf_stmt(load, SECCOMP_DATA_ARCH_OFFSET));
@@ -174,12 +182,12 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> seccompiler::sock_filter {
 
 fn load_program(program: &BpfProgram, flags: libc::c_ulong) -> Result<Option<OwnedFd>> {
     if program.is_empty() {
-        return Err(LandstripError::IoFailed(io::Error::other("linux: empty program")).into());
+        return Err(setup_failed("empty program").into());
     }
 
     // SAFETY: prctl(2) copies scalar arguments only.
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-        return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+        return Err(setup_failed(io::Error::last_os_error()).into());
     }
 
     let len =
@@ -199,7 +207,7 @@ fn load_program(program: &BpfProgram, flags: libc::c_ulong) -> Result<Option<Own
         )
     };
     if rc < 0 {
-        return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+        return Err(setup_failed(io::Error::last_os_error()).into());
     }
 
     if flags & libc::SECCOMP_FILTER_FLAG_NEW_LISTENER == 0 {
@@ -217,7 +225,7 @@ fn seccomp_condition(
     value: u64,
 ) -> Result<SeccompCondition> {
     SeccompCondition::new(arg_index, SeccompCmpArgLen::Dword, operator, value)
-        .map_err(|source| anyhow!("linux: {source}"))
+        .map_err(|source| setup_failed(source).into())
 }
 
 fn add_conditional_rule(
@@ -225,7 +233,7 @@ fn add_conditional_rule(
     syscall: i64,
     conditions: Vec<SeccompCondition>,
 ) -> Result<()> {
-    let rule = SeccompRule::new(conditions).map_err(|source| anyhow!("linux: {source}"))?;
+    let rule = SeccompRule::new(conditions).map_err(setup_failed)?;
     rules.entry(syscall).or_default().push(rule);
 
     Ok(())

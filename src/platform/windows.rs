@@ -3,10 +3,10 @@
 
 //! Windows sandbox platform using LPAC `AppContainer`.
 
-use crate::engine::error::Error as LandstripError;
-use crate::engine::policy::{AccessPolicy, AccessPolicyError, ReadAccess};
+use crate::engine::error::{Cause, Error as LandstripError, Mechanism};
+use crate::engine::policy::{AccessPolicy, ReadAccess};
 use crate::engine::trap_fd::TrapFd;
-use anyhow::{Error, Result, anyhow};
+use anyhow::Result;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString, c_void};
 use std::hash::{Hash, Hasher};
@@ -52,12 +52,47 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICA
 
 const INFINITE: u32 = 0xffff_ffff;
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+/// The `HRESULT` facility that wraps a Win32 error code.
+const FACILITY_WIN32: u32 = 7;
 
 const NETWORK_CAPABILITY_SIDS: [WELL_KNOWN_SID_TYPE; 3] = [
     WinCapabilityInternetClientSid,
     WinCapabilityInternetClientServerSid,
     WinCapabilityPrivateNetworkClientServerSid,
 ];
+
+/// An `AppContainer` landstrip could not create, grant, or launch into.
+fn setup_failed(source: impl Into<Cause>) -> LandstripError {
+    LandstripError::SandboxSetupFailed {
+        mechanism: Mechanism::Appcontainer,
+        source: source.into(),
+    }
+}
+
+/// A Win32 status code, as reported by the ACL APIs that return one instead of
+/// setting the last error.
+fn win32_error(status: u32) -> io::Error {
+    io::Error::from_raw_os_error(i32::from_ne_bytes(status.to_ne_bytes()))
+}
+
+/// The Win32 error an `HRESULT` carries, when it carries one at all.
+fn hresult_win32(hr: i32) -> Option<u32> {
+    let hresult = hresult_value(hr);
+
+    ((hresult >> 16) & 0x7ff == FACILITY_WIN32).then_some(hresult & 0xffff)
+}
+
+/// What an `HRESULT` failure means. The profile APIs report an `HRESULT`, not a
+/// Win32 error code, and `io::Error` on Windows carries Win32 codes: handing it
+/// the `HRESULT` verbatim (`0x800700b7`, say) makes it render a message for an
+/// error nobody reported. Unwrap the Win32 error where the `HRESULT` wraps one,
+/// and report the raw value where it does not.
+fn hresult_cause(hr: i32) -> Cause {
+    match hresult_win32(hr).map(|code| io::Error::from_raw_os_error(i32::from(code as u16))) {
+        Some(error) => error.into(),
+        None => format!("HRESULT 0x{:08x}", hresult_value(hr)).into(),
+    }
+}
 
 pub(crate) fn execute(
     policy: &AccessPolicy,
@@ -67,7 +102,7 @@ pub(crate) fn execute(
 ) -> Result<()> {
     let moniker = appcontainer_moniker(tool, policy);
     let profile = AppContainerProfile::new(&moniker)?;
-    let _grants = grant_policy_access(policy, profile.sid())?;
+    let grants = grant_policy_access(policy, profile.sid())?;
 
     let grant_network = policy.network_access.is_unrestricted();
     if !grant_network && !policy.network_access.connect_tcp_ports.is_empty() {
@@ -75,8 +110,17 @@ pub(crate) fn execute(
             "windows: per-port TCP filtering is unavailable; running with no network access"
         );
     }
-    let exit_code = create_process_in_appcontainer(profile.sid(), tool, args, grant_network)?;
-    std::process::exit(i32::from_ne_bytes(exit_code.to_ne_bytes()));
+    let exit_code = create_process_in_appcontainer(profile.sid(), tool, args, grant_network);
+
+    // The tool has exited, so the container's access to the policy roots is
+    // released here. std::process::exit runs no destructors, and this is the
+    // path every successful run takes: leaving it to `Drop` leaves the
+    // container's ACEs on the user's files and its profile on the machine.
+    // Grants go first — revoking an ACE needs the SID the profile owns.
+    drop(grants);
+    drop(profile);
+
+    std::process::exit(i32::from_ne_bytes(exit_code?.to_ne_bytes()));
 }
 
 fn appcontainer_moniker(tool: &OsStr, policy: &AccessPolicy) -> String {
@@ -116,13 +160,13 @@ impl AppContainerProfile {
             return Ok(Self { sid, moniker });
         }
 
-        if hresult_value(hr) & 0xffff != ERROR_ALREADY_EXISTS {
-            return Err(LandstripError::IoFailed(io::Error::from_raw_os_error(hr)).into());
+        if hresult_win32(hr) != Some(ERROR_ALREADY_EXISTS) {
+            return Err(setup_failed(hresult_cause(hr)).into());
         }
 
         let hr = unsafe { DeriveAppContainerSidFromAppContainerName(moniker.as_ptr(), &mut sid) };
         if hr != 0 {
-            return Err(LandstripError::IoFailed(io::Error::from_raw_os_error(hr)).into());
+            return Err(setup_failed(hresult_cause(hr)).into());
         }
 
         Ok(Self { sid, moniker })
@@ -148,7 +192,7 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess
     let read_roots = match &policy.read_access {
         ReadAccess::AllowRoots(read_roots) => read_roots,
         ReadAccess::Unrestricted => {
-            return Err(AccessPolicyError::UnrestrictedRead.into());
+            return Err(LandstripError::PolicyUnrestrictedRead.into());
         }
     };
     let mut granted = GrantedAccess {
@@ -216,12 +260,7 @@ fn set_path_access(path: &Path, sid: PSID, access: u32, mode: ACCESS_MODE) -> Re
         )
     };
     if status != 0 {
-        return Err(
-            LandstripError::IoFailed(io::Error::from_raw_os_error(i32::from_ne_bytes(
-                status.to_ne_bytes(),
-            )))
-            .into(),
-        );
+        return Err(setup_failed(win32_error(status)).into());
     }
 
     let explicit_access = EXPLICIT_ACCESS_W {
@@ -241,12 +280,7 @@ fn set_path_access(path: &Path, sid: PSID, access: u32, mode: ACCESS_MODE) -> Re
     let status = unsafe { SetEntriesInAclW(1, &explicit_access, old_dacl, &mut new_dacl) };
     if status != 0 {
         unsafe { LocalFree(security_descriptor) };
-        return Err(
-            LandstripError::IoFailed(io::Error::from_raw_os_error(i32::from_ne_bytes(
-                status.to_ne_bytes(),
-            )))
-            .into(),
-        );
+        return Err(setup_failed(win32_error(status)).into());
     }
 
     let status = unsafe {
@@ -267,12 +301,7 @@ fn set_path_access(path: &Path, sid: PSID, access: u32, mode: ACCESS_MODE) -> Re
     }
 
     if status != 0 {
-        return Err(
-            LandstripError::IoFailed(io::Error::from_raw_os_error(i32::from_ne_bytes(
-                status.to_ne_bytes(),
-            )))
-            .into(),
-        );
+        return Err(setup_failed(win32_error(status)).into());
     }
 
     Ok(())
@@ -286,7 +315,7 @@ impl SandboxJob {
     fn new() -> Result<Self> {
         let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
         if handle.is_null() {
-            return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+            return Err(setup_failed(io::Error::last_os_error()).into());
         }
 
         let job = Self {
@@ -304,7 +333,7 @@ impl SandboxJob {
             )
         };
         if ok == 0 {
-            return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+            return Err(setup_failed(io::Error::last_os_error()).into());
         }
 
         Ok(job)
@@ -394,20 +423,30 @@ fn create_process_in_appcontainer(
     };
 
     if created == 0 {
-        return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+        return Err(LandstripError::LaunchFailed {
+            tool: PathBuf::from(tool),
+            source: io::Error::last_os_error().into(),
+        }
+        .into());
     }
 
     let process = Handle(process_info.hProcess);
     let thread = Handle(process_info.hThread);
     let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
     if wait == WAIT_FAILED {
-        return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+        return Err(LandstripError::SuperviseFailed {
+            source: io::Error::last_os_error().into(),
+        }
+        .into());
     }
 
     let mut exit_code = 0;
     let ok = unsafe { GetExitCodeProcess(process.0, &mut exit_code) };
     if ok == 0 {
-        return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+        return Err(LandstripError::SuperviseFailed {
+            source: io::Error::last_os_error().into(),
+        }
+        .into());
     }
 
     drop(thread);
@@ -433,7 +472,7 @@ fn update_attribute(
         )
     };
     if ok == 0 {
-        return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+        return Err(setup_failed(io::Error::last_os_error()).into());
     }
     Ok(())
 }
@@ -448,14 +487,14 @@ impl ProcThreadAttributeList {
         let ok = unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), count, 0, &mut size) };
         let code = unsafe { GetLastError() };
         if ok != 0 || code != ERROR_INSUFFICIENT_BUFFER {
-            return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+            return Err(setup_failed(io::Error::last_os_error()).into());
         }
 
         let mut storage = vec![0_u8; size];
         let list = storage.as_mut_ptr().cast();
         let ok = unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) };
         if ok == 0 {
-            return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+            return Err(setup_failed(io::Error::last_os_error()).into());
         }
 
         Ok(Self { storage })
@@ -496,7 +535,7 @@ impl NetworkCapabilities {
                 CreateWellKnownSid(kind, ptr::null_mut(), sid.as_mut_ptr().cast(), &mut size)
             };
             if ok == 0 {
-                return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+                return Err(setup_failed(io::Error::last_os_error()).into());
             }
             sids.push(sid);
         }
@@ -544,11 +583,11 @@ fn command_line(tool: &OsStr, args: &[OsString]) -> Result<String> {
     Ok(parts.join(" "))
 }
 
-fn tool_encoding_error(tool: &OsStr, message: &str) -> Error {
-    anyhow!(
-        "command line encoding failed for {}: {message}",
-        tool.to_string_lossy()
-    )
+fn tool_encoding_error(tool: &OsStr, message: &'static str) -> LandstripError {
+    LandstripError::LaunchFailed {
+        tool: PathBuf::from(tool),
+        source: message.into(),
+    }
 }
 
 fn quote_command_arg(arg: &OsStr) -> std::result::Result<String, &'static str> {

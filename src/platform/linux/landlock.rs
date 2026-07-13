@@ -7,9 +7,9 @@
 //! This gives deny traversal snapshot semantics: a removed and recreated path is
 //! a new object unless an allowed ancestor covers it.
 
-use crate::engine::error::Error;
+use crate::engine::error::{Cause, Error, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use landlock::{
     ABI, AccessFs, AccessNet, BitFlags, NetPort, PathBeneath, Ruleset, RulesetAttr, RulesetCreated,
     RulesetCreatedAttr, RulesetStatus,
@@ -19,6 +19,14 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+
+/// A Landlock ruleset landstrip could not build or enforce.
+fn setup_failed(source: impl Into<Cause>) -> Error {
+    Error::SandboxSetupFailed {
+        mechanism: Mechanism::Landlock,
+        source: source.into(),
+    }
+}
 
 /// Landlock features handled by this module, pinned to the highest ABI the
 /// `landlock` crate understands (audit-logging controls only past ABI 6).
@@ -51,11 +59,15 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
         handled_access_net |= AccessNet::BindTcp;
     }
 
-    let mut ruleset = Ruleset::default().handle_access(handled_access_fs)?;
+    let mut ruleset = Ruleset::default()
+        .handle_access(handled_access_fs)
+        .map_err(setup_failed)?;
     if !handled_access_net.is_empty() {
-        ruleset = ruleset.handle_access(handled_access_net)?;
+        ruleset = ruleset
+            .handle_access(handled_access_net)
+            .map_err(setup_failed)?;
     }
-    let mut created = ruleset.create()?;
+    let mut created = ruleset.create().map_err(setup_failed)?;
 
     created = add_path_rules(
         created,
@@ -74,7 +86,7 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
         created = add_network_rules(created, policy)?;
     }
 
-    let status = created.restrict_self()?;
+    let status = created.restrict_self().map_err(setup_failed)?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => {}
         RulesetStatus::PartiallyEnforced => {
@@ -84,10 +96,11 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
             );
         }
         RulesetStatus::NotEnforced => {
-            bail!(
-                "landlock: not enforced by the kernel (Linux 5.13+ with CONFIG_SECURITY_LANDLOCK \
-                 required, and not disabled via the lsm= boot parameter)"
-            );
+            return Err(setup_failed(
+                "not enforced by the kernel (Linux 5.13+ with CONFIG_SECURITY_LANDLOCK required, \
+                 and not disabled via the lsm= boot parameter)",
+            )
+            .into());
         }
     }
 
@@ -149,7 +162,7 @@ fn add_path_rules(
                 seen_ancestors.push(ancestor);
                 fd
             }
-            Err(error) => return Err(Error::IoFailed(error).into()),
+            Err(error) => return Err(setup_failed(error).into()),
         };
 
         let path_access = if fd_is_dir(&fd)? {
@@ -161,7 +174,9 @@ fn add_path_rules(
             continue;
         }
 
-        ruleset = ruleset.add_rule(PathBeneath::new(fd, path_access))?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, path_access))
+            .map_err(setup_failed)?;
     }
 
     Ok(ruleset)
@@ -173,7 +188,9 @@ fn add_network_rules(mut ruleset: RulesetCreated, policy: &AccessPolicy) -> Resu
     }
 
     for port in &policy.network_access.connect_tcp_ports {
-        ruleset = ruleset.add_rule(NetPort::new(*port, AccessNet::ConnectTcp))?;
+        ruleset = ruleset
+            .add_rule(NetPort::new(*port, AccessNet::ConnectTcp))
+            .map_err(setup_failed)?;
     }
 
     Ok(ruleset)
@@ -201,7 +218,7 @@ fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {
         if error.raw_os_error() == Some(libc::EIO) || error.raw_os_error() == Some(libc::ENOTCONN) {
             return Ok(false);
         }
-        return Err(Error::IoFailed(error).into());
+        return Err(setup_failed(error).into());
     }
 
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFDIR)

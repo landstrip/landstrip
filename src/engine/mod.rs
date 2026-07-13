@@ -7,6 +7,5 @@
 pub(crate) mod error;
 pub(crate) mod paths;
 pub(crate) mod policy;
-#[cfg(target_os = "linux")]
 pub(crate) mod trap;
 pub(crate) mod trap_fd;

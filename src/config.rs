@@ -2,11 +2,11 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use crate::cli::PolicyFormat;
+use crate::engine::error::Error;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::error::Error as StdError;
-use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -50,53 +50,47 @@ pub(crate) fn load_settings(policy_paths: &[PathBuf], format: PolicyFormat) -> R
         let mut document = String::new();
         io::stdin()
             .read_to_string(&mut document)
+            .map_err(|source| Error::PolicyIoFailed { source })
             .context("policy stdin")?;
         let value = parse_policy_document(&document, format).context("policy stdin")?;
         merge_json(&mut merged, value);
-        serde_json::from_value(merged).context("policy stdin")
+        parse_settings(merged).context("policy stdin")
     } else {
         let mut last_path = &policy_paths[0];
         for path in policy_paths {
             log::debug!("config: {}", path.display());
 
             let document = fs::read_to_string(path)
+                .map_err(|source| Error::PolicyIoFailed { source })
                 .with_context(|| format!("policy file {}", path.display()))?;
             let value = parse_policy_document(&document, format)
                 .with_context(|| format!("policy file {}", path.display()))?;
             merge_json(&mut merged, value);
             last_path = path;
         }
-        serde_json::from_value(merged)
-            .with_context(|| format!("policy file {}", last_path.display()))
+        parse_settings(merged).with_context(|| format!("policy file {}", last_path.display()))
     }
 }
 
 fn parse_policy_document(
     document: &str,
     format: PolicyFormat,
-) -> std::result::Result<Value, PolicyDocumentError> {
+) -> std::result::Result<Value, Error> {
     match format {
-        PolicyFormat::Json => serde_json::from_str(document).map_err(PolicyDocumentError::Json),
-        PolicyFormat::Yaml => serde_yml::from_str(document).map_err(PolicyDocumentError::Yaml),
+        PolicyFormat::Json => serde_json::from_str(document).map_err(parse_failed),
+        PolicyFormat::Yaml => serde_yml::from_str(document).map_err(parse_failed),
     }
 }
 
-#[derive(Debug)]
-enum PolicyDocumentError {
-    Json(serde_json::Error),
-    Yaml(serde_yml::Error),
+fn parse_settings(document: Value) -> std::result::Result<Settings, Error> {
+    serde_json::from_value(document).map_err(parse_failed)
 }
 
-impl fmt::Display for PolicyDocumentError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Json(error) => error.fmt(f),
-            Self::Yaml(error) => error.fmt(f),
-        }
+fn parse_failed(source: impl StdError + Send + Sync + 'static) -> Error {
+    Error::PolicyParseFailed {
+        source: Box::new(source),
     }
 }
-
-impl StdError for PolicyDocumentError {}
 
 fn deserialize_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
 where

@@ -3,10 +3,10 @@
 
 //! macOS Seatbelt (SBPL) sandbox platform.
 
-use crate::engine::error::Error;
+use crate::engine::error::{Cause, Error, Mechanism};
 use crate::engine::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use crate::engine::trap_fd::TrapFd;
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};
 use std::fs;
@@ -25,16 +25,40 @@ pub(crate) fn execute(
     policy: &AccessPolicy,
     tool: &OsStr,
     args: &[OsString],
-    _trap_fd: &TrapFd,
+    trap_fd: &TrapFd,
 ) -> Result<()> {
-    let profile = render_profile(policy).context("macos: profile")?;
+    let profile = render_profile(policy).map_err(setup_failed)?;
     apply_profile(&profile)?;
-    close_inherited_fds();
+    close_inherited_fds(trap_fd.fd()).map_err(setup_failed)?;
     let error = Command::new(tool).args(args).exec();
-    Err(Error::IoFailed(error).into())
+    Err(Error::LaunchFailed {
+        tool: PathBuf::from(tool),
+        source: error.into(),
+    }
+    .into())
 }
 
-fn close_inherited_fds() {
+/// A Seatbelt profile landstrip could not render or install.
+fn setup_failed(source: impl Into<Cause>) -> Error {
+    Error::SandboxSetupFailed {
+        mechanism: Mechanism::Seatbelt,
+        source: source.into(),
+    }
+}
+
+/// Close every descriptor the launcher left open so the tool cannot reach them:
+/// an inherited descriptor is writable regardless of the Seatbelt profile, which
+/// would be a hole in the write policy.
+///
+/// The trap descriptor is the exception. landstrip still owes the launcher a
+/// launch trap on it right up until `exec` replaces this process, so it is
+/// marked close-on-exec instead: the kernel drops it the instant the tool
+/// starts, and it survives long enough to report an `exec` that never did.
+fn close_inherited_fds(trap_fd: Option<RawFd>) -> io::Result<()> {
+    if let Some(fd) = trap_fd {
+        set_cloexec(fd)?;
+    }
+
     if let Ok(mut entries) = fs::read_dir("/dev/fd") {
         let mut fds = Vec::new();
         for entry in entries.by_ref().flatten() {
@@ -55,14 +79,29 @@ fn close_inherited_fds() {
         fds.sort_unstable();
         fds.dedup();
         for fd in fds {
-            close_fd(fd);
+            close_fd(fd, trap_fd);
         }
-        return;
+        return Ok(());
     }
 
     for fd in FIRST_INHERITED_FD..open_fd_limit() {
-        close_fd(fd);
+        close_fd(fd, trap_fd);
     }
+    Ok(())
+}
+
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fcntl(2) copies scalar arguments only.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: fcntl(2) copies scalar arguments only.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn open_fd_limit() -> RawFd {
@@ -76,18 +115,18 @@ fn clamp_fd_limit(limit: libc::c_long) -> RawFd {
     RawFd::try_from(limit).map_or(FALLBACK_FD_LIMIT, |limit| limit.min(FALLBACK_FD_LIMIT))
 }
 
-fn close_fd(fd: RawFd) {
-    if fd >= FIRST_INHERITED_FD {
+fn close_fd(fd: RawFd, trap_fd: Option<RawFd>) {
+    if fd >= FIRST_INHERITED_FD && Some(fd) != trap_fd {
         unsafe { libc::close(fd) };
     }
 }
 
 fn apply_profile(profile: &str) -> Result<()> {
     let profile = CString::new(profile).map_err(|source| {
-        anyhow!(
-            "macos: profile: interior nul at offset {}",
+        setup_failed(format!(
+            "profile: interior nul at offset {}",
             source.nul_position()
-        )
+        ))
     })?;
     let mut errorbuf = ptr::null_mut();
 
@@ -97,11 +136,7 @@ fn apply_profile(profile: &str) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(Error::IoFailed(io::Error::other(format!(
-            "macos: {}",
-            take_sandbox_error(errorbuf)
-        )))
-        .into())
+        Err(setup_failed(take_sandbox_error(errorbuf)).into())
     }
 }
 

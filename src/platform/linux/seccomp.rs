@@ -15,10 +15,10 @@
 use super::fd::close_inherited_fds;
 use super::filter::{
     NetworkFilters, build_errno_filter, build_notify_filter, needs_unix_socket_broker,
-    unix_socket_filter,
+    setup_failed, unix_socket_filter,
 };
 use super::landlock::enforce_broker_access_policy;
-use crate::engine::error::Error as LandstripError;
+use crate::engine::error::{Cause, Error as LandstripError};
 use crate::engine::paths::{normalize_path, normalize_path_lexically, normalize_path_nofollow};
 use crate::engine::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
 use crate::engine::trap::{
@@ -37,7 +37,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
-use std::io::{self, IoSlice, IoSliceMut};
+use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -90,7 +90,7 @@ enum BrokerError {
 impl BrokerError {
     fn errno(&self) -> i32 {
         match self {
-            Self::PolicyDenied => libc::EACCES,
+            Self::PolicyDenied => LandstripError::DENIAL_ERRNO,
             Self::AddressFamilyNotSupported => libc::EAFNOSUPPORT,
             Self::InvalidAddress => libc::EINVAL,
             Self::BadFileDescriptor => libc::EBADF,
@@ -98,6 +98,17 @@ impl BrokerError {
             Self::NameTooLong => libc::ENAMETOOLONG,
             Self::SystemCall { errno } => *errno,
         }
+    }
+}
+
+/// A syscall that failed while supervising the sandboxed child.
+fn supervise_errno(errno: Errno) -> LandstripError {
+    supervise_failed(io::Error::from_raw_os_error(errno as i32))
+}
+
+fn supervise_failed(source: impl Into<Cause>) -> LandstripError {
+    LandstripError::SuperviseFailed {
+        source: source.into(),
     }
 }
 
@@ -140,40 +151,58 @@ pub(super) fn run_broker(
     };
 
     let filters = NetworkFilters::new(errno, notify);
-    let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::IoFailed)?;
+    let (parent, child_sock) = UnixStream::pair().map_err(supervise_failed)?;
 
     // SAFETY: landstrip forks before spawning threads; the child either execs the tool or exits.
-    match unsafe { fork() }.map_err(LandstripError::from)? {
+    match unsafe { fork() }.map_err(supervise_errno)? {
         ForkResult::Child => {
             drop(parent);
+            let mut child_sock = child_sock;
+            let mut handed_off = false;
 
             let result = (|| -> Result<()> {
                 enforce_broker_access_policy(policy)?;
 
                 {
-                    let child_sock = child_sock;
                     let notify = filters.load_with_listener()?;
 
                     // SAFETY: notify is borrowed only for the duration of fcntl(2).
                     let notify_fd = unsafe { BorrowedFd::borrow_raw(notify.as_raw_fd()) };
-                    let notify = fcntl(notify_fd, FcntlArg::F_DUPFD_CLOEXEC(0))
-                        .map_err(LandstripError::from)?;
+                    let notify =
+                        fcntl(notify_fd, FcntlArg::F_DUPFD_CLOEXEC(0)).map_err(supervise_errno)?;
                     // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
                     let notify = unsafe { OwnedFd::from_raw_fd(notify) };
 
                     send_fd(&child_sock, notify.as_raw_fd())?;
+                    handed_off = true;
                 }
-                close_inherited_fds();
+
+                let mut excluded = vec![child_sock.as_raw_fd()];
+                if let Some(fd) = trap_fd.fd() {
+                    excluded.push(fd);
+                }
+                close_inherited_fds(&excluded).map_err(supervise_failed)?;
 
                 let mut child_tool = Command::new(tool);
                 child_tool.args(args);
 
                 let error = child_tool.exec();
-                Err(LandstripError::IoFailed(error).into())
+                Err(LandstripError::LaunchFailed {
+                    tool: PathBuf::from(tool),
+                    source: error.into(),
+                }
+                .into())
             })();
 
             if let Err(error) = result {
-                log::error!("landstrip child setup failed: {error:#}");
+                let trap = error
+                    .chain()
+                    .find_map(<(dyn std::error::Error + 'static)>::downcast_ref::<LandstripError>)
+                    .map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from_error);
+                if handed_off || send_trap(&mut child_sock, &trap).is_err() {
+                    trap_fd.write(&trap);
+                    trap.emit();
+                }
             }
 
             // SAFETY: _exit terminates the child without running duplicated parent cleanup.
@@ -181,20 +210,34 @@ pub(super) fn run_broker(
         }
         ForkResult::Parent { child } => {
             drop(child_sock);
-            let notify = get_notify_fd(&parent)?;
-            drop(parent);
-            let notify_fd = notify.as_raw_fd();
+            match get_notify_fd(&parent)? {
+                NotifyStartup::Ready(notify) => {
+                    drop(parent);
+                    let notify_fd = notify.as_raw_fd();
 
-            supervise_child(
-                policy,
-                child,
-                notify_fd,
-                &syscalls,
-                notify_filesystem,
-                trap_fd,
-            )
+                    supervise_child(
+                        policy,
+                        child,
+                        notify_fd,
+                        &syscalls,
+                        notify_filesystem,
+                        trap_fd,
+                    )
+                }
+                NotifyStartup::Trap(trap) => {
+                    drop(parent);
+                    trap_fd.write_json(&trap);
+                    Trap::emit_json(&trap);
+                    Ok(1)
+                }
+            }
         }
     }
+}
+
+enum NotifyStartup {
+    Ready(OwnedFd),
+    Trap(String),
 }
 
 #[derive(Deserialize)]
@@ -242,7 +285,7 @@ fn supervise_child(
                 Ok(status) => return Ok(denials.emit(status)),
                 Err(Errno::EINTR) => continue,
                 Err(error) => {
-                    return Err(LandstripError::from(error).into());
+                    return Err(supervise_errno(error).into());
                 }
             }
         }
@@ -264,7 +307,7 @@ fn supervise_child(
                 }
                 Err(Errno::EINTR) => continue,
                 Err(error) => {
-                    return Err(LandstripError::from(error).into());
+                    return Err(supervise_errno(error).into());
                 }
             }
         };
@@ -279,7 +322,7 @@ fn supervise_child(
                     Ok(status) => return Ok(denials.emit(status)),
                     Err(Errno::EINTR) => continue,
                     Err(error) => {
-                        return Err(LandstripError::from(error).into());
+                        return Err(supervise_errno(error).into());
                     }
                 }
             }
@@ -324,7 +367,7 @@ fn supervise_child(
                             Ok(status) => return Ok(denials.emit(status)),
                             Err(Errno::EINTR) => continue,
                             Err(error) => {
-                                return Err(LandstripError::from(error).into());
+                                return Err(supervise_errno(error).into());
                             }
                         }
                     }
@@ -534,7 +577,7 @@ fn seccomp_probe(operation: libc::c_uint, data: *mut libc::c_void) -> Result<()>
     // SAFETY: seccomp(2) copies the operation-specific data pointer before returning.
     let rc = unsafe { libc::syscall(libc::SYS_seccomp, operation, 0, data) };
     if rc < 0 {
-        return Err(LandstripError::IoFailed(io::Error::last_os_error()).into());
+        return Err(setup_failed(io::Error::last_os_error()).into());
     }
 
     Ok(())
@@ -549,7 +592,7 @@ fn receive_notification(fd: RawFd) -> Result<libc::seccomp_notif> {
             Ok(_) => return Ok(request),
             Err(Errno::EINTR) => continue,
             Err(error) => {
-                return Err(LandstripError::from(error).into());
+                return Err(supervise_errno(error).into());
             }
         }
     }
@@ -562,7 +605,7 @@ fn respond_notification(fd: RawFd, mut response: libc::seccomp_notif_resp) -> Re
             Ok(_) => return Ok(()),
             Err(Errno::EINTR) => continue,
             Err(error) => {
-                return Err(LandstripError::from(error).into());
+                return Err(supervise_errno(error).into());
             }
         }
     }
@@ -576,7 +619,7 @@ fn validate_notification_id(fd: RawFd, id: u64) -> Result<bool> {
             Err(Errno::EINTR) => continue,
             Err(Errno::ENOENT) => return Ok(false),
             Err(error) => {
-                return Err(LandstripError::from(error).into());
+                return Err(supervise_errno(error).into());
             }
         }
     }
@@ -585,8 +628,12 @@ fn validate_notification_id(fd: RawFd, id: u64) -> Result<bool> {
 fn process_context(pid: u32) -> ProcessContext {
     ProcessContext {
         pid,
-        exe: fs::read_link(format!("/proc/{pid}/exe")).ok(),
-        cwd: fs::read_link(format!("/proc/{pid}/cwd")).ok(),
+        exe: fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
+        cwd: fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned()),
     }
 }
 
@@ -1788,7 +1835,10 @@ fn process_control_responses(
                     }
                 },
                 ControlAction::Deny => {
-                    let _ = respond_notification(notify_fd, notification_error(id, -libc::EACCES));
+                    let _ = respond_notification(
+                        notify_fd,
+                        notification_error(id, -LandstripError::DENIAL_ERRNO),
+                    );
                 }
             }
         }
@@ -1807,7 +1857,10 @@ fn deny_all_pending(
     for (_id, pending) in pending_queries.drain() {
         let id = pending.request.id;
         if validate_notification_id(notify_fd, id).unwrap_or(false) {
-            let _ = respond_notification(notify_fd, notification_error(id, -libc::EACCES));
+            let _ = respond_notification(
+                notify_fd,
+                notification_error(id, -LandstripError::DENIAL_ERRNO),
+            );
         }
     }
 }
@@ -1837,7 +1890,10 @@ fn grant_open(notify_fd: RawFd, id: u64, grant: &OpenGrant) {
     // SAFETY: addfd points to an initialized struct and opened is a live fd; the
     // SEND flag makes the ioctl complete the notification atomically.
     if unsafe { seccomp_notif_addfd(notify_fd, ptr::addr_of!(addfd)) }.is_err() {
-        let _ = respond_notification(notify_fd, notification_error(id, -libc::EACCES));
+        let _ = respond_notification(
+            notify_fd,
+            notification_error(id, -LandstripError::DENIAL_ERRNO),
+        );
     }
 }
 
@@ -2102,45 +2158,82 @@ fn send_fd(socket: &UnixStream, fd: RawFd) -> Result<()> {
             Ok(_) => return Ok(()),
             // A signal during the fd transfer must not abort the broker setup.
             Err(Errno::EINTR) => continue,
-            Err(error) => return Err(LandstripError::from(error).into()),
+            Err(error) => return Err(supervise_errno(error).into()),
         }
     }
 }
 
-fn get_notify_fd(socket: &UnixStream) -> Result<OwnedFd> {
+fn send_trap(socket: &mut UnixStream, trap: &Trap) -> Result<()> {
+    let payload = trap.json_line();
+    let length =
+        u32::try_from(payload.len()).map_err(|_| supervise_failed("notify: trap is too large"))?;
+
+    socket.write_all(&[1_u8]).map_err(supervise_failed)?;
+    socket
+        .write_all(&length.to_be_bytes())
+        .map_err(supervise_failed)?;
+    socket
+        .write_all(payload.as_bytes())
+        .map_err(supervise_failed)?;
+    Ok(())
+}
+
+fn get_notify_fd(socket: &UnixStream) -> Result<NotifyStartup> {
     let mut byte = [0_u8];
     let mut iov = [IoSliceMut::new(&mut byte)];
     let mut control = nix::cmsg_space!([RawFd; 1]);
-    let message = loop {
-        match recvmsg::<()>(
+    let (bytes, fd) = loop {
+        let message = match recvmsg::<()>(
             socket.as_raw_fd(),
             &mut iov,
             Some(&mut control),
             MsgFlags::empty(),
         ) {
-            Ok(message) => break message,
+            Ok(message) => message,
             Err(Errno::EINTR) => continue,
-            Err(error) => return Err(LandstripError::from(error).into()),
-        }
+            Err(error) => return Err(supervise_errno(error).into()),
+        };
+        let fd = message
+            .cmsgs()
+            .map_err(supervise_errno)?
+            .find_map(|control| match control {
+                ControlMessageOwned::ScmRights(fds) => fds.first().copied(),
+                _ => None,
+            });
+        break (message.bytes, fd);
     };
 
-    if message.bytes == 0 {
-        return Err(
-            LandstripError::IoFailed(io::Error::other("linux: notify: unexpected eof")).into(),
-        );
+    if bytes == 0 {
+        return Err(supervise_failed("notify: unexpected eof").into());
     }
 
-    for control in message.cmsgs().map_err(LandstripError::from)? {
-        if let ControlMessageOwned::ScmRights(fds) = control {
-            let Some(fd) = fds.first().copied() else {
-                continue;
-            };
-            // SAFETY: SCM_RIGHTS transfers ownership of the received descriptor.
-            return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+    match byte[0] {
+        0 => fd.map_or_else(
+            || Err(supervise_failed("notify: missing descriptor").into()),
+            |fd| {
+                // SAFETY: SCM_RIGHTS transfers ownership of the received descriptor.
+                Ok(NotifyStartup::Ready(unsafe { OwnedFd::from_raw_fd(fd) }))
+            },
+        ),
+        1 => {
+            let mut length = [0_u8; 4];
+            let mut socket = socket;
+            socket.read_exact(&mut length).map_err(supervise_failed)?;
+            let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+            if length > 1_048_576 {
+                return Err(supervise_failed("notify: trap is too large").into());
+            }
+            let mut payload = vec![0_u8; length];
+            socket.read_exact(&mut payload).map_err(supervise_failed)?;
+            let trap = String::from_utf8(payload)
+                .map_err(|error| supervise_failed(format!("notify: invalid trap: {error}")))?;
+            if serde_json::from_str::<serde_json::Value>(&trap).is_err() {
+                return Err(supervise_failed("notify: invalid trap").into());
+            }
+            Ok(NotifyStartup::Trap(trap))
         }
+        _ => Err(supervise_failed("notify: invalid marker").into()),
     }
-
-    Err(LandstripError::IoFailed(io::Error::other("linux: notify: invalid data")).into())
 }
 
 #[derive(Debug)]

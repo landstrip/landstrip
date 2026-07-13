@@ -14,18 +14,35 @@ mod platform;
 
 use crate::cli::{Cli, parse_cli};
 use crate::config::load_settings;
+use crate::engine::error::Error;
 use crate::engine::policy::resolve_policy;
+use crate::engine::trap::Trap;
 use crate::engine::trap_fd::TrapFd;
 use anyhow::Result;
+use std::error::Error as StdError;
 use std::process;
 
 fn main() {
-    let cli = parse_cli().unwrap_or_else(|error| {
-        eprintln!("{error}");
-        process::exit(2);
-    });
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // The trap fd is part of the arguments that just failed to parse, so
+            // a usage trap can only go to stderr.
+            if let Error::Usage { message } = &error {
+                eprintln!("{message}");
+            }
+            Trap::from_error(&error).emit();
+            process::exit(2);
+        }
+    };
 
     if let Err(error) = run_with_cli(&cli) {
+        let trap = error
+            .chain()
+            .find_map(<(dyn StdError + 'static)>::downcast_ref::<Error>)
+            .map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from_error);
+        TrapFd::from_fd(cli.trap_fd).write(&trap);
+        trap.emit();
         log::error!("{error:#}");
         process::exit(1);
     }
@@ -38,7 +55,7 @@ fn run_with_cli(cli: &Cli) -> Result<()> {
         .format_timestamp(None)
         .init();
 
-    let cwd = std::env::current_dir()?;
+    let cwd = std::env::current_dir().map_err(|source| Error::PolicyIoFailed { source })?;
 
     log::debug!("cli: cwd: {}", cwd.display());
     let settings = load_settings(&cli.policy_paths, cli.format)?;

@@ -247,18 +247,27 @@ uses a Less-Privileged AppContainer. The backend creates or reuses a
 deterministic AppContainer profile and grants that AppContainer SID access to
 the lowered read and write roots with Windows ACL entries. Because LPAC has no
 broad filesystem read capability, Windows policies must use explicit read
-allowlists; unrestricted read policy is rejected. AppContainer profiles and ACL
-grants can persist after the sandboxed process exits.
+allowlists; unrestricted read policy is rejected. The profile and the ACL grants
+are released when
+.Nm
+exits, so the container keeps no access to the policy roots once the tool is
+done; they can outlive a
+.Nm
+that is killed outright.
 .Sh OUTPUT
 .Nm
-prints sandbox denial traps as JSON objects on standard error,
-one object per line. Each object has a fixed
+reports failure and completed-denial events as JSON objects on standard error,
+one object per line. Pending Linux query events go only to
+.Fl -trap-fd Ar fd . Each object has a fixed
 .Va kind
 discriminant and a stable
-.Va code .
-The trap kinds are
-.Va filesystem
-(a filesystem access denial, with
+.Va code
+naming the stage that failed, not the operating system that reported it: the
+same code is raised by every backend that has that stage, and the platform
+detail rides along in the record. The trap kinds are:
+.Bl -tag -width Ds
+.It Va filesystem
+A filesystem access denial, with
 .Va code
 .Va FILESYSTEM_DENIED ,
 an
@@ -267,14 +276,19 @@ of
 .Va read
 or
 .Va write ,
+a
+.Va reason
+of
+.Va allow_miss
+or
+.Va deny_match ,
 and a
 .Va mechanism
 of
 .Va seccomp ,
-the user-notification broker being the only layer with a per-denial
-callback ) and
-.Va network
-(a denied TCP connect or bind, with
+the user-notification broker being the only layer with a per-denial callback.
+.It Va network
+A denied TCP connect or bind, with
 .Va code
 .Va NETWORK_DENIED ,
 an
@@ -286,19 +300,59 @@ or
 and a
 .Va target
 of
-.Ar address : Ns Ar port ) .
+.Ar address : Ns Ar port .
+.It Va launch
+The sandbox was installed but the tool did not start, with
+.Va code
+.Va LAUNCH_FAILED ,
+the
+.Va program ,
+and its symbolic
+.Va errno
+where the platform has one.
+.It Va usage
+The command line was rejected, with
+.Va code
+.Va USAGE_ERROR .
+Reaches standard error only: the trap descriptor is part of the arguments that
+failed to parse.
+.It Va internal
+Everything that fails before the tool runs. The
+.Va code
+names the stage:
+.Va POLICY_PARSE_FAILED ,
+.Va POLICY_IO_FAILED ,
+.Va SANDBOX_SETUP_FAILED ,
+.Va SUPERVISE_FAILED ,
+.Va PLATFORM_UNSUPPORTED ,
+.Va INTEGER_TOO_LARGE ,
+a
+.Va POLICY_ Ns * validation rejection, or
+.Va INTERNAL_ERROR
+for a failure the code space does not name. A
+.Va mechanism
+of
+.Va landlock ,
+.Va seccomp ,
+.Va seatbelt ,
+or
+.Va appcontainer
+accompanies
+.Va SANDBOX_SETUP_FAILED .
+.El
 .Pp
-Usage, policy, launch, platform, and other system errors are printed as plain
-text. Usage errors exit with status 2. Logs and sandboxed command output are
-not part of the trap response. Normal successful command execution does not
-print a trap because standard error belongs to landstrip and standard output
-belongs to the sandboxed command.
+Failure traps are accompanied by a human-readable log line; the JSON is what
+machines should read. Logs and sandboxed command output are not part of the trap
+response. Normal successful command execution does not print a trap because
+standard error belongs to landstrip and standard output belongs to the sandboxed
+command.
 .Pp
 When
 .Fl -trap-fd Ar fd
 is used,
 .Nm
-writes JSON trap responses to that file descriptor. Each trap is emitted as a
+writes broker-produced traps, including pending Linux queries, to that file
+descriptor. Each trap is emitted as a
 single line with no whitespace; the example below is indented and wrapped only
 for readability. A Linux filesystem denial carries these fields:
 .Bd -literal -offset indent
@@ -317,8 +371,9 @@ for readability. A Linux filesystem denial carries these fields:
   "process": {"pid": 1234, "exe": "/usr/bin/sh", "cwd": "/repo"}
 }
 .Ed
-This trap stream is separate from the sandboxed command's standard output
-and standard error.
+A launch failure inside the Linux broker reaches standard error only, since the
+descriptor is already closed by then. This trap stream is separate from the
+sandboxed command's standard output and standard error.
 .Sh EXIT STATUS
 On success,
 .Nm
@@ -329,6 +384,6 @@ and returns that command's exit status. When seccomp user notification is needed
 supervises the sandboxed child and exits with the child's status. If policy
 loading or sandbox setup fails,
 .Nm
-prints a plain-text error and exits non-zero. Usage errors exit with status 2.
+reports a coded trap and exits non-zero. Usage errors exit with status 2.
 .Sh AUTHORS
 .An Jarkko Sakkinen Aq Mt jarkko.sakkinen@iki.fi

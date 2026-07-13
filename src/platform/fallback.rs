@@ -6,9 +6,10 @@
 //! Returns an error to communicate that the current operating system is not yet
 //! supported by landstrip.
 
+use crate::engine::error::Error;
 use crate::engine::policy::AccessPolicy;
 use crate::engine::trap_fd::TrapFd;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::ffi::{OsStr, OsString};
 
 pub(crate) fn execute(
@@ -17,5 +18,5 @@ pub(crate) fn execute(
     _args: &[OsString],
     _trap_fd: &TrapFd,
 ) -> Result<()> {
-    Err(anyhow!("unsupported platform"))
+    Err(Error::PlatformUnsupported.into())
 }

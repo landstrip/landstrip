@@ -5,11 +5,14 @@
 # %PID% are expanded. Every case starts with empty allowed/ and denied/ dirs.
 # os= gates a line to a platform set; lines without os= run everywhere.
 
-# --- error channels stay plain stderr, never the trap fd ---
+# --- error channels: every failure is a coded trap on stderr, and on the trap
+# fd whenever landstrip still owns it ---
 
-name=usage error is plain stderr only | os=linux,macos | trap=true | status=2 | out=Usage: | out!="kind":"usage" | out!=USAGE_ERROR | trapfd_empty
-name=launch error is plain stderr only | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%TMP%/no-such-tool-%PID% | status=!0 | out!="kind":"launch" | out!=LAUNCH_FAILED | trapfd_empty
-name=internal error is plain stderr only | os=linux,macos | policy={bad | trap=true | cmd=%SHELL% -c 'printf ok' | status=!0 | out!="kind":"internal" | out!=INTERNAL_ERROR | trapfd_empty
+name=usage error reports a usage trap | os=linux,macos | trap=true | status=2 | out=Usage: | out="kind":"usage" | out="code":"USAGE_ERROR" | trapfd_empty
+name=launch error reports a launch trap (linux) | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%TMP%/no-such-tool-%PID% | status=!0 | out="kind":"launch" | out="code":"LAUNCH_FAILED" | out="errno":"ENOENT" | out=no-such-tool | trapfd="kind":"launch" | trapfd="code":"LAUNCH_FAILED"
+name=launch error reports a launch trap (macos) | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%TMP%/no-such-tool-%PID% | status=!0 | out="kind":"launch" | out="code":"LAUNCH_FAILED" | out="errno":"ENOENT" | trapfd="kind":"launch" | trapfd="code":"LAUNCH_FAILED"
+name=policy parse error reports an internal trap | os=linux,macos | policy={bad | trap=true | cmd=%SHELL% -c 'printf ok' | status=!0 | out="kind":"internal" | out="code":"POLICY_PARSE_FAILED" | trapfd="kind":"internal" | trapfd="code":"POLICY_PARSE_FAILED"
+name=invalid proxy port reports an internal trap | os=linux,macos | policy={"network":{"httpProxyPort":0},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%SHELL% -c 'printf ok' | status=!0 | out="kind":"internal" | out="code":"POLICY_INVALID_PORT" | trapfd="code":"POLICY_INVALID_PORT"
 
 # --- basic read/write policy ---
 
@@ -31,6 +34,7 @@ name=denyRead blocks subdirectory listing | os=macos | policy={"network":{"allow
 
 name=successful write denial is reported (linux) | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'cat /dev/null >/dev/null; true' | status=0 | out="kind":"filesystem" | out="write" | out=/dev/null
 name=successful write denial is reported (macos) | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'cat /dev/null >/dev/null; true' | status=0 | out=Operation not permitted | out=/dev/null
+name=trap fd is not inherited by the tool | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%SHELL% -c 'if test -e /dev/fd/3; then echo fd3-inherited >&2; fi; echo bypass >&3' | status=!0 | out!=fd3-inherited | trapfd!=bypass
 name=trap fd reports write denial | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%SHELL% -c 'if test -e /proc/self/fd/3; then echo fd3-inherited >&2; fi; : > "$1"; exit 1' _ %TMP%/denied/trap-fd.txt | status=!0 | out!=fd3-inherited | trapfd="kind":"filesystem" | trapfd="write" | trapfd="seccomp" | trapfd="code":"FILESYSTEM_DENIED" | trapfd="syscall":"openat" | trapfd="errno":"EACCES" | trapfd=O_CREAT | trapfd=requested_path | trapfd="reason":"allow_miss" | trapfd="suggested_grant":{"allowWrite" | trapfd="process":{"pid" | trapfd=denied/trap-fd.txt
 
 # --- yaml policy parsing ---
