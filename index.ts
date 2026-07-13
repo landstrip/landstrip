@@ -14,6 +14,7 @@ import {
   type LandstripTrap,
   type SandboxConfig,
   type SandboxFilesystemConfig,
+  controlResponseLine,
   extractDomainsFromCommand,
   formatLandstripTraps,
   getConfigPaths,
@@ -61,7 +62,7 @@ interface SandboxPermissionDecision {
 
 type ToastVariant = 'info' | 'success' | 'warning' | 'error';
 
-const LANDSTRIP_VERSION = [0, 16, 4] as const;
+const LANDSTRIP_VERSION = [0, 17, 0] as const;
 const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 
@@ -257,9 +258,6 @@ function extractBlockedPath(
   const landstripTraps = parseLandstripTraps(output);
   for (const trap of landstripTraps) {
     if (trap.kind === 'filesystem') return normalizeBlockedPath(trap.path, baseDirectory);
-    if (trap.kind === 'internal' && trap.detail.file) {
-      return normalizeBlockedPath(trap.detail.file, baseDirectory);
-    }
   }
 
   if (
@@ -639,6 +637,7 @@ function startTrapServer(
   baseDirectory: string,
   sessionAllowedReadPaths: Set<string>,
   sessionAllowedWritePaths: Set<string>,
+  sessionAllowedTargets: Set<string>,
 ): Promise<{ server: ReturnType<typeof createServer>; port: number; trapLines: string[] }> {
   const trapLines: string[] = [];
   const server = createServer((trapSocket) => {
@@ -660,33 +659,50 @@ function startTrapServer(
         } catch {
           obj = null;
         }
-        if (
-          obj &&
-          obj.state === 'query' &&
-          typeof obj.query_id === 'number' &&
-          (obj.operation === 'read' || obj.operation === 'write') &&
-          typeof obj.path === 'string'
-        ) {
-          const path = canonicalizePath(obj.path, baseDirectory);
-          const operation = obj.operation as 'read' | 'write';
-          // Per landstrip policy: a deny rule overrides allow only when more
-          // specific; a tie or more-specific allow carves the path back in.
-          const denyReadDepth = matchDepth(path, denyRead, baseDirectory);
-          const allowReadDepth = matchDepth(path, effectiveAllowRead, baseDirectory);
-          const denyWriteDepth = matchDepth(path, denyWrite, baseDirectory);
-          const allowWriteDepth = matchDepth(path, effectiveAllowWrite, baseDirectory);
-          const allowed =
-            operation === 'read'
-              ? !(denyReadDepth > allowReadDepth) && allowReadDepth >= 0
-              : !(denyWriteDepth > allowWriteDepth) && allowWriteDepth >= 0;
-          if (allowed) {
-            trapSocket.write(JSON.stringify({ query_id: obj.query_id, action: 'allow' }) + '\n');
+        if (obj && obj.state === 'query' && typeof obj.query_id === 'string') {
+          const queryId = obj.query_id;
+          if (
+            (obj.operation === 'read' || obj.operation === 'write') &&
+            typeof obj.path === 'string'
+          ) {
+            const path = canonicalizePath(obj.path, baseDirectory);
+            const operation = obj.operation as 'read' | 'write';
+            // Per landstrip policy: a deny rule overrides allow only when more
+            // specific; a tie or more-specific allow carves the path back in.
+            const denyReadDepth = matchDepth(path, denyRead, baseDirectory);
+            const allowReadDepth = matchDepth(path, effectiveAllowRead, baseDirectory);
+            const denyWriteDepth = matchDepth(path, denyWrite, baseDirectory);
+            const allowWriteDepth = matchDepth(path, effectiveAllowWrite, baseDirectory);
+            const allowed =
+              operation === 'read'
+                ? !(denyReadDepth > allowReadDepth) && allowReadDepth >= 0
+                : !(denyWriteDepth > allowWriteDepth) && allowWriteDepth >= 0;
+            if (allowed) {
+              trapSocket.write(controlResponseLine(queryId, 'allow'));
+            } else {
+              // Auto-grant via session scope and allow so the command proceeds.
+              const scope = sessionScopeFor(path, baseDirectory);
+              if (operation === 'read') sessionAllowedReadPaths.add(scope);
+              else sessionAllowedWritePaths.add(scope);
+              trapSocket.write(controlResponseLine(queryId, 'allow'));
+              trapLines.push(line);
+            }
+          } else if (
+            (obj.operation === 'connect' || obj.operation === 'bind') &&
+            typeof obj.target === 'string'
+          ) {
+            // No policy field expresses "allow this address:port" (allowedDomains
+            // is hostname-based and enforced by the HTTP(S) proxy, not the broker),
+            // so — matching the filesystem branch above — auto-grant, remember it
+            // for the rest of the session, and surface it afterward rather than
+            // hanging or hard-denying an already-approved command.
+            const target = obj.target;
+            if (!sessionAllowedTargets.has(target)) {
+              sessionAllowedTargets.add(target);
+              trapLines.push(line);
+            }
+            trapSocket.write(controlResponseLine(queryId, 'allow'));
           } else {
-            // Auto-grant via session scope and allow so the command proceeds.
-            const scope = sessionScopeFor(path, baseDirectory);
-            if (operation === 'read') sessionAllowedReadPaths.add(scope);
-            else sessionAllowedWritePaths.add(scope);
-            trapSocket.write(JSON.stringify({ query_id: obj.query_id, action: 'allow' }) + '\n');
             trapLines.push(line);
           }
         } else {
@@ -829,6 +845,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
   const callAllowances = new Set<string>();
   const sessionAllowedReadPaths = new Set<string>();
   const sessionAllowedWritePaths = new Set<string>();
+  const sessionAllowedTargets = new Set<string>();
 
   function getEffectiveAllowRead(config: SandboxConfig): string[] {
     return [...config.filesystem.allowRead, ...sessionAllowedReadPaths];
@@ -1153,6 +1170,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       directory,
       sessionAllowedReadPaths,
       sessionAllowedWritePaths,
+      sessionAllowedTargets,
     );
 
     const wrappedCommand = buildWrappedCommand(

@@ -17,7 +17,6 @@
     "index.ts",
     "tui.ts",
     "shared.ts",
-    "landstrip.d.ts",
     "README.md",
     "sandbox.json"
   ],
@@ -49,7 +48,7 @@
     "ci:test": "npm test"
   },
   "dependencies": {
-    "@landstrip/landstrip": "^0.16.19"
+    "@landstrip/landstrip": "^0.17.0"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.17.7",

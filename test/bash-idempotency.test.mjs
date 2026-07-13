@@ -46,8 +46,8 @@ async function withPlugin(options, run, mock = {}) {
     await writeFile(
       fakeLandstrip,
       process.platform === 'win32'
-        ? '@echo landstrip 0.16.4\r\n'
-        : '#!/bin/sh\nprintf "landstrip 0.16.4\\n"\n',
+        ? '@echo landstrip 0.17.0\r\n'
+        : '#!/bin/sh\nprintf "landstrip 0.17.0\\n"\n',
     );
     if (process.platform !== 'win32') await chmod(fakeLandstrip, 0o755);
 
@@ -654,3 +654,94 @@ test('query-response: recovery re-extracts the original command', linuxOnly, asy
     },
   );
 });
+
+function readLine(socket) {
+  return new Promise((resolvePromise, reject) => {
+    let buffer = '';
+    const onData = (chunk) => {
+      buffer += chunk.toString('utf8');
+      const newline = buffer.indexOf('\n');
+      if (newline !== -1) {
+        socket.off('data', onData);
+        socket.off('error', onError);
+        resolvePromise(buffer.slice(0, newline));
+      }
+    };
+    const onError = (error) => {
+      socket.off('data', onData);
+      reject(error);
+    };
+    socket.on('data', onData);
+    socket.on('error', onError);
+  });
+}
+
+test(
+  'query-response: startTrapServer answers filesystem and network queries',
+  linuxOnly,
+  async () => {
+    await withPlugin(
+      {
+        enabled: true,
+        filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+        network: { allowedDomains: ['*'], deniedDomains: [] },
+      },
+      async ({ hooks }) => {
+        const input = { callID: 'trap-server', tool: 'bash' };
+        const output = { args: { command: 'git status --short', description: 'status' } };
+        try {
+          await hooks['tool.execute.before'](input, output);
+          const portMatch = output.args.command.match(/\/dev\/tcp\/127\.0\.0\.1\/(\d+)\b/);
+          assert.ok(portMatch, 'wrapped command carries the trap-server port');
+          const port = Number(portMatch[1]);
+
+          const socket = connect(port, '127.0.0.1');
+          await new Promise((res, rej) => {
+            socket.once('connect', res);
+            socket.once('error', rej);
+          });
+          try {
+            // A path outside allowRead/allowWrite is a miss: startTrapServer
+            // auto-grants (the command itself was already approved), but the
+            // query_id must round-trip as the same string, or landstrip's own
+            // deserializer would reject the answer and the syscall would hang.
+            socket.write(
+              JSON.stringify({
+                kind: 'filesystem',
+                operation: 'read',
+                path: '/etc/hostname',
+                state: 'query',
+                query_id: '42',
+              }) + '\n',
+            );
+            assert.deepEqual(JSON.parse(await readLine(socket)), {
+              query_id: '42',
+              action: 'allow',
+            });
+
+            // Network connect/bind queries were previously unhandled entirely
+            // (no response sent at all, so the syscall hung forever) — this is
+            // the regression guard for that hang.
+            socket.write(
+              JSON.stringify({
+                kind: 'network',
+                operation: 'connect',
+                target: '93.184.216.34:443',
+                state: 'query',
+                query_id: '43',
+              }) + '\n',
+            );
+            assert.deepEqual(JSON.parse(await readLine(socket)), {
+              query_id: '43',
+              action: 'allow',
+            });
+          } finally {
+            socket.destroy();
+          }
+        } finally {
+          await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+        }
+      },
+    );
+  },
+);

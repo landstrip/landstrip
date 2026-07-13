@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { binaryPath } from '@landstrip/landstrip';
+import {
+  binaryPath,
+  type LandstripControlResponse,
+  type LandstripTrap,
+} from '@landstrip/landstrip';
+
+// Re-exported so index.ts/tui.ts can import the trap/response types from this
+// module alongside the parsing functions that produce/consume them.
+export type { LandstripControlResponse, LandstripTrap };
 
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -396,79 +404,52 @@ export function updateForPermission(
 }
 
 // Landstrip emits one JSON trap per line on its trap fd/file. The `state` field
-// (landstrip >= 0.15.4) distinguishes a terminal `info` trap from a `query`
-// trap that holds a syscall pending until the host answers with `queryId`. It
-// is absent on the static-profile platforms (macOS/Windows), so both fields are
-// optional. Parsing lives here so the server hook and the TUI socket handler
-// decode identically.
-export type LandstripTrapState = 'query' | 'info';
-
-export type LandstripTrap =
-  | {
-      kind: 'filesystem';
-      operation: 'read' | 'write';
-      path: string;
-      mechanism: string;
-      state?: LandstripTrapState;
-      queryId?: number;
-    }
-  | { kind: 'network'; operation: string; target: string; mechanism: string }
-  | { kind: 'launch'; program: string; message: string }
-  | { kind: 'usage'; message: string }
-  | { kind: 'internal'; detail: Record<string, string> };
-
+// distinguishes a terminal `info` trap from a `query` trap that holds a syscall
+// pending until the host answers with the trap's `query_id`. Parsing lives here
+// so the server hook and the TUI socket handler decode identically.
 const LANDSTRIP_OPERATIONS = new Set<'read' | 'write'>(['read', 'write']);
 
 function isLandstripOperation(value: unknown): value is 'read' | 'write' {
   return typeof value === 'string' && LANDSTRIP_OPERATIONS.has(value as 'read' | 'write');
 }
 
-function decodeTrapState(value: unknown): LandstripTrapState | undefined {
-  return value === 'query' || value === 'info' ? value : undefined;
+// The declarations landstrip ships are compile-time only, so a runtime guard is
+// still required — but it only has to validate the fields actually read below.
+// Deliberately does not validate `state`: a missing or unknown state degrades to
+// "informational", the safe direction. `query_id` must be a string on both
+// filesystem and network traps — landstrip < 0.17 sent a number here, and a
+// numeric id fails landstrip's own deserializer when echoed back, so treating
+// it as undecodable (rather than coercing it) keeps a stale/mismatched trap
+// from ever being answered with a shape the broker would reject.
+function isLandstripTrap(value: unknown): value is LandstripTrap {
+  if (!isRecord(value)) return false;
+
+  switch (value.kind) {
+    case 'filesystem':
+      return (
+        isLandstripOperation(value.operation) &&
+        typeof value.path === 'string' &&
+        typeof value.query_id === 'string'
+      );
+    case 'network':
+      return (
+        typeof value.operation === 'string' &&
+        typeof value.target === 'string' &&
+        typeof value.query_id === 'string'
+      );
+    case 'launch':
+      return typeof value.program === 'string' && typeof value.message === 'string';
+    case 'usage':
+      return typeof value.message === 'string';
+    case 'internal':
+      return typeof value.code === 'string' && typeof value.message === 'string';
+    default:
+      return false;
+  }
 }
 
 export function decodeLandstripTrap(value: unknown): LandstripTrap | null {
-  if (!isRecord(value)) return null;
-  const mechanism = typeof value.mechanism === 'string' ? value.mechanism : '';
-
-  switch (value.kind) {
-    case 'filesystem': {
-      const { operation, path } = value;
-      if (!isLandstripOperation(operation) || typeof path !== 'string') return null;
-      const trap: LandstripTrap = { kind: 'filesystem', operation, path, mechanism };
-      const state = decodeTrapState(value.state);
-      if (state) trap.state = state;
-      if (typeof value.query_id === 'number') trap.queryId = value.query_id;
-      return trap;
-    }
-    case 'network': {
-      const { operation, target } = value;
-      if (typeof operation !== 'string' || typeof target !== 'string') return null;
-      return { kind: 'network', operation, target, mechanism };
-    }
-    case 'launch': {
-      const { program, message } = value;
-      if (typeof program !== 'string') return null;
-      return { kind: 'launch', program, message: typeof message === 'string' ? message : '' };
-    }
-    case 'usage': {
-      const { message } = value;
-      if (typeof message !== 'string') return null;
-      return { kind: 'usage', message };
-    }
-    case 'internal': {
-      const detail: Record<string, string> = {};
-      const payload = value.detail;
-      if (isRecord(payload)) {
-        for (const [key, val] of Object.entries(payload)) {
-          detail[key] = typeof val === 'string' ? val : JSON.stringify(val);
-        }
-      }
-      return { kind: 'internal', detail };
-    }
-    default:
-      return null;
-  }
+  return isLandstripTrap(value) ? value : null;
 }
 
 export function parseLandstripTraps(output: string): LandstripTrap[] {
@@ -507,16 +488,25 @@ export function formatLandstripTrap(trap: LandstripTrap): string {
     case 'usage':
       return `landstrip: usage error: ${trap.message}`;
     case 'internal': {
-      const detail = Object.entries(trap.detail)
-        .map(([key, val]) => `${key}: ${val}`)
-        .join(', ');
-      return `landstrip: internal error${detail ? ` (${detail})` : ''}`;
+      const mechanism = trap.mechanism ? ` [${trap.mechanism}]` : '';
+      return `landstrip: ${trap.code}${mechanism}: ${trap.message}`;
     }
   }
 }
 
 export function formatLandstripTraps(traps: LandstripTrap[]): string {
   return traps.map(formatLandstripTrap).join('\n');
+}
+
+// The broker matches an answer to its query by the exact decimal `query_id`
+// string the trap carried. A numeric id fails its deserializer, the line is
+// dropped, and the child's syscall stays suspended.
+export function controlResponseLine(
+  queryId: string,
+  action: LandstripControlResponse['action'],
+): string {
+  const response: LandstripControlResponse = { query_id: queryId, action };
+  return JSON.stringify(response) + '\n';
 }
 
 // The TUI plugin runs the query-response socket server and publishes its port
