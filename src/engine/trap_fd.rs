@@ -143,11 +143,13 @@ fn write_without_sigpipe(fd: i32, line: &[u8]) -> isize {
         let broken_pipe =
             written < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE);
         if broken_pipe && !was_pending {
-            let timeout = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            libc::sigtimedwait(&sigpipe, std::ptr::null_mut(), &timeout);
+            let mut pending = std::mem::zeroed::<libc::sigset_t>();
+            if libc::sigpending(&mut pending) == 0
+                && libc::sigismember(&pending, libc::SIGPIPE) == 1
+            {
+                let mut signal = 0;
+                libc::sigwait(&sigpipe, &mut signal);
+            }
         }
 
         libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut());

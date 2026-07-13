@@ -33,7 +33,7 @@ pub(crate) enum PolicyFormat {
 #[derive(Debug, FromArgs)]
 #[argh(
     help_triggers("-h", "--help"),
-    description = "Landlock sandbox runner",
+    description = "OS-level sandbox runner",
     usage = "[OPTIONS] <TOOL> [ARG...]",
     example = "{command_name} -p policy.json cargo test"
 )]
