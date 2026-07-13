@@ -57,7 +57,10 @@ jobs:
           cache-dependency-path: packages/${{ matrix.package }}/package-lock.json
 
       - name: Install dependencies
-        run: npm install --package-lock=false --ignore-scripts
+        run: |
+          tarball="$(npm pack ../.. --silent)"
+          npm install --package-lock=false --ignore-scripts --no-save "./${tarball}"
+          rm -f "${tarball}"
 
       - name: Format check
         run: npm run ci:fmt
