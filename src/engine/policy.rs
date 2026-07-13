@@ -225,7 +225,13 @@ pub(crate) fn resolve_policy(
     let read_denied_roots = effective_denied_roots(&read_deny, &read_allow);
     let (read_access, read_symlinks) = if read_deny.is_empty() {
         (ReadAccess::Unrestricted, Vec::new())
-    } else if read_allow.iter().any(|root| root == Path::new("/")) {
+    } else if read_allow.iter().any(|root| root == Path::new("/"))
+        && !read_deny.iter().any(|deny| {
+            read_allow
+                .iter()
+                .any(|allow| allow.starts_with(deny) && allow.as_path() != deny.as_path())
+        })
+    {
         // A `/` allowRead grants the whole tree; the surviving denyRead roots are
         // layered back as deny rules rather than by carving the live filesystem.
         (ReadAccess::AllowRoots(vec![PathBuf::from("/")]), Vec::new())
@@ -254,7 +260,9 @@ pub(crate) fn resolve_policy(
         // enumerating the parent directory. Landlock path_beneath on the
         // parent covers all descendants including runtime-created ones.
         for allow in &read_allow {
-            read_roots.push(allow.clone());
+            if allow.as_path() != Path::new("/") {
+                read_roots.push(allow.clone());
+            }
         }
         normalize_roots(&mut read_roots);
         (ReadAccess::AllowRoots(read_roots), read_symlinks)
