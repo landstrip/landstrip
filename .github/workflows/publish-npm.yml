@@ -388,11 +388,33 @@ jobs:
             npm publish "./${package_dir}" --access public --provenance
           }
 
+          wait_for_npm_package() {
+            package_dir="$1"
+            package_name="$(node -p "require('./${package_dir}/package.json').name")"
+            package_version="$(node -p "require('./${package_dir}/package.json').version")"
+
+            for attempt in $(seq 1 30); do
+              if [[ "$(npm view "${package_name}@${package_version}" version 2>/dev/null || true)" == "${package_version}" ]]; then
+                echo "${package_name}@${package_version} is available"
+                return 0
+              fi
+
+              echo "Waiting for ${package_name}@${package_version} to become available (${attempt}/30)"
+              sleep 10
+            done
+
+            echo "Timed out waiting for ${package_name}@${package_version}" >&2
+            return 1
+          }
+
           publish_if_missing npm/darwin-arm64
           publish_if_missing npm/darwin-x64
           publish_if_missing npm/linux-x64
           publish_if_missing npm/win32-x64
           publish_if_missing .
+
+          wait_for_npm_package npm/linux-x64
+          wait_for_npm_package .
 
 
       - name: Test extensions
