@@ -1,6 +1,6 @@
 {
   "name": "pi-landstrip",
-  "version": "0.16.29",
+  "version": "0.17.1",
   "description": "Landlock-based sandboxing for pi with interactive permission prompts",
   "keywords": [
     "landstrip",
@@ -32,7 +32,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-tui": "^0.78.0",
-    "@landstrip/landstrip": "^0.17.0"
+    "@landstrip/landstrip": "^0.17.1"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.2",
