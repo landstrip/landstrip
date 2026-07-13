@@ -121,7 +121,6 @@ glob patterns are evaluated dynamically by the seccomp broker at each write
 attempt, so files created after sandbox startup are also blocked.
 On macOS, glob patterns are snapshot-expanded when the Seatbelt profile is
 compiled and do not protect future matching files; a warning is logged.
-compiled and do not protect future matching files; a warning is logged.
 .Pp
 Write access is denied by default. The
 .Va allowWrite
@@ -141,7 +140,6 @@ contains entries, read access is lowered to an allowlist by traversing from
 and subtracting denied paths. Entries in
 .Va allowRead
 are then added back to the read allowlist.
-.Pp
 .Pp
 For TCP port rules,
 .Nm
@@ -359,6 +357,8 @@ for readability. A Linux filesystem denial carries these fields:
 {
   "kind": "filesystem",
   "code": "FILESYSTEM_DENIED",
+  "state": "info",
+  "query_id": "0",
   "operation": "write",
   "path": "/repo/out",
   "requested_path": "out",
@@ -371,8 +371,9 @@ for readability. A Linux filesystem denial carries these fields:
   "process": {"pid": 1234, "exe": "/usr/bin/sh", "cwd": "/repo"}
 }
 .Ed
-A launch failure inside the Linux broker reaches standard error only, since the
-descriptor is already closed by then. This trap stream is separate from the
+A Linux broker launch failure also reaches
+.Fl -trap-fd Ar fd
+while the descriptor remains open. This trap stream is separate from the
 sandboxed command's standard output and standard error.
 .Sh EXIT STATUS
 On success,

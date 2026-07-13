@@ -42,8 +42,9 @@ statically, e.g. for many filesystem mutator syscalls, or when denials must be
 reported back to the launcher. The broker intercepts `openat`/`openat2` via
 seccomp user-notifications, resolves the real path, and validates it
 
-Finally there's some logic to deduce that Landlock and Seccomp (mostly for
-mutator syscall, which take fd) are fairly disjoint entities.
+Landlock and seccomp cover mostly disjoint filesystem operations: Landlock
+handles kernel-enforced path access, while seccomp mediates unsupported mutators
+and reports broker decisions.
 
 ### Windows
 
@@ -191,6 +192,8 @@ derived from the policy and the requested path:
 {
   "kind": "filesystem",
   "code": "FILESYSTEM_DENIED",
+  "state": "info",
+  "query_id": "0",
   "operation": "write",
   "path": "/repo/out",
   "requested_path": "out",
@@ -205,6 +208,8 @@ derived from the policy and the requested path:
 {
   "kind": "network",
   "code": "NETWORK_DENIED",
+  "state": "info",
+  "query_id": "0",
   "operation": "connect",
   "target": "127.0.0.1:9999",
   "syscall": "connect",
@@ -236,8 +241,8 @@ otherwise.
 
 Writing to `--trap-fd` is best-effort: it needs an already-open descriptor (3 or
 greater; 0-2 are reserved), and if the write fails the trap is dropped while the
-policy stays in effect. A launch failure inside the Linux broker reaches standard
-error only, since the descriptor is already closed by then.
+policy stays in effect. On Linux, a broker launch failure also reaches
+`--trap-fd` while the descriptor remains open.
 
 ## Development
 
