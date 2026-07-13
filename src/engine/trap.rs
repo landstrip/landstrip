@@ -51,7 +51,7 @@ pub(crate) struct ProcessContext {
 pub(crate) struct FilesystemTrap {
     pub(crate) code: &'static str,
     pub(crate) state: &'static str,
-    pub(crate) query_id: u64,
+    pub(crate) query_id: String,
     pub(crate) operation: TrapOperation,
     pub(crate) path: String,
     pub(crate) requested_path: String,
@@ -83,7 +83,7 @@ pub(crate) struct FilesystemDenial {
 pub(crate) struct NetworkTrap {
     pub(crate) code: &'static str,
     pub(crate) state: &'static str,
-    pub(crate) query_id: u64,
+    pub(crate) query_id: String,
     pub(crate) operation: &'static str,
     pub(crate) target: String,
     pub(crate) syscall: &'static str,
@@ -154,7 +154,7 @@ impl Trap {
         Self::Filesystem(Box::new(FilesystemTrap {
             code: Error::FilesystemDenied.code(),
             state: if query_id.is_some() { "query" } else { "info" },
-            query_id: query_id.unwrap_or(0),
+            query_id: query_id.unwrap_or(0).to_string(),
             operation,
             path,
             requested_path,
@@ -179,7 +179,7 @@ impl Trap {
         Self::Network(Box::new(NetworkTrap {
             code: Error::NetworkDenied.code(),
             state: if query_id.is_some() { "query" } else { "info" },
-            query_id: query_id.unwrap_or(0),
+            query_id: query_id.unwrap_or(0).to_string(),
             operation: syscall,
             target,
             syscall,

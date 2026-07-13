@@ -28,7 +28,8 @@ export interface LandstripFilesystemTrap {
   kind: 'filesystem';
   code: 'FILESYSTEM_DENIED';
   state: LandstripTrapState;
-  query_id: number;
+  /** Decimal `u64`; `"0"` marks a terminal `info` event. */
+  query_id: string;
   operation: 'read' | 'write';
   /** The resolved path. */
   path: string;
@@ -49,7 +50,8 @@ export interface LandstripNetworkTrap {
   kind: 'network';
   code: 'NETWORK_DENIED';
   state: LandstripTrapState;
-  query_id: number;
+  /** Decimal `u64`; `"0"` marks a terminal `info` event. */
+  query_id: string;
   operation: 'connect' | 'bind';
   /** `address:port`. */
   target: string;
@@ -130,10 +132,11 @@ export type LandstripCode = LandstripTrap['code'];
 
 /**
  * The answer to a `state: "query"` trap, written back to the trap socket as one
- * JSON line. An unanswered query holds the sandboxed syscall.
+ * JSON line. `query_id` is an opaque decimal `u64` copied verbatim from the
+ * trap. An unanswered query holds the sandboxed syscall.
  */
 export interface LandstripControlResponse {
-  query_id: number;
+  query_id: string;
   action: 'allow' | 'deny';
 }
 

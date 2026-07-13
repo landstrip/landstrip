@@ -250,7 +250,7 @@ enum ControlAction {
 
 #[derive(Deserialize)]
 struct ControlResponse {
-    query_id: u64,
+    query_id: String,
     action: ControlAction,
 }
 
@@ -1815,7 +1815,10 @@ fn process_control_responses(
         else {
             continue;
         };
-        if let Some(pending) = pending_queries.remove(&response.query_id) {
+        let Ok(query_id) = response.query_id.parse::<u64>() else {
+            continue;
+        };
+        if let Some(pending) = pending_queries.remove(&query_id) {
             let id = pending.request.id;
             if !validate_notification_id(notify_fd, id).unwrap_or(false) {
                 continue;
