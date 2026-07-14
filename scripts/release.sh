@@ -25,6 +25,9 @@ version_parts() {
 	VERSION_C="${BASH_REMATCH[3]}"
 }
 
+mapfile -t extension_dirs < <(scripts/test-extensions.sh --list)
+((${#extension_dirs[@]} > 0)) || die "no extension workspaces found"
+
 release_files=(
 	Cargo.toml
 	Cargo.lock
@@ -34,11 +37,10 @@ release_files=(
 	npm/linux-x64/package.json
 	npm/win32-x64/package.json
 	man/man1/landstrip.1
-	packages/pi-landstrip/package.json
-	packages/pi-landstrip/package-lock.json
-	packages/opencode-landstrip/package.json
-	packages/opencode-landstrip/package-lock.json
 )
+for package_dir in "${extension_dirs[@]}"; do
+	release_files+=("$package_dir/package.json" "$package_dir/package-lock.json")
+done
 committed=0
 
 cleanup() {
@@ -72,7 +74,7 @@ version_parts "$core_ver"
 ver_gt "$next_a" "$next_b" "$next_c" "$VERSION_A" "$VERSION_B" "$VERSION_C" \
 	|| die "$next_ver is not greater than Landstrip $core_ver"
 
-for package_dir in packages/pi-landstrip packages/opencode-landstrip; do
+for package_dir in "${extension_dirs[@]}"; do
 	extension_ver="$(node -p "require('./$package_dir/package.json').version")" \
 		|| die "cannot find version in $package_dir/package.json"
 	version_parts "$extension_ver"
@@ -80,20 +82,14 @@ for package_dir in packages/pi-landstrip packages/opencode-landstrip; do
 		|| die "$next_ver is not greater than $package_dir $extension_ver"
 done
 
-core_log="$(git log --first-parent --format='- %s (%an)' --no-merges "$core_ver"..HEAD -- . ':(exclude)packages/pi-landstrip' ':(exclude)packages/opencode-landstrip')"
-pi_log="$(git log --format='- %s (%an)' --no-merges "$core_ver"..HEAD -- packages/pi-landstrip)"
-opencode_log="$(git log --format='- %s (%an)' --no-merges "$core_ver"..HEAD -- packages/opencode-landstrip)"
-[[ -n "$core_log" ]] || core_log='- No source changes.'
-[[ -n "$pi_log" ]] || pi_log='- Merged pi-landstrip into this repository.'
-[[ -n "$opencode_log" ]] || opencode_log='- Merged opencode-landstrip into this repository.'
-
-for package_dir in packages/pi-landstrip packages/opencode-landstrip; do
-	npm ci --prefix "$package_dir" --ignore-scripts
-	npm --prefix "$package_dir" run ci:fmt
-	npm --prefix "$package_dir" run ci:lint
-	npm --prefix "$package_dir" run ci:check
-	npm --prefix "$package_dir" run ci:test
+core_log_args=(.)
+for package_dir in "${extension_dirs[@]}"; do
+	core_log_args+=(":(exclude)$package_dir")
 done
+core_log="$(git log --first-parent --format='- %s (%an)' --no-merges "$core_ver"..HEAD -- "${core_log_args[@]}")"
+[[ -n "$core_log" ]] || core_log='- No source changes.'
+
+npm run ci:extensions
 
 node - "$next_ver" <<'NODE'
 const fs = require('node:fs');
@@ -121,7 +117,21 @@ for (const [packagePath, data] of corePackages) {
   fs.writeFileSync(packagePath, `${JSON.stringify(data, null, 2)}\n`);
 }
 
-for (const packageDir of ['packages/pi-landstrip', 'packages/opencode-landstrip']) {
+const { workspaces } = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+if (!Array.isArray(workspaces)) {
+  throw new Error('package.json workspaces must be an array');
+}
+const packageDirs = workspaces.flatMap((workspace) => {
+  if (!workspace.endsWith('/*')) {
+    throw new Error(`unsupported workspace pattern: ${workspace}`);
+  }
+  const parent = workspace.slice(0, -2);
+  return fs.readdirSync(parent, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && fs.existsSync(`${parent}/${entry.name}/package.json`))
+    .map((entry) => `${parent}/${entry.name}`);
+});
+
+for (const packageDir of packageDirs) {
   const packagePath = `${packageDir}/package.json`;
   const data = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
   data.version = nextVersion;
@@ -160,21 +170,25 @@ git commit -s -m "Bump the version to $next_ver"
 committed=1
 
 sob="Signed-off-by: $(git config user.name) <$(git config user.email)>"
-cat >".git/landstrip-$next_ver-tag-message.txt" <<EOF
+tag_message=".git/landstrip-$next_ver-tag-message.txt"
+cat >"$tag_message" <<EOF
 Landstrip $next_ver
 
 landstrip:
 $core_log
-
-pi-landstrip:
-$pi_log
-
-opencode-landstrip:
-$opencode_log
-
-$sob
 EOF
 
-git tag -s "$next_ver" -F ".git/landstrip-$next_ver-tag-message.txt"
+for package_dir in "${extension_dirs[@]}"; do
+	package_name="$(basename "$package_dir")"
+	package_log="$(git log --format='- %s (%an)' --no-merges "$core_ver"..HEAD -- "$package_dir")"
+	[[ -n "$package_log" ]] || package_log="- Merged $package_name into this repository."
+	{
+		printf '\n%s:\n%s\n' "$package_name" "$package_log"
+	} >>"$tag_message"
+done
+
+printf '\n%s\n' "$sob" >>"$tag_message"
+
+git tag -s "$next_ver" -F "$tag_message"
 
 echo "tagged $next_ver"

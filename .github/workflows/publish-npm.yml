@@ -79,17 +79,38 @@ jobs:
             }
           }
 
+          function extensionPackageFiles(tag, root) {
+            if (!Array.isArray(root.workspaces)) {
+              // Tags published before the monorepo workspace metadata.
+              return [
+                'packages/pi-landstrip/package.json',
+                'packages/opencode-landstrip/package.json',
+              ];
+            }
+
+            return root.workspaces.flatMap((workspace) => {
+              if (!workspace.endsWith('/*')) {
+                throw new Error(`unsupported workspace pattern: ${workspace}`);
+              }
+              const parent = workspace.slice(0, -2);
+              return execFileSync('git', ['ls-tree', '-r', '--name-only', tag, '--', parent], {
+                encoding: 'utf8',
+              }).split('\n').filter((file) => file.endsWith('/package.json'));
+            });
+          }
+
           function isPublishableTag({ tag }) {
-            return [
+            const packageFiles = [
               'Cargo.toml',
               'package.json',
               'npm/darwin-arm64/package.json',
               'npm/darwin-x64/package.json',
               'npm/linux-x64/package.json',
               'npm/win32-x64/package.json',
-              'packages/pi-landstrip/package.json',
-              'packages/opencode-landstrip/package.json',
-            ].every((file) => tagHasFile(tag, file));
+            ];
+            const root = JSON.parse(readTagFile(tag, 'package.json'));
+            packageFiles.push(...extensionPackageFiles(tag, root));
+            return packageFiles.every((file) => tagHasFile(tag, file));
           }
 
           function readTagFile(tag, file) {
@@ -130,15 +151,15 @@ jobs:
           }
 
           const latest = publishableTags.at(-1);
-          const packageFiles = [
+          const corePackageFiles = [
             'package.json',
             'npm/darwin-arm64/package.json',
             'npm/darwin-x64/package.json',
             'npm/linux-x64/package.json',
             'npm/win32-x64/package.json',
-            'packages/pi-landstrip/package.json',
-            'packages/opencode-landstrip/package.json',
           ];
+          const root = JSON.parse(readTagFile(latest.tag, 'package.json'));
+          const packageFiles = [...corePackageFiles, ...extensionPackageFiles(latest.tag, root)];
           const packages = packageFiles.map((file) => JSON.parse(readTagFile(latest.tag, file)));
           const missingPackages = packages.filter((data) =>
             npmPackageVersion(data.name, data.version) !== data.version
@@ -169,6 +190,26 @@ jobs:
             return execFileSync('git', ['show', `${tag}:${file}`], {
               encoding: 'utf8',
               stdio: ['ignore', 'pipe', 'inherit'],
+            });
+          }
+
+          function extensionPackageFiles(root) {
+            if (!Array.isArray(root.workspaces)) {
+              // Tags published before the monorepo workspace metadata.
+              return [
+                'packages/pi-landstrip/package.json',
+                'packages/opencode-landstrip/package.json',
+              ];
+            }
+
+            return root.workspaces.flatMap((workspace) => {
+              if (!workspace.endsWith('/*')) {
+                throw new Error(`unsupported workspace pattern: ${workspace}`);
+              }
+              const parent = workspace.slice(0, -2);
+              return execFileSync('git', ['ls-tree', '-r', '--name-only', tag, '--', parent], {
+                encoding: 'utf8',
+              }).split('\n').filter((file) => file.endsWith('/package.json'));
             });
           }
 
@@ -207,8 +248,8 @@ jobs:
             }
           }
 
-          for (const packageName of ['pi-landstrip', 'opencode-landstrip']) {
-            const packagePath = `packages/${packageName}/package.json`;
+          const extensionPackagePaths = extensionPackageFiles(root);
+          for (const packagePath of extensionPackagePaths) {
             const data = JSON.parse(readTagFile(packagePath));
             if (data.version !== root.version) {
               throw new Error(`${packagePath} version ${data.version} does not match ${root.version}`);
@@ -418,14 +459,7 @@ jobs:
 
 
       - name: Test extensions
-        run: |
-          for package_dir in packages/pi-landstrip packages/opencode-landstrip; do
-            npm ci --prefix "$package_dir" --ignore-scripts
-            npm --prefix "$package_dir" run ci:fmt
-            npm --prefix "$package_dir" run ci:lint
-            npm --prefix "$package_dir" run ci:check
-            npm --prefix "$package_dir" run ci:test
-          done
+        run: npm run ci:extensions
 
       - name: Publish extensions
         env:
@@ -441,8 +475,9 @@ jobs:
             fi
             npm publish "./${package_dir}" --access public --provenance
           }
-          publish_if_missing packages/pi-landstrip
-          publish_if_missing packages/opencode-landstrip
+          while IFS= read -r package_dir; do
+            publish_if_missing "$package_dir"
+          done < <(scripts/test-extensions.sh --list)
 
   github-release:
     name: Create GitHub Release

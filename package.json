@@ -40,5 +40,12 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "ci:extensions": "scripts/test-extensions.sh",
+    "ci:extensions:local": "scripts/test-extensions.sh --local-root"
   }
 }

@@ -36,14 +36,8 @@ jobs:
 
 
   extensions:
-    name: Test ${{ matrix.package }}
+    name: Test extensions
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        package: [pi-landstrip, opencode-landstrip]
-    defaults:
-      run:
-        working-directory: packages/${{ matrix.package }}
 
     steps:
       - name: Checkout
@@ -54,23 +48,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: packages/${{ matrix.package }}/package-lock.json
+          cache-dependency-path: packages/*/package-lock.json
 
       - name: Install dependencies
-        run: |
-          npm ci --ignore-scripts
-          tarball="$(npm pack ../.. --silent)"
-          npm install --package-lock=false --ignore-scripts --no-save "./${tarball}"
-          rm -f "${tarball}"
-
-      - name: Format check
-        run: npm run ci:fmt
-
-      - name: Lint
-        run: npm run ci:lint
-
-      - name: Type check
-        run: npm run ci:check
-
-      - name: Test
-        run: npm run ci:test
+        run: npm run ci:extensions:local
