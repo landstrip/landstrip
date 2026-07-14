@@ -35,7 +35,7 @@
     "@landstrip/landstrip": "^0.17.4"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.2",
+    "@earendil-works/pi-coding-agent": "^0.80.6",
     "@types/node": "^24.0.0",
     "oxfmt": "^0.53.0",
     "oxlint": "^1.68.0",
@@ -43,7 +43,7 @@
     "vitest": "^4.1.9"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.2"
+    "@earendil-works/pi-coding-agent": "^0.80.6"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
