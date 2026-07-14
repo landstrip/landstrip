@@ -48,13 +48,13 @@
     "ci:test": "npm test"
   },
   "dependencies": {
-    "@landstrip/landstrip": "^0.17.4"
+    "@landstrip/landstrip": "^0.17.4",
+    "@opentui/solid": ">=0.3.4"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.17.7",
     "@opentui/core": ">=0.3.4",
     "@opentui/keymap": ">=0.3.4",
-    "@opentui/solid": ">=0.3.4",
     "@types/node": "^24.0.0",
     "oxfmt": "^0.53.0",
     "oxlint": "^1.68.0",
