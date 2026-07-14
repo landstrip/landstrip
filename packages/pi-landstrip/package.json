@@ -39,7 +39,7 @@
     "@types/node": "^24.0.0",
     "oxfmt": "^0.53.0",
     "oxlint": "^1.68.0",
-    "typescript": "^5.0.0",
+    "typescript": "^7.0.2",
     "vitest": "^4.1.9"
   },
   "peerDependencies": {
