@@ -611,10 +611,16 @@ export function sandboxSummary(
   const denyWrite = list(config.filesystem.denyWrite);
 
   const status = statusOverride ?? (config.enabled ? 'active' : 'disabled by config');
+  let binary: string;
+  try {
+    binary = landstripBinaryPath();
+  } catch {
+    binary = '(unavailable)';
+  }
 
   return [
     `Status: ${status}`,
-    `landstrip package binary: ${landstripBinaryPath()}`,
+    `landstrip package binary: ${binary}`,
     '',
     'Config files',
     `${projectPath} ${existsSync(projectPath) ? '(found)' : '(missing)'}`,

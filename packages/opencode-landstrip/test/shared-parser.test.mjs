@@ -72,6 +72,32 @@ test('shared parser agrees across server and TUI permission shapes', async () =>
   }
 });
 
+test('sandbox summary reports an unavailable landstrip binary', async () => {
+  const { mod, cleanup } = await loadShared();
+  try {
+    const summary = mod.sandboxSummary(
+      {
+        enabled: true,
+        network: {
+          allowNetwork: false,
+          allowLocalBinding: false,
+          allowAllUnixSockets: false,
+          allowUnixSockets: [],
+          allowedDomains: [],
+          deniedDomains: [],
+        },
+        filesystem: { denyRead: [], allowRead: [], allowWrite: [], denyWrite: [] },
+      },
+      '/global/sandbox.json',
+      '/project/sandbox.json',
+    );
+
+    assert.match(summary, /landstrip package binary: \(unavailable\)/);
+  } finally {
+    await cleanup();
+  }
+});
+
 // Landstrip 0.17 tags filesystem/network traps with `state` ("query" vs
 // "info") and a decimal-string `query_id` ("0" marks a terminal event); the
 // static-profile platforms omit both. Before 0.17 `query_id` was a JSON
