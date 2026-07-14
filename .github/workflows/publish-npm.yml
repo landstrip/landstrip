@@ -462,7 +462,16 @@ jobs:
 
 
       - name: Test extensions
-        run: npm run ci:extensions
+        run: |
+          set -euo pipefail
+          while IFS= read -r package_dir; do
+            npm install --prefix "$package_dir" --workspaces=false --package-lock=false \
+              --ignore-scripts --no-save "@landstrip/landstrip@${{ needs.metadata.outputs.version }}"
+            npm --prefix "$package_dir" run ci:fmt
+            npm --prefix "$package_dir" run ci:lint
+            npm --prefix "$package_dir" run ci:check
+            npm --prefix "$package_dir" run ci:test
+          done < <(scripts/test-extensions.sh --list)
 
       - name: Publish extensions
         env:
