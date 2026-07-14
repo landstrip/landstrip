@@ -88,7 +88,7 @@ opencode_log="$(git log --format='- %s (%an)' --no-merges "$core_ver"..HEAD -- p
 [[ -n "$opencode_log" ]] || opencode_log='- Merged opencode-landstrip into this repository.'
 
 for package_dir in packages/pi-landstrip packages/opencode-landstrip; do
-	npm install --prefix "$package_dir" --package-lock=false --ignore-scripts
+	npm ci --prefix "$package_dir" --ignore-scripts
 	npm --prefix "$package_dir" run ci:fmt
 	npm --prefix "$package_dir" run ci:lint
 	npm --prefix "$package_dir" run ci:check

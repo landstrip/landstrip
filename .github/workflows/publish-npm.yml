@@ -420,7 +420,7 @@ jobs:
       - name: Test extensions
         run: |
           for package_dir in packages/pi-landstrip packages/opencode-landstrip; do
-            npm install --prefix "$package_dir" --package-lock=false --ignore-scripts
+            npm ci --prefix "$package_dir" --ignore-scripts
             npm --prefix "$package_dir" run ci:fmt
             npm --prefix "$package_dir" run ci:lint
             npm --prefix "$package_dir" run ci:check
