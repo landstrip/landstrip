@@ -56,7 +56,7 @@
     "@opentui/core": ">=0.3.4",
     "@opentui/keymap": ">=0.3.4",
     "@types/node": "^24.0.0",
-    "oxfmt": "^0.53.0",
+    "oxfmt": "^0.58.0",
     "oxlint": "^1.68.0",
     "typescript": "^5.8.2"
   },
