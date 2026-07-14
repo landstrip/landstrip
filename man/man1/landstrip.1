@@ -10,7 +10,6 @@
 .Op Fl -format Ar format
 .Op Fl -trap-fd Ar fd
 .Op Fl p Ar policy | Fl -policy Ar policy
-.Op Ar policy ...
 .Ar command
 .Op Ar argument ...
 .Nm
@@ -50,15 +49,6 @@ Read a policy file. This option may be repeated. Later policy arguments
 are merged over earlier policy arguments. Object values are merged recursively,
 arrays are concatenated without duplicates, and scalar values replace earlier
 values. Commas are literal filename characters.
-Files ending in
-.Pa .json ,
-.Pa .yaml ,
-or
-.Pa .yml
-that appear before the tool argument are detected positionally and automatically
-consumed as
-.Fl p
-arguments.
 .It Fl V , Fl -version
 Print version information and exit.
 .It Fl h , Fl -help
