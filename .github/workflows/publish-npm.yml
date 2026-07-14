@@ -108,6 +108,9 @@ jobs:
               'npm/linux-x64/package.json',
               'npm/win32-x64/package.json',
             ];
+            if (!tagHasFile(tag, 'package.json')) {
+              return false;
+            }
             const root = JSON.parse(readTagFile(tag, 'package.json'));
             packageFiles.push(...extensionPackageFiles(tag, root));
             return packageFiles.every((file) => tagHasFile(tag, file));
