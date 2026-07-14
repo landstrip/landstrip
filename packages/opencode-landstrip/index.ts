@@ -1016,7 +1016,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     if (!config.enabled) {
       await notifyOnce(
         `not-configured:${directory}`,
-        'Sandbox is not configured — no sandbox.json5 found',
+        'Sandbox is disabled by configuration',
         'info',
       );
       return null;

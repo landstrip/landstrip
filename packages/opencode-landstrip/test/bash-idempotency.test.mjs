@@ -128,6 +128,19 @@ test('bash wrapping is idempotent for repeated before hooks', async () => {
   );
 });
 
+test('disabled sandbox reports its configuration state', async () => {
+  await withPlugin(
+    { enabled: false },
+    async ({ hooks, messages }) => {
+      const output = { args: { command: 'git status --short', description: 'Shows git status' } };
+      await hooks['tool.execute.before']({ callID: 'disabled', tool: 'bash' }, output);
+
+      assert.equal(output.args.command, 'git status --short');
+      assert.ok(messages.includes('Sandbox is disabled by configuration'));
+    },
+  );
+});
+
 test('setSandboxConfigEnabled toggles persisted enabled and the server honors it', async () => {
   await withPlugin(
     {
