@@ -58,10 +58,11 @@ if (( local_root )); then
 fi
 
 for package_dir in "${extension_dirs[@]}"; do
-	npm ci --prefix "$package_dir" --workspaces=false --ignore-scripts
 	if (( local_root )); then
 		npm install --prefix "$package_dir" --workspaces=false --package-lock=false \
 			--ignore-scripts --no-save "./$tarball"
+	else
+		npm ci --prefix "$package_dir" --workspaces=false --ignore-scripts
 	fi
 	npm --prefix "$package_dir" run ci:fmt
 	npm --prefix "$package_dir" run ci:lint
