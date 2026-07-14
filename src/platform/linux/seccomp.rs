@@ -2098,6 +2098,9 @@ fn broker_open(grant: &OpenGrant) -> std::result::Result<OwnedFd, i32> {
 
 fn resolve_child_path(pid: Pid, dirfd: i32, path: &Path) -> SysResult<PathBuf> {
     if path.is_absolute() {
+        if let Ok(suffix) = path.strip_prefix("/proc/self") {
+            return Ok(Path::new("/proc").join(pid.to_string()).join(suffix));
+        }
         return Ok(path.to_path_buf());
     }
 
