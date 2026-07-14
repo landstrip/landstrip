@@ -8,3 +8,11 @@ updates:
       default-days: 10
       semver-minor-days: 14 # wait 14 days before applying minor updates
       semver-major-days: 28
+  - package-ecosystem: npm
+    directory: /packages/pi-landstrip
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /packages/opencode-landstrip
+    schedule:
+      interval: weekly
