@@ -37,6 +37,7 @@ release_files=(
 	npm/linux-x64/package.json
 	npm/linux-arm64/package.json
 	npm/win32-x64/package.json
+	npm/win32-arm64/package.json
 	man/man1/landstrip.1
 )
 for package_dir in "${extension_dirs[@]}"; do
@@ -90,7 +91,7 @@ done
 core_log="$(git log --first-parent --format='- %s (%an)' --no-merges "$core_ver"..HEAD -- "${core_log_args[@]}")"
 [[ -n "$core_log" ]] || core_log='- No source changes.'
 
-npm run ci:extensions
+npm run ci:extensions:local
 
 node - "$next_ver" <<'NODE'
 const fs = require('node:fs');
@@ -103,6 +104,7 @@ const corePackagePaths = [
   'npm/linux-x64/package.json',
   'npm/linux-arm64/package.json',
   'npm/win32-x64/package.json',
+  'npm/win32-arm64/package.json',
 ];
 const corePackages = corePackagePaths.map((packagePath) => [
   packagePath,

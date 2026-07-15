@@ -108,6 +108,7 @@ jobs:
               'npm/linux-x64/package.json',
               'npm/linux-arm64/package.json',
               'npm/win32-x64/package.json',
+              'npm/win32-arm64/package.json',
             ];
             if (!tagHasFile(tag, 'package.json')) {
               return false;
@@ -162,6 +163,7 @@ jobs:
             'npm/linux-x64/package.json',
             'npm/linux-arm64/package.json',
             'npm/win32-x64/package.json',
+            'npm/win32-arm64/package.json',
           ];
           const root = JSON.parse(readTagFile(latest.tag, 'package.json'));
           const packageFiles = [...corePackageFiles, ...extensionPackageFiles(latest.tag, root)];
@@ -224,6 +226,7 @@ jobs:
             'npm/linux-x64',
             'npm/linux-arm64',
             'npm/win32-x64',
+            'npm/win32-arm64',
           ];
           const root = JSON.parse(readTagFile('package.json'));
           const cargoToml = readTagFile('Cargo.toml');
@@ -305,6 +308,12 @@ jobs:
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             package_dir: npm/win32-x64
+            binary: landstrip.exe
+            rustflags: '-C target-feature=+crt-static'
+          - package: win32-arm64
+            runner: windows-2025
+            target: aarch64-pc-windows-msvc
+            package_dir: npm/win32-arm64
             binary: landstrip.exe
             rustflags: '-C target-feature=+crt-static'
 
@@ -402,12 +411,17 @@ jobs:
         with:
           name: win32-x64
           path: artifacts/win32-x64
+      - name: Download win32-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: win32-arm64
+          path: artifacts/win32-arm64
 
       - name: Stage package binaries
         shell: bash
         run: |
           set -euo pipefail
-          package_dirs=(npm/darwin-arm64 npm/darwin-x64 npm/linux-x64 npm/linux-arm64 npm/win32-x64)
+          package_dirs=(npm/darwin-arm64 npm/darwin-x64 npm/linux-x64 npm/linux-arm64 npm/win32-x64 npm/win32-arm64)
           license_files=(LICENSE-APACHE-2.0 LICENSE-LGPL-2.1)
 
           for package_dir in "${package_dirs[@]}"; do
@@ -418,6 +432,7 @@ jobs:
           tar -xzf artifacts/linux-x64/linux-x64.tar.gz -C npm/linux-x64/bin
           tar -xzf artifacts/linux-arm64/linux-arm64.tar.gz -C npm/linux-arm64/bin
           tar -xzf artifacts/win32-x64/win32-x64.tar.gz -C npm/win32-x64/bin
+          tar -xzf artifacts/win32-arm64/win32-arm64.tar.gz -C npm/win32-arm64/bin
 
           for license_file in "${license_files[@]}"; do
             [[ -f "$license_file" ]] || { echo "missing $license_file" >&2; exit 1; }
@@ -430,6 +445,7 @@ jobs:
           chmod 755 npm/linux-x64/bin/landstrip
           chmod 755 npm/linux-arm64/bin/landstrip
           test -f npm/win32-x64/bin/landstrip.exe
+          test -f npm/win32-arm64/bin/landstrip.exe
 
       - name: Publish Landstrip npm packages
         env:
@@ -472,6 +488,7 @@ jobs:
           publish_if_missing npm/linux-x64
           publish_if_missing npm/linux-arm64
           publish_if_missing npm/win32-x64
+          publish_if_missing npm/win32-arm64
           publish_if_missing .
 
           wait_for_npm_package npm/linux-x64
@@ -547,6 +564,11 @@ jobs:
         with:
           name: win32-x64
           path: artifacts/win32-x64
+      - name: Download win32-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: win32-arm64
+          path: artifacts/win32-arm64
 
       - name: Prepare release assets
         shell: bash
@@ -564,6 +586,8 @@ jobs:
             "assets/landstrip-${ver}-linux-arm64-musl.tar.gz"
           mv artifacts/win32-x64/win32-x64.tar.gz \
             "assets/landstrip-${ver}-win32-x64.tar.gz"
+          mv artifacts/win32-arm64/win32-arm64.tar.gz \
+            "assets/landstrip-${ver}-win32-arm64.tar.gz"
 
       - name: Create GitHub Release
         shell: bash

@@ -1,0 +1,25 @@
+{
+  "name": "@landstrip/landstrip-win32-arm64",
+  "version": "0.17.7",
+  "description": "Windows arm64 binary for landstrip",
+  "license": "Apache-2.0 AND LGPL-2.1-or-later",
+  "homepage": "https://github.com/landstrip/landstrip#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/landstrip/landstrip.git"
+  },
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "bin/landstrip.exe",
+    "LICENSE-APACHE-2.0",
+    "LICENSE-LGPL-2.1"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

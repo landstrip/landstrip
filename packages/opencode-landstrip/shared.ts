@@ -54,6 +54,7 @@ const LANDSTRIP_PACKAGE_NAMES = new Set([
   '@landstrip/landstrip-linux-x64',
   '@landstrip/landstrip-linux-arm64',
   '@landstrip/landstrip-win32-x64',
+  '@landstrip/landstrip-win32-arm64',
 ]);
 
 // Breadth-first filesystem approval: a held read/write under a directory tree
