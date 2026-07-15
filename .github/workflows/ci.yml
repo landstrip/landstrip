@@ -50,5 +50,8 @@ jobs:
           cache: npm
           cache-dependency-path: packages/*/package-lock.json
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Install dependencies
         run: npm run ci:extensions:local

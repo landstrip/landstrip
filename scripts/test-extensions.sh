@@ -54,13 +54,23 @@ mapfile -t extension_dirs < <(list_extensions)
 
 if (( local_root )); then
 	tarball="$(npm pack . --silent)"
+	platform_package="npm/$(node -p '`${process.platform}-${process.arch}`')"
+	[[ -d "$platform_package" ]] || {
+		printf 'no local binary package for %s\n' "$platform_package" >&2
+		exit 1
+	}
+	binary="landstrip"
+	[[ "$platform_package" == npm/win32-* ]] && binary="landstrip.exe"
+	cargo build --locked
+	mkdir -p "$platform_package/bin"
+	install -m 755 "target/debug/$binary" "$platform_package/bin/$binary"
 	trap 'rm -f "$tarball"' EXIT
 fi
 
 for package_dir in "${extension_dirs[@]}"; do
 	if (( local_root )); then
 		npm install --prefix "$package_dir" --workspaces=false --package-lock=false \
-			--ignore-scripts --no-save "./$tarball"
+			--ignore-scripts --no-save "./$tarball" "./$platform_package"
 	else
 		npm ci --prefix "$package_dir" --workspaces=false --ignore-scripts
 	fi
