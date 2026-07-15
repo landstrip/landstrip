@@ -35,6 +35,7 @@ release_files=(
 	npm/darwin-arm64/package.json
 	npm/darwin-x64/package.json
 	npm/linux-x64/package.json
+	npm/linux-arm64/package.json
 	npm/win32-x64/package.json
 	man/man1/landstrip.1
 )
@@ -100,6 +101,7 @@ const corePackagePaths = [
   'npm/darwin-arm64/package.json',
   'npm/darwin-x64/package.json',
   'npm/linux-x64/package.json',
+  'npm/linux-arm64/package.json',
   'npm/win32-x64/package.json',
 ];
 const corePackages = corePackagePaths.map((packagePath) => [

@@ -106,6 +106,7 @@ jobs:
               'npm/darwin-arm64/package.json',
               'npm/darwin-x64/package.json',
               'npm/linux-x64/package.json',
+              'npm/linux-arm64/package.json',
               'npm/win32-x64/package.json',
             ];
             if (!tagHasFile(tag, 'package.json')) {
@@ -159,6 +160,7 @@ jobs:
             'npm/darwin-arm64/package.json',
             'npm/darwin-x64/package.json',
             'npm/linux-x64/package.json',
+            'npm/linux-arm64/package.json',
             'npm/win32-x64/package.json',
           ];
           const root = JSON.parse(readTagFile(latest.tag, 'package.json'));
@@ -220,6 +222,7 @@ jobs:
             'npm/darwin-arm64',
             'npm/darwin-x64',
             'npm/linux-x64',
+            'npm/linux-arm64',
             'npm/win32-x64',
           ];
           const root = JSON.parse(readTagFile('package.json'));
@@ -292,6 +295,12 @@ jobs:
             package_dir: npm/linux-x64
             binary: landstrip
             rustflags: ''
+          - package: linux-arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            package_dir: npm/linux-arm64
+            binary: landstrip
+            rustflags: ''
           - package: win32-x64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
@@ -311,11 +320,11 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install musl target
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: rustup target add x86_64-unknown-linux-musl
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        run: rustup target add ${{ matrix.target }}
 
       - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build binary
         env:
@@ -382,6 +391,11 @@ jobs:
         with:
           name: linux-x64
           path: artifacts/linux-x64
+      - name: Download linux-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: artifacts/linux-arm64
 
       - name: Download win32-x64 binary
         uses: actions/download-artifact@v4
@@ -393,7 +407,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          package_dirs=(npm/darwin-arm64 npm/darwin-x64 npm/linux-x64 npm/win32-x64)
+          package_dirs=(npm/darwin-arm64 npm/darwin-x64 npm/linux-x64 npm/linux-arm64 npm/win32-x64)
           license_files=(LICENSE-APACHE-2.0 LICENSE-LGPL-2.1)
 
           for package_dir in "${package_dirs[@]}"; do
@@ -402,6 +416,7 @@ jobs:
           tar -xzf artifacts/darwin-arm64/darwin-arm64.tar.gz -C npm/darwin-arm64/bin
           tar -xzf artifacts/darwin-x64/darwin-x64.tar.gz -C npm/darwin-x64/bin
           tar -xzf artifacts/linux-x64/linux-x64.tar.gz -C npm/linux-x64/bin
+          tar -xzf artifacts/linux-arm64/linux-arm64.tar.gz -C npm/linux-arm64/bin
           tar -xzf artifacts/win32-x64/win32-x64.tar.gz -C npm/win32-x64/bin
 
           for license_file in "${license_files[@]}"; do
@@ -413,6 +428,7 @@ jobs:
           chmod 755 npm/darwin-arm64/bin/landstrip
           chmod 755 npm/darwin-x64/bin/landstrip
           chmod 755 npm/linux-x64/bin/landstrip
+          chmod 755 npm/linux-arm64/bin/landstrip
           test -f npm/win32-x64/bin/landstrip.exe
 
       - name: Publish Landstrip npm packages
@@ -454,10 +470,12 @@ jobs:
           publish_if_missing npm/darwin-arm64
           publish_if_missing npm/darwin-x64
           publish_if_missing npm/linux-x64
+          publish_if_missing npm/linux-arm64
           publish_if_missing npm/win32-x64
           publish_if_missing .
 
           wait_for_npm_package npm/linux-x64
+          wait_for_npm_package npm/linux-arm64
           wait_for_npm_package .
 
 
@@ -518,6 +536,11 @@ jobs:
         with:
           name: linux-x64
           path: artifacts/linux-x64
+      - name: Download linux-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: artifacts/linux-arm64
 
       - name: Download win32-x64 binary
         uses: actions/download-artifact@v4
@@ -537,6 +560,8 @@ jobs:
             "assets/landstrip-${ver}-darwin-x64.tar.gz"
           mv artifacts/linux-x64/linux-x64.tar.gz \
             "assets/landstrip-${ver}-linux-x64-musl.tar.gz"
+          mv artifacts/linux-arm64/linux-arm64.tar.gz \
+            "assets/landstrip-${ver}-linux-arm64-musl.tar.gz"
           mv artifacts/win32-x64/win32-x64.tar.gz \
             "assets/landstrip-${ver}-win32-x64.tar.gz"
 

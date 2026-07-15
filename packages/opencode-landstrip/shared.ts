@@ -52,6 +52,7 @@ const LANDSTRIP_PACKAGE_NAMES = new Set([
   '@landstrip/landstrip-darwin-arm64',
   '@landstrip/landstrip-darwin-x64',
   '@landstrip/landstrip-linux-x64',
+  '@landstrip/landstrip-linux-arm64',
   '@landstrip/landstrip-win32-x64',
 ]);
 
