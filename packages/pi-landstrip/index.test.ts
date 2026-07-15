@@ -1,11 +1,240 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { homedir } from 'node:os';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
 
-import { matchesPattern, readAllowed, sessionScopeFor, shouldPromptForWrite } from './index.ts';
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ToolDefinition,
+} from '@earendil-works/pi-coding-agent';
+import { describe, expect, it, vi } from 'vitest';
+
+import landstripExtension, {
+  createLandstripIntegration,
+  matchesPattern,
+  isPublicProxyAddress,
+  readAllowed,
+  sessionScopeFor,
+  shouldPromptForWrite,
+  writeEnvFile,
+} from './index.ts';
+import type { SubagentRuntime } from './subagents.ts';
+
+describe('main Pi tool composition', () => {
+  it('leaves filesystem tool names available to Pi plugins', () => {
+    const tools: string[] = [];
+    const pi = {
+      registerTool(tool: ToolDefinition) {
+        tools.push(tool.name);
+      },
+      registerFlag() {},
+      registerCommand() {},
+      on() {},
+    } as unknown as ExtensionAPI;
+    landstripExtension(pi);
+    expect(tools).toEqual(['task', 'bash']);
+    expect(tools).not.toContain('read');
+    expect(tools).not.toContain('write');
+  });
+});
+
+it('registers the tabbed landstrip command and sandbox compatibility alias', async () => {
+  const commandNames: string[] = [];
+  let commandHandler: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  const pi = {
+    registerTool() {},
+    registerFlag() {},
+    registerCommand(
+      name: string,
+      command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+    ) {
+      commandNames.push(name);
+      if (name === 'landstrip') commandHandler = command.handler;
+    },
+    on() {},
+  } as unknown as ExtensionAPI;
+  let selected: string | undefined;
+  const agents = new Map([
+    [
+      'build',
+      {
+        name: 'build',
+        mode: 'primary' as const,
+        prompt: 'Build.',
+        hidden: false,
+        permissions: [],
+        providerOptions: {},
+      },
+    ],
+    [
+      'plan',
+      {
+        name: 'plan',
+        mode: 'primary' as const,
+        prompt: 'Plan.',
+        hidden: false,
+        permissions: [],
+        providerOptions: {},
+      },
+    ],
+  ]);
+  let maxSubagents = 0;
+  const runtime = {
+    getAgentCatalog: () => ({
+      agents,
+      permissions: [],
+      diagnostics: [],
+      warnings: [],
+      maxSubagents: 0,
+    }),
+    getPrimaryAgent: () => agents.get(selected ?? 'build'),
+    getMaxSubagents: () => maxSubagents,
+    setMaxSubagents(value: number) {
+      maxSubagents = value;
+    },
+    selectPrimaryAgent(name: string) {
+      selected = name;
+      return true;
+    },
+  } as unknown as SubagentRuntime;
+  createLandstripIntegration({ registerBashTool: false }).register(pi, runtime);
+  const ctx = {
+    cwd: join(tmpdir(), 'pi-landstrip-overlay-test'),
+    hasUI: true,
+    mode: 'tui',
+    isProjectTrusted: () => false,
+    ui: {
+      async custom(factory: (...args: unknown[]) => unknown) {
+        component = factory(
+          { requestRender() {} },
+          { fg: (_color: string, value: string) => value },
+          undefined,
+          () => {},
+        ) as typeof component;
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  await commandHandler?.('', ctx);
+  expect(commandNames).toEqual(['landstrip', 'sandbox']);
+  const sandboxView = component?.render(78).join('\n') ?? '';
+  expect(sandboxView).toContain('Sandbox │ Agents │ Settings');
+  expect(sandboxView).not.toContain('toggle persisted setting');
+  component?.handleInput('\t');
+  component?.handleInput('\x1b[B');
+  component?.handleInput('\r');
+  expect(selected).toBe('plan');
+  component?.handleInput('\t');
+  expect(component?.render(78).join('\n')).toContain('[x] Sandbox');
+  expect(component?.render(78).join('\n')).toContain('Maximum concurrent subagents (0-16)');
+  component?.handleInput('\x1b[B');
+  component?.handleInput('1');
+  component?.handleInput('6');
+  component?.handleInput('7');
+  expect(component?.render(78).join('\n')).toContain('[ 16 ] Maximum concurrent subagents');
+});
+
+describe('proxy destination addresses', () => {
+  it('accepts public addresses', () => {
+    expect(isPublicProxyAddress('8.8.8.8')).toBe(true);
+    expect(isPublicProxyAddress('2606:4700:4700::1111')).toBe(true);
+  });
+
+  it('rejects local and private addresses', () => {
+    expect(isPublicProxyAddress('127.0.0.1')).toBe(false);
+    expect(isPublicProxyAddress('10.0.0.1')).toBe(false);
+    expect(isPublicProxyAddress('169.254.169.254')).toBe(false);
+    expect(isPublicProxyAddress('::1')).toBe(false);
+    expect(isPublicProxyAddress('fd00::1')).toBe(false);
+  });
+});
+
+it('rejects a pre-aborted RPC worker startup before allocating resources', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  const integration = createLandstripIntegration();
+
+  await expect(
+    integration.prepareRpcWorker({
+      command: 'pi',
+      args: [],
+      cwd: PROJECT,
+      env: {},
+      ctx: {} as never,
+      readPaths: [],
+      writePaths: [],
+      signal: controller.signal,
+    }),
+  ).rejects.toThrow('Task cancelled');
+});
+
+it('allows RPC workers when sandboxing is explicitly disabled', async () => {
+  let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<void> | void) | undefined;
+  const notifications: string[] = [];
+  const pi = {
+    registerFlag() {},
+    registerCommand() {},
+    registerTool() {},
+    getFlag: (name: string) => name === 'no-sandbox',
+    on(event: string, handler: unknown) {
+      if (event === 'session_start') sessionStart = handler as typeof sessionStart;
+    },
+  } as unknown as ExtensionAPI;
+  const ctx = {
+    cwd: process.cwd(),
+    hasUI: true,
+    mode: 'tui',
+    isProjectTrusted: () => false,
+    ui: {
+      notify(message: string) {
+        notifications.push(message);
+      },
+      setStatus() {},
+    },
+  } as unknown as ExtensionContext;
+  const integration = createLandstripIntegration({ registerBashTool: false });
+  integration.register(pi);
+  await sessionStart?.({}, ctx);
+
+  const launch = await integration.prepareRpcWorker({
+    command: process.execPath,
+    args: ['--version'],
+    cwd: process.cwd(),
+    env: {},
+    ctx,
+    readPaths: [],
+    writePaths: [],
+  });
+
+  expect(launch.command).toBe(process.execPath);
+  expect(launch.args).toEqual(['--version']);
+  expect(notifications).toContain('Subagent processes are running without Landstrip sandboxing');
+
+  const child = launch.spawn?.(
+    launch.command,
+    [
+      '-e',
+      "const { spawn } = require('node:child_process'); const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); process.stdout.write(`${child.pid}\\n`); setInterval(() => {}, 1000);",
+    ],
+    { stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+  expect(child).toBeDefined();
+  const descendantPid = await new Promise<number>((resolve, reject) => {
+    child?.once('error', reject);
+    child?.stdout.once('data', (data) => resolve(Number.parseInt(data.toString(), 10)));
+  });
+  const exited = new Promise<void>((resolve) => child?.once('exit', () => resolve()));
+  expect(child?.kill('SIGKILL')).toBe(true);
+  await exited;
+  await vi.waitFor(() => {
+    expect(() => process.kill(descendantPid, 0)).toThrow();
+  });
+  await launch.dispose();
+});
 
 // The broker resolves relative policy entries (notably ".") against the command
 // `cwd` that landstrip uses as its policy base. Regression guard: before the fix
@@ -137,10 +366,6 @@ describe('readAllowed', () => {
     expect(readAllowed('/etc/passwd', ['.'], DENY, cwd)).toBe(false);
   });
 });
-
-import { existsSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { writeEnvFile } from './index.ts';
 
 describe('writeEnvFile', () => {
   it('writes export statements for each env var', () => {

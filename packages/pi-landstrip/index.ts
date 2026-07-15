@@ -2,6 +2,8 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { spawn, spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { lookup } from 'node:dns/promises';
 import {
   existsSync,
   mkdirSync,
@@ -13,15 +15,17 @@ import {
 } from 'node:fs';
 import {
   type AddressInfo,
+  BlockList,
   connect as connectNet,
   createServer,
+  isIP,
   type Socket,
   Socket as NetSocket,
 } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
-import { fileURLToPath } from 'node:url';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
-import { URL } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
+import { fileURLToPath, URL } from 'node:url';
 
 import type {
   AgentToolResult,
@@ -38,11 +42,10 @@ import {
   createBashToolDefinition,
   getAgentDir,
   getShellConfig,
-  isToolCallEventType,
   SettingsManager,
   withFileMutationQueue,
 } from '@earendil-works/pi-coding-agent';
-import { Key, matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
+import { matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 import {
   binaryPath,
   type LandstripControlResponse,
@@ -50,6 +53,15 @@ import {
   type LandstripNetworkTrap,
   type LandstripTrap,
 } from '@landstrip/landstrip';
+import type { RpcSpawn } from './rpc-process.ts';
+import {
+  type SubagentRuntime,
+  registerSubagents,
+  registerSubagentWorker,
+  workerConfigFromEnvironment,
+} from './subagents.ts';
+import { availablePrimaryAgents } from './agents.ts';
+import { MAX_SUBAGENTS, setMaxSubagentsConfig } from './config.ts';
 
 interface SandboxFilesystemConfig {
   denyRead: string[];
@@ -106,14 +118,47 @@ interface LandstripBashCallbacks {
   promptOnBlock?: boolean;
 }
 
+interface ExecutionAllowances {
+  readonly domains: string[];
+  readonly readPaths: string[];
+  readonly writePaths: string[];
+  readonly targets: string[];
+}
+
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
+const prohibitedProxyAddresses = new BlockList();
+
+for (const [network, prefix] of [
+  ['0.0.0.0', 8],
+  ['10.0.0.0', 8],
+  ['100.64.0.0', 10],
+  ['127.0.0.0', 8],
+  ['169.254.0.0', 16],
+  ['172.16.0.0', 12],
+  ['192.0.0.0', 24],
+  ['192.168.0.0', 16],
+  ['198.18.0.0', 15],
+  ['224.0.0.0', 4],
+  ['240.0.0.0', 4],
+] as const) {
+  prohibitedProxyAddresses.addSubnet(network, prefix, 'ipv4');
+}
+for (const [network, prefix] of [
+  ['::', 128],
+  ['::1', 128],
+  ['fc00::', 7],
+  ['fe80::', 10],
+  ['ff00::', 8],
+] as const) {
+  prohibitedProxyAddresses.addSubnet(network, prefix, 'ipv6');
+}
 
 // Grace period after the child exits for its stdio to drain before we stop
 // waiting; matches pi's own bash backend so a backgrounded process cannot hang us.
 const EXIT_STDIO_GRACE_MS = 100;
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
-type PermissionChoice = 'abort' | 'session' | 'project' | 'global';
+type PermissionChoice = 'abort' | 'once' | 'session' | 'project' | 'global';
 type NotificationLevel = Parameters<ExtensionContext['ui']['notify']>[1];
 
 interface PromptOption {
@@ -125,6 +170,7 @@ interface PromptOption {
 }
 
 const PERMISSION_OPTIONS: PromptOption[] = [
+  { label: 'Allow once', key: 'o', action: 'once' },
   { label: 'Allow for this session only', key: 's', action: 'session' },
   { label: 'Abort (keep blocked)', key: 'esc', action: 'abort' },
   {
@@ -144,11 +190,12 @@ const PERMISSION_OPTIONS: PromptOption[] = [
 ];
 
 const NETWORK_PERMISSION_OPTIONS: PromptOption[] = [
+  { label: 'Allow once', key: 'o', action: 'once' },
   { label: 'Allow for this session only', key: 's', action: 'session' },
   { label: 'Abort (keep blocked)', key: 'esc', action: 'abort' },
 ];
 
-function loadConfig(cwd: string): SandboxConfig {
+function loadSandboxConfig(cwd: string, includeProject: boolean): SandboxConfig {
   const projectConfigPath = join(cwd, '.pi', 'sandbox.json');
   const globalConfigPath = join(getAgentDir(), 'sandbox.json');
 
@@ -168,7 +215,7 @@ function loadConfig(cwd: string): SandboxConfig {
     console.error(`Warning: Could not parse ${globalConfigPath}: ${error}`);
   }
 
-  if (existsSync(projectConfigPath)) {
+  if (includeProject && existsSync(projectConfigPath)) {
     try {
       const projectConfig = JSON.parse(readFileSync(projectConfigPath, 'utf-8'));
       return deepMerge(globalConfig, projectConfig);
@@ -226,19 +273,26 @@ function readOrEmptyConfig(configPath: string): SandboxConfigFile {
 
 function writeConfigFile(configPath: string, config: SandboxConfigFile): void {
   mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf-8');
+  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf-8');
 }
 
-function getSandboxConfigWriteTarget(cwd: string): { scope: SandboxConfigScope; path: string } {
+function getSandboxConfigWriteTarget(
+  cwd: string,
+  includeProject = true,
+): { scope: SandboxConfigScope; path: string } {
   const { globalPath, projectPath } = getConfigPaths(cwd);
-  const projectConfig = readOrEmptyConfig(projectPath);
-
-  if (projectConfig.enabled !== undefined) return { scope: 'project', path: projectPath };
+  if (includeProject && existsSync(projectPath)) {
+    return { scope: 'project', path: projectPath };
+  }
   return { scope: 'global', path: globalPath };
 }
 
-async function setSandboxConfigEnabled(cwd: string, enabled: boolean): Promise<SandboxConfigScope> {
-  const { scope, path } = getSandboxConfigWriteTarget(cwd);
+async function setSandboxConfigEnabled(
+  cwd: string,
+  enabled: boolean,
+  includeProject = true,
+): Promise<SandboxConfigScope> {
+  const { scope, path } = getSandboxConfigWriteTarget(cwd, includeProject);
   await withFileMutationQueue(path, async () => {
     const config = readOrEmptyConfig(path);
     config.enabled = enabled;
@@ -289,18 +343,6 @@ async function addWritePathToConfig(configPath: string, pathToAdd: string): Prom
     };
     writeConfigFile(configPath, config);
   });
-}
-
-function extractDomainsFromCommand(command: string): string[] {
-  const urlRegex = /https?:\/\/([^\s/:?#]+)(?::\d+)?(?:[/?#]|\s|$)/g;
-  const domains = new Set<string>();
-  let match: RegExpExecArray | null;
-
-  while ((match = urlRegex.exec(command)) !== null) {
-    domains.add(match[1]);
-  }
-
-  return [...domains];
 }
 
 function domainMatchesPattern(domain: string, pattern: string): boolean {
@@ -667,7 +709,7 @@ function notify(ctx: ExtensionContext, message: string, level: NotificationLevel
 
 function hasTuiStatus(ctx: ExtensionContext): boolean {
   if (!ctx.hasUI) return false;
-  const mode = 'mode' in ctx ? (ctx as Record<string, unknown>).mode : undefined;
+  const mode = ctx.mode;
   return mode === undefined || mode === 'tui';
 }
 
@@ -695,158 +737,55 @@ function boxBottom(theme: Theme, width: number): string {
   return `${border('╰')}${border('─'.repeat(Math.max(0, width - 2)))}${border('╯')}`;
 }
 
+let permissionPromptTail = Promise.resolve();
+
 async function showPermissionPrompt(
   ctx: ExtensionContext,
   title: string,
   options: PromptOption[],
+  signal?: AbortSignal,
 ): Promise<PermissionChoice> {
   if (!ctx.hasUI) return 'abort';
 
-  const result = await ctx.ui.custom<PermissionChoice>(
-    (tui, theme, _kb, done) => {
-      let selectedIndex = 0;
-      let pendingAction: PermissionChoice | null = null;
+  let releasePrompt: (() => void) | undefined;
+  const previousPrompt = permissionPromptTail;
+  permissionPromptTail = new Promise<void>((resolve) => {
+    releasePrompt = resolve;
+  });
+  await previousPrompt;
 
-      function resolveChoice(action: PermissionChoice): void {
-        done(action);
-      }
-
-      return {
-        render(width: number): string[] {
-          const innerW = Math.max(1, width - 4);
-          const lines: string[] = [];
-          const dim = (s: string) => theme.fg('dim', s);
-
-          lines.push(boxTop(theme, width, 'Sandbox'));
-          lines.push(boxRow(theme, width));
-          lines.push(boxRow(theme, width, theme.fg('warning', title)));
-          lines.push(boxRow(theme, width));
-
-          // Options
-          for (let i = 0; i < options.length; i++) {
-            const option = options[i];
-            const isSelected = i === selectedIndex;
-            const isPending = pendingAction === option.action;
-
-            // Section divider before the permanent options (index 2 and 3)
-            if (i === 2) {
-              lines.push(boxRow(theme, width));
-              const secLabel = ' Permanent ';
-              const secDash = '─'.repeat(Math.max(0, innerW - visibleWidth(secLabel)));
-              lines.push(boxRow(theme, width, dim(secDash + secLabel)));
-              lines.push(boxRow(theme, width));
-            }
-
-            // Key badge
-            const keyBadge = isSelected
-              ? theme.fg('accent', `[${option.key}]`)
-              : dim(` ${option.key} `);
-
-            // Selection indicator
-            let cursor: string;
-            if (isSelected && isPending) {
-              cursor = theme.fg('warning', '▶');
-            } else if (isSelected) {
-              cursor = theme.fg('accent', '▶');
-            } else {
-              cursor = ' ';
-            }
-
-            // Label
-            let label: string;
-            if (isPending) {
-              label = theme.fg('warning', option.label + '  — press Enter to confirm');
-            } else if (isSelected) {
-              label = theme.fg('text', option.label);
-            } else {
-              label = dim(option.label);
-            }
-
-            // Hint
-            let hint = '';
-            if (option.hint && !isPending) {
-              hint = '  ' + dim(option.hint);
-            }
-
-            const fullLine = ` ${cursor} ${keyBadge} ${label}${hint}`;
-            lines.push(boxRow(theme, width, fullLine));
-          }
-
-          // Footer
-          lines.push(boxRow(theme, width));
-          const footerText = pendingAction
-            ? '↑↓ navigate  enter confirm  esc cancel'
-            : '↑↓ navigate  enter select  esc dismiss';
-          lines.push(boxRow(theme, width, dim(footerText)));
-          lines.push(boxBottom(theme, width));
-
-          return lines;
-        },
-
-        handleInput(data: string): void {
-          if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl('c'))) {
-            resolveChoice('abort');
-            return;
-          }
-
-          if (matchesKey(data, Key.enter)) {
-            resolveChoice(pendingAction ?? options[selectedIndex]?.action ?? 'abort');
-            return;
-          }
-
-          if (matchesKey(data, Key.up)) {
-            selectedIndex = Math.max(0, selectedIndex - 1);
-            pendingAction = null;
-            tui.requestRender();
-            return;
-          }
-
-          if (matchesKey(data, Key.down)) {
-            selectedIndex = Math.min(options.length - 1, selectedIndex + 1);
-            pendingAction = null;
-            tui.requestRender();
-            return;
-          }
-
-          for (let i = 0; i < options.length; i++) {
-            const option = options[i];
-
-            // Match case-insensitively so a `confirm` option always arms its
-            // two-step gate; an exact-key shortcut here would skip it.
-            if (data.toLowerCase() === option.key.toLowerCase()) {
-              if (option.confirm) {
-                pendingAction = option.action;
-                selectedIndex = i;
-              } else {
-                resolveChoice(option.action);
-              }
-              tui.requestRender();
-              return;
-            }
-          }
-        },
-
-        invalidate(): void {},
-      };
-    },
-    {
-      overlay: true,
-      overlayOptions: {
-        anchor: 'center',
-        width: 72,
-        margin: 2,
-      },
-    },
-  );
-
-  return result ?? 'abort';
+  try {
+    const labels = options.map((option) =>
+      option.hint ? `${option.label} ${option.hint}` : option.label,
+    );
+    const selected = await ctx.ui.select(title, labels, { signal });
+    const index = selected === undefined ? -1 : labels.indexOf(selected);
+    const option = options[index];
+    if (!option) return 'abort';
+    if (option.confirm) {
+      const confirmed = await ctx.ui.confirm(
+        `Confirm ${option.label.toLowerCase()}`,
+        option.hint ?? 'This changes persisted sandbox policy.',
+        { signal },
+      );
+      if (!confirmed) return 'abort';
+    }
+    return option.action;
+  } finally {
+    releasePrompt?.();
+  }
 }
 
-function promptDomainBlock(ctx: ExtensionContext, domain: string): Promise<PermissionChoice> {
+function promptDomainBlock(
+  ctx: ExtensionContext,
+  domain: string,
+  signal?: AbortSignal,
+): Promise<PermissionChoice> {
   return showPermissionPrompt(
     ctx,
     `Network blocked: "${domain}" is not in allowedDomains`,
     PERMISSION_OPTIONS,
+    signal,
   );
 }
 
@@ -854,22 +793,28 @@ function promptReadBlock(
   ctx: ExtensionContext,
   filePath: string,
   reason?: string,
+  signal?: AbortSignal,
 ): Promise<PermissionChoice> {
   const title = reason
     ? `Read blocked: "${filePath}" is in denyRead (${reason})`
     : `Read blocked: "${filePath}" is not in allowRead`;
-  return showPermissionPrompt(ctx, title, PERMISSION_OPTIONS);
+  return showPermissionPrompt(ctx, title, PERMISSION_OPTIONS, signal);
 }
 
-function promptWriteBlock(ctx: ExtensionContext, filePath: string): Promise<PermissionChoice> {
+function promptWriteBlock(
+  ctx: ExtensionContext,
+  filePath: string,
+  signal?: AbortSignal,
+): Promise<PermissionChoice> {
   return showPermissionPrompt(
     ctx,
     `Write blocked: "${filePath}" is not in allowWrite`,
     PERMISSION_OPTIONS,
+    signal,
   );
 }
 
-// The broker knows only address:port, and no sandbox.json field can express a
+// The broker knows only address:port, and no sandbox field can express a
 // grant for one: allowedDomains is a hostname list enforced by the proxy, and the
 // landstrip network policy is all-or-nothing (allowNetwork, allowLocalBinding).
 // So a connection is granted for the session or not at all.
@@ -877,11 +822,13 @@ function promptNetworkBlock(
   ctx: ExtensionContext,
   operation: string,
   target: string,
+  signal?: AbortSignal,
 ): Promise<PermissionChoice> {
   return showPermissionPrompt(
     ctx,
     `Network blocked: ${operation} to "${target}"`,
     NETWORK_PERMISSION_OPTIONS,
+    signal,
   );
 }
 
@@ -892,6 +839,14 @@ function landstripAvailable(): boolean {
     return spawnSync(binaryPath(), ['--version']).status === 0;
   } catch {
     return false;
+  }
+}
+
+function landstripDisplayPath(): string {
+  try {
+    return binaryPath();
+  } catch {
+    return 'unavailable';
   }
 }
 
@@ -965,6 +920,34 @@ function denyProxyRequest(client: Socket, status = '403 Forbidden'): void {
   client.end();
 }
 
+export function isPublicProxyAddress(address: string, family = isIP(address)): boolean {
+  if (family === 4) return !prohibitedProxyAddresses.check(address, 'ipv4');
+  if (family === 6) return !prohibitedProxyAddresses.check(address, 'ipv6');
+  return false;
+}
+
+async function resolveProxyEndpoint(host: string): Promise<{ address: string; family: 4 | 6 }> {
+  const literalFamily = isIP(host);
+  if (literalFamily === 4 || literalFamily === 6) {
+    if (!isPublicProxyAddress(host, literalFamily)) {
+      throw new Error(`Proxy destination is not public: ${host}`);
+    }
+    return { address: host, family: literalFamily };
+  }
+  const addresses = await lookup(host, { all: true, verbatim: true });
+  if (
+    addresses.length === 0 ||
+    addresses.some(({ address, family }) => !isPublicProxyAddress(address, family))
+  ) {
+    throw new Error(`Proxy destination resolves to a non-public address: ${host}`);
+  }
+  const endpoint = addresses[0];
+  if (!endpoint || (endpoint.family !== 4 && endpoint.family !== 6)) {
+    throw new Error(`Proxy could not resolve destination: ${host}`);
+  }
+  return { address: endpoint.address, family: endpoint.family };
+}
+
 function pipeSockets(client: Socket, upstream: Socket, initialData?: Buffer): void {
   upstream.on('error', () => client.destroy());
   client.on('error', () => upstream.destroy());
@@ -989,13 +972,42 @@ export interface LandstripIntegrationOptions {
 export interface LandstripIntegration {
   /** Create a bash tool definition that runs commands through landstrip when enabled. */
   createBashTool(cwd: string, ctx?: ExtensionContext): LandstripBashTool;
+  /** Prepare a full Pi RPC process constrained by the effective sandbox policy. */
+  prepareRpcWorker(options: LandstripRpcWorkerOptions): Promise<LandstripRpcWorkerLaunch>;
   /** Register the integration's tools, events, flags, and commands with Pi. */
-  register(pi: ExtensionAPI): void;
+  register(pi: ExtensionAPI, runtime?: SubagentRuntime): void;
+}
+
+export interface LandstripRpcWorkerOptions {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly ctx: ExtensionContext;
+  readonly readPaths: readonly string[];
+  readonly writePaths: readonly string[];
+  readonly signal?: AbortSignal;
+}
+
+export interface LandstripRpcWorkerLaunch {
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly spawn: RpcSpawn;
+  dispose(): Promise<void>;
 }
 
 /** Register the landstrip extension with Pi. */
 export default function (pi: ExtensionAPI) {
-  createLandstripIntegration().register(pi);
+  const workerConfig = workerConfigFromEnvironment();
+  if (workerConfig) {
+    registerSubagentWorker(pi, workerConfig);
+    return;
+  }
+  const integration = createLandstripIntegration();
+  const runtime = registerSubagents(pi, integration);
+  integration.register(pi, runtime);
 }
 
 /** Create a landstrip integration for registration or custom embedding. */
@@ -1004,6 +1016,11 @@ export function createLandstripIntegration(
 ): LandstripIntegration {
   const shouldRegisterBashTool = options.registerBashTool ?? true;
   const localCwd = options.cwd ?? process.cwd();
+  let projectConfigTrusted = false;
+
+  function loadConfig(cwd: string): SandboxConfig {
+    return loadSandboxConfig(cwd, projectConfigTrusted);
+  }
 
   function createPlainBashTool(cwd: string): LandstripBashTool {
     return createBashToolDefinition(cwd, {
@@ -1013,6 +1030,7 @@ export function createLandstripIntegration(
 
   let sandboxEnabled = false;
   let sandboxReady = false;
+  let unsandboxedWorkerWarningShown = false;
   const sessionAllowedDomains: string[] = [];
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
@@ -1023,29 +1041,53 @@ export function createLandstripIntegration(
     sessionAllowedReadPaths.length = 0;
     sessionAllowedWritePaths.length = 0;
     sessionAllowedTargets.length = 0;
+    unsandboxedWorkerWarningShown = false;
   }
 
-  function getEffectiveAllowedDomains(config: SandboxConfig): string[] {
-    return [...config.network.allowedDomains, ...sessionAllowedDomains];
+  function getEffectiveAllowedDomains(
+    config: SandboxConfig,
+    allowances?: ExecutionAllowances,
+  ): string[] {
+    return [
+      ...config.network.allowedDomains,
+      ...sessionAllowedDomains,
+      ...(allowances?.domains ?? []),
+    ];
   }
 
-  function getEffectiveAllowRead(config: SandboxConfig): string[] {
-    return [...config.filesystem.allowRead, ...sessionAllowedReadPaths];
+  function getEffectiveAllowRead(
+    config: SandboxConfig,
+    allowances?: ExecutionAllowances,
+  ): string[] {
+    return [
+      ...config.filesystem.allowRead,
+      ...sessionAllowedReadPaths,
+      ...(allowances?.readPaths ?? []),
+    ];
   }
 
-  function getEffectiveAllowWrite(config: SandboxConfig): string[] {
-    return [...config.filesystem.allowWrite, ...sessionAllowedWritePaths];
+  function getEffectiveAllowWrite(
+    config: SandboxConfig,
+    allowances?: ExecutionAllowances,
+  ): string[] {
+    return [
+      ...config.filesystem.allowWrite,
+      ...sessionAllowedWritePaths,
+      ...(allowances?.writePaths ?? []),
+    ];
   }
 
   async function applyDomainChoice(
     choice: Exclude<PermissionChoice, 'abort'>,
     domain: string,
     cwd: string,
+    allowances?: ExecutionAllowances,
   ): Promise<void> {
     const { globalPath, projectPath } = getConfigPaths(cwd);
-    if (!sessionAllowedDomains.includes(domain)) sessionAllowedDomains.push(domain);
     if (choice === 'project') await addDomainToConfig(projectPath, domain);
     if (choice === 'global') await addDomainToConfig(globalPath, domain);
+    const target = choice === 'once' ? allowances?.domains : sessionAllowedDomains;
+    if (target && !target.includes(domain)) target.push(domain);
   }
 
   // Breadth-first: approve the broadest reasonable ancestor of the blocked file
@@ -1067,38 +1109,15 @@ export function createLandstripIntegration(
     choice: Exclude<PermissionChoice, 'abort'>,
     filePath: string,
     cwd: string,
+    allowances?: ExecutionAllowances,
   ): Promise<void> {
     const { globalPath, projectPath } = getConfigPaths(cwd);
     const scope = sessionScopeFor(filePath, cwd);
-    if (!sessionAllowedReadPaths.includes(scope)) sessionAllowedReadPaths.push(scope);
     if (choice === 'project') await addReadPathToConfig(projectPath, scope);
     if (choice === 'global') await addReadPathToConfig(globalPath, scope);
+    const target = choice === 'once' ? allowances?.readPaths : sessionAllowedReadPaths;
+    if (target && !target.includes(scope)) target.push(scope);
     noteScope(ctx, 'Read', choice, filePath, scope);
-  }
-
-  // Gate a read of `filePath` against allowRead/denyRead, prompting when blocked.
-  // Returns a block result when the user aborts, otherwise undefined once access
-  // is settled. Shared by the read, grep, ls and find tools.
-  async function gateReadAccess(
-    ctx: ExtensionContext,
-    config: SandboxConfig,
-    filePath: string,
-  ): Promise<{ block: true; reason: string } | undefined> {
-    if (readAllowed(filePath, getEffectiveAllowRead(config), config.filesystem.denyRead, ctx.cwd)) {
-      return undefined;
-    }
-    const choice = await promptReadBlock(
-      ctx,
-      filePath,
-      matchesPattern(filePath, config.filesystem.denyRead, ctx.cwd)
-        ? 'granting allowRead will override it'
-        : undefined,
-    );
-    if (choice === 'abort') {
-      return { block: true, reason: `Sandbox: read access denied for "${filePath}"` };
-    }
-    await applyReadChoice(ctx, choice, filePath, ctx.cwd);
-    return undefined;
   }
 
   async function applyWriteChoice(
@@ -1106,12 +1125,14 @@ export function createLandstripIntegration(
     choice: Exclude<PermissionChoice, 'abort'>,
     filePath: string,
     cwd: string,
+    allowances?: ExecutionAllowances,
   ): Promise<void> {
     const { globalPath, projectPath } = getConfigPaths(cwd);
     const scope = sessionScopeFor(filePath, cwd);
-    if (!sessionAllowedWritePaths.includes(scope)) sessionAllowedWritePaths.push(scope);
     if (choice === 'project') await addWritePathToConfig(projectPath, scope);
     if (choice === 'global') await addWritePathToConfig(globalPath, scope);
+    const target = choice === 'once' ? allowances?.writePaths : sessionAllowedWritePaths;
+    if (target && !target.includes(scope)) target.push(scope);
     noteScope(ctx, 'Write', choice, filePath, scope);
   }
 
@@ -1119,20 +1140,26 @@ export function createLandstripIntegration(
     ctx: ExtensionContext,
     domain: string,
     cwd: string,
+    allowances?: ExecutionAllowances,
+    signal?: AbortSignal,
   ): Promise<boolean> {
     const config = loadConfig(cwd);
 
     if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
-    if (domainMatchesAny(domain, getEffectiveAllowedDomains(config))) return true;
+    if (domainMatchesAny(domain, getEffectiveAllowedDomains(config, allowances))) return true;
 
-    const choice = await promptDomainBlock(ctx, domain);
+    const choice = await promptDomainBlock(ctx, domain, signal);
     if (choice === 'abort') return false;
 
-    await applyDomainChoice(choice, domain, cwd);
+    await applyDomainChoice(choice, domain, cwd, allowances);
     return true;
   }
 
-  function buildLandstripPolicy(cwd: string, proxyPort: number | null): LandstripPolicy {
+  function buildLandstripPolicy(
+    cwd: string,
+    proxyPort: number | null,
+    allowances?: ExecutionAllowances,
+  ): LandstripPolicy {
     const config = loadConfig(cwd);
 
     return {
@@ -1145,32 +1172,41 @@ export function createLandstripIntegration(
       },
       filesystem: {
         denyRead: config.filesystem.denyRead,
-        allowRead: getEffectiveAllowRead(config),
-        allowWrite: getEffectiveAllowWrite(config),
+        allowRead: getEffectiveAllowRead(config, allowances),
+        allowWrite: getEffectiveAllowWrite(config, allowances),
         denyWrite: config.filesystem.denyWrite,
       },
     };
   }
 
-  function writePolicyFile(cwd: string, proxyPort: number | null): { dir: string; path: string } {
+  function writePolicyFile(
+    cwd: string,
+    proxyPort: number | null,
+    allowances?: ExecutionAllowances,
+  ): { dir: string; path: string } {
     const dir = mkdtempSync(join(tmpdir(), 'pi-landstrip-'));
     const path = join(dir, 'policy.json');
     writeFileSync(
       path,
-      JSON.stringify(buildLandstripPolicy(cwd, proxyPort), null, 2) + '\n',
+      JSON.stringify(buildLandstripPolicy(cwd, proxyPort, allowances), null, 2) + '\n',
       'utf-8',
     );
 
     return { dir, path };
   }
 
-  function startProxy(cwd: string): Promise<{ port: number; stop: () => Promise<void> }> {
+  function startProxy(
+    ctx: ExtensionContext,
+    allowances: ExecutionAllowances,
+    signal?: AbortSignal,
+    authorization?: string,
+  ): Promise<{ port: number; stop: () => Promise<void> }> {
     const sockets = new Set<Socket>();
 
-    function domainAllowed(domain: string): boolean {
-      const config = loadConfig(cwd);
+    async function domainAllowed(domain: string): Promise<boolean> {
+      const config = loadConfig(ctx.cwd);
       if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
-      return domainMatchesAny(domain, getEffectiveAllowedDomains(config));
+      return ensureDomainAllowed(ctx, domain, ctx.cwd, allowances, signal);
     }
 
     // Track the upstream socket so stop() tears it down, and abandon a still-
@@ -1191,17 +1227,21 @@ export function createLandstripIntegration(
         return;
       }
 
-      if (!domainAllowed(endpoint.host)) {
+      if (!(await domainAllowed(endpoint.host))) {
         denyProxyRequest(client);
         return;
       }
 
+      const resolved = await resolveProxyEndpoint(endpoint.host);
       let settled = false;
-      const upstream = connectNet(endpoint.port, endpoint.host, () => {
-        settled = true;
-        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        pipeSockets(client, upstream, rest);
-      });
+      const upstream = connectNet(
+        { host: resolved.address, port: endpoint.port, family: resolved.family },
+        () => {
+          settled = true;
+          client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          pipeSockets(client, upstream, rest);
+        },
+      );
       trackUpstream(upstream, client, () => settled);
       upstream.once('error', () => {
         if (settled) return;
@@ -1240,7 +1280,7 @@ export function createLandstripIntegration(
         }
       }
 
-      if (!domainAllowed(url.hostname)) {
+      if (!(await domainAllowed(url.hostname))) {
         denyProxyRequest(client);
         return;
       }
@@ -1255,10 +1295,15 @@ export function createLandstripIntegration(
       lines[0] = `${method} ${path} ${version}`;
 
       const rewrittenHeader = lines
-        .filter((line) => !line.toLowerCase().startsWith('proxy-connection:'))
+        .filter(
+          (line) =>
+            !line.toLowerCase().startsWith('proxy-connection:') &&
+            !line.toLowerCase().startsWith('proxy-authorization:'),
+        )
         .join('\r\n');
+      const resolved = await resolveProxyEndpoint(url.hostname);
       let settled = false;
-      const upstream = connectNet(port, url.hostname, () => {
+      const upstream = connectNet({ host: resolved.address, port, family: resolved.family }, () => {
         settled = true;
         upstream.write(`${rewrittenHeader}\r\n\r\n`);
         pipeSockets(client, upstream, rest);
@@ -1292,6 +1337,17 @@ export function createLandstripIntegration(
 
         const header = buffered.subarray(0, headerEnd).toString('utf-8');
         const rest = buffered.subarray(headerEnd + 4);
+        if (authorization) {
+          const supplied = header
+            .split(/\r?\n/)
+            .find((line) => line.toLowerCase().startsWith('proxy-authorization:'))
+            ?.slice('proxy-authorization:'.length)
+            .trim();
+          if (supplied !== authorization) {
+            denyProxyRequest(client, '407 Proxy Authentication Required');
+            return;
+          }
+        }
         const firstLine = header.split(/\r?\n/, 1)[0];
         const [method, target] = firstLine.split(' ');
 
@@ -1351,9 +1407,278 @@ export function createLandstripIntegration(
     });
   }
 
+  function attachWorkerTrap(
+    socket: NetSocket,
+    ctx: ExtensionContext,
+    cwd: string,
+    allowances: ExecutionAllowances,
+    signal?: AbortSignal,
+  ): void {
+    const decoder = new StringDecoder('utf8');
+    let buffer = '';
+    let prompts = Promise.resolve();
+    const reportTrapError = (message: string): void => {
+      notify(ctx, message, 'error');
+      if (!ctx.hasUI) console.error(`pi-landstrip: ${message}`);
+    };
+    const respond = (queryId: string, action: LandstripControlResponse['action']): void => {
+      if (socket.destroyed) return;
+      socket.write(controlResponseLine(queryId, action), (error) => {
+        if (error) reportTrapError(`Worker sandbox control response failed: ${error.message}`);
+      });
+    };
+
+    const handleFilesystem = (trap: LandstripFilesystemTrap): void => {
+      const path = normalizeBlockedPath(trap.path, cwd);
+      prompts = prompts
+        .then(async () => {
+          const config = loadConfig(cwd);
+          const allowed =
+            trap.operation === 'read'
+              ? readAllowed(
+                  path,
+                  getEffectiveAllowRead(config, allowances),
+                  config.filesystem.denyRead,
+                  cwd,
+                )
+              : !matchesPattern(path, config.filesystem.denyWrite, cwd) &&
+                !shouldPromptForWrite(path, getEffectiveAllowWrite(config, allowances), cwd);
+          if (allowed) {
+            respond(trap.query_id, 'allow');
+            return;
+          }
+          if (
+            trap.operation === 'write' &&
+            matchesPattern(path, config.filesystem.denyWrite, cwd)
+          ) {
+            respond(trap.query_id, 'deny');
+            return;
+          }
+          const choice =
+            trap.operation === 'read'
+              ? await promptReadBlock(ctx, path, undefined, signal)
+              : await promptWriteBlock(ctx, path, signal);
+          if (choice === 'abort') {
+            respond(trap.query_id, 'deny');
+            return;
+          }
+          if (trap.operation === 'read') {
+            await applyReadChoice(ctx, choice, path, cwd, allowances);
+          } else {
+            await applyWriteChoice(ctx, choice, path, cwd, allowances);
+          }
+          respond(trap.query_id, 'allow');
+        })
+        .catch(() => respond(trap.query_id, 'deny'));
+    };
+
+    const handleNetwork = (trap: LandstripNetworkTrap): void => {
+      const key = `${trap.operation}\u0000${trap.target}`;
+      prompts = prompts
+        .then(async () => {
+          if (sessionAllowedTargets.includes(key) || allowances.targets.includes(key)) {
+            respond(trap.query_id, 'allow');
+            return;
+          }
+          const choice = await promptNetworkBlock(ctx, trap.operation, trap.target, signal);
+          if (choice === 'abort') {
+            respond(trap.query_id, 'deny');
+            return;
+          }
+          const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
+          targets.push(key);
+          respond(trap.query_id, 'allow');
+        })
+        .catch(() => respond(trap.query_id, 'deny'));
+    };
+
+    socket.on('error', (error) => {
+      reportTrapError(`Worker sandbox control failed: ${error.message}`);
+    });
+
+    socket.on('data', (data: Buffer) => {
+      buffer += decoder.write(data);
+      let newline = buffer.indexOf('\n');
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf('\n');
+        const trap = parseTrapLine(line);
+        if (!trap) continue;
+        if (!isQueryTrap(trap)) {
+          reportTrapError(`Worker sandbox reported: ${formatLandstripTraps([trap])}`);
+          continue;
+        }
+        if (isFilesystemTrap(trap)) handleFilesystem(trap);
+        else handleNetwork(trap);
+      }
+    });
+  }
+
+  function prepareUnsandboxedRpcWorker(
+    options: LandstripRpcWorkerOptions,
+  ): LandstripRpcWorkerLaunch {
+    let spawned = false;
+    const spawnWorker: RpcSpawn = (command, args, spawnOptions) => {
+      if (spawned) throw new Error('RPC worker launch can only be spawned once');
+      spawned = true;
+      const child = spawn(command, [...args], {
+        ...spawnOptions,
+        cwd: options.cwd,
+        env: options.env,
+        detached: true,
+      });
+      const kill = child.kill.bind(child);
+      child.kill = (signal?: NodeJS.Signals | number): boolean => {
+        if (signal === 0 || child.pid === undefined) return kill(signal);
+        if (process.platform === 'win32') {
+          const result = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+            stdio: 'ignore',
+            windowsHide: true,
+          });
+          if (result.status === 0) return true;
+        } else {
+          try {
+            process.kill(-child.pid, signal);
+            return true;
+          } catch {
+            // Fall back when the process exited before its group was signalled.
+          }
+        }
+        return kill(signal);
+      };
+      return child as ReturnType<RpcSpawn>;
+    };
+
+    return {
+      command: options.command,
+      args: options.args,
+      cwd: options.cwd,
+      env: options.env,
+      spawn: spawnWorker,
+      async dispose() {},
+    };
+  }
+
+  async function prepareRpcWorker(
+    options: LandstripRpcWorkerOptions,
+  ): Promise<LandstripRpcWorkerLaunch> {
+    if (options.signal?.aborted) throw new Error('Task cancelled');
+    if (!ensureSandboxState(options.ctx)) {
+      const explicitlyDisabled = noSandboxFlag || !loadConfig(options.cwd).enabled;
+      if (!explicitlyDisabled) {
+        throw new Error('Sandbox is unavailable; refusing subagent process');
+      }
+      if (!unsandboxedWorkerWarningShown) {
+        warnUnsandboxed(
+          options.ctx,
+          'Subagent processes are running without Landstrip sandboxing',
+          'warning',
+        );
+        unsandboxedWorkerWarningShown = true;
+      }
+      return prepareUnsandboxedRpcWorker(options);
+    }
+    const allowances: ExecutionAllowances = {
+      domains: [],
+      readPaths: [...options.readPaths],
+      writePaths: [...options.writePaths],
+      targets: [],
+    };
+    const config = loadConfig(options.cwd);
+    const proxyToken = randomBytes(32).toString('base64url');
+    const proxyAuthorization = `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
+    const proxy = config.network.allowNetwork
+      ? null
+      : await startProxy(options.ctx, allowances, options.signal, proxyAuthorization);
+    let policy: ReturnType<typeof writePolicyFile> | undefined;
+    let trapSocket: NetSocket | undefined;
+    let childEnd: NetSocket | undefined;
+    let disposed = false;
+    try {
+      if (options.signal?.aborted) throw new Error('Task cancelled');
+      policy = writePolicyFile(options.cwd, proxy?.port ?? null, allowances);
+      [trapSocket, childEnd] = await createSocketPair();
+      if (options.signal?.aborted) throw new Error('Task cancelled');
+      attachWorkerTrap(trapSocket, options.ctx, options.cwd, allowances, options.signal);
+    } catch (error) {
+      trapSocket?.destroy();
+      childEnd?.destroy();
+      if (policy) rmSync(policy.dir, { recursive: true, force: true });
+      await proxy?.stop();
+      throw error;
+    }
+
+    const workerPolicy = policy;
+    const workerChildEnd = childEnd;
+    const workerEnv = { ...options.env };
+    if (proxy) {
+      const url = `http://landstrip:${proxyToken}@127.0.0.1:${proxy.port}`;
+      for (const name of [
+        'HTTP_PROXY',
+        'HTTPS_PROXY',
+        'ALL_PROXY',
+        'http_proxy',
+        'https_proxy',
+        'all_proxy',
+      ]) {
+        workerEnv[name] = url;
+      }
+      workerEnv.NO_PROXY = '';
+      workerEnv.no_proxy = '';
+    }
+    let spawned = false;
+    const spawnWorker: RpcSpawn = (_command, _args, spawnOptions) => {
+      if (spawned) throw new Error('RPC worker launch can only be spawned once');
+      spawned = true;
+      const child = spawn(
+        binaryPath(),
+        ['--trap-fd', '3', '-p', workerPolicy.path, options.command, ...options.args],
+        {
+          ...spawnOptions,
+          cwd: options.cwd,
+          env: workerEnv,
+          detached: true,
+          stdio: ['pipe', 'pipe', 'pipe', workerChildEnd],
+        },
+      );
+      workerChildEnd.destroy();
+      const kill = child.kill.bind(child);
+      child.kill = (signal?: NodeJS.Signals | number): boolean => {
+        if (child.pid !== undefined) {
+          try {
+            process.kill(-child.pid, signal);
+            return true;
+          } catch {
+            // Fall back when the process exited before its group was signalled.
+          }
+        }
+        return kill(signal);
+      };
+      return child as ReturnType<RpcSpawn>;
+    };
+
+    return {
+      command: options.command,
+      args: options.args,
+      cwd: options.cwd,
+      env: workerEnv,
+      spawn: spawnWorker,
+      async dispose() {
+        if (disposed) return;
+        disposed = true;
+        trapSocket.destroy();
+        workerChildEnd.destroy();
+        rmSync(workerPolicy.dir, { recursive: true, force: true });
+        await proxy?.stop();
+      },
+    };
+  }
+
   function createLandstripBashOps(
     ctx: ExtensionContext,
     callbacks: LandstripBashCallbacks = {},
+    allowances: ExecutionAllowances = { domains: [], readPaths: [], writePaths: [], targets: [] },
   ): BashOperations {
     return {
       async exec(command, cwd, { onData, signal, timeout, env }) {
@@ -1362,27 +1687,31 @@ export function createLandstripIntegration(
         const { shell, args } = getShellConfig(SettingsManager.create(cwd).getShellPath());
         const config = loadConfig(cwd);
         const allowNetwork = config.network.allowNetwork;
-        const proxy = allowNetwork ? null : await startProxy(cwd);
+        const proxy = allowNetwork ? null : await startProxy(ctx, allowances, signal);
 
         // Started/created before the child exists, so tear them down on any early
         // failure too — the env file holds a copy of the environment (secrets),
         // and the proxy keeps a listening socket. Idempotent: safe to call twice.
         let policy: ReturnType<typeof writePolicyFile> | undefined;
         let envFile: ReturnType<typeof writeEnvFile> | undefined;
-        const teardownResources = () => {
-          void proxy?.stop();
-          if (policy) rmSync(policy.dir, { recursive: true, force: true });
-          if (envFile) rmSync(envFile.dir, { recursive: true, force: true });
+        let teardownPromise: Promise<void> | undefined;
+        const teardownResources = (): Promise<void> => {
+          teardownPromise ??= (async () => {
+            await proxy?.stop();
+            if (policy) rmSync(policy.dir, { recursive: true, force: true });
+            if (envFile) rmSync(envFile.dir, { recursive: true, force: true });
+          })();
+          return teardownPromise;
         };
 
         let landstripArgs: string[];
         try {
-          policy = writePolicyFile(cwd, proxy?.port ?? null);
+          policy = writePolicyFile(cwd, proxy?.port ?? null, allowances);
           envFile = writeEnvFile({ ...process.env, ...env }, proxy?.port ?? null);
           const wrappedCommand = `source '${envFile.path}' && ${command}`;
           landstripArgs = ['--trap-fd', '3', '-p', policy.path, shell, ...args, wrappedCommand];
         } catch (error) {
-          teardownResources();
+          await teardownResources();
           throw error;
         }
 
@@ -1394,13 +1723,13 @@ export function createLandstripIntegration(
 
             const [trapSocket, childEnd] = await createSocketPair();
 
-            const cleanup = () => {
+            const cleanup = async () => {
               if (cleaned) return;
               cleaned = true;
               if (timeoutHandle) clearTimeout(timeoutHandle);
               signal?.removeEventListener('abort', onAbort);
-              teardownResources();
               trapSocket.destroy();
+              await teardownResources();
             };
 
             const child = spawn(binaryPath(), landstripArgs, {
@@ -1454,7 +1783,7 @@ export function createLandstripIntegration(
               child.stdout?.destroy();
               child.stderr?.destroy();
               void (async () => {
-                cleanup();
+                await cleanup();
                 if (signal?.aborted) {
                   reject(new Error('aborted'));
                   return;
@@ -1507,6 +1836,7 @@ export function createLandstripIntegration(
               stderrEnded = true;
               maybeFinalizeAfterExit();
             });
+            const trapDecoder = new StringDecoder('utf8');
             let trapBuffer = '';
             let queryChain: Promise<void> = Promise.resolve();
 
@@ -1538,9 +1868,14 @@ export function createLandstripIntegration(
               const config = loadConfig(cwd);
               const isAllowed = (cfg: SandboxConfig): boolean =>
                 operation === 'read'
-                  ? readAllowed(path, getEffectiveAllowRead(cfg), cfg.filesystem.denyRead, cwd)
+                  ? readAllowed(
+                      path,
+                      getEffectiveAllowRead(cfg, allowances),
+                      cfg.filesystem.denyRead,
+                      cwd,
+                    )
                   : !matchesPattern(path, cfg.filesystem.denyWrite, cwd) &&
-                    !shouldPromptForWrite(path, getEffectiveAllowWrite(cfg), cwd);
+                    !shouldPromptForWrite(path, getEffectiveAllowWrite(cfg, allowances), cwd);
 
               if (isAllowed(config)) {
                 respondQuery(queryId, 'allow');
@@ -1574,14 +1909,18 @@ export function createLandstripIntegration(
                           matchesPattern(path, cfg.filesystem.denyRead, cwd)
                             ? 'granting allowRead will override it'
                             : undefined,
+                          signal,
                         )
-                      : await promptWriteBlock(ctx, path);
+                      : await promptWriteBlock(ctx, path, signal);
                   if (choice === 'abort') {
                     respondQuery(queryId, 'deny');
                     return;
                   }
-                  if (operation === 'read') await applyReadChoice(ctx, choice, path, cwd);
-                  else await applyWriteChoice(ctx, choice, path, cwd);
+                  if (operation === 'read') {
+                    await applyReadChoice(ctx, choice, path, cwd, allowances);
+                  } else {
+                    await applyWriteChoice(ctx, choice, path, cwd, allowances);
+                  }
                   respondQuery(queryId, 'allow');
                 })
                 .catch(() => respondQuery(queryId, 'deny'));
@@ -1596,7 +1935,11 @@ export function createLandstripIntegration(
               target: string,
               rawLine: string,
             ): void => {
-              if (sessionAllowedTargets.includes(target)) {
+              const targetKey = `${operation}\u0000${target}`;
+              if (
+                sessionAllowedTargets.includes(targetKey) ||
+                allowances.targets.includes(targetKey)
+              ) {
                 respondQuery(queryId, 'allow');
                 return;
               }
@@ -1607,24 +1950,28 @@ export function createLandstripIntegration(
               }
               queryChain = queryChain
                 .then(async () => {
-                  if (sessionAllowedTargets.includes(target)) {
+                  if (
+                    sessionAllowedTargets.includes(targetKey) ||
+                    allowances.targets.includes(targetKey)
+                  ) {
                     respondQuery(queryId, 'allow');
                     return;
                   }
-                  const choice = await promptNetworkBlock(ctx, operation, target);
+                  const choice = await promptNetworkBlock(ctx, operation, target, signal);
                   if (choice === 'abort') {
                     appendErrorLine(rawLine);
                     respondQuery(queryId, 'deny');
                     return;
                   }
-                  sessionAllowedTargets.push(target);
+                  const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
+                  targets.push(targetKey);
                   respondQuery(queryId, 'allow');
                 })
                 .catch(() => respondQuery(queryId, 'deny'));
             };
 
             trapSocket.on('data', (data: Buffer) => {
-              trapBuffer += data.toString('utf8');
+              trapBuffer += trapDecoder.write(data);
               let nl = trapBuffer.indexOf('\n');
               while (nl !== -1) {
                 const line = trapBuffer.slice(0, nl);
@@ -1651,8 +1998,14 @@ export function createLandstripIntegration(
               if (execSettled) return;
               execSettled = true;
               if (postExitTimer) clearTimeout(postExitTimer);
-              cleanup();
-              reject(error);
+              void (async () => {
+                try {
+                  await cleanup();
+                  reject(error);
+                } catch (cleanupError) {
+                  reject(cleanupError);
+                }
+              })();
             });
 
             // Settle on 'exit' — the command itself has ended — rather than
@@ -1668,10 +2021,10 @@ export function createLandstripIntegration(
               }
             });
             child.once('close', (code) => finalizeExec(code));
-          })().catch((error: unknown) => {
+          })().catch(async (error: unknown) => {
             // A failure before the child is wired (e.g. createSocketPair) never
             // reaches cleanup(); free the proxy and temp dirs here too.
-            teardownResources();
+            await teardownResources();
             reject(error);
           });
         });
@@ -1688,16 +2041,26 @@ export function createLandstripIntegration(
   ): Promise<AgentToolResult<BashToolDetails | undefined>> {
     let landstripErrorOutput = '';
     let stderrOutput = '';
+    const allowances: ExecutionAllowances = {
+      domains: [],
+      readPaths: [],
+      writePaths: [],
+      targets: [],
+    };
     const sandboxedBash = createBashToolDefinition(ctx.cwd, {
-      operations: createLandstripBashOps(ctx, {
-        onErrorFd: (data) => {
-          landstripErrorOutput += data.toString('utf8');
+      operations: createLandstripBashOps(
+        ctx,
+        {
+          onErrorFd: (data) => {
+            landstripErrorOutput += data.toString('utf8');
+          },
+          onStderr: (data) => {
+            stderrOutput += data.toString('utf8');
+          },
+          promptOnBlock: true,
         },
-        onStderr: (data) => {
-          stderrOutput += data.toString('utf8');
-        },
-        promptOnBlock: true,
-      }),
+        allowances,
+      ),
       shellPath: SettingsManager.create(ctx.cwd).getShellPath(),
     });
 
@@ -1718,10 +2081,10 @@ export function createLandstripIntegration(
         return null;
       }
 
-      if (shouldPromptForWrite(blockedPath, getEffectiveAllowWrite(config), ctx.cwd)) {
-        const choice = await promptWriteBlock(ctx, blockedPath);
+      if (shouldPromptForWrite(blockedPath, getEffectiveAllowWrite(config, allowances), ctx.cwd)) {
+        const choice = await promptWriteBlock(ctx, blockedPath, signal);
         if (choice === 'abort') return null;
-        await applyWriteChoice(ctx, choice, blockedPath, ctx.cwd);
+        await applyWriteChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
       }
 
       config = loadConfig(ctx.cwd);
@@ -1751,16 +2114,17 @@ export function createLandstripIntegration(
       if (!ctx.hasUI) return null;
 
       const config = loadConfig(ctx.cwd);
-      if (!matchesPattern(blockedPath, getEffectiveAllowRead(config), ctx.cwd)) {
+      if (!matchesPattern(blockedPath, getEffectiveAllowRead(config, allowances), ctx.cwd)) {
         const choice = await promptReadBlock(
           ctx,
           blockedPath,
           matchesPattern(blockedPath, config.filesystem.denyRead, ctx.cwd)
             ? 'granting allowRead will override it'
             : undefined,
+          signal,
         );
         if (choice === 'abort') return null;
-        await applyReadChoice(ctx, choice, blockedPath, ctx.cwd);
+        await applyReadChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
       }
 
       onUpdate?.({
@@ -1822,17 +2186,6 @@ export function createLandstripIntegration(
 
     const retryResult = await retryWithReadAccess(blockedReadPath);
     return retryResult ?? result;
-  }
-
-  async function preflightCommandDomains(
-    command: string,
-    ctx: ExtensionContext,
-  ): Promise<string | null> {
-    for (const domain of extractDomainsFromCommand(command)) {
-      if (!(await ensureDomainAllowed(ctx, domain, ctx.cwd))) return domain;
-    }
-
-    return null;
   }
 
   function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
@@ -1942,23 +2295,29 @@ export function createLandstripIntegration(
     return true;
   }
 
-  function createBashTool(cwd: string, ctx?: ExtensionContext): LandstripBashTool {
+  function createBashTool(
+    cwd: string,
+    ctx?: ExtensionContext,
+    requireSandbox = false,
+  ): LandstripBashTool {
     const localBash = createPlainBashTool(cwd);
 
     return {
       ...localBash,
       label: 'bash (landstrip)',
       async execute(id, params, signal, onUpdate, callCtx) {
-        const effectiveCtx = callCtx ?? ctx;
-        if (!effectiveCtx || !ensureSandboxState(effectiveCtx))
+        const effectiveCtx = ctx ?? callCtx;
+        if (!effectiveCtx || !ensureSandboxState(effectiveCtx)) {
+          if (requireSandbox) throw new Error('Sandbox is unavailable; refusing subagent command');
           return localBash.execute(id, params, signal, onUpdate, effectiveCtx);
+        }
 
         return runBashWithOptionalRetry(id, params, signal, onUpdate, effectiveCtx);
       },
     };
   }
 
-  function register(pi: ExtensionAPI): void {
+  function register(pi: ExtensionAPI, runtime?: SubagentRuntime): void {
     const maybePi = pi as ExtensionAPI & {
       getFlag?: (name: string) => unknown;
       registerCommand?: ExtensionAPI['registerCommand'];
@@ -1973,98 +2332,16 @@ export function createLandstripIntegration(
 
     if (shouldRegisterBashTool) pi.registerTool(createBashTool(localCwd));
 
-    pi.on('user_bash', async (event, ctx) => {
+    pi.on('user_bash', async (_event, ctx) => {
       if (!ensureSandboxState(ctx)) return;
-      const config = loadConfig(ctx.cwd);
-
-      if (!config.network.allowNetwork) {
-        const blockedDomain = await preflightCommandDomains(event.command, ctx);
-        if (blockedDomain) {
-          return {
-            result: {
-              output: `Blocked: "${blockedDomain}" is not allowed by the sandbox. Use /sandbox to review your config.`,
-              exitCode: 1,
-              cancelled: false,
-              truncated: false,
-            },
-          };
-        }
-      }
 
       return { operations: createLandstripBashOps(ctx, { promptOnBlock: true }) };
     });
 
-    pi.on('tool_call', async (event, ctx) => {
-      if (!ensureSandboxState(ctx)) return;
-
-      const config = loadConfig(ctx.cwd);
-
-      const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
-
-      if (sandboxReady && isToolCallEventType('bash', event)) {
-        if (!config.network.allowNetwork) {
-          const blockedDomain = await preflightCommandDomains(event.input.command, ctx);
-          if (blockedDomain) {
-            return {
-              block: true,
-              reason: `Network access to "${blockedDomain}" is blocked by the sandbox.`,
-            };
-          }
-        }
-      }
-
-      if (isToolCallEventType('read', event)) {
-        const result = await gateReadAccess(
-          ctx,
-          config,
-          canonicalizePath(event.input.path, ctx.cwd),
-        );
-        if (result) return result;
-      }
-
-      // grep, ls and find read their target path (default: the cwd) and recurse
-      // into it, so gate them against allowRead/denyRead like the read tool —
-      // otherwise they run in-process, unsandboxed, and defeat denyRead.
-      if (
-        isToolCallEventType('grep', event) ||
-        isToolCallEventType('ls', event) ||
-        isToolCallEventType('find', event)
-      ) {
-        const result = await gateReadAccess(
-          ctx,
-          config,
-          canonicalizePath(event.input.path ?? '.', ctx.cwd),
-        );
-        if (result) return result;
-      }
-
-      if (isToolCallEventType('write', event) || isToolCallEventType('edit', event)) {
-        const filePath = canonicalizePath((event.input as { path: string }).path, ctx.cwd);
-
-        if (matchesPattern(filePath, config.filesystem.denyWrite, ctx.cwd)) {
-          return {
-            block: true,
-            reason:
-              `Sandbox: write access denied for "${filePath}" (in denyWrite). ` +
-              `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
-          };
-        }
-
-        if (shouldPromptForWrite(filePath, getEffectiveAllowWrite(config), ctx.cwd)) {
-          const choice = await promptWriteBlock(ctx, filePath);
-          if (choice === 'abort') {
-            return {
-              block: true,
-              reason: `Sandbox: write access denied for "${filePath}" (not in allowWrite)`,
-            };
-          }
-          await applyWriteChoice(ctx, choice, filePath, ctx.cwd);
-        }
-      }
-    });
-
     pi.on('session_start', async (_event, ctx) => {
       resetSessionAllowances();
+      const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
+      projectConfigTrusted = trustContext.isProjectTrusted?.() ?? false;
       noSandboxFlag = Boolean(maybePi.getFlag?.('no-sandbox'));
 
       if (noSandboxFlag) {
@@ -2082,8 +2359,8 @@ export function createLandstripIntegration(
 
       enableSandbox(ctx);
     });
-    maybePi.registerCommand?.('sandbox', {
-      description: 'Show sandbox configuration',
+    const landstripCommand: Parameters<ExtensionAPI['registerCommand']>[1] = {
+      description: 'Show Landstrip configuration',
       handler: async (_args, ctx) => {
         let config = loadConfig(ctx.cwd);
 
@@ -2092,6 +2369,11 @@ export function createLandstripIntegration(
         if (!ctx.hasUI) return;
         await ctx.ui.custom(
           (tui, theme, _kb, done) => {
+            let tab: 'sandbox' | 'agents' | 'settings' = 'sandbox';
+            let selectedAgent = 0;
+            let selectedSetting = 0;
+            let maxSubagentsValue = runtime?.getMaxSubagents() ?? 0;
+            let editingMaxSubagents = false;
             const dim = (s: string) => theme.fg('dim', s);
             const muted = (s: string) => theme.fg('muted', s);
             const accent = (s: string) => theme.fg('accent', s);
@@ -2114,10 +2396,6 @@ export function createLandstripIntegration(
                 const row = (content = '') => boxRow(theme, width, content);
                 const lines: string[] = [];
                 const status = sandboxStatus();
-                const toggleValue = config.enabled
-                  ? theme.fg('success', 'enabled')
-                  : theme.fg('warning', 'disabled');
-
                 function section(titleText: string, detail?: string): void {
                   lines.push(row(''));
                   lines.push(row(`${accent(titleText)}${detail ? dim(` · ${detail}`) : ''}`));
@@ -2132,13 +2410,79 @@ export function createLandstripIntegration(
                   return text(truncateToWidth(value, Math.max(10, maxWidth)));
                 }
 
-                lines.push(boxTop(theme, width, 'Sandbox'));
+                lines.push(boxTop(theme, width, 'Landstrip'));
+                const sandboxTab = tab === 'sandbox' ? accent('Sandbox') : muted('Sandbox');
+                const agentsTab = tab === 'agents' ? accent('Agents') : muted('Agents');
+                const settingsTab = tab === 'settings' ? accent('Settings') : muted('Settings');
+                lines.push(
+                  row(` ${sandboxTab} ${dim('│')} ${agentsTab} ${dim('│')} ${settingsTab}`),
+                  row(''),
+                );
+
+                if (tab === 'agents') {
+                  const catalog = runtime?.getAgentCatalog(ctx);
+                  const agents = catalog ? availablePrimaryAgents(catalog) : [];
+                  const activeAgent = runtime?.getPrimaryAgent()?.name;
+                  if (agents.length === 0) {
+                    lines.push(row(muted('No primary agents configured')));
+                  } else {
+                    selectedAgent = Math.min(selectedAgent, agents.length - 1);
+                    for (const [index, agent] of agents.entries()) {
+                      const cursor = index === selectedAgent ? accent('›') : ' ';
+                      const active =
+                        agent.name === activeAgent ? theme.fg('success', '●') : dim('○');
+                      const name = index === selectedAgent ? accent(agent.name) : text(agent.name);
+                      const description = agent.description ? dim(` · ${agent.description}`) : '';
+                      lines.push(row(`${cursor} ${active} ${name}${description}`));
+                    }
+                  }
+                  lines.push(
+                    row(''),
+                    row(
+                      `${dim('↑↓')} ${muted('select')}  ${dim('enter')} ${muted('activate')}  ${dim('tab')} ${muted('switch')}  ${dim('esc')} ${muted('close')}`,
+                    ),
+                    boxBottom(theme, width),
+                  );
+                  return lines;
+                }
+
+                if (tab === 'settings') {
+                  const sandboxCursor = selectedSetting === 0 ? accent('›') : ' ';
+                  const maxCursor = selectedSetting === 1 ? accent('›') : ' ';
+                  const checkbox = config.enabled ? theme.fg('success', '[x]') : muted('[ ]');
+                  const maxValue =
+                    selectedSetting === 1
+                      ? accent(`[ ${maxSubagentsValue} ]`)
+                      : text(`[ ${maxSubagentsValue} ]`);
+                  lines.push(
+                    row(`${sandboxCursor} ${checkbox} ${text('Sandbox')}`),
+                    row(
+                      `${maxCursor} ${maxValue} ${text('Maximum concurrent subagents')} ${dim(`(0-${MAX_SUBAGENTS})`)}`,
+                    ),
+                  );
+                  if (maxSubagentsValue === 0) {
+                    lines.push(row(`    ${dim('Task delegation is disabled')}`));
+                  }
+                  if (noSandboxFlag) {
+                    lines.push(row(`    ${dim('Sandbox is overridden by --no-sandbox')}`));
+                  }
+                  lines.push(
+                    row(''),
+                    row(
+                      `${dim('↑↓')} ${muted('select')}  ${dim('space/enter')} ${muted('toggle or save')}  ${dim('0-9')} ${muted('edit number')}  ${dim('tab')} ${muted('switch')}  ${dim('esc')} ${muted('close')}`,
+                    ),
+                    boxBottom(theme, width),
+                  );
+                  return lines;
+                }
 
                 const statusDot = theme.fg(status.color, '●');
-                const pathSnippet = text(truncateToWidth(binaryPath(), Math.max(20, innerW - 28)));
+                const pathSnippet = text(
+                  truncateToWidth(landstripDisplayPath(), Math.max(20, innerW - 28)),
+                );
                 lines.push(
                   row(
-                    `${statusDot} ${text(status.label)} ${dim('·')} persisted ${toggleValue} ${dim('·')} ${muted('landstrip')} ${pathSnippet}`,
+                    `${statusDot} ${text(status.label)} ${dim('·')} ${muted('landstrip')} ${pathSnippet}`,
                   ),
                 );
 
@@ -2170,9 +2514,7 @@ export function createLandstripIntegration(
 
                 lines.push(row(''));
                 lines.push(
-                  row(
-                    `${dim('t')} ${muted('toggle persisted setting')}  ${dim('esc')} ${muted('close')}`,
-                  ),
+                  row(`${dim('tab')} ${muted('switch')}  ${dim('esc')} ${muted('close')}`),
                 );
                 lines.push(boxBottom(theme, width));
 
@@ -2180,14 +2522,107 @@ export function createLandstripIntegration(
               },
 
               handleInput(data: string): void {
-                if (data !== 't' && data !== 'T') {
+                if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) {
                   done(undefined);
                   return;
                 }
+                if (matchesKey(data, 'tab') || matchesKey(data, 'right')) {
+                  tab = tab === 'sandbox' ? 'agents' : tab === 'agents' ? 'settings' : 'sandbox';
+                  if (tab === 'settings') {
+                    maxSubagentsValue = runtime?.getMaxSubagents() ?? 0;
+                    editingMaxSubagents = false;
+                  }
+                  tui.requestRender();
+                  return;
+                }
+                if (matchesKey(data, 'left')) {
+                  tab = tab === 'settings' ? 'agents' : tab === 'agents' ? 'sandbox' : 'settings';
+                  if (tab === 'settings') {
+                    maxSubagentsValue = runtime?.getMaxSubagents() ?? 0;
+                    editingMaxSubagents = false;
+                  }
+                  tui.requestRender();
+                  return;
+                }
+                if (tab === 'agents') {
+                  const catalog = runtime?.getAgentCatalog(ctx);
+                  const agents = catalog ? availablePrimaryAgents(catalog) : [];
+                  if (matchesKey(data, 'up')) {
+                    selectedAgent = Math.max(0, selectedAgent - 1);
+                    tui.requestRender();
+                  } else if (matchesKey(data, 'down')) {
+                    selectedAgent = Math.min(Math.max(0, agents.length - 1), selectedAgent + 1);
+                    tui.requestRender();
+                  } else if (matchesKey(data, 'return')) {
+                    const agent = agents[selectedAgent];
+                    if (agent && runtime?.selectPrimaryAgent(agent.name, ctx)) tui.requestRender();
+                  }
+                  return;
+                }
+
+                if (tab !== 'settings') return;
+                if (matchesKey(data, 'up')) {
+                  selectedSetting = Math.max(0, selectedSetting - 1);
+                  editingMaxSubagents = false;
+                  tui.requestRender();
+                  return;
+                }
+                if (matchesKey(data, 'down')) {
+                  selectedSetting = Math.min(1, selectedSetting + 1);
+                  editingMaxSubagents = false;
+                  tui.requestRender();
+                  return;
+                }
+
+                if (selectedSetting === 1) {
+                  if (/^[0-9]$/.test(data)) {
+                    const value = Number(
+                      editingMaxSubagents ? `${maxSubagentsValue}${data}` : data,
+                    );
+                    if (value <= MAX_SUBAGENTS) {
+                      maxSubagentsValue = value;
+                      editingMaxSubagents = true;
+                      tui.requestRender();
+                    }
+                    return;
+                  }
+                  if (data === '+' || data === '-') {
+                    maxSubagentsValue = Math.min(
+                      MAX_SUBAGENTS,
+                      Math.max(0, maxSubagentsValue + (data === '+' ? 1 : -1)),
+                    );
+                    editingMaxSubagents = false;
+                    tui.requestRender();
+                    return;
+                  }
+                  if (!matchesKey(data, 'return')) return;
+                  const maxSubagents = maxSubagentsValue;
+                  void setMaxSubagentsConfig(ctx.cwd, maxSubagents, projectConfigTrusted)
+                    .then((scope) => {
+                      runtime?.setMaxSubagents(maxSubagents);
+                      editingMaxSubagents = false;
+                      notify(
+                        ctx,
+                        `Maximum concurrent subagents set to ${maxSubagents} in ${scope} config`,
+                        'info',
+                      );
+                      tui.requestRender();
+                    })
+                    .catch((error: unknown) => {
+                      notify(ctx, `Could not update config: ${error}`, 'error');
+                    });
+                  return;
+                }
+
+                if (data !== ' ' && !matchesKey(data, 'return')) return;
 
                 void (async () => {
                   const enabled = !config.enabled;
-                  const scope = await setSandboxConfigEnabled(ctx.cwd, enabled);
+                  const scope = await setSandboxConfigEnabled(
+                    ctx.cwd,
+                    enabled,
+                    projectConfigTrusted,
+                  );
                   config = loadConfig(ctx.cwd);
 
                   if (!enabled) {
@@ -2220,8 +2655,13 @@ export function createLandstripIntegration(
           },
         );
       },
+    };
+    maybePi.registerCommand?.('landstrip', landstripCommand);
+    maybePi.registerCommand?.('sandbox', {
+      ...landstripCommand,
+      description: 'Deprecated alias for /landstrip',
     });
   }
 
-  return { createBashTool, register };
+  return { createBashTool, prepareRpcWorker, register };
 }

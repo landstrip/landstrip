@@ -22,10 +22,13 @@ npx landstrip -p policy.json cargo test
 The npm package installs a small Node.js wrapper and a platform-specific native
 binary package.
 
-
 ### Agent extensions
 
-The bundled extensions integrate Landstrip with Pi and OpenCode:
+The bundled extensions integrate Landstrip with Pi and OpenCode. The Pi
+extension sandboxes the main agent's Bash execution, provides OpenCode-compatible
+primary agent selection, and runs subagents as full Pi RPC processes. Subagents
+normally receive an outer Landstrip sandbox; explicitly disabling sandboxing
+uses a warned process-only fallback:
 
 ```sh
 pi install npm:pi-landstrip
@@ -49,7 +52,7 @@ details.
 
 Landlock carves the denied subtrees out of the allowed roots, and then grants
 `PATH_BENEATH` rules only for the surviving fragments. The denied path is never
-added to the ruleset, and the kernel enforces the path in-process.
+added to the ruleset, and the kernel enforces the path directly.
 
 Seccomp is applied when a policy needs more than Landlock can express
 statically, e.g. for many filesystem mutator syscalls, or when denials must be

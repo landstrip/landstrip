@@ -14,11 +14,13 @@ use std::io;
 use std::iter;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, LocalFree,
-    WAIT_FAILED,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS,
+    ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, LocalFree, WAIT_FAILED,
 };
 use windows_sys::Win32::Security::Authorization::{
     ACCESS_MODE, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, REVOKE_ACCESS,
@@ -29,24 +31,26 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, FreeSid, PSID, SECURITY_CAPABILITIES,
-    SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-    WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
-    WinCapabilityPrivateNetworkClientServerSid,
+    ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, FreeSid, PSID, SECURITY_ATTRIBUTES,
+    SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT, WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid,
+    WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    CreateFileW, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
@@ -344,6 +348,123 @@ impl SandboxJob {
     }
 }
 
+struct StandardHandles {
+    stdin: Handle,
+    stdout: Handle,
+    stderr: Handle,
+}
+
+impl StandardHandles {
+    fn duplicate() -> Result<Self> {
+        Ok(Self {
+            stdin: inheritable_standard_handle(
+                io::stdin().as_raw_handle().cast(),
+                StandardHandleDirection::Input,
+            )?,
+            stdout: inheritable_standard_handle(
+                io::stdout().as_raw_handle().cast(),
+                StandardHandleDirection::Output,
+            )?,
+            stderr: inheritable_standard_handle(
+                io::stderr().as_raw_handle().cast(),
+                StandardHandleDirection::Output,
+            )?,
+        })
+    }
+
+    fn raw(&self) -> [HANDLE; 3] {
+        [self.stdin.0, self.stdout.0, self.stderr.0]
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StandardHandleDirection {
+    Input,
+    Output,
+}
+
+impl StandardHandleDirection {
+    fn desired_access(self) -> u32 {
+        match self {
+            Self::Input => GENERIC_READ,
+            Self::Output => GENERIC_WRITE,
+        }
+    }
+}
+
+fn inheritable_standard_handle(
+    source: HANDLE,
+    direction: StandardHandleDirection,
+) -> Result<Handle> {
+    if !is_real_handle_value(source as isize) || !is_io_file_type(unsafe { GetFileType(source) }) {
+        return inheritable_null_handle(direction);
+    }
+
+    let process = unsafe { GetCurrentProcess() };
+    let mut duplicate = ptr::null_mut();
+    let ok = unsafe {
+        DuplicateHandle(
+            process,
+            source,
+            process,
+            &mut duplicate,
+            0,
+            1,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 {
+        return Err(setup_failed(io::Error::last_os_error()).into());
+    }
+    let duplicate = Handle(duplicate);
+    if !is_real_handle_value(duplicate.0 as isize)
+        || !is_io_file_type(unsafe { GetFileType(duplicate.0) })
+    {
+        return inheritable_null_handle(direction);
+    }
+
+    Ok(duplicate)
+}
+
+fn inheritable_null_handle(direction: StandardHandleDirection) -> Result<Handle> {
+    const NUL: [u16; 4] = [b'N' as u16, b'U' as u16, b'L' as u16, 0];
+
+    let security_attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(mem::size_of::<SECURITY_ATTRIBUTES>())
+            .map_err(|_| LandstripError::IntegerTooLarge)?,
+        lpSecurityDescriptor: ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    let handle = unsafe {
+        CreateFileW(
+            NUL.as_ptr(),
+            direction.desired_access(),
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &security_attributes,
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return Err(setup_failed(io::Error::last_os_error()).into());
+    }
+    if !is_io_file_type(unsafe { GetFileType(handle) }) {
+        unsafe { CloseHandle(handle) };
+        return Err(setup_failed("NUL did not produce an I/O handle").into());
+    }
+
+    Ok(Handle(handle))
+}
+
+fn is_real_handle_value(value: isize) -> bool {
+    value > 0
+}
+
+fn is_io_file_type(file_type: u32) -> bool {
+    matches!(file_type, FILE_TYPE_CHAR | FILE_TYPE_DISK | FILE_TYPE_PIPE)
+}
+
 fn create_process_in_appcontainer(
     sid: PSID,
     tool: &OsStr,
@@ -364,10 +485,17 @@ fn create_process_in_appcontainer(
     startup_info.StartupInfo.cb = u32::try_from(mem::size_of::<STARTUPINFOEXW>())
         .map_err(|_| LandstripError::IntegerTooLarge)?;
 
+    let standard_handles = StandardHandles::duplicate()?;
+    let mut inherited_handles = standard_handles.raw();
+    startup_info.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup_info.StartupInfo.hStdInput = inherited_handles[0];
+    startup_info.StartupInfo.hStdOutput = inherited_handles[1];
+    startup_info.StartupInfo.hStdError = inherited_handles[2];
+
     let job = SandboxJob::new()?;
     let mut job_handle = job.as_raw();
     let mut mitigation_policy = MITIGATION_POLICY;
-    let attribute_count = 4;
+    let attribute_count = 5;
     let mut attribute_list = ProcThreadAttributeList::new(attribute_count)?;
     let mut network_capabilities = NetworkCapabilities::new(grant_network)?;
     let mut capabilities = SECURITY_CAPABILITIES {
@@ -396,6 +524,12 @@ fn create_process_in_appcontainer(
         (&raw mut job_handle).cast(),
         mem::size_of::<HANDLE>(),
     )?;
+    update_attribute(
+        attribute_list.as_mut_ptr(),
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+        inherited_handles.as_mut_ptr().cast(),
+        mem::size_of_val(&inherited_handles),
+    )?;
     if mitigation_policy != 0 {
         update_attribute(
             attribute_list.as_mut_ptr(),
@@ -413,7 +547,7 @@ fn create_process_in_appcontainer(
             command_line.as_mut_ptr(),
             ptr::null(),
             ptr::null(),
-            0,
+            1,
             EXTENDED_STARTUPINFO_PRESENT,
             ptr::null(),
             ptr::null(),
@@ -421,15 +555,21 @@ fn create_process_in_appcontainer(
             &mut process_info,
         )
     };
+    let launch_error = (created == 0).then(io::Error::last_os_error);
+    drop(standard_handles);
 
-    if created == 0 {
+    if let Some(source) = launch_error {
         return Err(LandstripError::LaunchFailed {
             tool: PathBuf::from(tool),
-            source: io::Error::last_os_error().into(),
+            source: source.into(),
         }
         .into());
     }
 
+    supervise_process(process_info)
+}
+
+fn supervise_process(process_info: PROCESS_INFORMATION) -> Result<u32> {
     let process = Handle(process_info.hProcess);
     let thread = Handle(process_info.hThread);
     let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
@@ -638,4 +778,38 @@ fn wide_string(value: &str) -> Vec<u16> {
 
 fn hresult_value(hr: i32) -> u32 {
     u32::from_ne_bytes(hr.to_ne_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_positive_handle_values_are_real() {
+        assert!(!is_real_handle_value(0));
+        assert!(!is_real_handle_value(-1));
+        assert!(!is_real_handle_value(-2));
+        assert!(is_real_handle_value(1));
+    }
+
+    #[test]
+    fn only_io_file_types_are_accepted() {
+        assert!(is_io_file_type(FILE_TYPE_CHAR));
+        assert!(is_io_file_type(FILE_TYPE_DISK));
+        assert!(is_io_file_type(FILE_TYPE_PIPE));
+        assert!(!is_io_file_type(0));
+        assert!(!is_io_file_type(0x8000));
+    }
+
+    #[test]
+    fn null_access_matches_standard_handle_direction() {
+        assert_eq!(
+            StandardHandleDirection::Input.desired_access(),
+            GENERIC_READ
+        );
+        assert_eq!(
+            StandardHandleDirection::Output.desired_access(),
+            GENERIC_WRITE
+        );
+    }
 }

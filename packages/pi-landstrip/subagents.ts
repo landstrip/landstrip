@@ -1,0 +1,1581 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) Jarkko Sakkinen 2026
+
+import { randomUUID } from 'node:crypto';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import {
+  type ExtensionAPI,
+  type ExtensionContext,
+  getAgentDir,
+  type Theme,
+  type ToolDefinition,
+} from '@earendil-works/pi-coding-agent';
+import { truncateToWidth } from '@earendil-works/pi-tui';
+import { Type } from 'typebox';
+
+import {
+  type AgentCatalog,
+  type AgentDefinition,
+  availablePrimaryAgents,
+  availableSubagents,
+  loadAgentCatalog,
+  mergePermissionRules,
+  permissionDecision,
+  type PermissionRules,
+} from './agents.ts';
+import { MAX_SUBAGENTS } from './config.ts';
+import type { LandstripIntegration, LandstripRpcWorkerLaunch } from './index.ts';
+import { type ExtensionUiRequest, type ExtensionUiResult, RpcProcess } from './rpc-process.ts';
+
+const TASK_ENTRY = 'landstrip.task';
+const TASK_WIDGET = 'landstrip.subagents';
+const PRIMARY_AGENT_ENTRY = 'landstrip.primary-agent';
+const WORKER_ENV = 'PI_LANDSTRIP_WORKER';
+const CONTROL_TITLE = 'pi-landstrip:control:v1';
+const MAX_DEPTH = 3;
+const packageDir = dirname(fileURLToPath(import.meta.url));
+interface PiPackage {
+  readonly cliEntry: string;
+  readonly version: readonly [number, number, number];
+}
+
+const SUPPORTED_PI_MAJOR = 0;
+const SUPPORTED_PI_MINOR = 80;
+const MIN_SUPPORTED_PI_PATCH = 6;
+
+let cachedPiPackage: PiPackage | undefined;
+let piPackageResolved = false;
+
+export function isSupportedPiVersion(version: readonly number[]): boolean {
+  const [major, minor = -1, patch = -1] = version;
+  return (
+    Number.isInteger(major) &&
+    major === SUPPORTED_PI_MAJOR &&
+    minor === SUPPORTED_PI_MINOR &&
+    patch >= MIN_SUPPORTED_PI_PATCH
+  );
+}
+
+// Resolve the running Pi package from the extension's own location. The
+// extension is loaded by the running Pi and imports
+// `@earendil-works/pi-coding-agent`, so the nearest `node_modules` copy
+// reachable from `packageDir` is the running Pi itself. Reading its
+// `package.json` instead of spawning `pi --version` avoids depending on
+// `process.argv[1]`, which is not the Pi CLI entry when Pi runs as an embedded
+// or extension host and would otherwise report the Node version instead.
+export function resolvePiPackage(): PiPackage | undefined {
+  if (piPackageResolved) return cachedPiPackage;
+  piPackageResolved = true;
+  let dir = packageDir;
+  for (;;) {
+    const pkgPath = join(dir, 'node_modules', '@earendil-works', 'pi-coding-agent', 'package.json');
+    if (existsSync(pkgPath)) {
+      try {
+        const value: unknown = JSON.parse(readFileSync(pkgPath, 'utf8'));
+        if (
+          isRecord(value) &&
+          value.name === '@earendil-works/pi-coding-agent' &&
+          typeof value.version === 'string'
+        ) {
+          const parts = value.version.split('.').map(Number);
+          if (parts.length >= 3 && parts.slice(0, 3).every((n) => Number.isInteger(n))) {
+            const version = parts.slice(0, 3) as [number, number, number];
+            const binFile =
+              typeof value.bin === 'string'
+                ? value.bin
+                : isRecord(value.bin) && typeof value.bin.pi === 'string'
+                  ? value.bin.pi
+                  : undefined;
+            if (binFile) {
+              const cliEntry = join(
+                dir,
+                'node_modules',
+                '@earendil-works',
+                'pi-coding-agent',
+                binFile,
+              );
+              if (existsSync(cliEntry)) {
+                cachedPiPackage = { cliEntry, version };
+                return cachedPiPackage;
+              }
+            }
+          }
+        }
+      } catch {
+        // Malformed package.json; keep walking ancestors.
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+const taskParameters = Type.Object({
+  description: Type.String({ description: 'A short 3-5 word description of the task' }),
+  prompt: Type.String({ description: 'The complete task for the subagent' }),
+  subagent_type: Type.String({ description: 'The configured subagent name' }),
+  task_id: Type.Optional(Type.String({ description: 'An existing task ID to continue' })),
+  command: Type.Optional(Type.String({ description: 'The command that originated this task' })),
+  background: Type.Optional(Type.Boolean({ description: 'Run without blocking the parent task' })),
+});
+
+interface TaskInput {
+  description: string;
+  prompt: string;
+  subagent_type: string;
+  task_id?: string;
+  command?: string;
+  background?: boolean;
+}
+
+type TaskState = 'queued' | 'running' | 'completed' | 'error' | 'cancelled' | 'interrupted';
+const TASK_STATES = new Set<TaskState>([
+  'queued',
+  'running',
+  'completed',
+  'error',
+  'cancelled',
+  'interrupted',
+]);
+
+interface TaskRecord {
+  version?: 1;
+  id: string;
+  parentSessionId: string;
+  parentTaskId?: string;
+  parentSessionFile?: string;
+  sessionDir?: string;
+  sessionFile?: string;
+  agent: string;
+  description: string;
+  depth: number;
+  state: TaskState;
+  output?: string;
+  error?: string;
+  delivered?: boolean;
+  background?: boolean;
+}
+
+export interface SubagentTaskView {
+  readonly id: string;
+  readonly parentTaskId?: string;
+  readonly agent: string;
+  readonly description: string;
+  readonly state: 'queued' | 'running' | 'completed' | 'error' | 'cancelled' | 'interrupted';
+}
+
+interface TaskDetails {
+  taskId: string;
+  state: TaskState;
+  agent: string;
+}
+
+interface RunningTask {
+  rpc: RpcProcess;
+  promise: Promise<string>;
+}
+
+interface TaskLease {
+  release?: () => void;
+}
+
+interface WorkerConfig {
+  readonly rules: PermissionRules;
+  readonly task: Pick<TaskRecord, 'id' | 'description' | 'depth'>;
+  readonly taskEnabled: boolean;
+  readonly steps?: number;
+}
+
+interface ControlRequest {
+  readonly type: 'permission' | 'task';
+  readonly permission?: string;
+  readonly resource?: string;
+  readonly input?: TaskInput;
+}
+
+interface ControlResponse {
+  readonly ok: boolean;
+  readonly value?: string;
+  readonly task?: TaskDetails;
+  readonly error?: string;
+}
+
+interface WorkerHandle {
+  readonly rpc: RpcProcess;
+  dispose(): Promise<void>;
+}
+
+type CatalogLoader = typeof loadAgentCatalog;
+type WorkerFactory = (
+  task: TaskRecord,
+  agent: AgentDefinition,
+  rules: PermissionRules,
+  ctx: ExtensionContext,
+  signal: AbortSignal,
+  onRequest: (request: ExtensionUiRequest) => Promise<ExtensionUiResult>,
+) => Promise<WorkerHandle>;
+
+function isProjectTrusted(ctx: ExtensionContext): boolean {
+  const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
+  return trustContext.isProjectTrusted?.() ?? false;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function dependencyRoot(path: string): string | undefined {
+  const marker = `${sep}node_modules${sep}`;
+  const index = path.lastIndexOf(marker);
+  return index < 0 ? undefined : path.slice(0, index + marker.length - 1);
+}
+
+function agentBootstrapPaths(agentDir: string): string[] {
+  return [
+    'settings.json',
+    'models.json',
+    'auth.json',
+    'trust.json',
+    'AGENTS.md',
+    'SYSTEM.md',
+    'APPEND_SYSTEM.md',
+    'extensions',
+    'skills',
+    'prompts',
+    'themes',
+    'tools',
+    'bin',
+    'npm',
+    'git',
+  ].map((path) => join(agentDir, path));
+}
+
+class Semaphore {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(private limit: number) {}
+
+  setLimit(limit: number): void {
+    this.limit = limit;
+    while (this.active < this.limit && this.waiters.length > 0) this.waiters.shift()?.();
+  }
+
+  tryAcquire(): (() => void) | undefined {
+    if (this.active >= this.limit) return undefined;
+    this.active += 1;
+    return () => this.release();
+  }
+
+  async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) throw new Error('Task cancelled');
+    if (this.active < this.limit) {
+      this.active += 1;
+      return () => this.release();
+    }
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => {
+        const index = this.waiters.indexOf(start);
+        if (index >= 0) this.waiters.splice(index, 1);
+        reject(new Error('Task cancelled'));
+      };
+      const start = () => {
+        signal?.removeEventListener('abort', abort);
+        this.active += 1;
+        resolve();
+      };
+      this.waiters.push(start);
+      signal?.addEventListener('abort', abort, { once: true });
+    });
+    return () => this.release();
+  }
+
+  private release(): void {
+    this.active -= 1;
+    this.waiters.shift()?.();
+  }
+}
+
+class PermissionBroker {
+  private tail = Promise.resolve();
+  private readonly grants = new Set<string>();
+
+  async ask(
+    ctx: ExtensionContext,
+    task: string,
+    permission: string,
+    resource: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const key = `${permission}\u0000${resource}`;
+    if (this.grants.has(key)) return;
+    if (!ctx.hasUI) throw new Error(`Permission required: ${permission} ${resource}`);
+    let release: (() => void) | undefined;
+    const previous = this.tail;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    if (signal) {
+      let abort: (() => void) | undefined;
+      try {
+        await Promise.race([
+          previous,
+          new Promise<never>((_resolve, reject) => {
+            abort = () => reject(new Error('Permission request cancelled'));
+            signal.addEventListener('abort', abort, { once: true });
+          }),
+        ]);
+      } catch (error) {
+        void previous.finally(() => release?.());
+        throw error;
+      } finally {
+        if (abort) signal.removeEventListener('abort', abort);
+      }
+    } else {
+      await previous;
+    }
+    try {
+      if (this.grants.has(key)) return;
+      if (signal?.aborted) throw new Error('Permission request cancelled');
+      const choice = await ctx.ui.select(
+        `${task}: permission required`,
+        ['Allow once', 'Allow for this session', 'Reject'],
+        { signal },
+      );
+      if (choice === 'Allow for this session') this.grants.add(key);
+      if (choice !== 'Allow once' && choice !== 'Allow for this session') {
+        throw new Error(`Permission denied: ${permission} ${resource}`);
+      }
+    } finally {
+      release?.();
+    }
+  }
+
+  reset(): void {
+    this.grants.clear();
+    this.tail = Promise.resolve();
+  }
+}
+
+export function renderTaskResult(
+  id: string,
+  state: 'running' | 'completed' | 'error',
+  value: string,
+): string {
+  const tag = state === 'error' ? 'task_error' : 'task_result';
+  return `<task id="${id}" state="${state}">\n<${tag}>\n${value}\n</${tag}>\n</task>`;
+}
+
+function taskTreeLines(
+  tasks: readonly SubagentTaskView[],
+  renderTask: (task: SubagentTaskView) => string,
+): string[] {
+  const taskIds = new Set(tasks.map((task) => task.id));
+  const children = new Map<string, SubagentTaskView[]>();
+  const roots: SubagentTaskView[] = [];
+
+  for (const task of tasks) {
+    if (!task.parentTaskId || !taskIds.has(task.parentTaskId)) {
+      roots.push(task);
+      continue;
+    }
+    const siblings = children.get(task.parentTaskId) ?? [];
+    siblings.push(task);
+    children.set(task.parentTaskId, siblings);
+  }
+
+  const lines: string[] = [];
+  const visit = (task: SubagentTaskView, prefix: string, connector: string): void => {
+    lines.push(`${prefix}${connector}${renderTask(task)}`);
+    const descendants = children.get(task.id) ?? [];
+    for (const [index, child] of descendants.entries()) {
+      const last = index === descendants.length - 1;
+      visit(child, `${prefix}${connector === '├─ ' ? '│  ' : '   '}`, last ? '└─ ' : '├─ ');
+    }
+  };
+
+  for (const [index, root] of roots.entries()) {
+    visit(root, '', index === roots.length - 1 ? '└─ ' : '├─ ');
+  }
+  return lines;
+}
+
+export function renderTaskTree(tasks: readonly SubagentTaskView[]): string {
+  return taskTreeLines(
+    tasks,
+    (task) =>
+      `${task.state.padEnd(11)} @${task.agent}  ${task.description}  ${task.id.slice(0, 8)}`,
+  ).join('\n');
+}
+
+function taskState(theme: Theme, task: SubagentTaskView): string {
+  switch (task.state) {
+    case 'completed':
+      return `${theme.fg('success', '●')} ${theme.fg('success', 'completed')}`;
+    case 'running':
+      return `${theme.fg('accent', '●')} ${theme.fg('accent', 'running')}`;
+    case 'queued':
+      return `${theme.fg('warning', '○')} ${theme.fg('warning', 'queued')}`;
+    case 'cancelled':
+      return `${theme.fg('muted', '●')} ${theme.fg('muted', 'cancelled')}`;
+    case 'interrupted':
+      return `${theme.fg('warning', '●')} ${theme.fg('warning', 'interrupted')}`;
+    case 'error':
+      return `${theme.fg('error', '●')} ${theme.fg('error', 'error')}`;
+  }
+}
+
+function permissionName(tool: string): string {
+  if (tool === 'write' || tool === 'apply_patch') return 'edit';
+  if (tool === 'find') return 'glob';
+  if (tool === 'ls') return 'list';
+  return tool;
+}
+
+function canonicalPermissionPath(path: string, seen = new Set<string>()): string {
+  const missing: string[] = [];
+  let existing = path;
+  while (true) {
+    try {
+      const stat = lstatSync(existing);
+      if (stat.isSymbolicLink()) {
+        if (seen.has(existing)) return path;
+        seen.add(existing);
+        const target = resolve(dirname(existing), readlinkSync(existing), ...missing);
+        return canonicalPermissionPath(target, seen);
+      }
+      break;
+    } catch {
+      const parent = dirname(existing);
+      if (parent === existing) return path;
+      missing.unshift(basename(existing));
+      existing = parent;
+    }
+  }
+  try {
+    return resolve(realpathSync(existing), ...missing);
+  } catch {
+    return path;
+  }
+}
+
+function permissionResource(tool: string, input: Record<string, unknown>, cwd: string): string {
+  if (tool === 'bash' && typeof input.command === 'string') return input.command;
+  if (tool === 'task' && typeof input.subagent_type === 'string') return input.subagent_type;
+  if ((tool === 'grep' || tool === 'find') && typeof input.pattern === 'string') {
+    return input.pattern;
+  }
+  if (typeof input.path !== 'string') return '*';
+  const projectRoot = canonicalPermissionPath(resolve(cwd));
+  const absolutePath = canonicalPermissionPath(resolve(cwd, input.path));
+  const projectPath = relative(projectRoot, absolutePath);
+  if (
+    projectPath &&
+    !isAbsolute(projectPath) &&
+    !projectPath.startsWith(`..${sep}`) &&
+    projectPath !== '..'
+  ) {
+    return projectPath.split(sep).join('/');
+  }
+  return absolutePath.split(sep).join('/');
+}
+
+function permissionResources(tool: string, input: Record<string, unknown>, cwd: string): string[] {
+  if (tool !== 'apply_patch' || typeof input.patchText !== 'string') {
+    return [permissionResource(tool, input, cwd)];
+  }
+  const paths = [...input.patchText.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].map(
+    (match) => match[1].trim(),
+  );
+  paths.push(
+    ...[...input.patchText.matchAll(/^\*\*\* Move to: (.+)$/gm)].map((match) => match[1].trim()),
+  );
+  return paths.length > 0
+    ? [...new Set(paths.map((path) => permissionResource('edit', { path }, cwd)))]
+    : ['*'];
+}
+
+function parseWorkerConfig(): WorkerConfig | undefined {
+  const encoded = process.env[WORKER_ENV];
+  if (!encoded) return undefined;
+  try {
+    const value: unknown = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+    if (!isRecord(value) || !Array.isArray(value.rules) || !isRecord(value.task)) {
+      throw new Error('invalid shape');
+    }
+    return value as unknown as WorkerConfig;
+  } catch (error) {
+    throw new Error(
+      `Invalid ${WORKER_ENV}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function parseControlResponse(value: string | undefined): ControlResponse {
+  if (value === undefined) throw new Error('Supervisor cancelled the request');
+  const response: unknown = JSON.parse(value);
+  if (!isRecord(response) || typeof response.ok !== 'boolean') {
+    throw new Error('Invalid supervisor response');
+  }
+  if (!response.ok) {
+    throw new Error(typeof response.error === 'string' ? response.error : 'Request failed');
+  }
+  if (response.value !== undefined && typeof response.value !== 'string') {
+    throw new Error('Invalid supervisor response value');
+  }
+  if (
+    response.task !== undefined &&
+    (!isRecord(response.task) ||
+      typeof response.task.taskId !== 'string' ||
+      typeof response.task.state !== 'string' ||
+      !TASK_STATES.has(response.task.state as TaskState) ||
+      typeof response.task.agent !== 'string')
+  ) {
+    throw new Error('Invalid supervisor task response');
+  }
+  return response as unknown as ControlResponse;
+}
+
+/** Register the constrained half of this extension inside an RPC worker. */
+export function registerSubagentWorker(pi: ExtensionAPI, config: WorkerConfig): void {
+  pi.on('session_start', () => {
+    delete process.env[WORKER_ENV];
+  });
+  pi.on('tool_call', async (event, ctx) => {
+    // Nested task requests are validated by the root scheduler after transport.
+    if (event.toolName === 'task') return;
+    const permission = permissionName(event.toolName);
+    const input = isRecord(event.input) ? event.input : {};
+    for (const resource of permissionResources(event.toolName, input, ctx.cwd)) {
+      const decision = permissionDecision(config.rules, permission, resource);
+      if (decision === 'deny') {
+        return { block: true, reason: `Permission denied: ${permission} ${resource}` };
+      }
+      if (decision !== 'ask') continue;
+      const value = await ctx.ui.input(
+        CONTROL_TITLE,
+        JSON.stringify({ type: 'permission', permission, resource } satisfies ControlRequest),
+        { signal: ctx.signal },
+      );
+      try {
+        parseControlResponse(value);
+      } catch (error) {
+        return { block: true, reason: error instanceof Error ? error.message : String(error) };
+      }
+    }
+  });
+
+  if (config.taskEnabled) {
+    pi.registerTool({
+      name: 'task',
+      label: 'Task',
+      description: 'Delegate work to a process-backed subagent managed by the root supervisor.',
+      parameters: taskParameters,
+      executionMode: 'parallel',
+      async execute(_id, input, signal, _onUpdate, ctx) {
+        const value = await ctx.ui.input(
+          CONTROL_TITLE,
+          JSON.stringify({ type: 'task', input } satisfies ControlRequest),
+          { signal },
+        );
+        const response = parseControlResponse(value);
+        const text = response.value ?? '';
+        return {
+          content: [{ type: 'text', text }],
+          details: response.task ?? {
+            taskId: input.task_id ?? '',
+            state: input.background ? 'running' : 'completed',
+            agent: input.subagent_type,
+          },
+        };
+      },
+    });
+  }
+
+  if (config.steps) {
+    const maxTurns = config.steps;
+    let turns = 0;
+    pi.on('turn_end', (_event, ctx) => {
+      turns += 1;
+      if (turns >= maxTurns) ctx.abort();
+    });
+  }
+}
+
+export function workerConfigFromEnvironment(): WorkerConfig | undefined {
+  return parseWorkerConfig();
+}
+
+export class SubagentRuntime {
+  private semaphore = new Semaphore(1);
+  private readonly broker = new PermissionBroker();
+  private readonly tasks = new Map<string, TaskRecord>();
+  private readonly running = new Map<string, RunningTask>();
+  private readonly runPromises = new Map<string, Promise<string>>();
+  private readonly controllers = new Map<string, AbortController>();
+  private readonly leases = new Map<string, TaskLease>();
+  private readonly foregroundClaims = new Map<string, number>();
+  private readonly pendingPrompts = new Map<string, string[]>();
+  private primaryAgent: AgentDefinition | undefined;
+  private primaryRules: PermissionRules | undefined;
+  private primaryConfigurationError = false;
+  private maxSubagents = 0;
+  private shuttingDown = false;
+  private activeSessionId: string | undefined;
+
+  constructor(
+    private readonly pi: ExtensionAPI,
+    private readonly integration: LandstripIntegration,
+    private readonly createWorker: WorkerFactory = (...args) => this.defaultWorker(...args),
+    private readonly loadCatalog: CatalogLoader = loadAgentCatalog,
+  ) {}
+
+  register(): void {
+    this.pi.registerTool(this.createTaskTool());
+    this.pi.on('session_start', async (_event, ctx) => {
+      this.activeSessionId = undefined;
+      await this.dispose();
+      this.shuttingDown = false;
+      this.activeSessionId = ctx.sessionManager.getSessionId();
+      this.broker.reset();
+      this.restore(ctx);
+      this.restorePrimaryAgent(ctx);
+      const activeTools = this.pi.getActiveTools();
+      const withoutTask = activeTools.filter((tool) => tool !== 'task');
+      const nextTools = this.maxSubagents > 0 ? [...withoutTask, 'task'] : withoutTask;
+      if (nextTools.join('\0') !== activeTools.join('\0')) this.pi.setActiveTools(nextTools);
+    });
+    this.pi.on('session_before_switch', async (_event, ctx) => {
+      this.activeSessionId = undefined;
+      if (ctx.hasUI) ctx.ui.setWidget(TASK_WIDGET, undefined);
+      await this.dispose();
+    });
+    this.pi.on('session_shutdown', async (_event, ctx) => {
+      this.activeSessionId = undefined;
+      if (ctx.hasUI) ctx.ui.setWidget(TASK_WIDGET, undefined);
+      await this.dispose();
+    });
+    this.pi.on('before_agent_start', (event) => {
+      if (!this.primaryAgent?.prompt) return;
+      return { systemPrompt: `${event.systemPrompt}\n\n${this.primaryAgent.prompt}` };
+    });
+    this.pi.on('tool_call', async (event, ctx) => {
+      if (this.primaryConfigurationError) {
+        return { block: true, reason: 'Invalid primary agent configuration' };
+      }
+      if (!this.primaryAgent || !this.primaryRules || event.toolName === 'task') return;
+      const permission = permissionName(event.toolName);
+      for (const resource of permissionResources(event.toolName, event.input, ctx.cwd)) {
+        const decision = permissionDecision(this.primaryRules, permission, resource);
+        if (decision === 'deny') {
+          return {
+            block: true,
+            reason: `Permission denied by @${this.primaryAgent.name}: ${permission} ${resource}`,
+          };
+        }
+        if (decision === 'ask') {
+          try {
+            await this.broker.ask(
+              ctx,
+              `@${this.primaryAgent.name}`,
+              permission,
+              resource,
+              ctx.signal,
+            );
+          } catch (error) {
+            return { block: true, reason: error instanceof Error ? error.message : String(error) };
+          }
+        }
+      }
+    });
+  }
+
+  getAgentCatalog(ctx: ExtensionContext): AgentCatalog {
+    return this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
+  }
+
+  getPrimaryAgent(): AgentDefinition | undefined {
+    return this.primaryAgent;
+  }
+
+  getMaxSubagents(): number {
+    return this.maxSubagents;
+  }
+
+  setMaxSubagents(maxSubagents: number): void {
+    if (!Number.isInteger(maxSubagents) || maxSubagents < 0 || maxSubagents > MAX_SUBAGENTS) {
+      throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
+    }
+    this.maxSubagents = maxSubagents;
+    this.semaphore.setLimit(Math.max(1, maxSubagents));
+    const activeTools = this.pi.getActiveTools();
+    const withoutTask = activeTools.filter((tool) => tool !== 'task');
+    const nextTools = maxSubagents > 0 ? [...withoutTask, 'task'] : withoutTask;
+    if (nextTools.join('\0') !== activeTools.join('\0')) this.pi.setActiveTools(nextTools);
+  }
+
+  selectPrimaryAgent(name: string, ctx: ExtensionContext): boolean {
+    const catalog = this.getAgentCatalog(ctx);
+    for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
+    for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
+    if (catalog.diagnostics.length > 0) return false;
+    const agent = availablePrimaryAgents(catalog).find((candidate) => candidate.name === name);
+    if (!agent) {
+      ctx.ui.notify(`Unknown primary agent: ${name}`, 'error');
+      return false;
+    }
+    this.activatePrimaryAgent(agent, catalog, ctx, true);
+    return true;
+  }
+
+  private createTaskTool(
+    parentTask?: TaskRecord,
+    callerRules?: PermissionRules,
+    boundCtx?: ExtensionContext,
+  ): ToolDefinition<typeof taskParameters, TaskDetails> {
+    const cwd = boundCtx?.cwd ?? process.cwd();
+    const catalog = this.loadCatalog(
+      cwd,
+      getAgentDir(),
+      boundCtx ? isProjectTrusted(boundCtx) : false,
+    );
+    const agents = availableSubagents(catalog).filter(
+      (agent) =>
+        !agent.hidden &&
+        permissionDecision(callerRules ?? catalog.permissions, 'task', agent.name) !== 'deny',
+    );
+    const descriptions = agents
+      .map((agent) => `${agent.name}: ${agent.description ?? 'No description'}`)
+      .join('\n');
+    return {
+      name: 'task',
+      label: 'Task',
+      description:
+        'Delegate a task to a sandboxed Pi RPC process.' +
+        (descriptions ? `\n\nAvailable subagents:\n${descriptions}` : ''),
+      parameters: taskParameters,
+      executionMode: 'parallel',
+      execute: async (_toolCallId, input, signal, onUpdate, callCtx) => {
+        const result = await this.execute(
+          input,
+          boundCtx ?? callCtx,
+          signal,
+          parentTask,
+          callerRules,
+          (text, taskId) =>
+            onUpdate?.({
+              content: [{ type: 'text', text }],
+              details: {
+                taskId: taskId ?? input.task_id ?? '',
+                state: 'running',
+                agent: input.subagent_type,
+              },
+            }),
+        );
+        return {
+          content: [{ type: 'text', text: result.text }],
+          details: { taskId: result.task.id, state: result.task.state, agent: result.task.agent },
+        };
+      },
+    };
+  }
+
+  private async execute(
+    input: TaskInput,
+    ctx: ExtensionContext,
+    signal: AbortSignal | undefined,
+    parentTask: TaskRecord | undefined,
+    callerRules: PermissionRules | undefined,
+    update: (text: string, taskId?: string) => void,
+  ): Promise<{ task: TaskRecord; text: string }> {
+    if (!input.prompt.trim()) throw new Error('Task prompt cannot be empty');
+    const catalog = this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
+    for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
+    for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
+    if (catalog.diagnostics.length > 0) {
+      throw new Error(`Invalid agent configuration:\n${catalog.diagnostics.join('\n')}`);
+    }
+    if (catalog.maxSubagents === 0) throw new Error('Subagents are disabled by maxSubagents: 0');
+    const agent = catalog.agents.get(input.subagent_type);
+    if (!agent || agent.mode === 'primary')
+      throw new Error(`Unknown subagent: ${input.subagent_type}`);
+    const rules = callerRules ?? catalog.permissions;
+    const taskPermission = permissionDecision(rules, 'task', agent.name);
+    if (taskPermission === 'deny') throw new Error(`Task permission denied for ${agent.name}`);
+    if (taskPermission === 'ask') {
+      await this.broker.ask(ctx, input.description, 'task', agent.name, signal);
+    }
+
+    const depth = (parentTask?.depth ?? -1) + 1;
+    if (depth > MAX_DEPTH) throw new Error(`Maximum subagent depth (${MAX_DEPTH}) exceeded`);
+    let task: TaskRecord;
+    if (input.task_id) {
+      const continued = this.tasks.get(input.task_id);
+      if (!continued) throw new Error(`Unknown task: ${input.task_id}`);
+      task = continued;
+      if (task.parentSessionId !== ctx.sessionManager.getSessionId()) {
+        throw new Error(`Task ${task.id} does not belong to this session`);
+      }
+      if (task.parentTaskId !== parentTask?.id) {
+        throw new Error(`Task ${task.id} does not belong to this parent task`);
+      }
+      if (task.agent !== agent.name) {
+        throw new Error(`Task ${task.id} belongs to agent ${task.agent}, not ${agent.name}`);
+      }
+      if (
+        !this.running.has(task.id) &&
+        (!task.sessionDir || !existsSync(task.sessionDir)) &&
+        (!task.sessionFile || !existsSync(task.sessionFile))
+      ) {
+        throw new Error(`Task ${task.id} session is unavailable`);
+      }
+    } else {
+      task = this.createRecord(input, ctx, parentTask, agent, depth);
+    }
+
+    const existingRun = this.runPromises.get(task.id);
+
+    if (input.task_id) task.delivered = false;
+    if (existingRun) {
+      if (parentTask && !input.background && task.state === 'queued') {
+        throw new Error(
+          'No subagent capacity for a nested foreground task; use background: true or increase maxSubagents',
+        );
+      }
+      const controller = this.controllers.get(task.id);
+      let rejectCancelled: ((error: Error) => void) | undefined;
+      const cancelled = new Promise<never>((_resolve, reject) => {
+        rejectCancelled = reject;
+      });
+      const abort = () => {
+        controller?.abort();
+        rejectCancelled?.(new Error('Task cancelled'));
+      };
+      const waitFor = <T>(promise: Promise<T>): Promise<T> =>
+        signal && !input.background ? Promise.race([promise, cancelled]) : promise;
+      if (!input.background && signal?.aborted) {
+        controller?.abort();
+        throw new Error('Task cancelled');
+      }
+      if (!input.background) signal?.addEventListener('abort', abort, { once: true });
+      try {
+        const running = this.running.get(task.id);
+        if (running) {
+          await waitFor(running.rpc.request('follow_up', { message: input.prompt }));
+        } else {
+          const prompts = this.pendingPrompts.get(task.id) ?? [];
+          prompts.push(input.prompt);
+          this.pendingPrompts.set(task.id, prompts);
+        }
+        if (input.background) {
+          if (!task.background) {
+            task.background = true;
+            this.persist(task);
+            void this.notifyWhenDone(task, existingRun, ctx);
+          }
+          return { task, text: renderTaskResult(task.id, 'running', 'Background task updated') };
+        }
+        this.claimForeground(task.id);
+        try {
+          const output = await waitFor(existingRun);
+          task.delivered = true;
+          this.persist(task);
+          return { task, text: renderTaskResult(task.id, 'completed', output) };
+        } finally {
+          this.releaseForeground(task.id);
+        }
+      } finally {
+        signal?.removeEventListener('abort', abort);
+      }
+    }
+
+    task.state = 'queued';
+    task.delivered = false;
+    task.background = input.background === true;
+    this.persist(task);
+    this.updateTaskWidget(ctx);
+
+    const controller = new AbortController();
+    this.controllers.set(task.id, controller);
+    const abort = () => controller.abort();
+    if (!input.background && signal?.aborted) controller.abort();
+    if (!input.background) signal?.addEventListener('abort', abort, { once: true });
+    if (!input.background) this.claimForeground(task.id);
+    const run = this.runTask(
+      task,
+      agent,
+      input.prompt,
+      catalog,
+      ctx,
+      controller.signal,
+      parentTask !== undefined && !input.background,
+      (text) => update(text, task.id),
+    );
+    this.runPromises.set(task.id, run);
+    void run
+      .catch(() => undefined)
+      .finally(() => {
+        this.runPromises.delete(task.id);
+        this.controllers.delete(task.id);
+        signal?.removeEventListener('abort', abort);
+      });
+    if (input.background) {
+      task.background = true;
+      this.persist(task);
+      void this.notifyWhenDone(task, run, ctx);
+      return { task, text: renderTaskResult(task.id, 'running', 'Background task started') };
+    }
+    try {
+      const output = await run;
+      task.delivered = true;
+      this.persist(task);
+      return { task, text: renderTaskResult(task.id, 'completed', output) };
+    } finally {
+      this.releaseForeground(task.id);
+    }
+  }
+
+  private createRecord(
+    input: TaskInput,
+    ctx: ExtensionContext,
+    parentTask: TaskRecord | undefined,
+    agent: AgentDefinition,
+    depth: number,
+  ): TaskRecord {
+    const parentSession = parentTask?.sessionFile ?? ctx.sessionManager.getSessionFile();
+    const id = randomUUID();
+    const sessionDir = join(
+      getAgentDir(),
+      'sessions',
+      'pi-landstrip',
+      ctx.sessionManager.getSessionId(),
+      id,
+    );
+    mkdirSync(sessionDir, { recursive: true });
+    const task: TaskRecord = {
+      version: 1,
+      id,
+      parentSessionId: ctx.sessionManager.getSessionId(),
+      parentTaskId: parentTask?.id,
+      parentSessionFile: parentSession,
+      sessionDir,
+      agent: agent.name,
+      description: input.description,
+      depth,
+      state: 'queued',
+      background: input.background === true,
+    };
+    this.tasks.set(task.id, task);
+    this.persist(task);
+    this.updateTaskWidget(ctx);
+    return task;
+  }
+
+  private async runTask(
+    task: TaskRecord,
+    agent: AgentDefinition,
+    prompt: string,
+    catalog: AgentCatalog,
+    ctx: ExtensionContext,
+    signal: AbortSignal,
+    failIfBusy: boolean,
+    update: (text: string) => void,
+  ): Promise<string> {
+    let worker: WorkerHandle | undefined;
+    try {
+      const release = failIfBusy
+        ? this.semaphore.tryAcquire()
+        : await this.semaphore.acquire(signal);
+      if (!release) {
+        throw new Error(
+          'No subagent capacity for a nested foreground task; use background: true or increase maxSubagents',
+        );
+      }
+      this.leases.set(task.id, { release });
+      task.state = 'running';
+      task.error = undefined;
+      this.persist(task);
+      this.updateTaskWidget(ctx);
+      const rules = mergePermissionRules(catalog.permissions, agent.permissions);
+      const workerPromise = this.createWorker(task, agent, rules, ctx, signal, (request) =>
+        this.handleWorkerRequest(task, rules, ctx, request),
+      );
+      let rejectCancelled: ((error: Error) => void) | undefined;
+      const cancelled = new Promise<never>((_resolve, reject) => {
+        rejectCancelled = reject;
+      });
+      const abortStartup = () => rejectCancelled?.(new Error('Task cancelled'));
+      signal.addEventListener('abort', abortStartup, { once: true });
+      if (signal.aborted) abortStartup();
+      try {
+        worker = await Promise.race([workerPromise, cancelled]);
+      } catch (error) {
+        if (signal.aborted) {
+          void workerPromise.then(
+            async (lateWorker) => {
+              await lateWorker.rpc.stop().catch(() => undefined);
+              await lateWorker.dispose().catch(() => undefined);
+            },
+            () => undefined,
+          );
+        }
+        throw error;
+      } finally {
+        signal.removeEventListener('abort', abortStartup);
+      }
+      if (signal.aborted) throw new Error('Task cancelled');
+      let turns = 0;
+      worker.rpc.onEvent((event) => {
+        if (event.type === 'message_update' && isRecord(event.assistantMessageEvent)) {
+          const messageEvent = event.assistantMessageEvent;
+          if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string') {
+            update(messageEvent.delta);
+          }
+        }
+        if (event.type === 'turn_end') {
+          turns += 1;
+          if (agent.steps && turns >= agent.steps) void worker?.rpc.abort().catch(() => undefined);
+        }
+      });
+      const abort = () => void worker?.rpc.stop().catch(() => undefined);
+      signal.addEventListener('abort', abort, { once: true });
+      this.running.set(task.id, { rpc: worker.rpc, promise: Promise.resolve('') });
+      try {
+        const promise = worker.rpc
+          .prompt(prompt)
+          .then(async () => (await worker?.rpc.getLastAssistantText()) ?? '');
+        this.running.set(task.id, { rpc: worker.rpc, promise });
+        const pendingPrompts = this.pendingPrompts.get(task.id) ?? [];
+        this.pendingPrompts.delete(task.id);
+        for (const pendingPrompt of pendingPrompts) {
+          await worker.rpc.request('follow_up', { message: pendingPrompt });
+        }
+        const output = await promise;
+        if (signal.aborted) throw new Error('Task cancelled');
+        task.state = 'completed';
+        task.output = output;
+        this.persist(task);
+        this.updateTaskWidget(ctx);
+        return output;
+      } finally {
+        signal.removeEventListener('abort', abort);
+      }
+    } catch (error) {
+      task.state = signal.aborted ? 'cancelled' : 'error';
+      task.error = error instanceof Error ? error.message : String(error);
+      this.persist(task);
+      this.updateTaskWidget(ctx);
+      throw error;
+    } finally {
+      this.running.delete(task.id);
+      this.pendingPrompts.delete(task.id);
+      await worker?.rpc.stop().catch(() => undefined);
+      await worker?.dispose().catch(() => undefined);
+      this.releaseLease(task.id);
+      this.leases.delete(task.id);
+    }
+  }
+
+  private async defaultWorker(
+    task: TaskRecord,
+    agent: AgentDefinition,
+    rules: PermissionRules,
+    ctx: ExtensionContext,
+    signal: AbortSignal,
+    onRequest: (request: ExtensionUiRequest) => Promise<ExtensionUiResult>,
+  ): Promise<WorkerHandle> {
+    const invocation = this.piInvocation();
+    this.validatePiInvocation();
+    const model = agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+    if (!model) throw new Error(`No model available for subagent ${agent.name}`);
+    const thinkingLevels = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+    const thinking =
+      agent.variant && thinkingLevels.has(agent.variant)
+        ? agent.variant
+        : this.pi.getThinkingLevel();
+    if (agent.variant && !thinkingLevels.has(agent.variant)) {
+      ctx.ui.notify(
+        `Agent ${agent.name} uses unsupported Pi model variant: ${agent.variant}`,
+        'warning',
+      );
+    }
+    const providerOptionNames = Object.keys(agent.providerOptions);
+    if (providerOptionNames.length > 0) {
+      ctx.ui.notify(
+        `Agent ${agent.name} options are not supported by Pi RPC mode: ${providerOptionNames.join(', ')}`,
+        'warning',
+      );
+    }
+    const taskEnabled = agent.permissions.some(
+      (rule) => rule.permission === 'task' && rule.action !== 'deny',
+    );
+    const tools = taskEnabled
+      ? [...new Set([...this.pi.getActiveTools(), 'task'])]
+      : this.pi.getActiveTools().filter((tool) => tool !== 'task');
+    const args = [
+      ...invocation.args,
+      '--mode',
+      'rpc',
+      '--extension',
+      join(packageDir, 'index.ts'),
+      ...(task.sessionFile
+        ? ['--session', task.sessionFile]
+        : task.sessionDir
+          ? ['--session-dir', task.sessionDir]
+          : []),
+      '--model',
+      model,
+      '--thinking',
+      thinking,
+      '--system-prompt',
+      agent.prompt,
+      isProjectTrusted(ctx) ? '--approve' : '--no-approve',
+      '--tools',
+      tools.join(','),
+    ];
+    const config: WorkerConfig = { rules, task, taskEnabled, steps: agent.steps };
+    const temp = mkdtempSync(join(tmpdir(), `pi-landstrip-task-${task.id}-`));
+    const agentDir = getAgentDir();
+    let launch: LandstripRpcWorkerLaunch | undefined;
+    let rpc: RpcProcess | undefined;
+    const abortWorker = () => void rpc?.stop().catch(() => undefined);
+    try {
+      const sessionWritePath =
+        task.sessionDir ?? (task.sessionFile ? dirname(task.sessionFile) : undefined);
+      if (!sessionWritePath) throw new Error('Subagent task has no session directory or file');
+      const cliEntry = invocation.args[0] ?? invocation.command;
+      const cliRoot = dependencyRoot(cliEntry) ?? dirname(dirname(cliEntry));
+      const extensionRoot = dependencyRoot(packageDir);
+      launch = await this.integration.prepareRpcWorker({
+        command: invocation.command,
+        args,
+        cwd: ctx.cwd,
+        env: {
+          ...process.env,
+          [WORKER_ENV]: Buffer.from(JSON.stringify(config)).toString('base64url'),
+          JITI_FS_CACHE: 'false',
+          TMPDIR: temp,
+          TMP: temp,
+          TEMP: temp,
+        },
+        ctx,
+        readPaths: [
+          ...new Set(
+            [
+              ctx.cwd,
+              ...agentBootstrapPaths(agentDir),
+              join(homedir(), '.agents', 'skills'),
+              packageDir,
+              join(packageDir, 'node_modules'),
+              invocation.command,
+              cliRoot,
+              extensionRoot,
+              task.sessionDir,
+              task.sessionFile,
+              temp,
+            ].filter((path): path is string => path !== undefined),
+          ),
+        ],
+        writePaths: [sessionWritePath, temp],
+        signal,
+      });
+      if (signal.aborted) throw new Error('Task cancelled');
+      rpc = new RpcProcess({
+        command: launch.command,
+        args: launch.args,
+        cwd: launch.cwd,
+        env: launch.env,
+        spawn: launch.spawn,
+        onExtensionUiRequest: onRequest,
+        requestTimeoutMs: 120_000,
+        settleTimeoutMs: 24 * 60 * 60 * 1000,
+      });
+      signal.addEventListener('abort', abortWorker, { once: true });
+      if (signal.aborted) throw new Error('Task cancelled');
+      await rpc.start();
+      const state = await rpc.request<{ sessionFile?: string }>('get_state');
+      if (state.sessionFile) {
+        task.sessionFile = state.sessionFile;
+        this.persist(task);
+      }
+      signal.removeEventListener('abort', abortWorker);
+      return {
+        rpc,
+        async dispose() {
+          try {
+            await launch?.dispose();
+          } finally {
+            rmSync(temp, { recursive: true, force: true });
+          }
+        },
+      };
+    } catch (error) {
+      signal.removeEventListener('abort', abortWorker);
+      await rpc?.stop().catch(() => undefined);
+      await launch?.dispose().catch(() => undefined);
+      rmSync(temp, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  private piInvocation(): { command: string; args: string[] } {
+    const argvEntry = process.argv[1];
+    if (argvEntry && /(?:^|[/\\])cli\.(?:js|mjs|cjs|ts)$/.test(argvEntry)) {
+      return { command: process.execPath, args: [argvEntry] };
+    }
+    const pkg = resolvePiPackage();
+    if (!pkg) {
+      throw new Error(
+        'Unable to determine the running Pi CLI entry; process-backed subagents are unavailable',
+      );
+    }
+    return { command: process.execPath, args: [pkg.cliEntry] };
+  }
+
+  private validatePiInvocation(): void {
+    const pkg = resolvePiPackage();
+    if (!pkg) {
+      throw new Error(
+        'Unable to resolve the running Pi package; process-backed subagents are unavailable',
+      );
+    }
+    if (!isSupportedPiVersion(pkg.version)) {
+      throw new Error(
+        `Process-backed subagents require Pi >=0.80.6 <0.81.0; found ${pkg.version.join('.')}`,
+      );
+    }
+  }
+
+  private async handleWorkerRequest(
+    task: TaskRecord,
+    rules: PermissionRules,
+    ctx: ExtensionContext,
+    request: ExtensionUiRequest,
+  ): Promise<ExtensionUiResult> {
+    if (request.method === 'input' && request.title === CONTROL_TITLE) {
+      let response: ControlResponse;
+      try {
+        const control: unknown = JSON.parse(String(request.placeholder ?? ''));
+        if (!isRecord(control) || (control.type !== 'permission' && control.type !== 'task')) {
+          throw new Error('Invalid worker control request');
+        }
+        if (control.type === 'permission') {
+          if (typeof control.permission !== 'string' || typeof control.resource !== 'string') {
+            throw new Error('Invalid permission request');
+          }
+          await this.broker.ask(
+            ctx,
+            task.description,
+            control.permission,
+            control.resource,
+            this.controllers.get(task.id)?.signal,
+          );
+          response = { ok: true };
+        } else {
+          if (!isRecord(control.input)) throw new Error('Invalid nested task request');
+          const result = await this.execute(
+            control.input as unknown as TaskInput,
+            ctx,
+            this.controllers.get(task.id)?.signal,
+            task,
+            rules,
+            () => undefined,
+          );
+          response = {
+            ok: true,
+            value: result.text,
+            task: { taskId: result.task.id, state: result.task.state, agent: result.task.agent },
+          };
+        }
+      } catch (error) {
+        response = { ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+      return { value: JSON.stringify(response) };
+    }
+    return this.forwardWorkerUi(ctx, request, this.controllers.get(task.id)?.signal);
+  }
+
+  private async forwardWorkerUi(
+    ctx: ExtensionContext,
+    request: ExtensionUiRequest,
+    signal?: AbortSignal,
+  ): Promise<ExtensionUiResult> {
+    if (
+      request.method === 'select' &&
+      typeof request.title === 'string' &&
+      Array.isArray(request.options)
+    ) {
+      const options = request.options.filter((value): value is string => typeof value === 'string');
+      const value = await ctx.ui.select(request.title, options, { signal });
+      return value === undefined ? { cancelled: true } : { value };
+    }
+    if (request.method === 'confirm' && typeof request.title === 'string') {
+      return {
+        confirmed: await ctx.ui.confirm(
+          request.title,
+          typeof request.message === 'string' ? request.message : '',
+          { signal },
+        ),
+      };
+    }
+    if (request.method === 'input' && typeof request.title === 'string') {
+      const value = await ctx.ui.input(
+        request.title,
+        typeof request.placeholder === 'string' ? request.placeholder : undefined,
+        { signal },
+      );
+      return value === undefined ? { cancelled: true } : { value };
+    }
+    if (request.method === 'editor' && typeof request.title === 'string') {
+      const value = await ctx.ui.editor(
+        request.title,
+        typeof request.prefill === 'string' ? request.prefill : undefined,
+      );
+      return value === undefined ? { cancelled: true } : { value };
+    }
+    if (request.method === 'notify' && typeof request.message === 'string') {
+      const level =
+        request.notifyType === 'warning' || request.notifyType === 'error'
+          ? request.notifyType
+          : 'info';
+      ctx.ui.notify(request.message, level);
+    }
+  }
+
+  private async notifyWhenDone(
+    task: TaskRecord,
+    run: Promise<string>,
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    try {
+      const output = await run;
+      if (this.shuttingDown || task.delivered || this.foregroundClaims.has(task.id)) return;
+      const delivered = await this.deliverBackground(
+        task,
+        `Background task completed: ${task.description}\n\n${renderTaskResult(task.id, 'completed', output)}`,
+      );
+      if (!delivered) return;
+      task.delivered = true;
+      this.persist(task);
+    } catch (error) {
+      if (this.shuttingDown || task.delivered || this.foregroundClaims.has(task.id)) return;
+      const message = error instanceof Error ? error.message : String(error);
+      const delivered = await this.deliverBackground(
+        task,
+        `Background task failed: ${task.description}\n\n${renderTaskResult(task.id, 'error', message)}`,
+      );
+      if (!delivered) return;
+      ctx.ui.notify(`Background task failed: ${task.description}`, 'error');
+      task.delivered = true;
+      this.persist(task);
+    }
+  }
+
+  private async deliverBackground(task: TaskRecord, content: string): Promise<boolean> {
+    if (this.activeSessionId !== task.parentSessionId) return false;
+    const parent = task.parentTaskId ? this.running.get(task.parentTaskId) : undefined;
+    if (parent) {
+      try {
+        await parent.rpc.request('follow_up', { message: content });
+        return true;
+      } catch {
+        // The parent may have settled between lookup and delivery; route to root.
+      }
+    }
+    if (this.activeSessionId !== task.parentSessionId) return false;
+    this.pi.sendMessage(
+      {
+        customType: 'landstrip.task.result',
+        content,
+        display: true,
+        details: { taskId: task.id },
+      },
+      { triggerTurn: true, deliverAs: 'followUp' },
+    );
+    return true;
+  }
+
+  private persist(task: TaskRecord): void {
+    this.pi.appendEntry(TASK_ENTRY, { ...task });
+  }
+
+  private updateTaskWidget(ctx: ExtensionContext): void {
+    if (!ctx.hasUI || (ctx.mode !== undefined && ctx.mode !== 'tui')) return;
+
+    const tasks = [...this.tasks.values()];
+    const byId = new Map(tasks.map((task) => [task.id, task]));
+    const rootId = (task: TaskRecord): string => {
+      const seen = new Set<string>();
+      let current = task;
+      while (current.parentTaskId && !seen.has(current.id)) {
+        seen.add(current.id);
+        const parent = byId.get(current.parentTaskId);
+        if (!parent) break;
+        current = parent;
+      }
+      return current.id;
+    };
+    const active = tasks.filter((task) => task.state === 'queued' || task.state === 'running');
+    const activeRoots = new Set(active.map(rootId));
+    if (activeRoots.size === 0) {
+      ctx.ui.setWidget(TASK_WIDGET, undefined);
+      return;
+    }
+    const visible = tasks.filter((task) => activeRoots.has(rootId(task)));
+
+    ctx.ui.setWidget(TASK_WIDGET, (_tui, theme) => ({
+      render: (width: number) => {
+        const header =
+          theme.fg('accent', theme.bold('Subagents')) +
+          theme.fg('dim', `  ${active.length} active`);
+        const tree = taskTreeLines(visible, (task) => {
+          const agent = theme.fg('accent', `@${task.agent}`);
+          const description = theme.fg('text', task.description);
+          return `${taskState(theme, task)}  ${agent}  ${description}`;
+        });
+        const shown = tree.slice(0, 8);
+        if (tree.length > shown.length) {
+          shown.push(theme.fg('dim', `   … ${tree.length - shown.length} more`));
+        }
+        return [header, ...shown].map((line) => truncateToWidth(line, Math.max(1, width)));
+      },
+      invalidate() {},
+    }));
+  }
+
+  private restore(ctx: ExtensionContext): void {
+    this.tasks.clear();
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== 'custom' || entry.customType !== TASK_ENTRY) continue;
+      const task = entry.data as TaskRecord | undefined;
+      if (!task?.id || task.parentSessionId !== ctx.sessionManager.getSessionId()) continue;
+      this.tasks.set(task.id, {
+        ...task,
+        state: task.state === 'running' || task.state === 'queued' ? 'interrupted' : task.state,
+      });
+    }
+    for (const task of this.tasks.values()) {
+      if (!task.background || task.delivered) continue;
+      if (task.state !== 'completed' && task.state !== 'error') continue;
+      const failed = task.state === 'error';
+      const value = failed ? (task.error ?? 'Task failed') : (task.output ?? '');
+      const content = `Background task ${failed ? 'failed' : 'completed'}: ${task.description}\n\n${renderTaskResult(task.id, failed ? 'error' : 'completed', value)}`;
+      this.pi.sendMessage(
+        {
+          customType: 'landstrip.task.result',
+          content,
+          display: true,
+          details: { taskId: task.id },
+        },
+        { triggerTurn: true, deliverAs: 'followUp' },
+      );
+      task.delivered = true;
+      this.persist(task);
+    }
+    this.updateTaskWidget(ctx);
+  }
+
+  private restorePrimaryAgent(ctx: ExtensionContext): void {
+    this.primaryAgent = undefined;
+    this.primaryRules = undefined;
+    this.primaryConfigurationError = false;
+    const catalog = this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
+    for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
+    this.maxSubagents = catalog.maxSubagents;
+    this.semaphore = new Semaphore(Math.max(1, this.maxSubagents));
+    if (catalog.diagnostics.length > 0) {
+      this.primaryRules = [{ permission: '*', pattern: '*', action: 'deny' }];
+      this.primaryConfigurationError = true;
+      this.pi.registerTool(this.createTaskTool(undefined, this.primaryRules, ctx));
+      for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'error');
+      if (ctx.hasUI) ctx.ui.setStatus('landstrip-agent', '@invalid');
+      return;
+    }
+    let name = 'build';
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== 'custom' || entry.customType !== PRIMARY_AGENT_ENTRY) continue;
+      const value = entry.data as { name?: unknown } | undefined;
+      if (typeof value?.name === 'string') name = value.name;
+    }
+    const agents = availablePrimaryAgents(catalog);
+    const agent = agents.find((candidate) => candidate.name === name) ?? agents[0];
+    if (agent) this.activatePrimaryAgent(agent, catalog, ctx, false);
+  }
+
+  private activatePrimaryAgent(
+    agent: AgentDefinition,
+    catalog: AgentCatalog,
+    ctx: ExtensionContext,
+    persist: boolean,
+  ): void {
+    this.primaryAgent = agent;
+    this.primaryRules = mergePermissionRules(catalog.permissions, agent.permissions);
+    this.primaryConfigurationError = false;
+    this.broker.reset();
+    this.pi.registerTool(this.createTaskTool(undefined, this.primaryRules, ctx));
+    if (persist) this.pi.appendEntry(PRIMARY_AGENT_ENTRY, { name: agent.name });
+    if (ctx.hasUI) {
+      ctx.ui.setStatus('landstrip-agent', `@${agent.name}`);
+      if (persist) ctx.ui.notify(`Primary agent: ${agent.name}`, 'info');
+    }
+  }
+
+  private async dispose(): Promise<void> {
+    this.shuttingDown = true;
+    for (const controller of this.controllers.values()) controller.abort();
+    await Promise.allSettled([...this.running.values()].map(({ rpc }) => rpc.stop()));
+    await Promise.allSettled(this.runPromises.values());
+    this.running.clear();
+    this.runPromises.clear();
+    this.controllers.clear();
+    this.foregroundClaims.clear();
+    this.pendingPrompts.clear();
+    for (const taskId of this.leases.keys()) this.releaseLease(taskId);
+    this.leases.clear();
+  }
+
+  private claimForeground(taskId: string): void {
+    this.foregroundClaims.set(taskId, (this.foregroundClaims.get(taskId) ?? 0) + 1);
+  }
+
+  private releaseForeground(taskId: string): void {
+    const claims = this.foregroundClaims.get(taskId) ?? 0;
+    if (claims <= 1) this.foregroundClaims.delete(taskId);
+    else this.foregroundClaims.set(taskId, claims - 1);
+  }
+
+  private releaseLease(taskId: string): void {
+    const lease = this.leases.get(taskId);
+    lease?.release?.();
+    if (lease) lease.release = undefined;
+  }
+}
+
+export function registerSubagents(
+  pi: ExtensionAPI,
+  integration: LandstripIntegration,
+): SubagentRuntime {
+  const runtime = new SubagentRuntime(pi, integration);
+  runtime.register();
+  return runtime;
+}
+
+export function describeSubagents(catalog: AgentCatalog): string {
+  return availableSubagents(catalog)
+    .map((agent) => `${agent.name}: ${agent.description ?? 'No description'}`)
+    .join('\n');
+}

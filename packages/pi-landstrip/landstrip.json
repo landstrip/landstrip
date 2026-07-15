@@ -1,0 +1,49 @@
+{
+  "maxSubagents": 0,
+  "subagents": {
+    "agent": {
+      "build": {
+        "description": "Default primary agent with full development access",
+        "mode": "primary",
+        "prompt": "Work in build mode. Implement, test, and complete the requested changes."
+      },
+      "plan": {
+        "description": "Planning agent that asks before commands or file changes",
+        "mode": "primary",
+        "prompt": "Work in plan mode. Analyze the problem and produce a clear plan before making changes.",
+        "permission": { "edit": "ask", "bash": "ask", "task": "ask" }
+      },
+      "general": {
+        "description": "General-purpose agent for researching and executing complex tasks",
+        "mode": "subagent",
+        "prompt": "Complete the delegated task autonomously. Return one concise result to the parent.",
+        "permission": { "todowrite": "deny" }
+      },
+      "explore": {
+        "description": "Fast read-focused agent for exploring codebases",
+        "mode": "subagent",
+        "prompt": "Explore the codebase without modifying it. Report findings with file references.",
+        "permission": {
+          "*": "deny",
+          "read": {
+            "*": "allow",
+            "**/*.env": "ask",
+            "**/*.env.*": "ask",
+            "**/*.env.example": "allow"
+          },
+          "glob": "allow",
+          "grep": "allow",
+          "list": "allow"
+        }
+      }
+    },
+    "permission": {
+      "*": "allow",
+      "read": {
+        "**/*.env": "ask",
+        "**/*.env.*": "ask",
+        "**/*.env.example": "allow"
+      }
+    }
+  }
+}

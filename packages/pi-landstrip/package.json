@@ -1,12 +1,13 @@
 {
   "name": "pi-landstrip",
   "version": "0.17.6",
-  "description": "Landlock-based sandboxing for pi with interactive permission prompts",
+  "description": "Sandbox-aware Pi subagents and interactive command permissions",
   "keywords": [
     "landstrip",
     "pi-extension",
     "pi-package",
-    "sandbox"
+    "sandbox",
+    "subagents"
   ],
   "license": "Apache-2.0",
   "repository": {
@@ -14,41 +15,47 @@
     "url": "git+https://github.com/landstrip/landstrip.git"
   },
   "files": [
+    "agents.ts",
+    "config.ts",
     "index.ts",
+    "rpc-process.ts",
+    "subagents.ts",
     "README.md",
+    "landstrip.json",
     "sandbox.json"
   ],
   "type": "module",
   "scripts": {
-    "fmt": "oxfmt index.ts index.test.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md",
-    "lint": "oxlint index.ts index.test.ts",
+    "fmt": "oxfmt *.ts package.json tsconfig.json landstrip.json sandbox.json .oxfmtrc.json README.md",
+    "lint": "oxlint *.ts",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "all": "npm run fmt && npm run lint && npm run check && npm run test",
-    "ci:fmt": "oxfmt --check index.ts index.test.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md",
+    "ci:fmt": "oxfmt --check *.ts package.json tsconfig.json landstrip.json sandbox.json .oxfmtrc.json README.md",
     "ci:lint": "npm run lint",
     "ci:check": "npm run check",
     "ci:test": "npm run test"
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "^0.78.0",
-    "@landstrip/landstrip": "^0.17.6"
+    "@earendil-works/pi-tui": "^0.80.6",
+    "@landstrip/landstrip": "^0.17.6",
+    "minimatch": "^10.2.5"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.2",
+    "@earendil-works/pi-coding-agent": "^0.80.6",
     "@types/node": "^24.0.0",
     "oxfmt": "^0.53.0",
     "oxlint": "^1.68.0",
+    "typebox": "^1.3.6",
     "typescript": "^5.0.0",
     "vitest": "^4.1.9"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.2"
+    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "typebox": "^1.3.6"
   },
-  "peerDependenciesMeta": {
-    "@earendil-works/pi-coding-agent": {
-      "optional": true
-    }
+  "engines": {
+    "node": ">=22.19.0"
   },
   "pi": {
     "extensions": [
