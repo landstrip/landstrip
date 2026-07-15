@@ -69,58 +69,69 @@ export function isSupportedPiVersion(version: readonly number[]): boolean {
   );
 }
 
-// Resolve the running Pi package from the extension's own location. The
-// extension is loaded by the running Pi and imports
-// `@earendil-works/pi-coding-agent`, so the nearest `node_modules` copy
-// reachable from `packageDir` is the running Pi itself. Reading its
+// Resolve the Pi package used by this extension import. Reading its
 // `package.json` instead of spawning `pi --version` avoids depending on
 // `process.argv[1]`, which is not the Pi CLI entry when Pi runs as an embedded
 // or extension host and would otherwise report the Node version instead.
 export function resolvePiPackage(): PiPackage | undefined {
   if (piPackageResolved) return cachedPiPackage;
   piPackageResolved = true;
+
+  try {
+    const entry = fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent'));
+    let dir = dirname(entry);
+    for (;;) {
+      const pkgPath = join(dir, 'package.json');
+      if (existsSync(pkgPath)) {
+        const pkg = readPiPackage(pkgPath);
+        if (pkg) return pkg;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {
+    // Fall back to package discovery for runtimes without import.meta.resolve.
+  }
+
   let dir = packageDir;
   for (;;) {
     const pkgPath = join(dir, 'node_modules', '@earendil-works', 'pi-coding-agent', 'package.json');
     if (existsSync(pkgPath)) {
-      try {
-        const value: unknown = JSON.parse(readFileSync(pkgPath, 'utf8'));
-        if (
-          isRecord(value) &&
-          value.name === '@earendil-works/pi-coding-agent' &&
-          typeof value.version === 'string'
-        ) {
-          const parts = value.version.split('.').map(Number);
-          if (parts.length >= 3 && parts.slice(0, 3).every((n) => Number.isInteger(n))) {
-            const version = parts.slice(0, 3) as [number, number, number];
-            const binFile =
-              typeof value.bin === 'string'
-                ? value.bin
-                : isRecord(value.bin) && typeof value.bin.pi === 'string'
-                  ? value.bin.pi
-                  : undefined;
-            if (binFile) {
-              const cliEntry = join(
-                dir,
-                'node_modules',
-                '@earendil-works',
-                'pi-coding-agent',
-                binFile,
-              );
-              if (existsSync(cliEntry)) {
-                cachedPiPackage = { cliEntry, version };
-                return cachedPiPackage;
-              }
-            }
-          }
-        }
-      } catch {
-        // Malformed package.json; keep walking ancestors.
-      }
+      const pkg = readPiPackage(pkgPath);
+      if (pkg) return pkg;
     }
     const parent = dirname(dir);
     if (parent === dir) return undefined;
     dir = parent;
+  }
+}
+
+function readPiPackage(pkgPath: string): PiPackage | undefined {
+  try {
+    const value: unknown = JSON.parse(readFileSync(pkgPath, 'utf8'));
+    if (
+      !isRecord(value) ||
+      value.name !== '@earendil-works/pi-coding-agent' ||
+      typeof value.version !== 'string'
+    ) {
+      return undefined;
+    }
+    const parts = value.version.split('.').map(Number);
+    if (parts.length < 3 || !parts.slice(0, 3).every((n) => Number.isInteger(n))) return undefined;
+    const binFile =
+      typeof value.bin === 'string'
+        ? value.bin
+        : isRecord(value.bin) && typeof value.bin.pi === 'string'
+          ? value.bin.pi
+          : undefined;
+    if (!binFile) return undefined;
+    const cliEntry = join(dirname(pkgPath), binFile);
+    if (!existsSync(cliEntry)) return undefined;
+    cachedPiPackage = { cliEntry, version: parts.slice(0, 3) as [number, number, number] };
+    return cachedPiPackage;
+  } catch {
+    return undefined;
   }
 }
 
