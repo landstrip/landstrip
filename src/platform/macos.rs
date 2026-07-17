@@ -365,20 +365,25 @@ fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result
     // AF_UNIX socket creation stays allowed regardless of the socket policy.
     sb.push_str("(allow system-socket (socket-domain AF_UNIX))\n");
 
+    // Seatbelt's `localhost` token matches every local interface address,
+    // not just 127.0.0.1 (e.g. it permits 192.168.64.x on hosts with a
+    // vmnet/bridge interface). Anchor loopback rules to the 127.0.0.1
+    // literal so non-loopback local IPs stay denied, matching the Linux
+    // broker's ip.is_loopback() check.
     if network.restrict_connect_tcp {
         sb.push_str("(deny network-outbound)\n");
         for port in &network.connect_tcp_ports {
             writeln!(
                 sb,
-                "(allow network-outbound (remote tcp \"localhost:{port}\"))"
+                "(allow network-outbound (remote tcp \"127.0.0.1:{port}\"))"
             )?;
         }
     }
 
     if network.local_tcp_bind {
-        sb.push_str("(allow network-outbound (remote tcp \"localhost:*\"))\n");
-        sb.push_str("(allow network-bind (local tcp \"localhost:*\"))\n");
-        sb.push_str("(allow network-inbound (local tcp \"localhost:*\"))\n");
+        sb.push_str("(allow network-outbound (remote tcp \"127.0.0.1:*\"))\n");
+        sb.push_str("(allow network-bind (local tcp \"127.0.0.1:*\"))\n");
+        sb.push_str("(allow network-inbound (local tcp \"127.0.0.1:*\"))\n");
     }
 
     match &network.unix_socket_access {
