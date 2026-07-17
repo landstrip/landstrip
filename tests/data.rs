@@ -7,7 +7,7 @@
 //! status plus captured output are matched against the expectations.
 
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -721,37 +721,71 @@ fn run_loopback_allowed(
         return Err(format!("loopback connect was denied on port {port}"));
     }
 
-    if let Some(address) = non_loopback_ipv4() {
-        let listener = TcpListener::bind((address, 0))
-            .map_err(|error| format!("bind non-loopback listener: {error}"))?;
-        let denied_port = listener
+    if let Ok(listener) = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)) {
+        let port = listener
             .local_addr()
-            .map_err(|error| format!("read non-loopback listener address: {error}"))?
+            .map_err(|error| format!("read IPv6 loopback listener address: {error}"))?
             .port();
+        let connected = landstrip_net(ctx, format, policies)
+            .args([&ctx.nc, "-z", "-w1", "::1", &port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !connected {
+            return Err(format!("IPv6 loopback connect was denied on port {port}"));
+        }
+    }
+
+    if cfg!(target_os = "linux") {
+        if let Some(address) = non_loopback_ipv4() {
+            let listener = TcpListener::bind((address, 0))
+                .map_err(|error| format!("bind non-loopback listener: {error}"))?;
+            let denied_port = listener
+                .local_addr()
+                .map_err(|error| format!("read non-loopback listener address: {error}"))?
+                .port();
+            let output = landstrip_net(ctx, format, policies)
+                .args([
+                    &ctx.nc,
+                    "-z",
+                    "-w1",
+                    &address.to_string(),
+                    &denied_port.to_string(),
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|error| format!("spawn non-loopback connect: {error}"))?;
+            let merged = merge(&output.stdout, &output.stderr);
+            if output.status.success() {
+                return Err(format!(
+                    "non-loopback connect to {address}:{denied_port} was allowed"
+                ));
+            }
+            if !merged.contains(r#""kind":"network","code":"NETWORK_DENIED""#)
+                || !merged.contains(&format!("\"{address}:{denied_port}\""))
+            {
+                return Err(format!(
+                    "non-loopback connect was not denied by policy; output={}",
+                    merged.trim()
+                ));
+            }
+        }
+    }
+
+    if cfg!(target_os = "macos") {
         let output = landstrip_net(ctx, format, policies)
-            .args([
-                &ctx.nc,
-                "-z",
-                "-w1",
-                &address.to_string(),
-                &denied_port.to_string(),
-            ])
+            .args([&ctx.nc, "-z", "-v", "-w1", "1.1.1.1", "443"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
-            .map_err(|error| format!("spawn non-loopback connect: {error}"))?;
+            .map_err(|error| format!("spawn public connect: {error}"))?;
         let merged = merge(&output.stdout, &output.stderr);
-        if output.status.success() {
+        if output.status.success() || !merged.contains("Operation not permitted") {
             return Err(format!(
-                "non-loopback connect to {address}:{denied_port} was allowed"
-            ));
-        }
-        if cfg!(target_os = "linux")
-            && (!merged.contains(r#""kind":"network","code":"NETWORK_DENIED""#)
-                || !merged.contains(&format!("\"{address}:{denied_port}\"")))
-        {
-            return Err(format!(
-                "non-loopback connect was not denied by policy; output={}",
+                "public connect was not denied by policy; output={}",
                 merged.trim()
             ));
         }

@@ -152,8 +152,11 @@ settings are ignored.
 .Pp
 .Va allowLocalBinding
 permits binding to local TCP ports and connecting to loopback TCP addresses on
-any port, including listeners started outside the sandbox. It does not permit
-connections to non-loopback addresses.
+any port, including listeners started outside the sandbox. Linux denies
+non-loopback connections. On macOS, the required Seatbelt
+.Dq localhost
+matcher can also include addresses assigned to other local interfaces, but
+public remote addresses remain denied.
 .Pp
 On Windows, per-port TCP filtering is not implemented. A policy that requests
 proxy ports is accepted but unenforceable, so the AppContainer runs without

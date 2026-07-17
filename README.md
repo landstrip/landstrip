@@ -139,8 +139,10 @@ by platform:
 Sandbox mode denies direct network access by default. Proxy ports, loopback TCP
 binding and connections, and Unix sockets can be allowed with the Anthropic
 Sandbox Runtime network fields. `allowLocalBinding` permits both binding to and
-connecting to loopback TCP addresses; non-loopback connections remain denied.
-This includes loopback listeners started outside the sandbox.
+connecting to loopback TCP addresses, including listeners started outside the
+sandbox. Linux denies non-loopback connections. On macOS, Seatbelt's required
+`localhost` matcher can also include addresses assigned to other local
+interfaces, but public remote addresses remain denied.
 
 For a filesystem-only sandbox with unrestricted direct network access, set:
 
