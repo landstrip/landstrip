@@ -46,7 +46,10 @@ case "${1:-}" in
 		;;
 esac
 
-mapfile -t extension_dirs < <(list_extensions)
+extension_dirs=()
+while IFS= read -r extension_dir; do
+	extension_dirs+=("$extension_dir")
+done < <(list_extensions)
 ((${#extension_dirs[@]} > 0)) || {
 	printf 'no extension workspaces found\n' >&2
 	exit 1

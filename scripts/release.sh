@@ -25,7 +25,10 @@ version_parts() {
 	VERSION_C="${BASH_REMATCH[3]}"
 }
 
-mapfile -t extension_dirs < <(scripts/test-extensions.sh --list)
+extension_dirs=()
+while IFS= read -r extension_dir; do
+	extension_dirs+=("$extension_dir")
+done < <(scripts/test-extensions.sh --list)
 ((${#extension_dirs[@]} > 0)) || die "no extension workspaces found"
 
 release_files=(
