@@ -62,6 +62,7 @@ name=denied unix connect reports EACCES not EAFNOSUPPORT | os=linux | policy={"f
 
 name=denied TCP connect is reported | os=linux | policy={"network":{"httpProxyPort":1},"filesystem":{"denyRead":["/home"],"allowRead":["/usr","/lib","/lib64","/bin","/sbin","/etc"]}} | net=connect-denied
 name=httpProxyPort permits its loopback port only | os=linux,macos | net=connect-allowed
+name=allowLocalBinding permits loopback TCP connect | os=linux,macos | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=loopback-allowed
 
 # --- policy validation ---
 

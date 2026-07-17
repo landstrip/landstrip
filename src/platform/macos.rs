@@ -376,6 +376,7 @@ fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result
     }
 
     if network.local_tcp_bind {
+        sb.push_str("(allow network-outbound (remote tcp \"localhost:*\"))\n");
         sb.push_str("(allow network-bind (local tcp \"localhost:*\"))\n");
         sb.push_str("(allow network-inbound (local tcp \"localhost:*\"))\n");
     }

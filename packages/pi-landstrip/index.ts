@@ -814,10 +814,11 @@ function promptWriteBlock(
   );
 }
 
-// The broker knows only address:port, and no sandbox field can express a
-// grant for one: allowedDomains is a hostname list enforced by the proxy, and the
-// landstrip network policy is all-or-nothing (allowNetwork, allowLocalBinding).
-// So a connection is granted for the session or not at all.
+// The broker knows only address:port, and no sandbox field can express a grant
+// for one non-loopback endpoint: allowedDomains is enforced by the proxy,
+// allowLocalBinding grants all loopback endpoints, and allowNetwork disables
+// network enforcement. So a non-loopback connection is granted for the session
+// or not at all.
 function promptNetworkBlock(
   ctx: ExtensionContext,
   operation: string,

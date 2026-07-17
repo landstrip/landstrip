@@ -45,7 +45,7 @@ details.
 | ------------ | ------------------------ | ---------------------------- | ------------------------------- |
 | Policy       | path based rules         | file based rules             | per-run AppContainer ACLs       |
 | Timing       | dynamic subset of paths  | file based static ruleset    | per-run ACL grants              |
-| TCP          | localhost proxy ports    | loopback proxy ports         | allow all or deny all           |
+| TCP          | proxy or loopback        | proxy or loopback            | allow all or deny all           |
 | Unix sockets | allowlist                | allowlist via seccomp broker | allow all or deny all           |
 
 ### Linux
@@ -136,8 +136,11 @@ by platform:
 
 ## Network Policy
 
-Sandbox mode denies direct network access by default. Proxy ports, local binding,
-and Unix sockets can be allowed with the Anthropic Sandbox Runtime network fields.
+Sandbox mode denies direct network access by default. Proxy ports, loopback TCP
+binding and connections, and Unix sockets can be allowed with the Anthropic
+Sandbox Runtime network fields. `allowLocalBinding` permits both binding to and
+connecting to loopback TCP addresses; non-loopback connections remain denied.
+This includes loopback listeners started outside the sandbox.
 
 For a filesystem-only sandbox with unrestricted direct network access, set:
 

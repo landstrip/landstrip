@@ -3,9 +3,10 @@
 
 //! Seccomp filters and user-notification broker for network policy.
 //!
-//! Direct TCP is denied by default. Configured proxy ports are allowed only on
-//! loopback, and local TCP bind requires `allowLocalBinding`. Non-TCP INET,
-//! packet, and netlink sockets are blocked.
+//! Direct TCP is denied by default. Configured proxy ports and, when
+//! `allowLocalBinding` is enabled, arbitrary loopback ports are allowed. Local
+//! TCP bind also requires `allowLocalBinding`. Non-TCP INET, packet, and netlink
+//! sockets are blocked.
 //!
 //! Unix sockets are denied by default. `allowUnixSockets` mediates pathname
 //! `connect` and `bind`; abstract sockets, unnamed sockets, and `socketpair` are
@@ -125,7 +126,9 @@ pub(super) fn run_broker(
     let notify_bind =
         needs_network && (policy.network_access.local_tcp_bind || notify_unix_sockets);
     let notify_connect = needs_network
-        && (!policy.network_access.connect_tcp_ports.is_empty() || notify_unix_sockets);
+        && (policy.network_access.local_tcp_bind
+            || !policy.network_access.connect_tcp_ports.is_empty()
+            || notify_unix_sockets);
     let notify_filesystem = needs_filesystem;
     let unix_sockets = unix_socket_filter(&policy.network_access.unix_socket_access);
     ensure_notification_supported()?;
@@ -729,10 +732,11 @@ fn handle_connect(
         SocketKind::Tcp => {
             let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
             if !endpoint.loopback
-                || !policy
-                    .network_access
-                    .connect_tcp_ports
-                    .contains(&endpoint.port)
+                || (!policy.network_access.local_tcp_bind
+                    && !policy
+                        .network_access
+                        .connect_tcp_ports
+                        .contains(&endpoint.port))
             {
                 if query_enabled {
                     return Ok(network_query(

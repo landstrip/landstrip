@@ -7,6 +7,7 @@
 //! status plus captured output are matched against the expectations.
 
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -156,6 +157,7 @@ enum Net {
     ListenerAllowed,
     ConnectDenied,
     ConnectAllowed,
+    LoopbackAllowed,
     UnixAllowed,
     UnixDenied,
 }
@@ -515,6 +517,7 @@ fn parse_net(value: &str) -> Net {
         "listener-allowed" => Net::ListenerAllowed,
         "connect-denied" => Net::ConnectDenied,
         "connect-allowed" => Net::ConnectAllowed,
+        "loopback-allowed" => Net::LoopbackAllowed,
         "unix-allowed" => Net::UnixAllowed,
         "unix-denied" => Net::UnixDenied,
         other => panic!("unknown net kind `{other}`"),
@@ -548,6 +551,15 @@ fn next_port() -> u16 {
     port
 }
 
+fn non_loopback_ipv4() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(address) if !address.is_loopback() && !address.is_unspecified() => Some(address),
+        _ => None,
+    }
+}
+
 fn landstrip_net(ctx: &Context, format: PolicyFormat, policies: &[PathBuf]) -> Command {
     let mut command = Command::new(&ctx.bin);
     if format == PolicyFormat::Yaml {
@@ -576,6 +588,7 @@ fn run_net(
         }
         Net::ConnectDenied => run_connect_denied(ctx, format, policies),
         Net::ConnectAllowed => run_connect_allowed(ctx, dir),
+        Net::LoopbackAllowed => run_loopback_allowed(ctx, format, policies),
         Net::UnixAllowed => {
             let rel = unixsock
                 .as_ref()
@@ -679,10 +692,10 @@ fn run_connect_allowed(ctx: &Context, dir: &Path) -> Result<(), String> {
     std::thread::sleep(Duration::from_secs(1));
 
     let result = (|| {
-        if !sandbox_connect(ctx, &policies, proxy_port) {
+        if !sandbox_connect(ctx, PolicyFormat::Json, &policies, proxy_port) {
             return Err(format!("connect to proxy port {proxy_port} was denied"));
         }
-        if sandbox_connect(ctx, &policies, other_port) {
+        if sandbox_connect(ctx, PolicyFormat::Json, &policies, other_port) {
             return Err(format!("direct connect to port {other_port} was allowed"));
         }
         Ok(())
@@ -691,6 +704,60 @@ fn run_connect_allowed(ctx: &Context, dir: &Path) -> Result<(), String> {
     stop(&mut proxy);
     stop(&mut other);
     result
+}
+
+fn run_loopback_allowed(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+) -> Result<(), String> {
+    let port = next_port();
+    let mut listener = listen(ctx, port)?;
+    std::thread::sleep(Duration::from_secs(1));
+
+    let connected = sandbox_connect(ctx, format, policies, port);
+    stop(&mut listener);
+    if !connected {
+        return Err(format!("loopback connect was denied on port {port}"));
+    }
+
+    if let Some(address) = non_loopback_ipv4() {
+        let listener = TcpListener::bind((address, 0))
+            .map_err(|error| format!("bind non-loopback listener: {error}"))?;
+        let denied_port = listener
+            .local_addr()
+            .map_err(|error| format!("read non-loopback listener address: {error}"))?
+            .port();
+        let output = landstrip_net(ctx, format, policies)
+            .args([
+                &ctx.nc,
+                "-z",
+                "-w1",
+                &address.to_string(),
+                &denied_port.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("spawn non-loopback connect: {error}"))?;
+        let merged = merge(&output.stdout, &output.stderr);
+        if output.status.success() {
+            return Err(format!(
+                "non-loopback connect to {address}:{denied_port} was allowed"
+            ));
+        }
+        if cfg!(target_os = "linux")
+            && (!merged.contains(r#""kind":"network","code":"NETWORK_DENIED""#)
+                || !merged.contains(&format!("\"{address}:{denied_port}\"")))
+        {
+            return Err(format!(
+                "non-loopback connect was not denied by policy; output={}",
+                merged.trim()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn listen(ctx: &Context, port: u16) -> Result<Child, String> {
@@ -702,8 +769,8 @@ fn listen(ctx: &Context, port: u16) -> Result<Child, String> {
         .map_err(|e| format!("spawn nc listener on {port}: {e}"))
 }
 
-fn sandbox_connect(ctx: &Context, policies: &[PathBuf], port: u16) -> bool {
-    landstrip_net(ctx, PolicyFormat::Json, policies)
+fn sandbox_connect(ctx: &Context, format: PolicyFormat, policies: &[PathBuf], port: u16) -> bool {
+    landstrip_net(ctx, format, policies)
         .args([&ctx.nc, "-z", "-w1", "127.0.0.1", &port.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
