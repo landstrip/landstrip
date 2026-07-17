@@ -15,7 +15,7 @@ import {
   permissionDecision,
   type PermissionRules,
 } from './agents.ts';
-import { MAX_SUBAGENTS, setMaxSubagentsConfig } from './config.ts';
+import { MAX_SUBAGENTS, setMaxSubagentsConfig, setMaxSubagentsConfigForScope } from './config.ts';
 
 const temporaryDirectories: string[] = [];
 
@@ -123,6 +123,19 @@ describe('landstrip agent configuration', () => {
       maxSubagents: 6,
       subagents: { permission: { bash: 'ask' } },
     });
+  });
+
+  test('updates an explicitly selected scope', async () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+
+    await setMaxSubagentsConfigForScope(cwd, 3, 'global', agentDir);
+    await setMaxSubagentsConfigForScope(cwd, 5, 'project', agentDir);
+
+    expect(JSON.parse(readFileSync(join(agentDir, 'subagents.json'), 'utf8')).maxSubagents).toBe(3);
+    expect(JSON.parse(readFileSync(join(cwd, '.pi', 'subagents.json'), 'utf8')).maxSubagents).toBe(
+      5,
+    );
   });
 
   test('reports malformed agent permissions', () => {

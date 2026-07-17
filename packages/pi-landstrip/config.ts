@@ -76,21 +76,29 @@ export async function setMaxSubagentsConfig(
   includeProject = true,
   agentDir = getAgentDir(),
 ): Promise<'global' | 'project'> {
+  const { projectPath } = getLandstripConfigPaths(cwd, agentDir);
+  const scope = includeProject && existsSync(projectPath) ? 'project' : 'global';
+  await setMaxSubagentsConfigForScope(cwd, maxSubagents, scope, agentDir);
+  return scope;
+}
+
+export async function setMaxSubagentsConfigForScope(
+  cwd: string,
+  maxSubagents: number,
+  scope: 'global' | 'project',
+  agentDir = getAgentDir(),
+): Promise<void> {
   if (!Number.isInteger(maxSubagents) || maxSubagents < 0 || maxSubagents > MAX_SUBAGENTS) {
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
   }
   const { globalPath, projectPath } = getLandstripConfigPaths(cwd, agentDir);
-  const target =
-    includeProject && existsSync(projectPath)
-      ? { scope: 'project' as const, path: projectPath }
-      : { scope: 'global' as const, path: globalPath };
-  await withFileMutationQueue(target.path, async () => {
-    const config = readConfig(target.path);
+  const path = scope === 'project' ? projectPath : globalPath;
+  await withFileMutationQueue(path, async () => {
+    const config = readConfig(path);
     config.maxSubagents = maxSubagents;
-    mkdirSync(dirname(target.path), { recursive: true });
-    writeFileSync(target.path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   });
-  return target.scope;
 }
 
 export function loadLandstripConfig(

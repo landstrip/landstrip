@@ -61,7 +61,7 @@ import {
   workerConfigFromEnvironment,
 } from './subagents.ts';
 import { availablePrimaryAgents } from './agents.ts';
-import { MAX_SUBAGENTS, setMaxSubagentsConfig } from './config.ts';
+import { loadLandstripConfig, MAX_SUBAGENTS, setMaxSubagentsConfigForScope } from './config.ts';
 
 interface SandboxFilesystemConfig {
   denyRead: string[];
@@ -2360,63 +2360,98 @@ export function createLandstripIntegration(
 
       enableSandbox(ctx);
     });
-    const landstripCommand: Parameters<ExtensionAPI['registerCommand']>[1] = {
-      description: 'Show Landstrip configuration',
+    maybePi.registerCommand?.('sandbox', {
+      description: 'Show config and toggle the sandbox',
       handler: async (_args, ctx) => {
-        let config = loadConfig(ctx.cwd);
-
+        if (!ctx.hasUI) return;
+        const config = loadConfig(ctx.cwd);
         const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
+        const status = noSandboxFlag
+          ? 'disabled by --no-sandbox'
+          : config.enabled && sandboxEnabled && sandboxReady
+            ? 'active'
+            : config.enabled
+              ? 'inactive'
+              : 'disabled by config';
+        const list = (values: string[]): string => values.join(', ') || 'none';
+        const summary = [
+          `Status: ${status}`,
+          `landstrip package binary: ${landstripDisplayPath()}`,
+          '',
+          'Config files',
+          `${projectPath} ${existsSync(projectPath) ? '(found)' : '(missing)'}`,
+          `${globalPath} ${existsSync(globalPath) ? '(found)' : '(missing)'}`,
+          '',
+          `Network: ${config.network.allowNetwork ? 'unrestricted' : 'proxied'}`,
+          `allow network: ${config.network.allowNetwork ? 'yes' : 'no'}`,
+          `allowed: ${list(config.network.allowedDomains)}`,
+          `denied: ${list(config.network.deniedDomains)}`,
+          `unix sockets: ${config.network.allowAllUnixSockets ? 'all' : list(config.network.allowUnixSockets)}`,
+          '',
+          'Filesystem',
+          `deny read: ${list(config.filesystem.denyRead)}`,
+          `allow read: ${list(config.filesystem.allowRead)}`,
+          `allow write: ${list(config.filesystem.allowWrite)}`,
+          `deny write: ${list(config.filesystem.denyWrite)}`,
+        ].join('\n');
+        const enabled = !config.enabled;
+        const confirmed = await ctx.ui.confirm(
+          'Sandbox',
+          `${summary}\n\n${enabled ? 'Enable' : 'Disable'} the sandbox?`,
+        );
+        if (!confirmed) return;
 
+        try {
+          const scope = await setSandboxConfigEnabled(ctx.cwd, enabled, projectConfigTrusted);
+          if (!enabled) {
+            disableSandbox(ctx);
+          } else if (!noSandboxFlag) {
+            enableSandbox(ctx);
+          }
+          if (enabled && noSandboxFlag) {
+            notify(ctx, 'Sandbox remains disabled via --no-sandbox', 'warning');
+          } else {
+            notify(ctx, `Sandbox ${enabled ? 'enabled' : 'disabled'} in ${scope} config`, 'info');
+          }
+        } catch (error) {
+          notify(ctx, `Could not update config: ${error}`, 'error');
+        }
+      },
+    });
+
+    maybePi.registerCommand?.('agents', {
+      description: 'Select the primary agent and configure subagents',
+      handler: async (_args, ctx) => {
         if (!ctx.hasUI) return;
         await ctx.ui.custom(
           (tui, theme, _kb, done) => {
-            let tab: 'sandbox' | 'agents' | 'settings' = 'sandbox';
-            let selectedAgent = 0;
+            let tab: 'agents' | 'settings' = 'agents';
+            const initialAgents = runtime
+              ? availablePrimaryAgents(runtime.getAgentCatalog(ctx))
+              : [];
+            let selectedAgent = Math.max(
+              0,
+              initialAgents.findIndex((agent) => agent.name === runtime?.getPrimaryAgent()?.name),
+            );
             let selectedSetting = 0;
-            let maxSubagentsValue = runtime?.getMaxSubagents() ?? 0;
-            let editingMaxSubagents = false;
-            const dim = (s: string) => theme.fg('dim', s);
-            const muted = (s: string) => theme.fg('muted', s);
-            const accent = (s: string) => theme.fg('accent', s);
-            const text = (s: string) => theme.fg('text', s);
-
-            function sandboxStatus(): { color: 'success' | 'warning'; label: string } {
-              if (noSandboxFlag) return { color: 'warning', label: 'Disabled (--no-sandbox)' };
-              if (!config.enabled) return { color: 'warning', label: 'Disabled' };
-              if (!sandboxEnabled || !sandboxReady) return { color: 'warning', label: 'Inactive' };
-              return { color: 'success', label: 'Active' };
-            }
-
-            function boolVal(v: boolean): string {
-              return v ? theme.fg('warning', 'yes') : theme.fg('success', 'no');
-            }
+            let values = [
+              loadLandstripConfig(ctx.cwd, false).maxSubagents,
+              loadLandstripConfig(ctx.cwd, projectConfigTrusted).maxSubagents,
+            ];
+            let editing = false;
+            const dim = (value: string) => theme.fg('dim', value);
+            const muted = (value: string) => theme.fg('muted', value);
+            const accent = (value: string) => theme.fg('accent', value);
+            const text = (value: string) => theme.fg('text', value);
 
             return {
               render(width: number): string[] {
-                const innerW = Math.max(1, width - 4);
                 const row = (content = '') => boxRow(theme, width, content);
-                const lines: string[] = [];
-                const status = sandboxStatus();
-                function section(titleText: string, detail?: string): void {
-                  lines.push(row(''));
-                  lines.push(row(`${accent(titleText)}${detail ? dim(` · ${detail}`) : ''}`));
-                }
-
-                function item(label: string, value: string): void {
-                  lines.push(row(`  ${dim('•')} ${muted(label.padEnd(13))} ${value}`));
-                }
-
-                function listValue(values: string[], maxWidth: number): string {
-                  const value = values.join(', ') || 'none';
-                  return text(truncateToWidth(value, Math.max(10, maxWidth)));
-                }
-
-                lines.push(boxTop(theme, width, 'Landstrip'));
-                const sandboxTab = tab === 'sandbox' ? accent('Sandbox') : muted('Sandbox');
-                const agentsTab = tab === 'agents' ? accent('Agents') : muted('Agents');
-                const settingsTab = tab === 'settings' ? accent('Settings') : muted('Settings');
+                const lines = [boxTop(theme, width, 'Agents')];
                 lines.push(
-                  row(` ${sandboxTab} ${dim('│')} ${agentsTab} ${dim('│')} ${settingsTab}`),
+                  row(
+                    ` ${tab === 'agents' ? accent('Agents') : muted('Agents')} ${dim('│')} ${tab === 'settings' ? accent('Settings') : muted('Settings')}`,
+                  ),
                   row(''),
                 );
 
@@ -2424,101 +2459,44 @@ export function createLandstripIntegration(
                   const catalog = runtime?.getAgentCatalog(ctx);
                   const agents = catalog ? availablePrimaryAgents(catalog) : [];
                   const activeAgent = runtime?.getPrimaryAgent()?.name;
-                  if (agents.length === 0) {
-                    lines.push(row(muted('No primary agents configured')));
-                  } else {
-                    selectedAgent = Math.min(selectedAgent, agents.length - 1);
-                    for (const [index, agent] of agents.entries()) {
-                      const cursor = index === selectedAgent ? accent('›') : ' ';
-                      const active =
-                        agent.name === activeAgent ? theme.fg('success', '●') : dim('○');
-                      const name = index === selectedAgent ? accent(agent.name) : text(agent.name);
-                      const description = agent.description ? dim(` · ${agent.description}`) : '';
-                      lines.push(row(`${cursor} ${active} ${name}${description}`));
-                    }
+                  selectedAgent = Math.min(selectedAgent, Math.max(0, agents.length - 1));
+                  if (agents.length === 0) lines.push(row(muted('No primary agents configured')));
+                  for (const [index, agent] of agents.entries()) {
+                    const selected = index === selectedAgent;
+                    const cursor = selected ? accent('›') : ' ';
+                    const active = agent.name === activeAgent ? theme.fg('success', '●') : dim('○');
+                    const name = selected ? accent(agent.name) : text(agent.name);
+                    const description = agent.description ? dim(`  ${agent.description}`) : '';
+                    lines.push(row(`${cursor} ${active} ${name}${description}`));
                   }
-                  lines.push(
-                    row(''),
-                    row(
-                      `${dim('↑↓')} ${muted('select')}  ${dim('enter')} ${muted('activate')}  ${dim('tab')} ${muted('switch')}  ${dim('esc')} ${muted('close')}`,
-                    ),
-                    boxBottom(theme, width),
-                  );
-                  return lines;
+                } else {
+                  const scopes = ['Global', 'Project'] as const;
+                  for (const [index, scope] of scopes.entries()) {
+                    const selected = index === selectedSetting;
+                    const unavailable = scope === 'Project' && !projectConfigTrusted;
+                    const cursor = selected ? accent('›') : ' ';
+                    const value = selected
+                      ? accent(`[ ${values[index]} ]`)
+                      : text(`[ ${values[index]} ]`);
+                    const label = unavailable
+                      ? muted(`${scope} (project not trusted)`)
+                      : text(scope);
+                    lines.push(row(`${cursor} ${value} ${label}`));
+                  }
+                  if (values[selectedSetting] === 0) {
+                    lines.push(row(`    ${dim('Task delegation is disabled for this scope')}`));
+                  }
                 }
 
-                if (tab === 'settings') {
-                  const sandboxCursor = selectedSetting === 0 ? accent('›') : ' ';
-                  const maxCursor = selectedSetting === 1 ? accent('›') : ' ';
-                  const checkbox = config.enabled ? theme.fg('success', '[x]') : muted('[ ]');
-                  const maxValue =
-                    selectedSetting === 1
-                      ? accent(`[ ${maxSubagentsValue} ]`)
-                      : text(`[ ${maxSubagentsValue} ]`);
-                  lines.push(
-                    row(`${sandboxCursor} ${checkbox} ${text('Sandbox')}`),
-                    row(
-                      `${maxCursor} ${maxValue} ${text('Maximum concurrent subagents')} ${dim(`(0-${MAX_SUBAGENTS})`)}`,
-                    ),
-                  );
-                  if (maxSubagentsValue === 0) {
-                    lines.push(row(`    ${dim('Task delegation is disabled')}`));
-                  }
-                  if (noSandboxFlag) {
-                    lines.push(row(`    ${dim('Sandbox is overridden by --no-sandbox')}`));
-                  }
-                  lines.push(
-                    row(''),
-                    row(
-                      `${dim('↑↓')} ${muted('select')}  ${dim('space/enter')} ${muted('toggle or save')}  ${dim('0-9')} ${muted('edit number')}  ${dim('tab')} ${muted('switch')}  ${dim('esc')} ${muted('close')}`,
-                    ),
-                    boxBottom(theme, width),
-                  );
-                  return lines;
-                }
-
-                const statusDot = theme.fg(status.color, '●');
-                const pathSnippet = text(
-                  truncateToWidth(landstripDisplayPath(), Math.max(20, innerW - 28)),
-                );
                 lines.push(
+                  row(''),
                   row(
-                    `${statusDot} ${text(status.label)} ${dim('·')} ${muted('landstrip')} ${pathSnippet}`,
+                    tab === 'agents'
+                      ? `${dim('↑↓')} ${muted('select')}  ${dim('enter')} ${muted('activate')}  ${dim('tab')} ${muted('settings')}  ${dim('esc')} ${muted('close')}`
+                      : `${dim('↑↓')} ${muted('scope')}  ${dim('0-9/+/-')} ${muted('change')}  ${dim('enter')} ${muted('save')}  ${dim('tab')} ${muted('agents')}  ${dim('esc')} ${muted('close')}`,
                   ),
+                  boxBottom(theme, width),
                 );
-
-                section('Config');
-                item('project', text(projectPath));
-                item('global', text(globalPath));
-
-                const netMode = config.network.allowNetwork ? 'unrestricted' : 'proxied';
-                section('Network', netMode);
-                item('allow network', boolVal(config.network.allowNetwork));
-                item('allowed', listValue(config.network.allowedDomains, innerW - 17));
-                item('denied', listValue(config.network.deniedDomains, innerW - 17));
-                if (sessionAllowedDomains.length > 0)
-                  item('session', theme.fg('accent', sessionAllowedDomains.join(', ')));
-
-                section('Filesystem');
-                item('deny read', listValue(config.filesystem.denyRead, innerW - 17));
-                item('allow read', listValue(config.filesystem.allowRead, innerW - 17));
-                item('allow write', listValue(config.filesystem.allowWrite, innerW - 17));
-                item('deny write', listValue(config.filesystem.denyWrite, innerW - 17));
-
-                if (sessionAllowedReadPaths.length > 0 || sessionAllowedWritePaths.length > 0) {
-                  section('Session grants');
-                  if (sessionAllowedReadPaths.length > 0)
-                    item('read', theme.fg('accent', sessionAllowedReadPaths.join(', ')));
-                  if (sessionAllowedWritePaths.length > 0)
-                    item('write', theme.fg('accent', sessionAllowedWritePaths.join(', ')));
-                }
-
-                lines.push(row(''));
-                lines.push(
-                  row(`${dim('tab')} ${muted('switch')}  ${dim('esc')} ${muted('close')}`),
-                );
-                lines.push(boxBottom(theme, width));
-
                 return lines;
               },
 
@@ -2527,81 +2505,64 @@ export function createLandstripIntegration(
                   done(undefined);
                   return;
                 }
-                if (matchesKey(data, 'tab') || matchesKey(data, 'right')) {
-                  tab = tab === 'sandbox' ? 'agents' : tab === 'agents' ? 'settings' : 'sandbox';
-                  if (tab === 'settings') {
-                    maxSubagentsValue = runtime?.getMaxSubagents() ?? 0;
-                    editingMaxSubagents = false;
-                  }
-                  tui.requestRender();
-                  return;
-                }
-                if (matchesKey(data, 'left')) {
-                  tab = tab === 'settings' ? 'agents' : tab === 'agents' ? 'sandbox' : 'settings';
-                  if (tab === 'settings') {
-                    maxSubagentsValue = runtime?.getMaxSubagents() ?? 0;
-                    editingMaxSubagents = false;
-                  }
+                if (
+                  matchesKey(data, 'tab') ||
+                  matchesKey(data, 'left') ||
+                  matchesKey(data, 'right')
+                ) {
+                  tab = tab === 'agents' ? 'settings' : 'agents';
+                  editing = false;
                   tui.requestRender();
                   return;
                 }
                 if (tab === 'agents') {
                   const catalog = runtime?.getAgentCatalog(ctx);
                   const agents = catalog ? availablePrimaryAgents(catalog) : [];
-                  if (matchesKey(data, 'up')) {
-                    selectedAgent = Math.max(0, selectedAgent - 1);
-                    tui.requestRender();
-                  } else if (matchesKey(data, 'down')) {
+                  if (matchesKey(data, 'up')) selectedAgent = Math.max(0, selectedAgent - 1);
+                  else if (matchesKey(data, 'down')) {
                     selectedAgent = Math.min(Math.max(0, agents.length - 1), selectedAgent + 1);
-                    tui.requestRender();
                   } else if (matchesKey(data, 'return')) {
                     const agent = agents[selectedAgent];
-                    if (agent && runtime?.selectPrimaryAgent(agent.name, ctx)) tui.requestRender();
-                  }
+                    if (agent) runtime?.selectPrimaryAgent(agent.name, ctx);
+                  } else return;
+                  tui.requestRender();
                   return;
                 }
 
-                if (tab !== 'settings') return;
                 if (matchesKey(data, 'up')) {
                   selectedSetting = Math.max(0, selectedSetting - 1);
-                  editingMaxSubagents = false;
-                  tui.requestRender();
-                  return;
-                }
-                if (matchesKey(data, 'down')) {
+                  editing = false;
+                } else if (matchesKey(data, 'down')) {
                   selectedSetting = Math.min(1, selectedSetting + 1);
-                  editingMaxSubagents = false;
-                  tui.requestRender();
-                  return;
-                }
-
-                if (selectedSetting === 1) {
-                  if (/^[0-9]$/.test(data)) {
-                    const value = Number(
-                      editingMaxSubagents ? `${maxSubagentsValue}${data}` : data,
-                    );
-                    if (value <= MAX_SUBAGENTS) {
-                      maxSubagentsValue = value;
-                      editingMaxSubagents = true;
-                      tui.requestRender();
-                    }
+                  editing = false;
+                } else if (/^[0-9]$/.test(data)) {
+                  const value = Number(editing ? `${values[selectedSetting]}${data}` : data);
+                  if (value <= MAX_SUBAGENTS) {
+                    values[selectedSetting] = value;
+                    editing = true;
+                  }
+                } else if (data === '+' || data === '-') {
+                  values[selectedSetting] = Math.min(
+                    MAX_SUBAGENTS,
+                    Math.max(0, values[selectedSetting] + (data === '+' ? 1 : -1)),
+                  );
+                  editing = false;
+                } else if (matchesKey(data, 'return')) {
+                  const scope = selectedSetting === 0 ? 'global' : 'project';
+                  if (scope === 'project' && !projectConfigTrusted) {
+                    notify(ctx, 'Project settings require a trusted project', 'warning');
                     return;
                   }
-                  if (data === '+' || data === '-') {
-                    maxSubagentsValue = Math.min(
-                      MAX_SUBAGENTS,
-                      Math.max(0, maxSubagentsValue + (data === '+' ? 1 : -1)),
-                    );
-                    editingMaxSubagents = false;
-                    tui.requestRender();
-                    return;
-                  }
-                  if (!matchesKey(data, 'return')) return;
-                  const maxSubagents = maxSubagentsValue;
-                  void setMaxSubagentsConfig(ctx.cwd, maxSubagents, projectConfigTrusted)
-                    .then((scope) => {
-                      runtime?.setMaxSubagents(maxSubagents);
-                      editingMaxSubagents = false;
+                  const maxSubagents = values[selectedSetting];
+                  void setMaxSubagentsConfigForScope(ctx.cwd, maxSubagents, scope)
+                    .then(() => {
+                      const effective = loadLandstripConfig(
+                        ctx.cwd,
+                        projectConfigTrusted,
+                      ).maxSubagents;
+                      runtime?.setMaxSubagents(effective);
+                      values = [loadLandstripConfig(ctx.cwd, false).maxSubagents, effective];
+                      editing = false;
                       notify(
                         ctx,
                         `Maximum concurrent subagents set to ${maxSubagents} in ${scope} config`,
@@ -2613,34 +2574,8 @@ export function createLandstripIntegration(
                       notify(ctx, `Could not update config: ${error}`, 'error');
                     });
                   return;
-                }
-
-                if (data !== ' ' && !matchesKey(data, 'return')) return;
-
-                void (async () => {
-                  const enabled = !config.enabled;
-                  const scope = await setSandboxConfigEnabled(
-                    ctx.cwd,
-                    enabled,
-                    projectConfigTrusted,
-                  );
-                  config = loadConfig(ctx.cwd);
-
-                  if (!enabled) {
-                    disableSandbox(ctx);
-                    notify(ctx, `Sandbox disabled in ${scope} config`, 'info');
-                  } else if (noSandboxFlag) {
-                    notify(ctx, 'Sandbox remains disabled via --no-sandbox', 'warning');
-                  } else if (!config.enabled) {
-                    notify(ctx, 'Sandbox remains disabled via config', 'info');
-                  } else if (enableSandbox(ctx)) {
-                    notify(ctx, `Sandbox enabled in ${scope} config`, 'info');
-                  }
-
-                  tui.requestRender();
-                })().catch((error: unknown) => {
-                  notify(ctx, `Could not update config: ${error}`, 'error');
-                });
+                } else return;
+                tui.requestRender();
               },
 
               invalidate(): void {},
@@ -2648,19 +2583,10 @@ export function createLandstripIntegration(
           },
           {
             overlay: true,
-            overlayOptions: {
-              anchor: 'center',
-              width: 78,
-              margin: 2,
-            },
+            overlayOptions: { anchor: 'center', width: 72, margin: 2 },
           },
         );
       },
-    };
-    maybePi.registerCommand?.('landstrip', landstripCommand);
-    maybePi.registerCommand?.('sandbox', {
-      ...landstripCommand,
-      description: 'Deprecated alias for /landstrip',
     });
   }
 

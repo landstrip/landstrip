@@ -54,7 +54,7 @@ processes, but without the outer Landstrip OS sandbox. The extension warns once
 per session. Agent tool permissions still apply, but they are not an OS isolation
 boundary.
 
-Trusted project config overrides global config. `/landstrip` updates a trusted
+Trusted project config overrides global config. `/sandbox` updates a trusted
 project sandbox file when present, otherwise the global file. Pi versions
 without a project-trust API use only global configuration.
 
@@ -84,13 +84,13 @@ task's dedicated session directory. These paths are required to construct a
 normal Pi worker and are not persisted into `sandbox.json`. The worker receives
 write access only to its own session and temporary directories.
 
-Use `/landstrip` inside Pi. Its Sandbox tab shows the active policy, its Agents
-tab selects the primary role, and its Settings tab controls sandboxing and the
-maximum number of concurrent subagents.
+Use `/sandbox` inside Pi to inspect the active policy and toggle sandboxing. Use
+`/agents` to select the primary role; its Settings tab controls the global and
+trusted-project maximum number of concurrent subagents.
 
 ## Primary agents
 
-The Agents tab provides OpenCode-compatible `build` and `plan` roles by default.
+The `/agents` selector provides OpenCode-compatible `build` and `plan` roles by default.
 Build has normal development access; plan asks before shell commands and file
 changes. The selection controls the root system prompt and permissions and is
 restored with the session.
@@ -206,10 +206,9 @@ package entry. `subagents.json` accepts only top-level `maxSubagents` and
 ```
 
 `maxSubagents` is an integer from 0 through 16 controlling concurrent worker
-processes. Setting it to zero removes the `task` tool while retaining the Agents
-tab and primary roles. There is no separate subagent enable switch. The Settings
-tab in `/landstrip` edits this limit and the persisted sandbox enable checkbox;
-the Sandbox tab only reports effective policy and status.
+processes. Setting it to zero removes the `task` tool while retaining the primary
+roles. There is no separate subagent enable switch. The Settings tab in `/agents`
+edits this limit separately for global and trusted-project configuration.
 
 Agent modes, hidden/disabled agents, prompts, and ordered `allow`/`ask`/`deny`
 permissions apply to primary agents and subagents. Subagent workers also honor

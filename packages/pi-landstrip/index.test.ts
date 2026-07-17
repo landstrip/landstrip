@@ -41,9 +41,9 @@ describe('main Pi tool composition', () => {
   });
 });
 
-it('registers the tabbed landstrip command and sandbox compatibility alias', async () => {
+it('registers separate sandbox and agents commands', async () => {
   const commandNames: string[] = [];
-  let commandHandler: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  const commandHandlers = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
   let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
   const pi = {
     registerTool() {},
@@ -53,7 +53,7 @@ it('registers the tabbed landstrip command and sandbox compatibility alias', asy
       command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
     ) {
       commandNames.push(name);
-      if (name === 'landstrip') commandHandler = command.handler;
+      commandHandlers.set(name, command.handler);
     },
     on() {},
   } as unknown as ExtensionAPI;
@@ -102,12 +102,17 @@ it('registers the tabbed landstrip command and sandbox compatibility alias', asy
     },
   } as unknown as SubagentRuntime;
   createLandstripIntegration({ registerBashTool: false }).register(pi, runtime);
+  let sandboxMessage = '';
   const ctx = {
     cwd: join(tmpdir(), 'pi-landstrip-overlay-test'),
     hasUI: true,
     mode: 'tui',
     isProjectTrusted: () => false,
     ui: {
+      async confirm(_title: string, message: string) {
+        sandboxMessage = message;
+        return false;
+      },
       async custom(factory: (...args: unknown[]) => unknown) {
         component = factory(
           { requestRender() {} },
@@ -119,23 +124,26 @@ it('registers the tabbed landstrip command and sandbox compatibility alias', asy
     },
   } as unknown as ExtensionContext;
 
-  await commandHandler?.('', ctx);
-  expect(commandNames).toEqual(['landstrip', 'sandbox']);
-  const sandboxView = component?.render(78).join('\n') ?? '';
-  expect(sandboxView).toContain('Sandbox │ Agents │ Settings');
-  expect(sandboxView).not.toContain('toggle persisted setting');
-  component?.handleInput('\t');
+  await commandHandlers.get('sandbox')?.('', ctx);
+  expect(sandboxMessage).toContain('Config files');
+  expect(sandboxMessage).toContain('Filesystem');
+  expect(sandboxMessage).toMatch(/(?:Enable|Disable) the sandbox\?/);
+  await commandHandlers.get('agents')?.('', ctx);
+  expect(commandNames).toEqual(['sandbox', 'agents']);
+  expect(commandNames).not.toContain('landstrip');
+  const agentsView = component?.render(78).join('\n') ?? '';
+  expect(agentsView).toContain('Agents │ Settings');
+  expect(agentsView).toContain('build');
   component?.handleInput('\x1b[B');
   component?.handleInput('\r');
   expect(selected).toBe('plan');
   component?.handleInput('\t');
-  expect(component?.render(78).join('\n')).toContain('[x] Sandbox');
-  expect(component?.render(78).join('\n')).toContain('Maximum concurrent subagents (0-16)');
-  component?.handleInput('\x1b[B');
+  expect(component?.render(78).join('\n')).toContain('Global');
+  expect(component?.render(78).join('\n')).toContain('Project (project not trusted)');
   component?.handleInput('1');
   component?.handleInput('6');
   component?.handleInput('7');
-  expect(component?.render(78).join('\n')).toContain('[ 16 ] Maximum concurrent subagents');
+  expect(component?.render(78).join('\n')).toContain('[ 16 ] Global');
 });
 
 describe('proxy destination addresses', () => {
