@@ -39,7 +39,7 @@ fn main() {
     if let Err(error) = run_with_cli(&cli) {
         let trap = error
             .chain()
-            .find_map(<(dyn StdError + 'static)>::downcast_ref::<Error>)
+            .find_map(<dyn StdError + 'static>::downcast_ref::<Error>)
             .map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from_error);
         TrapFd::from_fd(cli.trap_fd).write(&trap);
         trap.emit();

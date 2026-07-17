@@ -125,16 +125,17 @@ fn write_without_sigpipe(fd: i32, line: &[u8]) -> isize {
     // SAFETY: the signal set pointers point to initialized local storage.
     unsafe {
         let mut sigpipe = std::mem::zeroed::<libc::sigset_t>();
-        if libc::sigemptyset(&mut sigpipe) != 0 || libc::sigaddset(&mut sigpipe, libc::SIGPIPE) != 0
+        if libc::sigemptyset(&raw mut sigpipe) != 0
+            || libc::sigaddset(&raw mut sigpipe, libc::SIGPIPE) != 0
         {
             return -1;
         }
 
         let mut pending = std::mem::zeroed::<libc::sigset_t>();
-        let was_pending =
-            libc::sigpending(&mut pending) == 0 && libc::sigismember(&pending, libc::SIGPIPE) == 1;
+        let was_pending = libc::sigpending(&raw mut pending) == 0
+            && libc::sigismember(&raw const pending, libc::SIGPIPE) == 1;
         let mut old_mask = std::mem::zeroed::<libc::sigset_t>();
-        if libc::pthread_sigmask(libc::SIG_BLOCK, &sigpipe, &mut old_mask) != 0 {
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &raw const sigpipe, &raw mut old_mask) != 0 {
             return -1;
         }
 
@@ -144,15 +145,15 @@ fn write_without_sigpipe(fd: i32, line: &[u8]) -> isize {
             written < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPIPE);
         if broken_pipe && !was_pending {
             let mut pending = std::mem::zeroed::<libc::sigset_t>();
-            if libc::sigpending(&mut pending) == 0
-                && libc::sigismember(&pending, libc::SIGPIPE) == 1
+            if libc::sigpending(&raw mut pending) == 0
+                && libc::sigismember(&raw const pending, libc::SIGPIPE) == 1
             {
                 let mut signal = 0;
-                libc::sigwait(&sigpipe, &mut signal);
+                libc::sigwait(&raw const sigpipe, &raw mut signal);
             }
         }
 
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut());
+        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old_mask, std::ptr::null_mut());
         written
     }
 }
