@@ -100,6 +100,16 @@ function canonicalizePath(filePath: string, baseDirectory: string): string {
   }
 }
 
+function canonicalizeGlobPath(pattern: string, baseDirectory: string): string {
+  const abs = expandPath(pattern, baseDirectory);
+  const wildcardIndex = abs.indexOf('*');
+  if (wildcardIndex === -1) return canonicalizePath(abs, baseDirectory);
+
+  const prefixEnd = abs.lastIndexOf('/', wildcardIndex);
+  const prefix = prefixEnd === 0 ? '/' : abs.slice(0, prefixEnd);
+  return canonicalizePath(prefix, baseDirectory) + abs.slice(prefixEnd);
+}
+
 const globRegExpCache = new Map<string, RegExp>();
 
 /**
@@ -154,7 +164,7 @@ function matchDepth(filePath: string, patterns: string[], baseDirectory: string)
 
   for (const pattern of patterns) {
     if (pattern.includes('*')) {
-      const absPattern = expandPath(pattern, baseDirectory);
+      const absPattern = canonicalizeGlobPath(pattern, baseDirectory);
       if (globToRegExp(absPattern).test(abs)) depth = Math.max(depth, pathDepth(abs));
     } else {
       const absPattern = canonicalizePath(pattern, baseDirectory);
@@ -171,7 +181,7 @@ function matchDepth(filePath: string, patterns: string[], baseDirectory: string)
 function resolveFilesystemPatterns(patterns: string[], baseDirectory: string): string[] {
   return patterns.map((pattern) =>
     pattern.includes('*')
-      ? expandPath(pattern, baseDirectory)
+      ? canonicalizeGlobPath(pattern, baseDirectory)
       : canonicalizePath(pattern, baseDirectory),
   );
 }
