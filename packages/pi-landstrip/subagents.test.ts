@@ -151,7 +151,7 @@ test('selects a primary agent and applies its prompt', async () => {
   const integration = { createTools: () => [] } as unknown as LandstripIntegration;
   const piAgentDir = temporaryDirectory();
   writeFileSync(
-    join(piAgentDir, 'landstrip.json'),
+    join(piAgentDir, 'subagents.json'),
     JSON.stringify({
       subagents: {
         agent: { plan: { permission: { edit: { '*': 'allow', 'secrets/**': 'deny' } } } },
@@ -215,7 +215,7 @@ test('registers task without spawning a worker process', async () => {
 
   const cwd = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
-  writeFileSync(join(cwd, '.pi', 'landstrip.json'), JSON.stringify({ maxSubagents: 4 }));
+  writeFileSync(join(cwd, '.pi', 'subagents.json'), JSON.stringify({ maxSubagents: 4 }));
   const warnings: string[] = [];
   const ctx = {
     cwd,
@@ -264,7 +264,7 @@ test('removes the task tool when maxSubagents is zero', async () => {
   } as unknown as ExtensionAPI;
   const cwd = temporaryDirectory();
   const piAgentDir = temporaryDirectory();
-  writeFileSync(join(piAgentDir, 'landstrip.json'), JSON.stringify({ maxSubagents: 0 }));
+  writeFileSync(join(piAgentDir, 'subagents.json'), JSON.stringify({ maxSubagents: 0 }));
   new SubagentRuntime(pi, {} as LandstripIntegration, undefined, (projectCwd) =>
     loadAgentCatalog(projectCwd, piAgentDir),
   ).register();
@@ -306,7 +306,7 @@ test('runs a foreground task in an injected RPC worker', async () => {
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
   writeFileSync(
-    join(cwd, '.pi', 'landstrip.json'),
+    join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
       maxSubagents: 4,
       subagents: {
@@ -408,7 +408,7 @@ test('cancels worker startup promptly and disposes a worker created afterward', 
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
   writeFileSync(
-    join(cwd, '.pi', 'landstrip.json'),
+    join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
       maxSubagents: 4,
       subagents: { agent: { review: { mode: 'subagent', prompt: 'Review.' } } },
@@ -464,7 +464,7 @@ test('sends a continuation queued during worker startup once RPC is available', 
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
   writeFileSync(
-    join(cwd, '.pi', 'landstrip.json'),
+    join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
       maxSubagents: 4,
       subagents: { agent: { review: { mode: 'subagent', prompt: 'Review.' } } },
@@ -548,7 +548,7 @@ test('records a running foreground task when continued in background', async () 
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
   writeFileSync(
-    join(cwd, '.pi', 'landstrip.json'),
+    join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
       maxSubagents: 4,
       subagents: { agent: { review: { mode: 'subagent', prompt: 'Review.' } } },
@@ -631,7 +631,7 @@ test('delivers a completed task when it is continued in background', async () =>
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
   writeFileSync(
-    join(cwd, '.pi', 'landstrip.json'),
+    join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
       maxSubagents: 4,
       subagents: { agent: { review: { mode: 'subagent', prompt: 'Review.' } } },
@@ -728,7 +728,7 @@ test('rejects an unknown continuation ID instead of creating a new task', async 
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
   writeFileSync(
-    join(cwd, '.pi', 'landstrip.json'),
+    join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
       maxSubagents: 4,
       subagents: { agent: { review: { mode: 'subagent', prompt: 'Review.' } } },

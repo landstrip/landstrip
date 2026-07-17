@@ -65,8 +65,8 @@ function getLandstripConfigPaths(
   agentDir = getAgentDir(),
 ): { globalPath: string; projectPath: string } {
   return {
-    globalPath: join(agentDir, 'landstrip.json'),
-    projectPath: join(cwd, '.pi', 'landstrip.json'),
+    globalPath: join(agentDir, 'subagents.json'),
+    projectPath: join(cwd, '.pi', 'subagents.json'),
   };
 }
 
@@ -99,7 +99,7 @@ export function loadLandstripConfig(
   agentDir = getAgentDir(),
 ): LandstripConfig {
   const { globalPath, projectPath } = getLandstripConfigPaths(cwd, agentDir);
-  let config = readConfig(join(packageDir, 'landstrip.json'));
+  let config = readConfig(join(packageDir, 'subagents.json'));
   config = mergeValue(config, readConfig(globalPath)) as LandstripConfigFile;
   if (includeProject) {
     config = mergeValue(config, readConfig(projectPath)) as LandstripConfigFile;

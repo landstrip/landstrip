@@ -114,7 +114,7 @@ function legacyConfigWarnings(piAgentDir: string): string[] {
     );
     if (fields.length === 0) return [];
     return [
-      `${path}: legacy ${fields.join(', ')} configuration is ignored; move it to landstrip.json`,
+      `${path}: legacy ${fields.join(', ')} configuration is ignored; move it to subagents.json`,
     ];
   } catch {
     return [];

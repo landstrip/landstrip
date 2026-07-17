@@ -6,7 +6,7 @@ format. It uses [`landstrip`](https://github.com/landstrip/landstrip) to
 implement the sandbox.
 
 `pi-landstrip` has a shared sandbox policy [sandbox.json](./sandbox.json) and a
-separate [landstrip.json](./landstrip.json) for primary-agent and subagent
+separate [subagents.json](./subagents.json) for primary-agent and subagent
 configuration. Global and trusted project files can override both.
 
 Pi >=0.80.6 <0.81.0 and Node.js >=22.19.0 are required for process-backed subagents.
@@ -172,12 +172,12 @@ first.
 
 ## Configuration
 
-Subagent configuration is read from `~/.pi/agent/landstrip.json` and, for
-trusted projects, `.pi/landstrip.json`. Project values override global values;
-both are merged over the packaged [default](./landstrip.json). Sandbox policy
+Subagent configuration is read from `~/.pi/agent/subagents.json` and, for
+trusted projects, `.pi/subagents.json`. Project values override global values;
+both are merged over the packaged [default](./subagents.json). Sandbox policy
 continues to use `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi's
 `settings.json` contains only normal Pi settings such as the `pi-landstrip`
-package entry. `landstrip.json` accepts only top-level `maxSubagents` and
+package entry. `subagents.json` accepts only top-level `maxSubagents` and
 `subagents`; sandbox fields belong only in `sandbox.json`.
 
 ```json
@@ -230,8 +230,8 @@ follows, then remove the old fields:
 - Convert legacy `tools` booleans to explicit `permission` rules.
 - Move Markdown agent prompts into each `subagents.agent.<name>.prompt` string.
 - Put the worker limit in top-level `maxSubagents`; zero disables delegation.
-- Use `~/.pi/agent/landstrip.json` for global configuration and
-  `.pi/landstrip.json` for trusted project configuration.
+- Use `~/.pi/agent/subagents.json` for global configuration and
+  `.pi/subagents.json` for trusted project configuration.
 - Leave sandbox policy in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`;
   those files are unchanged.
 

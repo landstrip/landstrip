@@ -53,17 +53,17 @@ describe('landstrip agent configuration', () => {
     expect(permissionDecision(exploreRules, 'read', '.env.example')).toBe('allow');
   });
 
-  test('merges global and project landstrip.json sections', () => {
+  test('merges global and project subagents.json sections', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'landstrip.json'), {
+    write(join(agentDir, 'subagents.json'), {
       maxSubagents: 2,
       subagents: {
         agent: { review: { mode: 'subagent', prompt: 'Review globally.' } },
         permission: { bash: { 'git status': 'deny', '*': 'ask' } },
       },
     });
-    write(join(cwd, '.pi', 'landstrip.json'), {
+    write(join(cwd, '.pi', 'subagents.json'), {
       maxSubagents: 1,
       subagents: {
         agent: { review: { description: 'Project review' } },
@@ -82,10 +82,10 @@ describe('landstrip agent configuration', () => {
     expect(permissionDecision(catalog.permissions, 'bash', 'git status')).toBe('allow');
   });
 
-  test('ignores project landstrip.json when the project is untrusted', () => {
+  test('ignores project subagents.json when the project is untrusted', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    write(join(cwd, '.pi', 'landstrip.json'), {
+    write(join(cwd, '.pi', 'subagents.json'), {
       maxSubagents: 2,
       subagents: { agent: { project: { mode: 'subagent' } } },
     });
@@ -97,7 +97,7 @@ describe('landstrip agent configuration', () => {
 
   test('allows maxSubagents zero without removing primary agents', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'landstrip.json'), { maxSubagents: 0 });
+    write(join(agentDir, 'subagents.json'), { maxSubagents: 0 });
 
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
     expect(catalog.maxSubagents).toBe(0);
@@ -106,7 +106,7 @@ describe('landstrip agent configuration', () => {
 
   test('rejects maxSubagents above the supported limit', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'landstrip.json'), { maxSubagents: MAX_SUBAGENTS + 1 });
+    write(join(agentDir, 'subagents.json'), { maxSubagents: MAX_SUBAGENTS + 1 });
 
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
     expect(catalog.diagnostics.join('\n')).toContain(`integer from 0 to ${MAX_SUBAGENTS}`);
@@ -115,7 +115,7 @@ describe('landstrip agent configuration', () => {
   test('updates maxSubagents without replacing other project settings', async () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    const path = join(cwd, '.pi', 'landstrip.json');
+    const path = join(cwd, '.pi', 'subagents.json');
     write(path, { maxSubagents: 2, subagents: { permission: { bash: 'ask' } } });
 
     await expect(setMaxSubagentsConfig(cwd, 6, true, agentDir)).resolves.toBe('project');
@@ -127,7 +127,7 @@ describe('landstrip agent configuration', () => {
 
   test('reports malformed agent permissions', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'landstrip.json'), {
+    write(join(agentDir, 'subagents.json'), {
       subagents: { agent: { unsafe: { permission: { bash: { '*': false } } } } },
     });
 
@@ -138,7 +138,7 @@ describe('landstrip agent configuration', () => {
 
   test('rejects unknown agent fields instead of treating typos as provider options', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'landstrip.json'), {
+    write(join(agentDir, 'subagents.json'), {
       subagents: { agent: { unsafe: { permissions: { bash: 'deny' } } } },
     });
 
@@ -163,9 +163,9 @@ describe('landstrip agent configuration', () => {
     expect(catalog.warnings.join('\n')).toContain(join(cwd, '.pi', 'settings.json'));
   });
 
-  test('rejects sandbox fields in landstrip.json', () => {
+  test('rejects sandbox fields in subagents.json', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'landstrip.json'), { sandbox: { enabled: false } });
+    write(join(agentDir, 'subagents.json'), { sandbox: { enabled: false } });
 
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
     expect(catalog.diagnostics.join('\n')).toContain('unknown top-level field sandbox');
@@ -173,7 +173,7 @@ describe('landstrip agent configuration', () => {
 
   test('includes the source path in malformed JSON diagnostics', () => {
     const agentDir = temporaryDirectory();
-    const path = join(agentDir, 'landstrip.json');
+    const path = join(agentDir, 'subagents.json');
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, '{');
 

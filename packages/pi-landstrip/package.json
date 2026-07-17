@@ -21,17 +21,17 @@
     "rpc-process.ts",
     "subagents.ts",
     "README.md",
-    "landstrip.json",
+    "subagents.json",
     "sandbox.json"
   ],
   "type": "module",
   "scripts": {
-    "fmt": "oxfmt *.ts package.json tsconfig.json landstrip.json sandbox.json .oxfmtrc.json README.md",
+    "fmt": "oxfmt *.ts package.json tsconfig.json subagents.json sandbox.json .oxfmtrc.json README.md",
     "lint": "oxlint *.ts",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "all": "npm run fmt && npm run lint && npm run check && npm run test",
-    "ci:fmt": "oxfmt --check *.ts package.json tsconfig.json landstrip.json sandbox.json .oxfmtrc.json README.md",
+    "ci:fmt": "oxfmt --check *.ts package.json tsconfig.json subagents.json sandbox.json .oxfmtrc.json README.md",
     "ci:lint": "npm run lint",
     "ci:check": "npm run check",
     "ci:test": "npm run test"
