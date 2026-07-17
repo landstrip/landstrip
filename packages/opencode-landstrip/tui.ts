@@ -96,6 +96,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
   const resolved = new Set<string>();
   const queue: QueueEntry[] = [];
   let activeId: string | undefined;
+  let refreshSandboxStatus: (() => void) | undefined;
 
   // Paths the user approved "for session": later queries for the same path are
   // auto-allowed without a dialog. This lives only in the TUI process — the
@@ -580,6 +581,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
         message,
         onConfirm: () => {
           const scope = setSandboxConfigEnabled(directory, next);
+          refreshSandboxStatus?.();
           api.ui.toast({
             title: 'Sandbox',
             message: `Sandbox ${next ? 'enabled' : 'disabled'} (${scope} config)`,
@@ -623,7 +625,10 @@ const tui: TuiPlugin = async (api, options, meta) => {
   // differently still loads the plugin — the badge just stays absent there.
   try {
     const { jsx } = await import('@opentui/solid/jsx-runtime');
+    const { createSignal } = await import('solid-js');
+    const [sandboxRevision, setSandboxRevision] = createSignal(0);
     const statusBadge = (ctx: TuiSlotContext) => {
+      sandboxRevision();
       const directory = api.state.path.directory || process.cwd();
       const config = loadConfig(directory, optionOverrides);
       const theme = ctx.theme.current;
@@ -644,6 +649,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
       },
     };
     api.slots.register(statusSlot);
+    refreshSandboxStatus = () => setSandboxRevision((revision) => revision + 1);
   } catch {
     // Solid runtime unavailable on this host — skip the status badge.
   }

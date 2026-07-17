@@ -49,7 +49,8 @@
   },
   "dependencies": {
     "@landstrip/landstrip": "^0.17.13",
-    "@opentui/solid": ">=0.3.4"
+    "@opentui/solid": ">=0.3.4",
+    "solid-js": "1.9.12"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.17.7",
