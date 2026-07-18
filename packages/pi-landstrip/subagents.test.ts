@@ -14,6 +14,7 @@ import {
 import { expect, test, vi } from 'vitest';
 
 import { loadAgentCatalog } from './agents.ts';
+import { contextFromEnvironment, LANDSTRIP_CONTEXT_ENV } from './api.ts';
 import type { LandstripIntegration } from './index.ts';
 import {
   boundTaskOutput,
@@ -29,6 +30,106 @@ import { temporaryDirectory as makeTemporaryDirectory } from './test-util.ts';
 function temporaryDirectory(): string {
   return makeTemporaryDirectory('pi-landstrip-tasks-');
 }
+
+test('propagates registered extensions and public context to workers', async () => {
+  const cwd = temporaryDirectory();
+  const sessionDir = join(cwd, 'session');
+  const extensionEntry = join(cwd, 'extension.ts');
+  mkdirSync(sessionDir, { recursive: true });
+  writeFileSync(extensionEntry, 'export default function () {}\n');
+  let prepared:
+    | {
+        args: readonly string[];
+        env: NodeJS.ProcessEnv;
+        readPaths: readonly string[];
+      }
+    | undefined;
+  const integration = {
+    getWorkerExtensions: () => [{ id: 'test', entry: extensionEntry }],
+    getContext: () => ({
+      version: 1,
+      host: 'pi',
+      role: 'primary',
+      sandbox: 'enabled',
+      cwd,
+      sessionId: 'root-session',
+      depth: 0,
+    }),
+    async prepareRpcWorker(options: typeof prepared) {
+      prepared = options;
+      throw new Error('stop after preparation');
+    },
+  } as unknown as LandstripIntegration;
+  const pi = {
+    getActiveTools: () => ['read', 'bash'],
+    getThinkingLevel: () => 'medium',
+  } as unknown as ExtensionAPI;
+  const runtime = new SubagentRuntime(pi, integration);
+  const privateRuntime = runtime as unknown as {
+    piInvocation(): { command: string; args: string[] };
+    validatePiInvocation(): void;
+    defaultWorker(
+      task: unknown,
+      agent: unknown,
+      rules: unknown,
+      ctx: ExtensionContext,
+      signal: AbortSignal,
+      onRequest: () => Promise<undefined>,
+    ): Promise<unknown>;
+  };
+  privateRuntime.piInvocation = () => ({ command: process.execPath, args: ['pi.js'] });
+  privateRuntime.validatePiInvocation = () => undefined;
+  const ctx = {
+    cwd,
+    model: { provider: 'test', id: 'model' },
+    ui: { notify() {} },
+    sessionManager: { getSessionId: () => 'root-session' },
+  } as unknown as ExtensionContext;
+
+  await expect(
+    privateRuntime.defaultWorker(
+      {
+        id: 'task-1',
+        description: 'Review',
+        depth: 2,
+        parentTaskId: 'task-0',
+        parentSessionId: 'root-session',
+        agent: 'review',
+        state: 'running',
+        background: false,
+        sessionDir,
+      },
+      {
+        name: 'review',
+        prompt: 'Review.',
+        mode: 'subagent',
+        hidden: false,
+        permissions: [],
+        providerOptions: {},
+      },
+      [],
+      ctx,
+      new AbortController().signal,
+      async () => undefined,
+    ),
+  ).rejects.toThrow('stop after preparation');
+
+  expect(prepared?.args).toContain(extensionEntry);
+  expect(prepared?.readPaths).toContain(extensionEntry);
+  expect(prepared?.readPaths).toContain(cwd);
+  const context = contextFromEnvironment({
+    [LANDSTRIP_CONTEXT_ENV]: prepared?.env[LANDSTRIP_CONTEXT_ENV],
+  });
+  expect(context).toMatchObject({
+    role: 'subagent',
+    sandbox: 'enabled',
+    taskId: 'task-1',
+    parentTaskId: 'task-0',
+    agent: 'review',
+    depth: 2,
+  });
+  expect(context).not.toHaveProperty('rules');
+});
 
 test('renders OpenCode-compatible task result envelopes', () => {
   expect(renderTaskResult('task-1', 'completed', 'Result text')).toBe(

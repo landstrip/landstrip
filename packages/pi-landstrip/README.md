@@ -246,6 +246,62 @@ follows, then remove the old fields:
 Do not put these fields in Pi's `settings.json`; `pi-landstrip` does not read
 them there.
 
+## Plugin API
+
+Pi extensions can discover the active Landstrip runtime through the versioned
+API exported by `pi-landstrip/api`:
+
+```ts
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { useLandstrip } from 'pi-landstrip/api';
+
+export default function (pi: ExtensionAPI) {
+  const dispose = useLandstrip(pi, (landstrip) => {
+    const context = landstrip.getContext();
+    // Register Landstrip-aware behavior here.
+  });
+  pi.on('session_shutdown', dispose);
+}
+```
+
+Discovery is callback-based so it works regardless of extension load order.
+Do not wait for discovery from an extension factory: Pi initializes extension
+factories sequentially. The returned function stops future notifications.
+
+The runtime exposes:
+
+- `getContext()` for the host, role, sandbox state, task identity, agent and
+  nesting depth.
+- `createBashTool()` for extensions that need Landstrip execution with their
+  own tool presentation.
+- `prepareProcess()` for single-use process launches under the effective
+  sandbox policy.
+- `registerWorkerExtension()` to load an absolute extension entry in Landstrip
+  subagents. The returned function removes the registration.
+- `on()` for typed `sandbox.changed`, `subagent.start` and `subagent.end`
+  lifecycle events.
+
+Registered worker extensions are trusted code. Landstrip adds their canonical
+directories and dependency roots to worker read access, loads them with Pi's
+`--extension` option, and propagates them to nested tasks.
+
+Workers receive a base64url JSON `LANDSTRIP_CONTEXT` environment variable.
+Extensions can read it without runtime discovery:
+
+```ts
+import { contextFromEnvironment } from 'pi-landstrip/api';
+
+const context = contextFromEnvironment();
+```
+
+This public context is informational and contains no permission rules, policy,
+credentials or proxy secrets. Environment values can be spoofed outside a
+Landstrip worker and must not be treated as authorization.
+
+Generic process preparation fails closed on Windows when sandboxing is disabled.
+Windows cannot reliably reclaim an unsandboxed descendant tree after its leader
+has exited; enabled Landstrip launches use an AppContainer job object instead.
+
 ## Limits
 
 `pi-landstrip` grants at most `maxSubagents` scheduler permits to active

@@ -53,6 +53,18 @@ import {
   type LandstripNetworkTrap,
   type LandstripTrap,
 } from '@landstrip/landstrip';
+import {
+  type LandstripBashTool,
+  type LandstripContextV1,
+  type LandstripEvent,
+  type LandstripPreparedProcess,
+  type LandstripProcessOptions,
+  type LandstripSandboxState,
+  type LandstripWorkerExtension,
+  LANDSTRIP_RUNTIME_VERSION,
+  type PiLandstripRuntimeV1,
+  publishLandstripRuntime,
+} from './api.ts';
 import type { RpcSpawn } from './rpc-process.ts';
 import {
   type SubagentRuntime,
@@ -766,6 +778,24 @@ function patchProcessGroupKill(child: ChildProcess): void {
   };
 }
 
+async function stopPreparedChild(child: ChildProcess | undefined): Promise<void> {
+  if (!child) return;
+
+  child.kill('SIGKILL');
+  if (child.exitCode !== null || child.signalCode !== null) return;
+
+  await new Promise<void>((resolve) => {
+    let settleTimer: NodeJS.Timeout | undefined;
+    const done = (): void => {
+      if (settleTimer) clearTimeout(settleTimer);
+      child.removeListener('exit', done);
+      resolve();
+    };
+    child.once('exit', done);
+    settleTimer = setTimeout(done, 1_000);
+  });
+}
+
 const permissionPromptQueue = new AsyncQueue();
 
 async function showPermissionPrompt(
@@ -976,8 +1006,6 @@ function pipeSockets(client: Socket, upstream: Socket, initialData?: Buffer): vo
   upstream.pipe(client);
 }
 
-type LandstripBashTool = ReturnType<typeof createBashToolDefinition>;
-
 /** Options for creating a landstrip sandbox integration. */
 export interface LandstripIntegrationOptions {
   /** Register a sandboxed bash tool when the integration is registered. */
@@ -987,34 +1015,35 @@ export interface LandstripIntegrationOptions {
 }
 
 /** Landstrip sandbox integration hooks for Pi. */
-export interface LandstripIntegration {
-  /** Create a bash tool definition that runs commands through landstrip when enabled. */
-  createBashTool(cwd: string, ctx?: ExtensionContext): LandstripBashTool;
+export interface LandstripIntegration extends PiLandstripRuntimeV1 {
   /** Prepare a full Pi RPC process constrained by the effective sandbox policy. */
   prepareRpcWorker(options: LandstripRpcWorkerOptions): Promise<LandstripRpcWorkerLaunch>;
   /** Register the integration's tools, events, flags, and commands with Pi. */
   register(pi: ExtensionAPI, runtime?: SubagentRuntime): void;
+  /** Publish an integration lifecycle event from an embedded runtime. */
+  emit(event: LandstripEvent): void;
 }
 
-export interface LandstripRpcWorkerOptions {
-  readonly command: string;
-  readonly args: readonly string[];
-  readonly cwd: string;
+export interface LandstripRpcWorkerOptions extends LandstripProcessOptions {
   readonly env: NodeJS.ProcessEnv;
-  readonly ctx: ExtensionContext;
   readonly readPaths: readonly string[];
   readonly writePaths: readonly string[];
-  readonly signal?: AbortSignal;
 }
 
-export interface LandstripRpcWorkerLaunch {
-  readonly command: string;
-  readonly args: readonly string[];
-  readonly cwd: string;
-  readonly env: NodeJS.ProcessEnv;
+export interface LandstripRpcWorkerLaunch extends LandstripPreparedProcess {
   readonly spawn: RpcSpawn;
-  dispose(): Promise<void>;
 }
+
+export type {
+  LandstripBashTool,
+  LandstripContextV1,
+  LandstripEvent,
+  LandstripPreparedProcess,
+  LandstripProcessOptions,
+  LandstripSandboxState,
+  LandstripWorkerExtension,
+  PiLandstripRuntimeV1,
+} from './api.ts';
 
 /** Register the landstrip extension with Pi. */
 export default function (pi: ExtensionAPI) {
@@ -1048,11 +1077,91 @@ export function createLandstripIntegration(
 
   let sandboxEnabled = false;
   let sandboxReady = false;
+  let sandboxState: LandstripSandboxState = 'unavailable';
   let unsandboxedWorkerWarningShown = false;
+  let activeContext: ExtensionContext | undefined;
+  let unpublishRuntime: (() => void) | undefined;
+  const eventHandlers = new Set<(event: LandstripEvent) => void>();
+  const workerExtensions = new Map<string, { entry: string; registrations: number }>();
   const sessionAllowedDomains: string[] = [];
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
   const sessionAllowedTargets: string[] = [];
+
+  function getContext(ctx = activeContext): LandstripContextV1 {
+    return {
+      version: LANDSTRIP_RUNTIME_VERSION,
+      host: 'pi',
+      role: 'primary',
+      sandbox: sandboxState,
+      cwd: ctx?.cwd ?? localCwd,
+      sessionId: ctx?.sessionManager?.getSessionId(),
+      depth: 0,
+    };
+  }
+
+  function emitEvent(event: LandstripEvent): void {
+    for (const handler of eventHandlers) {
+      try {
+        handler(event);
+      } catch (error) {
+        console.error(`pi-landstrip: lifecycle listener failed: ${formatError(error)}`);
+      }
+    }
+  }
+
+  function setSandboxState(state: LandstripSandboxState, ctx: ExtensionContext): void {
+    if (sandboxState === state) return;
+    sandboxState = state;
+    emitEvent({ type: 'sandbox.changed', context: getContext(ctx) });
+  }
+
+  function on<T extends LandstripEvent['type']>(
+    type: T,
+    handler: (event: Extract<LandstripEvent, { type: T }>) => void,
+  ): () => void {
+    const listener = (event: LandstripEvent): void => {
+      if (event.type === type) handler(event as Extract<LandstripEvent, { type: T }>);
+    };
+    eventHandlers.add(listener);
+    return () => eventHandlers.delete(listener);
+  }
+
+  function registerWorkerExtension(extension: LandstripWorkerExtension): () => void {
+    const id = extension.id.trim();
+    if (!id) throw new Error('Worker extension id must not be empty');
+    const requestedEntry = extension.entry.startsWith('file:')
+      ? fileURLToPath(extension.entry)
+      : extension.entry;
+    if (!isAbsolute(requestedEntry)) {
+      throw new Error('Worker extension entry must be an absolute path or file URL');
+    }
+    if (!existsSync(requestedEntry)) {
+      throw new Error(`Worker extension entry does not exist: ${requestedEntry}`);
+    }
+    const entry = realpathSync(requestedEntry);
+
+    const existing = workerExtensions.get(id);
+    if (existing && existing.entry !== entry) {
+      throw new Error(`Worker extension id is already registered with another entry: ${id}`);
+    }
+    if (existing) existing.registrations += 1;
+    else workerExtensions.set(id, { entry, registrations: 1 });
+
+    let disposed = false;
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      const registration = workerExtensions.get(id);
+      if (!registration || registration.entry !== entry) return;
+      registration.registrations -= 1;
+      if (registration.registrations === 0) workerExtensions.delete(id);
+    };
+  }
+
+  function getWorkerExtensions(): readonly LandstripWorkerExtension[] {
+    return [...workerExtensions].map(([id, extension]) => ({ id, entry: extension.entry }));
+  }
 
   function resetSessionAllowances(): void {
     sessionAllowedDomains.length = 0;
@@ -1546,8 +1655,12 @@ export function createLandstripIntegration(
     options: LandstripRpcWorkerOptions,
   ): LandstripRpcWorkerLaunch {
     let spawned = false;
+    let disposed = false;
+    let disposePromise: Promise<void> | undefined;
+    let preparedChild: ChildProcess | undefined;
     const spawnWorker: RpcSpawn = (command, args, spawnOptions) => {
-      if (spawned) throw new Error('RPC worker launch can only be spawned once');
+      if (disposed) throw new Error('Prepared process has been disposed');
+      if (spawned) throw new Error('Prepared process can only be spawned once');
       spawned = true;
       const child = spawn(command, [...args], {
         ...spawnOptions,
@@ -1556,6 +1669,7 @@ export function createLandstripIntegration(
         detached: true,
       });
       patchProcessGroupKill(child);
+      preparedChild = child;
       return child as ReturnType<RpcSpawn>;
     };
 
@@ -1565,7 +1679,13 @@ export function createLandstripIntegration(
       cwd: options.cwd,
       env: options.env,
       spawn: spawnWorker,
-      async dispose() {},
+      dispose() {
+        disposePromise ??= (async () => {
+          disposed = true;
+          await stopPreparedChild(preparedChild);
+        })();
+        return disposePromise;
+      },
     };
   }
 
@@ -1630,8 +1750,11 @@ export function createLandstripIntegration(
       workerEnv.no_proxy = '';
     }
     let spawned = false;
+    let disposePromise: Promise<void> | undefined;
+    let preparedChild: ChildProcess | undefined;
     const spawnWorker: RpcSpawn = (_command, _args, spawnOptions) => {
-      if (spawned) throw new Error('RPC worker launch can only be spawned once');
+      if (disposed) throw new Error('Prepared process has been disposed');
+      if (spawned) throw new Error('Prepared process can only be spawned once');
       spawned = true;
       const child = spawn(
         binaryPath(),
@@ -1646,6 +1769,7 @@ export function createLandstripIntegration(
       );
       workerChildEnd.destroy();
       patchProcessGroupKill(child);
+      preparedChild = child;
       return child as ReturnType<RpcSpawn>;
     };
 
@@ -1655,15 +1779,32 @@ export function createLandstripIntegration(
       cwd: options.cwd,
       env: workerEnv,
       spawn: spawnWorker,
-      async dispose() {
-        if (disposed) return;
-        disposed = true;
-        trapSocket.destroy();
-        workerChildEnd.destroy();
-        rmSync(workerPolicy.dir, { recursive: true, force: true });
-        await proxy?.stop();
+      dispose() {
+        disposePromise ??= (async () => {
+          disposed = true;
+          await stopPreparedChild(preparedChild);
+          trapSocket.destroy();
+          workerChildEnd.destroy();
+          rmSync(workerPolicy.dir, { recursive: true, force: true });
+          await proxy?.stop();
+        })();
+        return disposePromise;
       },
     };
+  }
+
+  async function prepareProcess(
+    options: LandstripProcessOptions,
+  ): Promise<LandstripPreparedProcess> {
+    if (process.platform === 'win32' && (noSandboxFlag || !loadConfig(options.cwd).enabled)) {
+      throw new Error('Generic process preparation requires sandboxing on Windows');
+    }
+    return prepareRpcWorker({
+      ...options,
+      env: options.env ?? process.env,
+      readPaths: options.readPaths ?? [],
+      writePaths: options.writePaths ?? [],
+    });
   }
 
   function createLandstripBashOps(
@@ -2135,6 +2276,7 @@ export function createLandstripIntegration(
     if (!SUPPORTED_PLATFORMS.has(process.platform)) {
       sandboxEnabled = false;
       sandboxReady = false;
+      setSandboxState('unavailable', ctx);
       warnUnsandboxed(
         ctx,
         `landstrip sandboxing is not supported on ${process.platform}`,
@@ -2146,6 +2288,7 @@ export function createLandstripIntegration(
     if (!landstripAvailable()) {
       sandboxEnabled = false;
       sandboxReady = false;
+      setSandboxState('unavailable', ctx);
       warnUnsandboxed(
         ctx,
         `landstrip was not found. Reinstall with: npm install @landstrip/landstrip`,
@@ -2156,6 +2299,7 @@ export function createLandstripIntegration(
 
     sandboxEnabled = true;
     sandboxReady = true;
+    setSandboxState('enabled', ctx);
     warnIfAllDomainsAllowed(ctx, config);
     enableStatus(ctx, config);
     return true;
@@ -2165,6 +2309,7 @@ export function createLandstripIntegration(
   function disableSandbox(ctx: ExtensionContext): void {
     sandboxEnabled = false;
     sandboxReady = false;
+    setSandboxState('disabled', ctx);
     setTuiStatus(ctx, 'sandbox', undefined);
   }
 
@@ -2219,6 +2364,9 @@ export function createLandstripIntegration(
       default: false,
     });
 
+    unpublishRuntime?.();
+    unpublishRuntime = publishLandstripRuntime(pi, integration);
+
     if (shouldRegisterBashTool) pi.registerTool(createBashTool(localCwd));
 
     pi.on('user_bash', async (_event, ctx) => {
@@ -2228,6 +2376,7 @@ export function createLandstripIntegration(
     });
 
     pi.on('session_start', async (_event, ctx) => {
+      activeContext = ctx;
       resetSessionAllowances();
       const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
       projectConfigTrusted = trustContext.isProjectTrusted?.() ?? false;
@@ -2236,6 +2385,7 @@ export function createLandstripIntegration(
       if (noSandboxFlag) {
         disableSandbox(ctx);
         notify(ctx, 'Sandbox disabled via --no-sandbox', 'warning');
+        if (!unpublishRuntime) unpublishRuntime = publishLandstripRuntime(pi, integration);
         return;
       }
 
@@ -2243,10 +2393,17 @@ export function createLandstripIntegration(
       if (!config.enabled) {
         disableSandbox(ctx);
         notify(ctx, 'Sandbox disabled via config', 'info');
+        if (!unpublishRuntime) unpublishRuntime = publishLandstripRuntime(pi, integration);
         return;
       }
 
       enableSandbox(ctx);
+      if (!unpublishRuntime) unpublishRuntime = publishLandstripRuntime(pi, integration);
+    });
+    pi.on('session_shutdown', () => {
+      activeContext = undefined;
+      unpublishRuntime?.();
+      unpublishRuntime = undefined;
     });
     maybePi.registerCommand?.('sandbox', {
       description: 'Show config and toggle the sandbox',
@@ -2641,5 +2798,17 @@ export function createLandstripIntegration(
     });
   }
 
-  return { createBashTool, prepareRpcWorker, register };
+  const integration: LandstripIntegration = {
+    version: LANDSTRIP_RUNTIME_VERSION,
+    getContext,
+    createBashTool,
+    prepareProcess,
+    prepareRpcWorker,
+    registerWorkerExtension,
+    getWorkerExtensions,
+    on,
+    register,
+    emit: emitEvent,
+  };
+  return integration;
 }

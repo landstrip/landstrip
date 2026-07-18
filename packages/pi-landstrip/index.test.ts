@@ -255,22 +255,36 @@ it('allows RPC workers when sandboxing is explicitly disabled', async () => {
     launch.command,
     [
       '-e',
-      "const { spawn } = require('node:child_process'); const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); process.stdout.write(`${child.pid}\\n`); setInterval(() => {}, 1000);",
+      "const { spawn } = require('node:child_process'); const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); child.unref(); process.stdout.write(`${child.pid}\\n`);",
     ],
     { stdio: ['pipe', 'pipe', 'pipe'] },
   );
   expect(child).toBeDefined();
+  const exited = new Promise<void>((resolve) => child?.once('exit', () => resolve()));
   const descendantPid = await new Promise<number>((resolve, reject) => {
     child?.once('error', reject);
     child?.stdout.once('data', (data) => resolve(Number.parseInt(data.toString(), 10)));
   });
-  const exited = new Promise<void>((resolve) => child?.once('exit', () => resolve()));
-  expect(child?.kill('SIGKILL')).toBe(true);
   await exited;
+  const firstDispose = launch.dispose();
+  const secondDispose = launch.dispose();
+  expect(secondDispose).toBe(firstDispose);
+  await firstDispose;
   await vi.waitFor(() => {
     expect(() => process.kill(descendantPid, 0)).toThrow();
   });
-  await launch.dispose();
+  expect(() => launch.spawn(launch.command, launch.args, {})).toThrow(
+    'Prepared process has been disposed',
+  );
+
+  const prepared = await integration.prepareProcess({
+    command: process.execPath,
+    args: ['--version'],
+    cwd: process.cwd(),
+    ctx,
+  });
+  expect(prepared.env.HOME).toBe(process.env.HOME);
+  await prepared.dispose();
 });
 
 // The broker resolves relative policy entries (notably ".") against the command

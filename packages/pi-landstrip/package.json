@@ -15,6 +15,7 @@
     "url": "git+https://github.com/landstrip/landstrip.git"
   },
   "files": [
+    "api.ts",
     "agents.ts",
     "box.ts",
     "config.ts",
@@ -27,6 +28,11 @@
     "sandbox.json"
   ],
   "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./api": "./api.ts",
+    "./*": "./*"
+  },
   "scripts": {
     "fmt": "oxfmt *.ts package.json tsconfig.json subagents.json sandbox.json .oxfmtrc.json README.md",
     "lint": "oxlint *.ts",

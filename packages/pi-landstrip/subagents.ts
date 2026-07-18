@@ -29,6 +29,7 @@ import {
 import { matchesKey, Text, truncateToWidth } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 
+import { encodeLandstripContext, type LandstripContextV1, LANDSTRIP_CONTEXT_ENV } from './api.ts';
 import {
   type AgentCatalog,
   type AgentDefinition,
@@ -1296,6 +1297,7 @@ export class SubagentRuntime {
     update: (text: string) => void,
   ): Promise<string> {
     let worker: WorkerHandle | undefined;
+    let started = false;
     try {
       const release = await this.semaphore.acquire(signal);
       this.leases.set(task.id, { release });
@@ -1303,6 +1305,8 @@ export class SubagentRuntime {
       task.startedAt = Date.now();
       task.finishedAt = undefined;
       task.error = undefined;
+      started = true;
+      this.integration.emit?.({ type: 'subagent.start', context: this.taskContext(task, ctx) });
       this.persist(task);
       this.updateTaskWidget(ctx);
       const rules = mergePermissionRules(catalog.permissions, agent.permissions);
@@ -1411,6 +1415,13 @@ export class SubagentRuntime {
       if (task.error === message) throw error;
       throw new Error(task.error);
     } finally {
+      if (started && ['completed', 'cancelled', 'error'].includes(task.state)) {
+        this.integration.emit?.({
+          type: 'subagent.end',
+          context: this.taskContext(task, ctx),
+          status: task.state as 'completed' | 'cancelled' | 'error',
+        });
+      }
       this.running.delete(task.id);
       this.pendingPrompts.delete(task.id);
       await worker?.rpc.stop().catch(() => undefined);
@@ -1456,12 +1467,14 @@ export class SubagentRuntime {
     const tools = taskEnabled
       ? [...new Set([...this.pi.getActiveTools(), 'task'])]
       : this.pi.getActiveTools().filter((tool) => tool !== 'task');
+    const workerExtensions = this.integration.getWorkerExtensions?.() ?? [];
     const args = [
       ...invocation.args,
       '--mode',
       'rpc',
       '--extension',
       join(packageDir, 'index.ts'),
+      ...workerExtensions.flatMap((extension) => ['--extension', extension.entry]),
       ...(task.sessionFile
         ? ['--session', task.sessionFile]
         : task.sessionDir
@@ -1478,6 +1491,7 @@ export class SubagentRuntime {
       tools.join(','),
     ];
     const config: WorkerConfig = { rules, task, taskEnabled, steps: agent.steps };
+    const publicContext = this.taskContext(task, ctx);
     const temp = mkdtempSync(join(tmpdir(), `pi-landstrip-task-${task.id}-`));
     const agentDir = getAgentDir();
     let launch: LandstripRpcWorkerLaunch | undefined;
@@ -1497,6 +1511,7 @@ export class SubagentRuntime {
         env: {
           ...process.env,
           [WORKER_ENV]: Buffer.from(JSON.stringify(config)).toString('base64url'),
+          [LANDSTRIP_CONTEXT_ENV]: encodeLandstripContext(publicContext),
           JITI_FS_CACHE: 'false',
           TMPDIR: temp,
           TMP: temp,
@@ -1514,6 +1529,11 @@ export class SubagentRuntime {
               invocation.command,
               cliRoot,
               extensionRoot,
+              ...workerExtensions.flatMap((extension) => [
+                extension.entry,
+                dirname(extension.entry),
+                dependencyRoot(extension.entry),
+              ]),
               task.sessionDir,
               task.sessionFile,
               temp,
@@ -1560,6 +1580,27 @@ export class SubagentRuntime {
       rmSync(temp, { recursive: true, force: true });
       throw error;
     }
+  }
+
+  private taskContext(task: TaskRecord, ctx: ExtensionContext): LandstripContextV1 {
+    const context = this.integration.getContext?.(ctx) ?? {
+      version: 1,
+      host: 'pi',
+      role: 'primary',
+      sandbox: 'unavailable',
+      cwd: ctx.cwd,
+      sessionId: ctx.sessionManager.getSessionId(),
+      depth: 0,
+    };
+    return {
+      ...context,
+      role: 'subagent',
+      sessionId: undefined,
+      taskId: task.id,
+      parentTaskId: task.parentTaskId,
+      agent: task.agent,
+      depth: task.depth,
+    };
   }
 
   private piInvocation(): { command: string; args: string[] } {
