@@ -94,8 +94,6 @@ done
 core_log="$(git log --first-parent --format='- %s (%an)' --no-merges "$core_ver"..HEAD -- "${core_log_args[@]}")"
 [[ -n "$core_log" ]] || core_log='- No source changes.'
 
-npm run ci:extensions:local
-
 node - "$next_ver" <<'NODE'
 const fs = require('node:fs');
 
@@ -124,6 +122,33 @@ for (const [packagePath, data] of corePackages) {
   fs.writeFileSync(packagePath, `${JSON.stringify(data, null, 2)}\n`);
 }
 
+const landstripDependency = '@landstrip/landstrip';
+const landstripRange = `^${nextVersion}`;
+const platformDependencies = Object.keys(root.optionalDependencies);
+
+function updateLockedPackage(lock, packageName) {
+  const lockedPackage = lock.packages[`node_modules/${packageName}`];
+  if (!lockedPackage) {
+    throw new Error(`package-lock.json does not contain ${packageName}`);
+  }
+
+  const unscopedName = packageName.slice(packageName.indexOf('/') + 1);
+  lockedPackage.version = nextVersion;
+  lockedPackage.resolved =
+    `https://registry.npmjs.org/${packageName}/-/${unscopedName}-${nextVersion}.tgz`;
+  delete lockedPackage.integrity;
+}
+
+function updateExtensionLock(lock) {
+  updateLockedPackage(lock, landstripDependency);
+  for (const packageName of platformDependencies) updateLockedPackage(lock, packageName);
+
+  const lockedLandstrip = lock.packages[`node_modules/${landstripDependency}`];
+  for (const packageName of platformDependencies) {
+    lockedLandstrip.optionalDependencies[packageName] = nextVersion;
+  }
+}
+
 const { workspaces } = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 if (!Array.isArray(workspaces)) {
   throw new Error('package.json workspaces must be an array');
@@ -142,14 +167,15 @@ for (const packageDir of packageDirs) {
   const packagePath = `${packageDir}/package.json`;
   const data = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
   data.version = nextVersion;
-  data.dependencies['@landstrip/landstrip'] = `^${nextVersion}`;
+  data.dependencies[landstripDependency] = landstripRange;
   fs.writeFileSync(packagePath, `${JSON.stringify(data, null, 2)}\n`);
 
   const lockPath = `${packageDir}/package-lock.json`;
   const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
   lock.version = nextVersion;
   lock.packages[''].version = nextVersion;
-  lock.packages[''].dependencies['@landstrip/landstrip'] = `^${nextVersion}`;
+  lock.packages[''].dependencies[landstripDependency] = landstripRange;
+  updateExtensionLock(lock);
   fs.writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
 }
 NODE
@@ -167,6 +193,8 @@ sed -E -i.bak "s/^\\.Dd .*/.Dd $date/" man/man1/landstrip.1
 rm -f man/man1/landstrip.1.bak
 grep -Fxq ".Dd $date" man/man1/landstrip.1 \
 	|| die "failed to update man/man1/landstrip.1"
+
+npm run ci:extensions:local
 
 cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
