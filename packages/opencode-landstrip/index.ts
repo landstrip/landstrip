@@ -15,6 +15,7 @@ import {
   type SandboxConfig,
   type SandboxFilesystemConfig,
   controlResponseLine,
+  decodeLandstripTrap,
   extractDomainsFromCommand,
   formatLandstripTraps,
   getConfigPaths,
@@ -29,16 +30,12 @@ import {
   sessionScopeFor,
 } from './shared.js';
 
-interface LandstripPolicy {
-  network: {
-    allowNetwork: boolean;
-    allowLocalBinding: boolean;
-    allowAllUnixSockets: boolean;
-    allowUnixSockets: string[];
+type LandstripPolicy = {
+  network: Omit<SandboxConfig['network'], 'allowedDomains' | 'deniedDomains'> & {
     httpProxyPort?: number;
   };
   filesystem: SandboxFilesystemConfig;
-}
+};
 
 interface BashSandboxState {
   originalCommand: string;
@@ -219,8 +216,23 @@ function allowsAllDomains(allowedDomains: string[]): boolean {
   return allowedDomains.includes('*');
 }
 
-function normalizeBlockedPath(path: string, baseDirectory: string): string {
-  return canonicalizePath(isAbsolute(path) ? path : join(baseDirectory, path), baseDirectory);
+function isDomainAllowed(domain: string, config: SandboxConfig): boolean {
+  return (
+    config.network.allowNetwork ||
+    (!domainMatchesAny(domain, config.network.deniedDomains) &&
+      domainMatchesAny(domain, config.network.allowedDomains))
+  );
+}
+
+function isFilesystemAllowed(
+  path: string,
+  allowPatterns: string[],
+  denyPatterns: string[],
+  baseDirectory: string,
+): boolean {
+  const allowDepth = matchDepth(path, allowPatterns, baseDirectory);
+  const denyDepth = matchDepth(path, denyPatterns, baseDirectory);
+  return allowDepth >= 0 && allowDepth >= denyDepth;
 }
 
 function extractCandidatePaths(command: string): string[] {
@@ -250,24 +262,24 @@ function extractBlockedPath(
   let match = output.match(
     /(?:\/bin\/bash|bash|sh): (?:line \d+: )?([^:\n]+): (?:Operation not permitted|Permission denied)/,
   );
-  if (match?.[1]) return normalizeBlockedPath(match[1], baseDirectory);
+  if (match?.[1]) return canonicalizePath(match[1], baseDirectory);
 
   // ls/cat/cp: cannot open/access/stat '/path': Permission denied
   match = output.match(
     /^[a-zA-Z0-9_-]+: cannot (?:open|access|stat|create)(?: directory)? '?([^'\n]+?)'?(?: for (?:reading|writing))?: Permission denied$/m,
   );
-  if (match?.[1]) return normalizeBlockedPath(match[1], baseDirectory);
+  if (match?.[1]) return canonicalizePath(match[1], baseDirectory);
 
   // Generic: cmd: /absolute/path: Permission denied or Operation not permitted
   match = output.match(
     /^[a-zA-Z0-9_-]+: (\/[^\n:]+): (?:Operation not permitted|Permission denied)$/m,
   );
-  if (match?.[1]) return normalizeBlockedPath(match[1], baseDirectory);
+  if (match?.[1]) return canonicalizePath(match[1], baseDirectory);
 
   // Landstrip structured trap format carrying a denied path
   const landstripTraps = parseLandstripTraps(output);
   for (const trap of landstripTraps) {
-    if (trap.kind === 'filesystem') return normalizeBlockedPath(trap.path, baseDirectory);
+    if (trap.kind === 'filesystem') return canonicalizePath(trap.path, baseDirectory);
   }
 
   if (
@@ -290,15 +302,15 @@ function evaluateReadPermission(
   effectiveAllowRead: string[],
 ): SandboxPermissionDecision {
   const filePath = canonicalizePath(path, baseDirectory);
-  const allowDepth = matchDepth(filePath, effectiveAllowRead, baseDirectory);
-  const denyDepth = matchDepth(filePath, config.filesystem.denyRead, baseDirectory);
 
   // Reads are interactive, so the read tool never hard-denies: a path covered by
   // allowRead at least as specifically as any denyRead is allowed silently;
   // everything else asks for approval (allow once/session/persist or reject)
   // rather than being blocked outright. denyRead still hard-applies to bash
   // through the landstrip binary policy, which has no way to prompt.
-  if (allowDepth >= 0 && allowDepth >= denyDepth) {
+  if (
+    isFilesystemAllowed(filePath, effectiveAllowRead, config.filesystem.denyRead, baseDirectory)
+  ) {
     return { status: 'allow', kind: 'read', resource: filePath, message: '' };
   }
 
@@ -329,7 +341,9 @@ function evaluateWritePermission(
     };
   }
 
-  if (allowDepth >= 0) {
+  if (
+    isFilesystemAllowed(filePath, effectiveAllowWrite, config.filesystem.denyWrite, baseDirectory)
+  ) {
     return { status: 'allow', kind: 'write', resource: filePath, message: '' };
   }
 
@@ -358,7 +372,7 @@ function evaluateDomainPermission(
     };
   }
 
-  if (domainMatchesAny(domain, config.network.allowedDomains)) {
+  if (isDomainAllowed(domain, config)) {
     return { status: 'allow', kind: 'domain', resource: domain, message: '' };
   }
 
@@ -368,6 +382,16 @@ function evaluateDomainPermission(
     resource: domain,
     message: `Sandbox: network access requires approval for "${domain}" (not in network.allowedDomains).`,
   };
+}
+
+function evaluateCommandDomains(
+  command: string,
+  config: SandboxConfig,
+): SandboxPermissionDecision[] {
+  if (config.network.allowNetwork) return [];
+  return extractDomainsFromCommand(command).map((domain) =>
+    evaluateDomainPermission(domain, config),
+  );
 }
 
 function landstripVersion(): string | null {
@@ -467,11 +491,6 @@ function writePolicyFile(
 function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => Promise<void> }> {
   const sockets = new Set<Socket>();
 
-  function domainAllowed(domain: string): boolean {
-    if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
-    return domainMatchesAny(domain, config.network.allowedDomains);
-  }
-
   async function handleConnect(client: Socket, target: string, rest: Buffer): Promise<void> {
     const endpoint = splitHostPort(target, 443);
     if (!endpoint || !Number.isFinite(endpoint.port)) {
@@ -479,7 +498,7 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
       return;
     }
 
-    if (!domainAllowed(endpoint.host)) {
+    if (!isDomainAllowed(endpoint.host, config)) {
       denyProxyRequest(client);
       return;
     }
@@ -525,7 +544,7 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
       url = new URL(`http://${host}${rawTarget}`);
     }
 
-    if (!domainAllowed(url.hostname)) {
+    if (!isDomainAllowed(url.hostname, config)) {
       denyProxyRequest(client);
       return;
     }
@@ -660,33 +679,25 @@ function startTrapServer(
         buffer = buffer.slice(nl + 1);
         nl = buffer.indexOf('\n');
         if (line.length === 0) continue;
-        let obj: Record<string, unknown> | null = null;
+        let trap: LandstripTrap | null = null;
         try {
-          const parsed: unknown = JSON.parse(line);
-          if (typeof parsed === 'object' && parsed !== null) {
-            obj = parsed as Record<string, unknown>;
-          }
+          trap = decodeLandstripTrap(JSON.parse(line));
         } catch {
-          obj = null;
+          trap = null;
         }
-        if (obj && obj.state === 'query' && typeof obj.query_id === 'string') {
-          const queryId = obj.query_id;
-          if (
-            (obj.operation === 'read' || obj.operation === 'write') &&
-            typeof obj.path === 'string'
-          ) {
-            const path = canonicalizePath(obj.path, baseDirectory);
-            const operation = obj.operation as 'read' | 'write';
-            // Per landstrip policy: a deny rule overrides allow only when more
-            // specific; a tie or more-specific allow carves the path back in.
-            const denyReadDepth = matchDepth(path, denyRead, baseDirectory);
-            const allowReadDepth = matchDepth(path, effectiveAllowRead, baseDirectory);
-            const denyWriteDepth = matchDepth(path, denyWrite, baseDirectory);
-            const allowWriteDepth = matchDepth(path, effectiveAllowWrite, baseDirectory);
+        if (
+          (trap?.kind === 'filesystem' || trap?.kind === 'network') &&
+          trap.state === 'query' &&
+          trap.query_id
+        ) {
+          const queryId = trap.query_id;
+          if (trap.kind === 'filesystem') {
+            const path = canonicalizePath(trap.path, baseDirectory);
+            const operation = trap.operation;
             const allowed =
               operation === 'read'
-                ? !(denyReadDepth > allowReadDepth) && allowReadDepth >= 0
-                : !(denyWriteDepth > allowWriteDepth) && allowWriteDepth >= 0;
+                ? isFilesystemAllowed(path, effectiveAllowRead, denyRead, baseDirectory)
+                : isFilesystemAllowed(path, effectiveAllowWrite, denyWrite, baseDirectory);
             if (allowed) {
               trapSocket.write(controlResponseLine(queryId, 'allow'));
             } else {
@@ -698,15 +709,15 @@ function startTrapServer(
               trapLines.push(line);
             }
           } else if (
-            (obj.operation === 'connect' || obj.operation === 'bind') &&
-            typeof obj.target === 'string'
+            trap.kind === 'network' &&
+            (trap.operation === 'connect' || trap.operation === 'bind')
           ) {
             // No policy field expresses "allow this address:port" (allowedDomains
             // is hostname-based and enforced by the HTTP(S) proxy, not the broker),
             // so — matching the filesystem branch above — auto-grant, remember it
             // for the rest of the session, and surface it afterward rather than
             // hanging or hard-denying an already-approved command.
-            const target = obj.target;
+            const target = trap.target;
             if (!sessionAllowedTargets.has(target)) {
               sessionAllowedTargets.add(target);
               trapLines.push(line);
@@ -843,6 +854,45 @@ function extractPatchPaths(patchText: string): string[] {
   return paths;
 }
 
+function evaluateToolPermissions(
+  tool: string,
+  args: Record<string, unknown>,
+  config: SandboxConfig,
+  baseDirectory: string,
+  effectiveAllowRead: string[],
+  effectiveAllowWrite: string[],
+): SandboxPermissionDecision[] {
+  if (tool === 'read') {
+    const paths = Array.isArray(args.paths)
+      ? args.paths.filter((path): path is string => typeof path === 'string')
+      : [getToolPath(args)].filter((path): path is string => path !== undefined);
+    return paths.map((path) =>
+      evaluateReadPermission(path, config, baseDirectory, effectiveAllowRead),
+    );
+  }
+
+  if (tool === 'glob' || tool === 'grep' || tool === 'list') {
+    return [evaluateReadPermission(getSearchPath(args), config, baseDirectory, effectiveAllowRead)];
+  }
+
+  if (tool === 'write' || tool === 'edit') {
+    const path = getToolPath(args);
+    return path ? [evaluateWritePermission(path, config, baseDirectory, effectiveAllowWrite)] : [];
+  }
+
+  if (tool === 'apply_patch' && typeof args.patchText === 'string') {
+    return extractPatchPaths(args.patchText).map((path) =>
+      evaluateWritePermission(path, config, baseDirectory, effectiveAllowWrite),
+    );
+  }
+
+  if (tool === 'bash' && typeof args.command === 'string') {
+    return evaluateCommandDomains(args.command, config);
+  }
+
+  return [];
+}
+
 function errorWithConfigPaths(baseDirectory: string, message: string): Error {
   const { globalPath, projectPath } = getConfigPaths(baseDirectory);
   return new Error(`${message}\n\nUpdate sandbox config in:\n  ${projectPath}\n  ${globalPath}`);
@@ -857,12 +907,16 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
   const sessionAllowedWritePaths = new Set<string>();
   const sessionAllowedTargets = new Set<string>();
 
+  function mergeAllowances(configured: string[], session: Set<string>): string[] {
+    return [...configured, ...session];
+  }
+
   function getEffectiveAllowRead(config: SandboxConfig): string[] {
-    return [...config.filesystem.allowRead, ...sessionAllowedReadPaths];
+    return mergeAllowances(config.filesystem.allowRead, sessionAllowedReadPaths);
   }
 
   function getEffectiveAllowWrite(config: SandboxConfig): string[] {
-    return [...config.filesystem.allowWrite, ...sessionAllowedWritePaths];
+    return mergeAllowances(config.filesystem.allowWrite, sessionAllowedWritePaths);
   }
   let enabledNotified = false;
   let configuredShell: string | undefined;
@@ -1139,11 +1193,10 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     };
 
     if (!allowNetwork) {
-      for (const domain of extractDomainsFromCommand(args.command as string)) {
-        const decision = evaluateDomainPermission(domain, effectiveConfig);
+      for (const decision of evaluateCommandDomains(args.command as string, effectiveConfig)) {
         if (decision.status === 'allow') continue;
         if (decision.status === 'ask' && hasCallAllowance(callID, decision)) {
-          callAllowedDomains.push(domain);
+          callAllowedDomains.push(decision.resource);
           continue;
         }
         throw errorWithConfigPaths(directory, decision.message);
@@ -1226,41 +1279,22 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
             : undefined;
       const patterns = permissionPatterns(request);
 
-      const decisions: SandboxPermissionDecision[] = [];
       const effectiveAllowRead = getEffectiveAllowRead(config);
       const effectiveAllowWrite = getEffectiveAllowWrite(config);
-
-      if (permission === 'read') {
-        for (const pattern of patterns) {
-          decisions.push(evaluateReadPermission(pattern, config, directory, effectiveAllowRead));
-        }
-      }
-
-      if (permission === 'glob' || permission === 'grep' || permission === 'list') {
-        const searchPath = typeof metadata.path === 'string' ? metadata.path : '.';
-        decisions.push(evaluateReadPermission(searchPath, config, directory, effectiveAllowRead));
-      }
-
+      const args: Record<string, unknown> = { ...metadata };
+      if (permission === 'read') args.paths = patterns;
       if (permission === 'edit') {
-        const filepath =
-          typeof metadata.filepath === 'string'
-            ? metadata.filepath
-            : patterns.length === 1
-              ? patterns[0]
-              : undefined;
-        if (filepath) {
-          decisions.push(evaluateWritePermission(filepath, config, directory, effectiveAllowWrite));
-        }
+        args.path = typeof metadata.filepath === 'string' ? metadata.filepath : patterns[0];
       }
-
-      if (permission === 'bash') {
-        const command = typeof metadata.command === 'string' ? metadata.command : patterns[0];
-        if (typeof command === 'string' && !config.network.allowNetwork) {
-          for (const domain of extractDomainsFromCommand(command)) {
-            decisions.push(evaluateDomainPermission(domain, config));
-          }
-        }
-      }
+      if (permission === 'bash' && typeof args.command !== 'string') args.command = patterns[0];
+      const decisions = evaluateToolPermissions(
+        permission,
+        args,
+        config,
+        directory,
+        effectiveAllowRead,
+        effectiveAllowWrite,
+      );
 
       const decision =
         decisions.find((item) => item.status === 'deny') ??
@@ -1277,49 +1311,21 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       const config = await activeConfig();
       if (!config) return;
 
-      const effectiveAllowRead = getEffectiveAllowRead(config);
-      const effectiveAllowWrite = getEffectiveAllowWrite(config);
-
       if (input.tool === 'bash') {
         await prepareBash(input.callID, output.args, config);
         return;
       }
 
-      if (input.tool === 'read') {
-        const path = getToolPath(output.args);
-        if (path)
-          enforcePermission(
-            input.callID,
-            evaluateReadPermission(path, config, directory, effectiveAllowRead),
-          );
-        return;
-      }
-
-      if (input.tool === 'glob' || input.tool === 'grep' || input.tool === 'list') {
-        enforcePermission(
-          input.callID,
-          evaluateReadPermission(getSearchPath(output.args), config, directory, effectiveAllowRead),
-        );
-        return;
-      }
-
-      if (input.tool === 'write' || input.tool === 'edit') {
-        const path = getToolPath(output.args);
-        if (path)
-          enforcePermission(
-            input.callID,
-            evaluateWritePermission(path, config, directory, effectiveAllowWrite),
-          );
-        return;
-      }
-
-      if (input.tool === 'apply_patch' && typeof output.args.patchText === 'string') {
-        for (const path of extractPatchPaths(output.args.patchText)) {
-          enforcePermission(
-            input.callID,
-            evaluateWritePermission(path, config, directory, effectiveAllowWrite),
-          );
-        }
+      const decisions = evaluateToolPermissions(
+        input.tool,
+        output.args,
+        config,
+        directory,
+        getEffectiveAllowRead(config),
+        getEffectiveAllowWrite(config),
+      );
+      for (const decision of decisions) {
+        enforcePermission(input.callID, decision);
       }
     },
 
@@ -1430,11 +1436,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
           if (writeDecision.status === 'deny') reportBlocked(writeDecision);
         }
 
-        if (!config.network.allowNetwork) {
-          for (const domain of extractDomainsFromCommand(shellCommand)) {
-            const decision = evaluateDomainPermission(domain, config);
-            if (decision.status !== 'allow') reportBlocked(decision);
-          }
+        for (const decision of evaluateCommandDomains(shellCommand, config)) {
+          if (decision.status !== 'allow') reportBlocked(decision);
         }
       }
     },

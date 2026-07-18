@@ -2,13 +2,13 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { existsSync, readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { minimatch } from 'minimatch';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 
 import { loadLandstripConfig, type ConfigObject } from './config.ts';
+import { expandHomePath, formatError, isRecord } from './util.ts';
 
 export type PermissionAction = 'allow' | 'ask' | 'deny';
 
@@ -58,30 +58,19 @@ const AGENT_FIELDS = new Set([
   'color',
 ]);
 
-function isObject(value: unknown): value is ConfigObject {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function normalizeAbsolutePath(value: string): string {
   return /^(?:[A-Za-z]:[\\/]|\\\\)/.test(value) ? value.replaceAll('\\', '/') : value;
 }
 
 function expandPattern(pattern: string): string {
-  if (pattern === '~' || pattern === '$HOME') return normalizeAbsolutePath(homedir());
-  if (pattern.startsWith('~/')) {
-    return normalizeAbsolutePath(join(homedir(), pattern.slice(2)));
-  }
-  if (pattern.startsWith('$HOME/')) {
-    return normalizeAbsolutePath(join(homedir(), pattern.slice(6)));
-  }
-  return normalizeAbsolutePath(pattern);
+  return normalizeAbsolutePath(expandHomePath(pattern));
 }
 
 function permissionEntries(permission: string, value: unknown): PermissionRule[] {
   if (value === 'allow' || value === 'ask' || value === 'deny') {
     return [{ permission, pattern: '*', action: value }];
   }
-  if (!isObject(value)) {
+  if (!isRecord(value)) {
     throw new Error(`permission ${permission} must be allow, ask, deny, or a map`);
   }
   return Object.entries(value).map(([pattern, action]) => {
@@ -97,7 +86,7 @@ function normalizePermissions(value: unknown): PermissionRules {
     return [{ permission: '*', pattern: '*', action: value }];
   }
   if (value === undefined) return [];
-  if (!isObject(value)) throw new Error('permission must be allow, ask, deny, or a map');
+  if (!isRecord(value)) throw new Error('permission must be allow, ask, deny, or a map');
   return Object.entries(value).flatMap(([permission, rules]) =>
     permissionEntries(permission, rules),
   );
@@ -108,7 +97,7 @@ function legacyConfigWarnings(piAgentDir: string): string[] {
   if (!existsSync(path)) return [];
   try {
     const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
-    if (!isObject(value)) return [];
+    if (!isRecord(value)) return [];
     const fields = ['agent', 'permission', 'subagents', 'maxSubagents'].filter(
       (field) => value[field] !== undefined,
     );
@@ -135,7 +124,7 @@ function normalizeAgent(name: string, raw: ConfigObject): AgentDefinition | unde
   for (const key of Object.keys(raw)) {
     if (!AGENT_FIELDS.has(key)) throw new Error(`agent ${name} has an unknown field ${key}`);
   }
-  if (raw.options !== undefined && !isObject(raw.options)) {
+  if (raw.options !== undefined && !isRecord(raw.options)) {
     throw new Error(`agent ${name} options must be an object`);
   }
   for (const field of ['temperature', 'top_p'] as const) {
@@ -152,7 +141,7 @@ function normalizeAgent(name: string, raw: ConfigObject): AgentDefinition | unde
   ) {
     throw new Error(`agent ${name} has an invalid mode`);
   }
-  const providerOptions: Record<string, unknown> = isObject(raw.options) ? { ...raw.options } : {};
+  const providerOptions: Record<string, unknown> = isRecord(raw.options) ? { ...raw.options } : {};
   if (typeof raw.temperature === 'number') providerOptions.temperature = raw.temperature;
   if (typeof raw.top_p === 'number') providerOptions.top_p = raw.top_p;
   if (raw.steps !== undefined && (!Number.isInteger(raw.steps) || (raw.steps as number) <= 0)) {
@@ -189,16 +178,16 @@ export function loadAgentCatalog(
     maxSubagents = config.maxSubagents;
     subagents = config.subagents;
   } catch (error) {
-    diagnostics.push(error instanceof Error ? error.message : String(error));
+    diagnostics.push(formatError(error));
   }
 
   const normalized = new Map<string, AgentDefinition>();
-  if (subagents.agent !== undefined && !isObject(subagents.agent)) {
+  if (subagents.agent !== undefined && !isRecord(subagents.agent)) {
     diagnostics.push('subagents.agent must be an object');
-  } else if (isObject(subagents.agent)) {
+  } else if (isRecord(subagents.agent)) {
     for (const name of Object.keys(subagents.agent).sort()) {
       const value = subagents.agent[name];
-      if (!isObject(value)) {
+      if (!isRecord(value)) {
         diagnostics.push(`agent ${name} must be an object`);
         continue;
       }
@@ -206,7 +195,7 @@ export function loadAgentCatalog(
         const agent = normalizeAgent(name, value);
         if (agent) normalized.set(name, agent);
       } catch (error) {
-        diagnostics.push(error instanceof Error ? error.message : String(error));
+        diagnostics.push(formatError(error));
       }
     }
   }
@@ -220,7 +209,7 @@ export function loadAgentCatalog(
   try {
     permissions = normalizePermissions(subagents.permission);
   } catch (error) {
-    diagnostics.push(error instanceof Error ? error.message : String(error));
+    diagnostics.push(formatError(error));
   }
   return { agents: normalized, permissions, diagnostics, warnings, maxSubagents };
 }

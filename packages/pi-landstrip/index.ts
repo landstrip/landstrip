@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { spawn, spawnSync } from 'node:child_process';
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import {
@@ -45,7 +45,7 @@ import {
   SettingsManager,
   withFileMutationQueue,
 } from '@earendil-works/pi-coding-agent';
-import { matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
+import { matchesKey, truncateToWidth } from '@earendil-works/pi-tui';
 import {
   binaryPath,
   type LandstripControlResponse,
@@ -61,7 +61,14 @@ import {
   workerConfigFromEnvironment,
 } from './subagents.ts';
 import { availablePrimaryAgents, availableSubagents } from './agents.ts';
-import { loadLandstripConfig, MAX_SUBAGENTS, setMaxSubagentsConfigForScope } from './config.ts';
+import { boxBottom, boxRow, boxTop } from './box.ts';
+import {
+  getPiConfigPaths,
+  loadLandstripConfig,
+  MAX_SUBAGENTS,
+  setMaxSubagentsConfigForScope,
+} from './config.ts';
+import { AsyncQueue, expandHomePath, formatError } from './util.ts';
 
 interface SandboxFilesystemConfig {
   denyRead: string[];
@@ -107,8 +114,6 @@ interface LandstripPolicy {
   };
   filesystem: SandboxFilesystemConfig;
 }
-
-type LandstripOperation = 'read' | 'write';
 
 type LandstripDenialTrap = LandstripFilesystemTrap | LandstripNetworkTrap;
 
@@ -156,6 +161,14 @@ for (const [network, prefix] of [
 // Grace period after the child exits for its stdio to drain before we stop
 // waiting; matches pi's own bash backend so a backgrounded process cannot hang us.
 const EXIT_STDIO_GRACE_MS = 100;
+const PROXY_ENVIRONMENT_VARIABLES = [
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+] as const;
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 type PermissionChoice = 'abort' | 'once' | 'session' | 'project' | 'global';
@@ -256,10 +269,7 @@ function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxCo
 }
 
 function getConfigPaths(cwd: string): { globalPath: string; projectPath: string } {
-  return {
-    globalPath: join(getAgentDir(), 'sandbox.json'),
-    projectPath: join(cwd, '.pi', 'sandbox.json'),
-  };
+  return getPiConfigPaths(cwd, 'sandbox.json');
 }
 
 function readOrEmptyConfig(configPath: string): SandboxConfigFile {
@@ -302,47 +312,60 @@ async function setSandboxConfigEnabled(
   return scope;
 }
 
-async function addDomainToConfig(configPath: string, domain: string): Promise<void> {
+async function addConfigValue(
+  configPath: string,
+  value: string,
+  readValues: (config: SandboxConfigFile) => string[],
+  writeValues: (config: SandboxConfigFile, values: string[]) => void,
+): Promise<void> {
   await withFileMutationQueue(configPath, async () => {
     const config = readOrEmptyConfig(configPath);
-    const existing = config.network?.allowedDomains ?? [];
-    if (existing.includes(domain)) return;
-
-    config.network = {
-      ...config.network,
-      allowedDomains: [...existing, domain],
-      deniedDomains: config.network?.deniedDomains ?? [],
-    };
+    const existing = readValues(config);
+    if (existing.includes(value)) return;
+    writeValues(config, [...existing, value]);
     writeConfigFile(configPath, config);
   });
 }
 
-async function addReadPathToConfig(configPath: string, pathToAdd: string): Promise<void> {
-  await withFileMutationQueue(configPath, async () => {
-    const config = readOrEmptyConfig(configPath);
-    const existing = config.filesystem?.allowRead ?? [];
-    if (existing.includes(pathToAdd)) return;
-
-    config.filesystem = {
-      ...config.filesystem,
-      allowRead: [...existing, pathToAdd],
-    };
-    writeConfigFile(configPath, config);
-  });
+function addDomainToConfig(configPath: string, domain: string): Promise<void> {
+  return addConfigValue(
+    configPath,
+    domain,
+    (config) => config.network?.allowedDomains ?? [],
+    (config, allowedDomains) => {
+      config.network = {
+        ...config.network,
+        allowedDomains,
+        deniedDomains: config.network?.deniedDomains ?? [],
+      };
+    },
+  );
 }
 
-async function addWritePathToConfig(configPath: string, pathToAdd: string): Promise<void> {
-  await withFileMutationQueue(configPath, async () => {
-    const config = readOrEmptyConfig(configPath);
-    const existing = config.filesystem?.allowWrite ?? [];
-    if (existing.includes(pathToAdd)) return;
+function addReadPathToConfig(configPath: string, pathToAdd: string): Promise<void> {
+  return addConfigValue(
+    configPath,
+    pathToAdd,
+    (config) => config.filesystem?.allowRead ?? [],
+    (config, allowRead) => {
+      config.filesystem = { ...config.filesystem, allowRead };
+    },
+  );
+}
 
-    config.filesystem = {
-      ...config.filesystem,
-      allowWrite: [...existing, pathToAdd],
-    };
-    writeConfigFile(configPath, config);
-  });
+function addWritePathToConfig(configPath: string, pathToAdd: string): Promise<void> {
+  return addConfigValue(
+    configPath,
+    pathToAdd,
+    (config) => config.filesystem?.allowWrite ?? [],
+    (config, allowWrite) => {
+      config.filesystem = { ...config.filesystem, allowWrite };
+    },
+  );
+}
+
+function mergeAllowances(base: string[], session: string[], execution?: string[]): string[] {
+  return [...base, ...session, ...(execution ?? [])];
 }
 
 function domainMatchesPattern(domain: string, pattern: string): boolean {
@@ -378,7 +401,7 @@ export function shouldPromptForWrite(path: string, allowWrite: string[], cwd: st
 // allow/deny decision diverge from landstrip's whenever the agent operates
 // outside the directory pi was launched from.
 function expandPath(filePath: string, cwd: string): string {
-  return resolve(cwd, filePath.replace(/^~(?=$|\/)/, homedir()));
+  return resolve(cwd, expandHomePath(filePath));
 }
 
 function canonicalizePath(filePath: string, cwd: string): string {
@@ -596,19 +619,13 @@ function extractNativeWriteDeniedPath(output: string, cwd: string): string | nul
   return null;
 }
 
-function extractBlockedWritePath(trapOutput: string, cwd: string): string | null {
+function extractTrapBlockedPath(
+  trapOutput: string,
+  cwd: string,
+  operation: 'read' | 'write',
+): string | null {
   for (const error of parseLandstripTraps(trapOutput).filter(isFilesystemTrap)) {
-    if (error.operation === 'write') {
-      return normalizeBlockedPath(error.path, cwd);
-    }
-  }
-
-  return null;
-}
-
-function extractBlockedReadPath(trapOutput: string, cwd: string): string | null {
-  for (const error of parseLandstripTraps(trapOutput).filter(isFilesystemTrap)) {
-    if (error.operation === 'read') {
+    if (error.operation === operation) {
       return normalizeBlockedPath(error.path, cwd);
     }
   }
@@ -718,26 +735,38 @@ function setTuiStatus(ctx: ExtensionContext, key: string, value: string | undefi
   ctx.ui.setStatus(key, value);
 }
 
-function boxTop(theme: Theme, width: number, title: string): string {
-  const label = theme.fg('accent', ` ${title} `);
-  const fill = theme.fg('border', '─'.repeat(Math.max(0, width - 4 - visibleWidth(label))));
-  return `${theme.fg('border', '╭─')}${label}${fill}${theme.fg('border', '─╮')}`;
+function themeColors(theme: Theme) {
+  return {
+    dim: (value: string) => theme.fg('dim', value),
+    muted: (value: string) => theme.fg('muted', value),
+    accent: (value: string) => theme.fg('accent', value),
+    text: (value: string) => theme.fg('text', value),
+  };
 }
 
-function boxRow(theme: Theme, width: number, content = ''): string {
-  const innerW = Math.max(1, width - 4);
-  const border = theme.fg('border', '│');
-  const line = truncateToWidth(content, innerW);
-  const pad = Math.max(0, innerW - visibleWidth(line));
-  return `${border} ${line}${' '.repeat(pad)} ${border}`;
+function patchProcessGroupKill(child: ChildProcess): void {
+  const kill = child.kill.bind(child);
+  child.kill = (signal?: NodeJS.Signals | number): boolean => {
+    if (signal === 0 || child.pid === undefined) return kill(signal);
+    if (process.platform === 'win32') {
+      const result = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      if (result.status === 0) return true;
+    } else {
+      try {
+        process.kill(-child.pid, signal);
+        return true;
+      } catch {
+        // Fall back when the process exited before its group was signalled.
+      }
+    }
+    return kill(signal);
+  };
 }
 
-function boxBottom(theme: Theme, width: number): string {
-  const border = (s: string) => theme.fg('border', s);
-  return `${border('╰')}${border('─'.repeat(Math.max(0, width - 2)))}${border('╯')}`;
-}
-
-let permissionPromptTail = Promise.resolve();
+const permissionPromptQueue = new AsyncQueue();
 
 async function showPermissionPrompt(
   ctx: ExtensionContext,
@@ -747,12 +776,7 @@ async function showPermissionPrompt(
 ): Promise<PermissionChoice> {
   if (!ctx.hasUI) return 'abort';
 
-  let releasePrompt: (() => void) | undefined;
-  const previousPrompt = permissionPromptTail;
-  permissionPromptTail = new Promise<void>((resolve) => {
-    releasePrompt = resolve;
-  });
-  await previousPrompt;
+  const releasePrompt = await permissionPromptQueue.acquire();
 
   try {
     const labels = options.map((option) =>
@@ -772,7 +796,7 @@ async function showPermissionPrompt(
     }
     return option.action;
   } finally {
-    releasePrompt?.();
+    releasePrompt();
   }
 }
 
@@ -873,15 +897,8 @@ export function writeEnvFile(
   }
   if (proxyPort !== null) {
     const url = `http://127.0.0.1:${proxyPort}`;
-    for (const v of [
-      'HTTP_PROXY',
-      'HTTPS_PROXY',
-      'ALL_PROXY',
-      'http_proxy',
-      'https_proxy',
-      'all_proxy',
-    ]) {
-      lines.push(`export ${v}='${url}'`);
+    for (const name of PROXY_ENVIRONMENT_VARIABLES) {
+      lines.push(`export ${name}='${url}'`);
     }
     lines.push("export NO_PROXY=''");
     lines.push("export no_proxy=''");
@@ -1049,33 +1066,33 @@ export function createLandstripIntegration(
     config: SandboxConfig,
     allowances?: ExecutionAllowances,
   ): string[] {
-    return [
-      ...config.network.allowedDomains,
-      ...sessionAllowedDomains,
-      ...(allowances?.domains ?? []),
-    ];
+    return mergeAllowances(
+      config.network.allowedDomains,
+      sessionAllowedDomains,
+      allowances?.domains,
+    );
   }
 
   function getEffectiveAllowRead(
     config: SandboxConfig,
     allowances?: ExecutionAllowances,
   ): string[] {
-    return [
-      ...config.filesystem.allowRead,
-      ...sessionAllowedReadPaths,
-      ...(allowances?.readPaths ?? []),
-    ];
+    return mergeAllowances(
+      config.filesystem.allowRead,
+      sessionAllowedReadPaths,
+      allowances?.readPaths,
+    );
   }
 
   function getEffectiveAllowWrite(
     config: SandboxConfig,
     allowances?: ExecutionAllowances,
   ): string[] {
-    return [
-      ...config.filesystem.allowWrite,
-      ...sessionAllowedWritePaths,
-      ...(allowances?.writePaths ?? []),
-    ];
+    return mergeAllowances(
+      config.filesystem.allowWrite,
+      sessionAllowedWritePaths,
+      allowances?.writePaths,
+    );
   }
 
   async function applyDomainChoice(
@@ -1408,6 +1425,71 @@ export function createLandstripIntegration(
     });
   }
 
+  interface TrapQueryResult {
+    action: LandstripControlResponse['action'];
+    reason?: 'unprompted' | 'rejected' | 'hard-deny';
+  }
+
+  async function resolveTrapQuery(
+    trap: LandstripFilesystemTrap | LandstripNetworkTrap,
+    ctx: ExtensionContext,
+    cwd: string,
+    allowances: ExecutionAllowances,
+    promptOnBlock: boolean,
+    signal?: AbortSignal,
+  ): Promise<TrapQueryResult> {
+    if (!isFilesystemTrap(trap)) {
+      const key = `${trap.operation}\u0000${trap.target}`;
+      if (sessionAllowedTargets.includes(key) || allowances.targets.includes(key)) {
+        return { action: 'allow' };
+      }
+      if (!ctx.hasUI || !promptOnBlock) return { action: 'deny', reason: 'unprompted' };
+
+      const choice = await promptNetworkBlock(ctx, trap.operation, trap.target, signal);
+      if (choice === 'abort') return { action: 'deny', reason: 'rejected' };
+      const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
+      targets.push(key);
+      return { action: 'allow' };
+    }
+
+    const path = normalizeBlockedPath(trap.path, cwd);
+    const config = loadConfig(cwd);
+    const allowed =
+      trap.operation === 'read'
+        ? readAllowed(
+            path,
+            getEffectiveAllowRead(config, allowances),
+            config.filesystem.denyRead,
+            cwd,
+          )
+        : !matchesPattern(path, config.filesystem.denyWrite, cwd) &&
+          !shouldPromptForWrite(path, getEffectiveAllowWrite(config, allowances), cwd);
+    if (allowed) return { action: 'allow' };
+    if (trap.operation === 'write' && matchesPattern(path, config.filesystem.denyWrite, cwd)) {
+      return { action: 'deny', reason: 'hard-deny' };
+    }
+    if (!ctx.hasUI || !promptOnBlock) return { action: 'deny', reason: 'unprompted' };
+
+    const choice =
+      trap.operation === 'read'
+        ? await promptReadBlock(
+            ctx,
+            path,
+            matchesPattern(path, config.filesystem.denyRead, cwd)
+              ? 'granting allowRead will override it'
+              : undefined,
+            signal,
+          )
+        : await promptWriteBlock(ctx, path, signal);
+    if (choice === 'abort') return { action: 'deny', reason: 'rejected' };
+    if (trap.operation === 'read') {
+      await applyReadChoice(ctx, choice, path, cwd, allowances);
+    } else {
+      await applyWriteChoice(ctx, choice, path, cwd, allowances);
+    }
+    return { action: 'allow' };
+  }
+
   function attachWorkerTrap(
     socket: NetSocket,
     ctx: ExtensionContext,
@@ -1429,66 +1511,11 @@ export function createLandstripIntegration(
       });
     };
 
-    const handleFilesystem = (trap: LandstripFilesystemTrap): void => {
-      const path = normalizeBlockedPath(trap.path, cwd);
+    const handleQuery = (trap: LandstripFilesystemTrap | LandstripNetworkTrap): void => {
       prompts = prompts
         .then(async () => {
-          const config = loadConfig(cwd);
-          const allowed =
-            trap.operation === 'read'
-              ? readAllowed(
-                  path,
-                  getEffectiveAllowRead(config, allowances),
-                  config.filesystem.denyRead,
-                  cwd,
-                )
-              : !matchesPattern(path, config.filesystem.denyWrite, cwd) &&
-                !shouldPromptForWrite(path, getEffectiveAllowWrite(config, allowances), cwd);
-          if (allowed) {
-            respond(trap.query_id, 'allow');
-            return;
-          }
-          if (
-            trap.operation === 'write' &&
-            matchesPattern(path, config.filesystem.denyWrite, cwd)
-          ) {
-            respond(trap.query_id, 'deny');
-            return;
-          }
-          const choice =
-            trap.operation === 'read'
-              ? await promptReadBlock(ctx, path, undefined, signal)
-              : await promptWriteBlock(ctx, path, signal);
-          if (choice === 'abort') {
-            respond(trap.query_id, 'deny');
-            return;
-          }
-          if (trap.operation === 'read') {
-            await applyReadChoice(ctx, choice, path, cwd, allowances);
-          } else {
-            await applyWriteChoice(ctx, choice, path, cwd, allowances);
-          }
-          respond(trap.query_id, 'allow');
-        })
-        .catch(() => respond(trap.query_id, 'deny'));
-    };
-
-    const handleNetwork = (trap: LandstripNetworkTrap): void => {
-      const key = `${trap.operation}\u0000${trap.target}`;
-      prompts = prompts
-        .then(async () => {
-          if (sessionAllowedTargets.includes(key) || allowances.targets.includes(key)) {
-            respond(trap.query_id, 'allow');
-            return;
-          }
-          const choice = await promptNetworkBlock(ctx, trap.operation, trap.target, signal);
-          if (choice === 'abort') {
-            respond(trap.query_id, 'deny');
-            return;
-          }
-          const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
-          targets.push(key);
-          respond(trap.query_id, 'allow');
+          const result = await resolveTrapQuery(trap, ctx, cwd, allowances, true, signal);
+          respond(trap.query_id, result.action);
         })
         .catch(() => respond(trap.query_id, 'deny'));
     };
@@ -1510,8 +1537,7 @@ export function createLandstripIntegration(
           reportTrapError(`Worker sandbox reported: ${formatLandstripTraps([trap])}`);
           continue;
         }
-        if (isFilesystemTrap(trap)) handleFilesystem(trap);
-        else handleNetwork(trap);
+        handleQuery(trap);
       }
     });
   }
@@ -1529,25 +1555,7 @@ export function createLandstripIntegration(
         env: options.env,
         detached: true,
       });
-      const kill = child.kill.bind(child);
-      child.kill = (signal?: NodeJS.Signals | number): boolean => {
-        if (signal === 0 || child.pid === undefined) return kill(signal);
-        if (process.platform === 'win32') {
-          const result = spawnSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
-            stdio: 'ignore',
-            windowsHide: true,
-          });
-          if (result.status === 0) return true;
-        } else {
-          try {
-            process.kill(-child.pid, signal);
-            return true;
-          } catch {
-            // Fall back when the process exited before its group was signalled.
-          }
-        }
-        return kill(signal);
-      };
+      patchProcessGroupKill(child);
       return child as ReturnType<RpcSpawn>;
     };
 
@@ -1615,14 +1623,7 @@ export function createLandstripIntegration(
     const workerEnv = { ...options.env };
     if (proxy) {
       const url = `http://landstrip:${proxyToken}@127.0.0.1:${proxy.port}`;
-      for (const name of [
-        'HTTP_PROXY',
-        'HTTPS_PROXY',
-        'ALL_PROXY',
-        'http_proxy',
-        'https_proxy',
-        'all_proxy',
-      ]) {
+      for (const name of PROXY_ENVIRONMENT_VARIABLES) {
         workerEnv[name] = url;
       }
       workerEnv.NO_PROXY = '';
@@ -1644,18 +1645,7 @@ export function createLandstripIntegration(
         },
       );
       workerChildEnd.destroy();
-      const kill = child.kill.bind(child);
-      child.kill = (signal?: NodeJS.Signals | number): boolean => {
-        if (child.pid !== undefined) {
-          try {
-            process.kill(-child.pid, signal);
-            return true;
-          } catch {
-            // Fall back when the process exited before its group was signalled.
-          }
-        }
-        return kill(signal);
-      };
+      patchProcessGroupKill(child);
       return child as ReturnType<RpcSpawn>;
     };
 
@@ -1857,120 +1847,6 @@ export function createLandstripIntegration(
               callbacks.onErrorFd?.(Buffer.from(infoLine, 'utf8'));
             };
 
-            // Answer a landstrip query (state:"query"). The broker suspends the
-            // child's syscall until we respond allow/deny on the trap socket.
-            const handleQuery = (
-              queryId: string,
-              operation: LandstripOperation,
-              rawPath: string,
-              rawLine: string,
-            ): void => {
-              const path = normalizeBlockedPath(rawPath, cwd);
-              const config = loadConfig(cwd);
-              const isAllowed = (cfg: SandboxConfig): boolean =>
-                operation === 'read'
-                  ? readAllowed(
-                      path,
-                      getEffectiveAllowRead(cfg, allowances),
-                      cfg.filesystem.denyRead,
-                      cwd,
-                    )
-                  : !matchesPattern(path, cfg.filesystem.denyWrite, cwd) &&
-                    !shouldPromptForWrite(path, getEffectiveAllowWrite(cfg, allowances), cwd);
-
-              if (isAllowed(config)) {
-                respondQuery(queryId, 'allow');
-                return;
-              }
-              // Without an interactive prompt, deny and let the retry path grant.
-              if (!ctx.hasUI || !callbacks.promptOnBlock) {
-                appendErrorLine(rawLine);
-                respondQuery(queryId, 'deny');
-                return;
-              }
-              // denyWrite is a hard block: never prompt to override it.
-              if (operation === 'write' && matchesPattern(path, config.filesystem.denyWrite, cwd)) {
-                respondQuery(queryId, 'deny');
-                return;
-              }
-              // Serialize prompts so concurrent queries never overlap on screen and
-              // a path granted by one prompt auto-allows later queries for it.
-              queryChain = queryChain
-                .then(async () => {
-                  const cfg = loadConfig(cwd);
-                  if (isAllowed(cfg)) {
-                    respondQuery(queryId, 'allow');
-                    return;
-                  }
-                  const choice =
-                    operation === 'read'
-                      ? await promptReadBlock(
-                          ctx,
-                          path,
-                          matchesPattern(path, cfg.filesystem.denyRead, cwd)
-                            ? 'granting allowRead will override it'
-                            : undefined,
-                          signal,
-                        )
-                      : await promptWriteBlock(ctx, path, signal);
-                  if (choice === 'abort') {
-                    respondQuery(queryId, 'deny');
-                    return;
-                  }
-                  if (operation === 'read') {
-                    await applyReadChoice(ctx, choice, path, cwd, allowances);
-                  } else {
-                    await applyWriteChoice(ctx, choice, path, cwd, allowances);
-                  }
-                  respondQuery(queryId, 'allow');
-                })
-                .catch(() => respondQuery(queryId, 'deny'));
-            };
-
-            // A denied connect or bind is a query too, and the broker re-issues it
-            // itself once we allow. The target is address:port, so a grant only
-            // lasts for the session (see promptNetworkBlock).
-            const handleNetworkQuery = (
-              queryId: string,
-              operation: string,
-              target: string,
-              rawLine: string,
-            ): void => {
-              const targetKey = `${operation}\u0000${target}`;
-              if (
-                sessionAllowedTargets.includes(targetKey) ||
-                allowances.targets.includes(targetKey)
-              ) {
-                respondQuery(queryId, 'allow');
-                return;
-              }
-              if (!ctx.hasUI || !callbacks.promptOnBlock) {
-                appendErrorLine(rawLine);
-                respondQuery(queryId, 'deny');
-                return;
-              }
-              queryChain = queryChain
-                .then(async () => {
-                  if (
-                    sessionAllowedTargets.includes(targetKey) ||
-                    allowances.targets.includes(targetKey)
-                  ) {
-                    respondQuery(queryId, 'allow');
-                    return;
-                  }
-                  const choice = await promptNetworkBlock(ctx, operation, target, signal);
-                  if (choice === 'abort') {
-                    appendErrorLine(rawLine);
-                    respondQuery(queryId, 'deny');
-                    return;
-                  }
-                  const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
-                  targets.push(targetKey);
-                  respondQuery(queryId, 'allow');
-                })
-                .catch(() => respondQuery(queryId, 'deny'));
-            };
-
             trapSocket.on('data', (data: Buffer) => {
               trapBuffer += trapDecoder.write(data);
               let nl = trapBuffer.indexOf('\n');
@@ -1984,11 +1860,25 @@ export function createLandstripIntegration(
                 // gets an answer; anything else is informational and kept for
                 // post-close handling.
                 if (trap && isQueryTrap(trap)) {
-                  if (isFilesystemTrap(trap)) {
-                    handleQuery(trap.query_id, trap.operation, trap.path, line);
-                  } else {
-                    handleNetworkQuery(trap.query_id, trap.operation, trap.target, line);
-                  }
+                  queryChain = queryChain
+                    .then(async () => {
+                      const result = await resolveTrapQuery(
+                        trap,
+                        ctx,
+                        cwd,
+                        allowances,
+                        callbacks.promptOnBlock === true,
+                        signal,
+                      );
+                      if (
+                        result.reason === 'unprompted' ||
+                        (!isFilesystemTrap(trap) && result.reason === 'rejected')
+                      ) {
+                        appendErrorLine(line);
+                      }
+                      respondQuery(trap.query_id, result.action);
+                    })
+                    .catch(() => respondQuery(trap.query_id, 'deny'));
                 } else {
                   appendErrorLine(line);
                 }
@@ -2066,14 +1956,18 @@ export function createLandstripIntegration(
     });
 
     const run = () => sandboxedBash.execute(id, params, signal, onUpdate, ctx);
-    const retryWithWriteAccess = async (
+    const retryWithAccess = async (
+      operation: 'read' | 'write',
       blockedPath: string,
     ): Promise<AgentToolResult<BashToolDetails | undefined> | null> => {
       if (!ctx.hasUI) return null;
 
       let config = loadConfig(ctx.cwd);
       const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
-      if (matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)) {
+      if (
+        operation === 'write' &&
+        matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)
+      ) {
         notify(
           ctx,
           `"${blockedPath}" is blocked by denyWrite. Check:\n  ${projectPath}\n  ${globalPath}`,
@@ -2082,14 +1976,35 @@ export function createLandstripIntegration(
         return null;
       }
 
-      if (shouldPromptForWrite(blockedPath, getEffectiveAllowWrite(config, allowances), ctx.cwd)) {
-        const choice = await promptWriteBlock(ctx, blockedPath, signal);
+      const needsPrompt =
+        operation === 'read'
+          ? !matchesPattern(blockedPath, getEffectiveAllowRead(config, allowances), ctx.cwd)
+          : shouldPromptForWrite(blockedPath, getEffectiveAllowWrite(config, allowances), ctx.cwd);
+      if (needsPrompt) {
+        const choice =
+          operation === 'read'
+            ? await promptReadBlock(
+                ctx,
+                blockedPath,
+                matchesPattern(blockedPath, config.filesystem.denyRead, ctx.cwd)
+                  ? 'granting allowRead will override it'
+                  : undefined,
+                signal,
+              )
+            : await promptWriteBlock(ctx, blockedPath, signal);
         if (choice === 'abort') return null;
-        await applyWriteChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
+        if (operation === 'read') {
+          await applyReadChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
+        } else {
+          await applyWriteChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
+        }
       }
 
       config = loadConfig(ctx.cwd);
-      if (matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)) {
+      if (
+        operation === 'write' &&
+        matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)
+      ) {
         notify(
           ctx,
           `"${blockedPath}" was added to allowWrite, but denyWrite still blocks it. Check:\n  ${projectPath}\n  ${globalPath}`,
@@ -2100,37 +2015,10 @@ export function createLandstripIntegration(
 
       onUpdate?.({
         content: [
-          { type: 'text', text: `\n--- Write access granted for "${blockedPath}", retrying ---\n` },
-        ],
-        details: {},
-      });
-      landstripErrorOutput = '';
-      stderrOutput = '';
-      return run();
-    };
-
-    const retryWithReadAccess = async (
-      blockedPath: string,
-    ): Promise<AgentToolResult<BashToolDetails | undefined> | null> => {
-      if (!ctx.hasUI) return null;
-
-      const config = loadConfig(ctx.cwd);
-      if (!matchesPattern(blockedPath, getEffectiveAllowRead(config, allowances), ctx.cwd)) {
-        const choice = await promptReadBlock(
-          ctx,
-          blockedPath,
-          matchesPattern(blockedPath, config.filesystem.denyRead, ctx.cwd)
-            ? 'granting allowRead will override it'
-            : undefined,
-          signal,
-        );
-        if (choice === 'abort') return null;
-        await applyReadChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
-      }
-
-      onUpdate?.({
-        content: [
-          { type: 'text', text: `\n--- Read access granted for "${blockedPath}", retrying ---\n` },
+          {
+            type: 'text',
+            text: `\n--- ${operation === 'read' ? 'Read' : 'Write'} access granted for "${blockedPath}", retrying ---\n`,
+          },
         ],
         details: {},
       });
@@ -2143,21 +2031,21 @@ export function createLandstripIntegration(
     try {
       result = await run();
     } catch (error) {
-      const errorText = error instanceof Error ? error.message : String(error);
+      const errorText = formatError(error);
       const fallbackOutput = `${stderrOutput}\n${errorText}`;
       const blockedWritePath =
-        extractBlockedWritePath(landstripErrorOutput, ctx.cwd) ??
+        extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'write') ??
         extractNativeWriteDeniedPath(fallbackOutput, ctx.cwd);
       if (blockedWritePath) {
-        const retryResult = await retryWithWriteAccess(blockedWritePath);
+        const retryResult = await retryWithAccess('write', blockedWritePath);
         if (retryResult) return retryResult;
       }
 
       const blockedReadPath =
-        extractBlockedReadPath(landstripErrorOutput, ctx.cwd) ??
+        extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'read') ??
         extractNativeDeniedPath(fallbackOutput, ctx.cwd);
       if (blockedReadPath) {
-        const retryResult = await retryWithReadAccess(blockedReadPath);
+        const retryResult = await retryWithAccess('read', blockedReadPath);
         if (retryResult) return retryResult;
       }
 
@@ -2173,19 +2061,19 @@ export function createLandstripIntegration(
       result.content.unshift({ type: 'text', text: `\n${message}\n` });
     }
     const blockedWritePath =
-      extractBlockedWritePath(landstripErrorOutput, ctx.cwd) ??
+      extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'write') ??
       extractNativeWriteDeniedPath(stderrOutput, ctx.cwd);
     if (blockedWritePath) {
-      const retryResult = await retryWithWriteAccess(blockedWritePath);
+      const retryResult = await retryWithAccess('write', blockedWritePath);
       if (retryResult) return retryResult;
     }
 
     const blockedReadPath =
-      extractBlockedReadPath(landstripErrorOutput, ctx.cwd) ??
+      extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'read') ??
       extractNativeDeniedPath(stderrOutput, ctx.cwd);
     if (!blockedReadPath) return result;
 
-    const retryResult = await retryWithReadAccess(blockedReadPath);
+    const retryResult = await retryWithAccess('read', blockedReadPath);
     return retryResult ?? result;
   }
 
@@ -2368,10 +2256,7 @@ export function createLandstripIntegration(
         const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
         const shouldToggle = await ctx.ui.custom<boolean>(
           (_tui, theme, _kb, done) => {
-            const dim = (value: string) => theme.fg('dim', value);
-            const muted = (value: string) => theme.fg('muted', value);
-            const accent = (value: string) => theme.fg('accent', value);
-            const text = (value: string) => theme.fg('text', value);
+            const { dim, muted, accent, text } = themeColors(theme);
 
             function sandboxStatus(): { color: 'success' | 'warning'; label: string } {
               if (noSandboxFlag) return { color: 'warning', label: 'Disabled (--no-sandbox)' };
@@ -2524,10 +2409,7 @@ export function createLandstripIntegration(
               'xhigh',
               'max',
             ]);
-            const dim = (value: string) => theme.fg('dim', value);
-            const muted = (value: string) => theme.fg('muted', value);
-            const accent = (value: string) => theme.fg('accent', value);
-            const text = (value: string) => theme.fg('text', value);
+            const { dim, muted, accent, text } = themeColors(theme);
 
             return {
               render(width: number): string[] {

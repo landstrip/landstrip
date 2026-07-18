@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 import { getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent';
 
+import { formatError, isRecord } from './util.ts';
+
 export type ConfigObject = Record<string, unknown>;
 
 export const MAX_SUBAGENTS = 16;
@@ -23,20 +25,16 @@ export interface LandstripConfig extends LandstripConfigFile {
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
-function isObject(value: unknown): value is ConfigObject {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 function readConfig(path: string): LandstripConfigFile {
   if (!existsSync(path)) return {};
   let value: unknown;
   try {
     value = JSON.parse(readFileSync(path, 'utf8'));
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = formatError(error);
     throw new Error(`${path}: ${message}`);
   }
-  if (!isObject(value)) throw new Error(`${path} must contain a JSON object`);
+  if (!isRecord(value)) throw new Error(`${path} must contain a JSON object`);
   for (const key of Object.keys(value)) {
     if (key !== 'maxSubagents' && key !== 'subagents') {
       throw new Error(`${path}: unknown top-level field ${key}`);
@@ -48,7 +46,7 @@ function readConfig(path: string): LandstripConfigFile {
 function mergeValue(base: unknown, override: unknown): unknown {
   if (override === undefined) return base;
   if (Array.isArray(override)) return [...override];
-  if (isObject(base) && isObject(override)) {
+  if (isRecord(base) && isRecord(override)) {
     const result: ConfigObject = { ...base };
     for (const [key, value] of Object.entries(override)) {
       const merged = mergeValue(result[key], value);
@@ -60,13 +58,14 @@ function mergeValue(base: unknown, override: unknown): unknown {
   return override;
 }
 
-function getLandstripConfigPaths(
+export function getPiConfigPaths(
   cwd: string,
+  fileName: string,
   agentDir = getAgentDir(),
 ): { globalPath: string; projectPath: string } {
   return {
-    globalPath: join(agentDir, 'subagents.json'),
-    projectPath: join(cwd, '.pi', 'subagents.json'),
+    globalPath: join(agentDir, fileName),
+    projectPath: join(cwd, '.pi', fileName),
   };
 }
 
@@ -76,7 +75,7 @@ export async function setMaxSubagentsConfig(
   includeProject = true,
   agentDir = getAgentDir(),
 ): Promise<'global' | 'project'> {
-  const { projectPath } = getLandstripConfigPaths(cwd, agentDir);
+  const { projectPath } = getPiConfigPaths(cwd, 'subagents.json', agentDir);
   const scope = includeProject && existsSync(projectPath) ? 'project' : 'global';
   await setMaxSubagentsConfigForScope(cwd, maxSubagents, scope, agentDir);
   return scope;
@@ -91,7 +90,7 @@ export async function setMaxSubagentsConfigForScope(
   if (!Number.isInteger(maxSubagents) || maxSubagents < 0 || maxSubagents > MAX_SUBAGENTS) {
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
   }
-  const { globalPath, projectPath } = getLandstripConfigPaths(cwd, agentDir);
+  const { globalPath, projectPath } = getPiConfigPaths(cwd, 'subagents.json', agentDir);
   const path = scope === 'project' ? projectPath : globalPath;
   await withFileMutationQueue(path, async () => {
     const config = readConfig(path);
@@ -106,7 +105,7 @@ export function loadLandstripConfig(
   includeProject = true,
   agentDir = getAgentDir(),
 ): LandstripConfig {
-  const { globalPath, projectPath } = getLandstripConfigPaths(cwd, agentDir);
+  const { globalPath, projectPath } = getPiConfigPaths(cwd, 'subagents.json', agentDir);
   let config = readConfig(join(packageDir, 'subagents.json'));
   config = mergeValue(config, readConfig(globalPath)) as LandstripConfigFile;
   if (includeProject) {
@@ -119,6 +118,6 @@ export function loadLandstripConfig(
   ) {
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
   }
-  if (!isObject(config.subagents)) throw new Error('subagents must be an object');
+  if (!isRecord(config.subagents)) throw new Error('subagents must be an object');
   return config as LandstripConfig;
 }

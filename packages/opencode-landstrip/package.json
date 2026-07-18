@@ -37,12 +37,12 @@
     }
   },
   "scripts": {
-    "fmt": "oxfmt index.ts tui.ts shared.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md test/*.test.mjs",
+    "fmt": "oxfmt index.ts tui.ts shared.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md test/*.mjs",
     "lint": "oxlint index.ts tui.ts shared.ts",
     "check": "tsc --noEmit",
     "test": "node --test test/*.test.mjs",
     "all": "npm run fmt && npm run lint && npm run check && npm test",
-    "ci:fmt": "oxfmt --check index.ts tui.ts shared.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md test/*.test.mjs",
+    "ci:fmt": "oxfmt --check index.ts tui.ts shared.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md test/*.mjs",
     "ci:lint": "npm run lint",
     "ci:check": "npm run check",
     "ci:test": "npm test"

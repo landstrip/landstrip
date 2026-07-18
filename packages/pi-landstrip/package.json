@@ -16,10 +16,12 @@
   },
   "files": [
     "agents.ts",
+    "box.ts",
     "config.ts",
     "index.ts",
     "rpc-process.ts",
     "subagents.ts",
+    "util.ts",
     "README.md",
     "subagents.json",
     "sandbox.json"

@@ -26,7 +26,7 @@ import {
   type Theme,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
-import { matchesKey, Text, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
+import { matchesKey, Text, truncateToWidth } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 
 import {
@@ -39,9 +39,11 @@ import {
   permissionDecision,
   type PermissionRules,
 } from './agents.ts';
+import { boxBottom, boxRow, boxTop } from './box.ts';
 import { MAX_SUBAGENTS } from './config.ts';
 import type { LandstripIntegration, LandstripRpcWorkerLaunch } from './index.ts';
 import { type ExtensionUiRequest, type ExtensionUiResult, RpcProcess } from './rpc-process.ts';
+import { AsyncQueue, formatError, isRecord } from './util.ts';
 
 const TASK_ENTRY = 'landstrip.task';
 const TASK_WIDGET = 'landstrip.subagents';
@@ -52,27 +54,6 @@ const MAX_DEPTH = 3;
 const packageDir = dirname(fileURLToPath(import.meta.url));
 const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
 const INSPECTOR_BODY_LINES = 16;
-
-function boxTop(theme: Theme, width: number, title: string): string {
-  if (width < 5) return truncateToWidth(theme.fg('accent', title), Math.max(1, width));
-  const label = theme.fg('accent', ` ${title} `);
-  const fill = theme.fg('border', '─'.repeat(Math.max(0, width - 4 - visibleWidth(label))));
-  return `${theme.fg('border', '╭─')}${label}${fill}${theme.fg('border', '─╮')}`;
-}
-
-function boxRow(theme: Theme, width: number, content = ''): string {
-  if (width < 5) return truncateToWidth(content, Math.max(1, width));
-  const innerWidth = Math.max(1, width - 4);
-  const border = theme.fg('border', '│');
-  const line = truncateToWidth(content, innerWidth);
-  return `${border} ${line}${' '.repeat(Math.max(0, innerWidth - visibleWidth(line)))} ${border}`;
-}
-
-function boxBottom(theme: Theme, width: number): string {
-  if (width < 5) return '';
-  const border = (value: string) => theme.fg('border', value);
-  return `${border('╰')}${border('─'.repeat(Math.max(0, width - 2)))}${border('╯')}`;
-}
 
 interface PiPackage {
   readonly cliEntry: string;
@@ -308,9 +289,7 @@ function taskTranscript(task: TaskRecord): string[] {
     }
     return lines.length > 0 ? lines : ['Child session has no messages yet.'];
   } catch (error) {
-    return [
-      `Could not read child session: ${error instanceof Error ? error.message : String(error)}`,
-    ];
+    return [`Could not read child session: ${formatError(error)}`];
   }
 }
 
@@ -362,10 +341,6 @@ type WorkerFactory = (
 function isProjectTrusted(ctx: ExtensionContext): boolean {
   const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
   return trustContext.isProjectTrusted?.() ?? false;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function dependencyRoot(path: string): string | undefined {
@@ -441,7 +416,7 @@ class Semaphore {
 }
 
 class PermissionBroker {
-  private tail = Promise.resolve();
+  private readonly queue = new AsyncQueue();
   private readonly grants = new Set<string>();
 
   async ask(
@@ -454,30 +429,7 @@ class PermissionBroker {
     const key = `${permission}\u0000${resource}`;
     if (this.grants.has(key)) return;
     if (!ctx.hasUI) throw new Error(`Permission required: ${permission} ${resource}`);
-    let release: (() => void) | undefined;
-    const previous = this.tail;
-    this.tail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    if (signal) {
-      let abort: (() => void) | undefined;
-      try {
-        await Promise.race([
-          previous,
-          new Promise<never>((_resolve, reject) => {
-            abort = () => reject(new Error('Permission request cancelled'));
-            signal.addEventListener('abort', abort, { once: true });
-          }),
-        ]);
-      } catch (error) {
-        void previous.finally(() => release?.());
-        throw error;
-      } finally {
-        if (abort) signal.removeEventListener('abort', abort);
-      }
-    } else {
-      await previous;
-    }
+    const release = await this.queue.acquire(signal, 'Permission request cancelled');
     try {
       if (this.grants.has(key)) return;
       if (signal?.aborted) throw new Error('Permission request cancelled');
@@ -491,13 +443,13 @@ class PermissionBroker {
         throw new Error(`Permission denied: ${permission} ${resource}`);
       }
     } finally {
-      release?.();
+      release();
     }
   }
 
   reset(): void {
     this.grants.clear();
-    this.tail = Promise.resolve();
+    this.queue.reset();
   }
 }
 
@@ -679,9 +631,7 @@ function parseWorkerConfig(): WorkerConfig | undefined {
     }
     return value as unknown as WorkerConfig;
   } catch (error) {
-    throw new Error(
-      `Invalid ${WORKER_ENV}: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    throw new Error(`Invalid ${WORKER_ENV}: ${formatError(error)}`);
   }
 }
 
@@ -734,7 +684,7 @@ export function registerSubagentWorker(pi: ExtensionAPI, config: WorkerConfig): 
       try {
         parseControlResponse(value);
       } catch (error) {
-        return { block: true, reason: error instanceof Error ? error.message : String(error) };
+        return { block: true, reason: formatError(error) };
       }
     }
   });
@@ -861,7 +811,7 @@ export class SubagentRuntime {
               ctx.signal,
             );
           } catch (error) {
-            return { block: true, reason: error instanceof Error ? error.message : String(error) };
+            return { block: true, reason: formatError(error) };
           }
         }
       }
@@ -1451,7 +1401,7 @@ export class SubagentRuntime {
       }
     } catch (error) {
       task.state = signal.aborted ? 'cancelled' : 'error';
-      const message = error instanceof Error ? error.message : String(error);
+      const message = formatError(error);
       task.error = this.storeTaskText(task, message, 'error');
       task.currentTool = undefined;
       task.retryAttempt = undefined;
@@ -1683,7 +1633,7 @@ export class SubagentRuntime {
           };
         }
       } catch (error) {
-        response = { ok: false, error: error instanceof Error ? error.message : String(error) };
+        response = { ok: false, error: formatError(error) };
       }
       return { value: JSON.stringify(response) };
     }
@@ -1757,7 +1707,7 @@ export class SubagentRuntime {
       this.persist(task);
     } catch (error) {
       if (this.shuttingDown || task.delivered || this.foregroundClaims.has(task.id)) return;
-      const message = error instanceof Error ? error.message : String(error);
+      const message = formatError(error);
       const delivered = await this.deliverBackground(
         task,
         `Background task failed: ${task.description}\n\n${renderTaskResult(task.id, 'error', message)}`,

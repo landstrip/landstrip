@@ -5,6 +5,8 @@ import { spawn, type SpawnOptions } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 
+import { formatError, isRecord } from './util.ts';
+
 export type RpcRecord = Readonly<Record<string, unknown>>;
 
 export interface RpcResponse extends RpcRecord {
@@ -94,10 +96,6 @@ function defaultSpawn(
   options: SpawnOptions,
 ): RpcChildProcess {
   return spawn(command, [...args], options) as RpcChildProcess;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -514,7 +512,7 @@ export class RpcProcess {
   }
 
   private asError(error: unknown, prefix: string): Error {
-    const detail = error instanceof Error ? error.message : String(error);
+    const detail = formatError(error);
     return new Error(`${prefix}: ${detail}`);
   }
 }

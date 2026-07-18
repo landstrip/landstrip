@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { afterEach, describe, expect, test } from 'vitest';
+import { describe, expect, test } from 'vitest';
 
 import {
   availablePrimaryAgents,
@@ -16,23 +15,16 @@ import {
   type PermissionRules,
 } from './agents.ts';
 import { MAX_SUBAGENTS, setMaxSubagentsConfig, setMaxSubagentsConfigForScope } from './config.ts';
-
-const temporaryDirectories: string[] = [];
+import { temporaryDirectory as makeTemporaryDirectory } from './test-util.ts';
 
 function temporaryDirectory(): string {
-  const path = mkdtempSync(join(tmpdir(), 'pi-landstrip-agents-'));
-  temporaryDirectories.push(path);
-  return path;
+  return makeTemporaryDirectory('pi-landstrip-agents-');
 }
 
 function write(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
-
-afterEach(() => {
-  for (const path of temporaryDirectories.splice(0)) rmSync(path, { recursive: true, force: true });
-});
 
 describe('landstrip agent configuration', () => {
   test('provides default primary agents and subagents', () => {

@@ -1,30 +1,17 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { join } from 'node:path';
 import test from 'node:test';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 
-import ts from 'typescript';
+import { installLandstripMock, packageRoot, transpile } from './helper.mjs';
 
 async function loadShared() {
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const tempDir = await mkdtemp(join(tmpdir(), 'opencode-landstrip-shared-'));
-  const compiled = ts.transpileModule(await readFile(join(root, 'shared.ts'), 'utf8'), {
-    compilerOptions: {
-      module: ts.ModuleKind.ES2022,
-      target: ts.ScriptTarget.ES2022,
-      verbatimModuleSyntax: false,
-    },
-  }).outputText;
+  const compiled = transpile(await readFile(join(packageRoot, 'shared.ts'), 'utf8'));
 
-  const landstripDir = join(tempDir, 'node_modules', '@landstrip', 'landstrip');
-  await mkdir(landstripDir, { recursive: true });
-  await writeFile(
-    join(landstripDir, 'package.json'),
-    JSON.stringify({ name: '@landstrip/landstrip', type: 'module', main: './index.mjs' }),
-  );
-  await writeFile(join(landstripDir, 'index.mjs'), 'export function binaryPath() { return ""; }');
+  await installLandstripMock(tempDir, 'export function binaryPath() { return ""; }');
 
   const modulePath = join(tempDir, 'shared.js');
   await writeFile(modulePath, compiled);

@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -20,7 +11,7 @@ import {
   SessionManager,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
-import { afterEach, expect, test, vi } from 'vitest';
+import { expect, test, vi } from 'vitest';
 
 import { loadAgentCatalog } from './agents.ts';
 import type { LandstripIntegration } from './index.ts';
@@ -33,18 +24,11 @@ import {
   resolvePiPackage,
   SubagentRuntime,
 } from './subagents.ts';
-
-const temporaryDirectories: string[] = [];
+import { temporaryDirectory as makeTemporaryDirectory } from './test-util.ts';
 
 function temporaryDirectory(): string {
-  const path = mkdtempSync(join(tmpdir(), 'pi-landstrip-tasks-'));
-  temporaryDirectories.push(path);
-  return path;
+  return makeTemporaryDirectory('pi-landstrip-tasks-');
 }
-
-afterEach(() => {
-  for (const path of temporaryDirectories.splice(0)) rmSync(path, { recursive: true, force: true });
-});
 
 test('renders OpenCode-compatible task result envelopes', () => {
   expect(renderTaskResult('task-1', 'completed', 'Result text')).toBe(

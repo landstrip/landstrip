@@ -2,46 +2,39 @@ import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
 
-import ts from 'typescript';
+import { installLandstripMock, packageRoot, transpile } from './helper.mjs';
 
 async function withPlugin(options, run, mock = {}) {
-  const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   const tempDir = await mkdtemp(join(tmpdir(), 'opencode-landstrip-test-'));
   const modulePath = join(tempDir, 'plugin.mjs');
   const home = join(tempDir, 'home');
   const originalHome = process.env.HOME;
 
-  const transpile = (text) =>
-    ts.transpileModule(text, {
-      compilerOptions: {
-        module: ts.ModuleKind.ES2022,
-        target: ts.ScriptTarget.ES2022,
-        verbatimModuleSyntax: false,
-      },
-    }).outputText;
-
   try {
-    const compiled = transpile(await readFile(join(root, 'index.ts'), 'utf8'));
-    const sharedCompiled = transpile(await readFile(join(root, 'shared.ts'), 'utf8'));
+    const compiled = transpile(await readFile(join(packageRoot, 'index.ts'), 'utf8'));
+    const sharedCompiled = transpile(await readFile(join(packageRoot, 'shared.ts'), 'utf8'));
 
     await mkdir(home, { recursive: true });
     await writeFile(join(tempDir, 'shared.js'), sharedCompiled);
     await writeFile(
       join(tempDir, 'sandbox.json'),
-      await readFile(join(root, 'sandbox.json'), 'utf8'),
+      await readFile(join(packageRoot, 'sandbox.json'), 'utf8'),
     );
     await writeFile(modulePath, compiled);
     process.env.HOME = home;
 
     const landstripMockDir = join(tempDir, 'node_modules', '@landstrip', 'landstrip');
-    await mkdir(landstripMockDir, { recursive: true });
     const fakeLandstrip = join(
       mock.externalBinary ? tempDir : landstripMockDir,
       process.platform === 'win32' ? 'landstrip.cmd' : 'landstrip',
+    );
+    await installLandstripMock(
+      tempDir,
+      `export function binaryPath() { return ${JSON.stringify(fakeLandstrip)}; }`,
     );
     await writeFile(
       fakeLandstrip,
@@ -50,15 +43,6 @@ async function withPlugin(options, run, mock = {}) {
         : '#!/bin/sh\nprintf "landstrip 0.17.0\\n"\n',
     );
     if (process.platform !== 'win32') await chmod(fakeLandstrip, 0o755);
-
-    await writeFile(
-      join(landstripMockDir, 'package.json'),
-      JSON.stringify({ name: '@landstrip/landstrip', type: 'module', main: './index.mjs' }),
-    );
-    await writeFile(
-      join(landstripMockDir, 'index.mjs'),
-      `export function binaryPath() { return ${JSON.stringify(fakeLandstrip)}; }`,
-    );
 
     const {
       default: { server: plugin },
