@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,6 +24,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 import { loadAgentCatalog } from './agents.ts';
 import type { LandstripIntegration } from './index.ts';
 import {
+  boundTaskOutput,
   isSupportedPiVersion,
   registerSubagentWorker,
   renderTaskResult,
@@ -41,6 +50,20 @@ test('renders OpenCode-compatible task result envelopes', () => {
     '<task id="task-1" state="completed">\n<task_result>\nResult text\n</task_result>\n</task>',
   );
   expect(renderTaskResult('task-2', 'error', 'Failure')).toContain('<task_error>\nFailure');
+});
+
+test('bounds task output and preserves the full artifact', () => {
+  const directory = temporaryDirectory();
+  const artifactPath = join(directory, 'output.txt');
+  const output = 'start🙂'.repeat(100) + 'finished';
+  const bounded = boundTaskOutput(output, artifactPath, 256);
+
+  expect(Buffer.byteLength(bounded)).toBeLessThanOrEqual(256);
+  expect(bounded).toContain(`[Task output truncated; full output: ${artifactPath}]`);
+  expect(bounded).toContain('start');
+  expect(bounded).toContain('finished');
+  expect(bounded).not.toContain('�');
+  expect(readFileSync(artifactPath, 'utf8')).toBe(output);
 });
 
 test('renders nested tasks as a tree', () => {
@@ -174,7 +197,7 @@ test('selects a primary agent and applies its prompt', async () => {
   await expect(
     toolCall?.({ toolName: 'bash', input: { command: 'git status' } }, ctx),
   ).resolves.toBe(undefined);
-  expect(selections).toEqual(['@plan: permission required']);
+  expect(selections).toEqual(['@plan: permission required\nbash: git status']);
   await expect(
     toolCall?.(
       {
@@ -340,9 +363,23 @@ test('runs a foreground task in an injected RPC worker', async () => {
   } as unknown as ExtensionAPI;
   const integration = { createTools: () => [] } as unknown as LandstripIntegration;
   let createdAgent: string | undefined;
+  let emit: ((event: Record<string, unknown>) => void) | undefined;
+  const onUpdate = vi.fn();
   const fakeRpc = {
-    onEvent: () => () => {},
-    async prompt() {},
+    onEvent(listener: (event: Record<string, unknown>) => void) {
+      emit = listener;
+      return () => {};
+    },
+    async prompt() {
+      emit?.({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', delta: 'Review' },
+      });
+      emit?.({
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', delta: 'ed.' },
+      });
+    },
     async getLastAssistantText() {
       return 'Reviewed.';
     },
@@ -381,11 +418,16 @@ test('runs a foreground task in an injected RPC worker', async () => {
       subagent_type: 'review',
     },
     undefined,
-    undefined,
+    onUpdate,
     ctx,
   );
   expect(result?.content[0]).toMatchObject({ type: 'text' });
   expect(result?.content[0]?.type === 'text' ? result.content[0].text : '').toContain('Reviewed.');
+  expect(
+    onUpdate.mock.calls.map(
+      ([update]) => (update as { content: Array<{ type: string; text: string }> }).content[0]?.text,
+    ),
+  ).toEqual(['Review', 'Reviewed.']);
   expect(createdAgent).toBe('review');
   expect(sentMessages).toEqual([]);
   const widget = widgets.find((value) => typeof value === 'function') as

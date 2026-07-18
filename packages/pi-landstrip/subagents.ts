@@ -11,6 +11,7 @@ import {
   readlinkSync,
   realpathSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -47,6 +48,7 @@ const WORKER_ENV = 'PI_LANDSTRIP_WORKER';
 const CONTROL_TITLE = 'pi-landstrip:control:v1';
 const MAX_DEPTH = 3;
 const packageDir = dirname(fileURLToPath(import.meta.url));
+const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
 interface PiPackage {
   readonly cliEntry: string;
   readonly version: readonly [number, number, number];
@@ -177,6 +179,8 @@ interface TaskRecord {
   state: TaskState;
   output?: string;
   error?: string;
+  outputFile?: string;
+  errorFile?: string;
   delivered?: boolean;
   background?: boolean;
 }
@@ -363,7 +367,7 @@ class PermissionBroker {
       if (this.grants.has(key)) return;
       if (signal?.aborted) throw new Error('Permission request cancelled');
       const choice = await ctx.ui.select(
-        `${task}: permission required`,
+        `${task}: permission required\n${permission}: ${resource}`,
         ['Allow once', 'Allow for this session', 'Reject'],
         { signal },
       );
@@ -389,6 +393,36 @@ export function renderTaskResult(
 ): string {
   const tag = state === 'error' ? 'task_error' : 'task_result';
   return `<task id="${id}" state="${state}">\n<${tag}>\n${value}\n</${tag}>\n</task>`;
+}
+
+function utf8Slice(value: string, maxBytes: number, fromEnd: boolean): string {
+  if (maxBytes <= 0) return '';
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const length = Math.ceil((low + high) / 2);
+    const candidate = fromEnd ? value.slice(value.length - length) : value.slice(0, length);
+    if (Buffer.byteLength(candidate) <= maxBytes) low = length;
+    else high = length - 1;
+  }
+  let result = fromEnd ? value.slice(value.length - low) : value.slice(0, low);
+  if (fromEnd && /^[\uDC00-\uDFFF]/.test(result)) result = result.slice(1);
+  if (!fromEnd && /[\uD800-\uDBFF]$/.test(result)) result = result.slice(0, -1);
+  return result;
+}
+
+export function boundTaskOutput(
+  value: string,
+  artifactPath: string,
+  maxBytes = MAX_TASK_OUTPUT_BYTES,
+): string {
+  if (Buffer.byteLength(value) <= maxBytes) return value;
+  writeFileSync(artifactPath, value, 'utf8');
+  const marker = `\n\n[Task output truncated; full output: ${artifactPath}]\n\n`;
+  const contentBytes = Math.max(0, maxBytes - Buffer.byteLength(marker));
+  const headBytes = Math.ceil(contentBytes / 2);
+  const tailBytes = Math.floor(contentBytes / 2);
+  return `${utf8Slice(value, headBytes, false)}${marker}${utf8Slice(value, tailBytes, true)}`;
 }
 
 function taskTreeLines(
@@ -1050,11 +1084,13 @@ export class SubagentRuntime {
       }
       if (signal.aborted) throw new Error('Task cancelled');
       let turns = 0;
+      let streamedText = '';
       worker.rpc.onEvent((event) => {
         if (event.type === 'message_update' && isRecord(event.assistantMessageEvent)) {
           const messageEvent = event.assistantMessageEvent;
           if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string') {
-            update(messageEvent.delta);
+            streamedText += messageEvent.delta;
+            update(streamedText);
           }
         }
         if (event.type === 'turn_end') {
@@ -1078,19 +1114,21 @@ export class SubagentRuntime {
         const output = await promise;
         if (signal.aborted) throw new Error('Task cancelled');
         task.state = 'completed';
-        task.output = output;
+        task.output = this.storeTaskText(task, output, 'output');
         this.persist(task);
         this.updateTaskWidget(ctx);
-        return output;
+        return task.output;
       } finally {
         signal.removeEventListener('abort', abort);
       }
     } catch (error) {
       task.state = signal.aborted ? 'cancelled' : 'error';
-      task.error = error instanceof Error ? error.message : String(error);
+      const message = error instanceof Error ? error.message : String(error);
+      task.error = this.storeTaskText(task, message, 'error');
       this.persist(task);
       this.updateTaskWidget(ctx);
-      throw error;
+      if (task.error === message) throw error;
+      throw new Error(task.error);
     } finally {
       this.running.delete(task.id);
       this.pendingPrompts.delete(task.id);
@@ -1418,6 +1456,18 @@ export class SubagentRuntime {
       { triggerTurn: true, deliverAs: 'followUp' },
     );
     return true;
+  }
+
+  private storeTaskText(task: TaskRecord, value: string, kind: 'output' | 'error'): string {
+    if (Buffer.byteLength(value) <= MAX_TASK_OUTPUT_BYTES) return value;
+    const directory = task.sessionDir ?? (task.sessionFile ? dirname(task.sessionFile) : undefined);
+    if (!directory) throw new Error(`Task ${task.id} has no artifact directory`);
+    mkdirSync(directory, { recursive: true });
+    const artifactPath = join(directory, `${kind}.txt`);
+    const bounded = boundTaskOutput(value, artifactPath);
+    if (kind === 'output') task.outputFile = artifactPath;
+    else task.errorFile = artifactPath;
+    return bounded;
   }
 
   private persist(task: TaskRecord): void {
