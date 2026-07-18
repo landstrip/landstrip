@@ -444,6 +444,8 @@ const tui: TuiPlugin = async (api, options, meta) => {
   }
 
   const unsubscribeAsked = api.event.on('permission.asked', (event) => {
+    const directory = api.state.path.directory || process.cwd();
+    if (!loadConfig(directory, optionOverrides).enabled) return;
     const pending = event.properties as PendingPermission;
     enqueue(pending);
     reconcile(pending.sessionID);
@@ -483,10 +485,16 @@ const tui: TuiPlugin = async (api, options, meta) => {
           buffer = buffer.slice(newline + 1);
 
           for (const trap of parseLandstripTraps(line)) {
+            const directory = api.state.path.directory || process.cwd();
             if (trap.kind !== 'filesystem' && trap.kind !== 'network') continue;
             if (trap.state !== 'query') continue;
             if (seen.has(trap.query_id)) continue;
             seen.add(trap.query_id);
+
+            if (!loadConfig(directory, optionOverrides).enabled) {
+              respondQuery(socket, trap.query_id, 'allow');
+              continue;
+            }
 
             if (trap.kind === 'filesystem') {
               const sessionPaths =
