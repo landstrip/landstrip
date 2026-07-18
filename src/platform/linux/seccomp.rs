@@ -943,9 +943,37 @@ fn read_target_addr(pid: Pid, target_addr: usize, addr_len: usize) -> SysResult<
     Ok(addr)
 }
 
+fn thread_group_leader(pid: Pid) -> SysResult<Pid> {
+    let status_path = Path::new("/proc")
+        .join(pid.as_raw().to_string())
+        .join("status");
+    let status = fs::read_to_string(status_path).map_err(|error| BrokerError::SystemCall {
+        errno: error.raw_os_error().unwrap_or(libc::EIO),
+    })?;
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("Tgid:"))
+        .ok_or(BrokerError::InvalidAddress)?;
+    let value = line
+        .strip_prefix("Tgid:")
+        .ok_or(BrokerError::InvalidAddress)?;
+    let tgid = value
+        .trim()
+        .parse::<i32>()
+        .map_err(|_| BrokerError::InvalidAddress)?;
+    if tgid <= 0 {
+        return Err(BrokerError::InvalidAddress);
+    }
+
+    Ok(Pid::from_raw(tgid))
+}
+
 fn duplicate_target_fd(pid: Pid, fd: RawFd) -> SysResult<OwnedFd> {
+    // Seccomp reports the calling thread ID, but pidfd_open without
+    // PIDFD_THREAD accepts only a thread-group leader.
+    let process = thread_group_leader(pid)?;
     // SAFETY: pidfd_open copies scalar arguments and returns a new fd on success.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.as_raw(), 0) };
     if pidfd < 0 {
         return Err(BrokerError::SystemCall {
             errno: Errno::last() as i32,
