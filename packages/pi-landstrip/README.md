@@ -127,10 +127,12 @@ The tool accepts the OpenCode task fields:
 ```
 
 Foreground tasks return the child result directly. Background tasks return a
-running result while the worker continues, then deliver completion to the
-parent automatically. The process exits when the run settles; its Pi session
-remains on disk and can be continued with `task_id`. While tasks are active, Pi
-shows their parent-child tree automatically above the editor.
+queued result while the worker continues, then deliver completion to the
+parent automatically. Task rows show lifecycle state, the current child tool or
+retry, tool-call count, elapsed time, and expandable output. The process exits
+when the run settles; its Pi session remains on disk and can be continued with
+`task_id`. While tasks are active, Pi shows their parent-child tree automatically
+above the editor.
 Session switching or shutdown stops live workers. After an unclean restart,
 unfinished work is marked interrupted rather than silently rerun; a completed
 but undelivered background result is delivered when the root session resumes.
@@ -241,12 +243,14 @@ Do not put `subagents`, `agent`, `permission`, or `maxSubagents` in Pi's
 
 ## Limits
 
-Pi-Landstrip runs at most `maxSubagents` worker processes concurrently and
-allows nesting to three levels. A foreground parent hands its scheduler permit to a child
-while waiting, preventing nested-task deadlocks. A worker receives a nested
-`task` tool only when its agent has an explicit `task` permission. Nested tasks
-are separate Pi processes supervised by the root and Landstrip-wrapped unless
-sandboxing is explicitly disabled. Persisted sessions remain resumable by `task_id`.
+`pi-Landstrip` grants at most `maxSubagents` scheduler permits to active
+subagent work and allows nesting to three levels. A foreground parent returns
+its permit while waiting for a child and reacquires it before resuming,
+preventing nested-task deadlocks. A worker receives a nested `task` tool only
+when its agent has an explicit `task` permission. Nested tasks are separate Pi
+processes supervised by the root and Landstrip-wrapped unless sandboxing is
+explicitly disabled, so an inactive parent process can remain alive during the
+handoff.  Persisted sessions remain resumable by `task_id`.
 
 ## License
 

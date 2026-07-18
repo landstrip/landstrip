@@ -21,10 +21,11 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
+  keyHint,
   type Theme,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
-import { truncateToWidth } from '@earendil-works/pi-tui';
+import { Text, truncateToWidth } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 
 import {
@@ -183,6 +184,11 @@ interface TaskRecord {
   errorFile?: string;
   delivered?: boolean;
   background?: boolean;
+  currentTool?: string;
+  toolCalls?: number;
+  retryAttempt?: number;
+  startedAt?: number;
+  finishedAt?: number;
 }
 
 export interface SubagentTaskView {
@@ -197,6 +203,43 @@ interface TaskDetails {
   taskId: string;
   state: TaskState;
   agent: string;
+  description?: string;
+  background?: boolean;
+  currentTool?: string;
+  toolCalls?: number;
+  retryAttempt?: number;
+  startedAt?: number;
+  finishedAt?: number;
+  output?: string;
+  error?: string;
+}
+
+function taskDetails(task: TaskRecord, state: TaskState = task.state): TaskDetails {
+  return {
+    taskId: task.id,
+    state,
+    agent: task.agent,
+    description: task.description,
+    background: task.background,
+    currentTool: task.currentTool,
+    toolCalls: task.toolCalls,
+    retryAttempt: task.retryAttempt,
+    startedAt: task.startedAt,
+    finishedAt: task.finishedAt,
+    output: task.output,
+    error: task.error,
+  };
+}
+
+function taskDuration(details: TaskDetails): string | undefined {
+  if (details.startedAt === undefined) return undefined;
+  const end = details.finishedAt ?? Date.now();
+  const seconds = Math.max(0, end - details.startedAt) / 1000;
+  return seconds < 10 ? `${seconds.toFixed(1)}s` : `${Math.round(seconds)}s`;
+}
+
+function taskOutput(details: TaskDetails, fallback: string): string {
+  return details.error ?? details.output ?? fallback;
 }
 
 interface RunningTask {
@@ -388,7 +431,7 @@ class PermissionBroker {
 
 export function renderTaskResult(
   id: string,
-  state: 'running' | 'completed' | 'error',
+  state: 'queued' | 'running' | 'completed' | 'error',
   value: string,
 ): string {
   const tag = state === 'error' ? 'task_error' : 'task_result';
@@ -643,7 +686,7 @@ export function registerSubagentWorker(pi: ExtensionAPI, config: WorkerConfig): 
           content: [{ type: 'text', text }],
           details: response.task ?? {
             taskId: input.task_id ?? '',
-            state: input.background ? 'running' : 'completed',
+            state: input.background ? 'queued' : 'completed',
             agent: input.subagent_type,
           },
         };
@@ -814,6 +857,18 @@ export class SubagentRuntime {
         (descriptions ? `\n\nAvailable subagents:\n${descriptions}` : ''),
       parameters: taskParameters,
       executionMode: 'parallel',
+      renderCall: (input, theme) => {
+        const background = input.background ? theme.fg('muted', ' (background)') : '';
+        const description = input.description?.trim() || '...';
+        const agent = input.subagent_type?.trim() || '...';
+        const title = theme.fg('toolTitle', theme.bold('Agent Task'));
+        return new Text(
+          `${title}${background}${theme.fg('muted', ' — ')}${theme.fg('text', description)}\n` +
+            theme.fg('dim', `  @${agent}`),
+          0,
+          0,
+        );
+      },
       execute: async (_toolCallId, input, signal, onUpdate, callCtx) => {
         const result = await this.execute(
           input,
@@ -821,20 +876,58 @@ export class SubagentRuntime {
           signal,
           parentTask,
           callerRules,
-          (text, taskId) =>
+          (text, updatedTask) =>
             onUpdate?.({
               content: [{ type: 'text', text }],
-              details: {
-                taskId: taskId ?? input.task_id ?? '',
-                state: 'running',
-                agent: input.subagent_type,
-              },
+              details: updatedTask
+                ? taskDetails(updatedTask)
+                : {
+                    taskId: input.task_id ?? '',
+                    state: 'running',
+                    agent: input.subagent_type,
+                    description: input.description,
+                    background: input.background,
+                  },
             }),
         );
         return {
           content: [{ type: 'text', text: result.text }],
-          details: { taskId: result.task.id, state: result.task.state, agent: result.task.agent },
+          details: taskDetails(result.task, result.state),
         };
+      },
+      renderResult: (result, { expanded }, theme) => {
+        const details = result.details;
+        const fallback = result.content.find((item) => item.type === 'text')?.text ?? '(no output)';
+        if (!details) return new Text(fallback, 0, 0);
+
+        const stateView: SubagentTaskView = {
+          id: details.taskId,
+          agent: details.agent,
+          description: details.description ?? '',
+          state: details.state,
+        };
+        let text = taskState(theme, stateView);
+        if (details.currentTool) text += theme.fg('muted', `  → ${details.currentTool}`);
+        if (details.retryAttempt) text += theme.fg('warning', `  retry ${details.retryAttempt}`);
+
+        const metrics: string[] = [];
+        if (details.toolCalls !== undefined) {
+          metrics.push(`${details.toolCalls} tool call${details.toolCalls === 1 ? '' : 's'}`);
+        }
+        const duration = taskDuration(details);
+        if (duration) metrics.push(duration);
+        if (metrics.length > 0) text += `\n${theme.fg('dim', metrics.join(' · '))}`;
+
+        const output = taskOutput(details, '');
+        if (output) {
+          const lines = output.trimEnd().split('\n');
+          const shown = expanded ? lines : lines.slice(0, 3);
+          text += `\n${theme.fg(details.state === 'error' ? 'error' : 'toolOutput', shown.join('\n'))}`;
+          if (!expanded && lines.length > shown.length) {
+            text += `\n${theme.fg('muted', `… ${keyHint('app.tools.expand', 'to expand')}`)}`;
+          }
+        }
+        return new Text(text, 0, 0);
       },
     };
   }
@@ -845,8 +938,8 @@ export class SubagentRuntime {
     signal: AbortSignal | undefined,
     parentTask: TaskRecord | undefined,
     callerRules: PermissionRules | undefined,
-    update: (text: string, taskId?: string) => void,
-  ): Promise<{ task: TaskRecord; text: string }> {
+    update: (text: string, task?: TaskRecord) => void,
+  ): Promise<{ task: TaskRecord; text: string; state: TaskState }> {
     if (!input.prompt.trim()) throw new Error('Task prompt cannot be empty');
     const catalog = this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
     for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
@@ -896,11 +989,6 @@ export class SubagentRuntime {
 
     if (input.task_id) task.delivered = false;
     if (existingRun) {
-      if (parentTask && !input.background && task.state === 'queued') {
-        throw new Error(
-          'No subagent capacity for a nested foreground task; use background: true or increase maxSubagents',
-        );
-      }
       const controller = this.controllers.get(task.id);
       let rejectCancelled: ((error: Error) => void) | undefined;
       const cancelled = new Promise<never>((_resolve, reject) => {
@@ -932,14 +1020,16 @@ export class SubagentRuntime {
             this.persist(task);
             void this.notifyWhenDone(task, existingRun, ctx);
           }
-          return { task, text: renderTaskResult(task.id, 'running', 'Background task updated') };
+          const state = task.state === 'queued' ? 'queued' : 'running';
+          const status = state === 'queued' ? 'Background task queued' : 'Background task updated';
+          return { task, text: renderTaskResult(task.id, state, status), state };
         }
         this.claimForeground(task.id);
         try {
           const output = await waitFor(existingRun);
           task.delivered = true;
           this.persist(task);
-          return { task, text: renderTaskResult(task.id, 'completed', output) };
+          return { task, text: renderTaskResult(task.id, 'completed', output), state: 'completed' };
         } finally {
           this.releaseForeground(task.id);
         }
@@ -951,6 +1041,13 @@ export class SubagentRuntime {
     task.state = 'queued';
     task.delivered = false;
     task.background = input.background === true;
+    task.output = undefined;
+    task.error = undefined;
+    task.currentTool = undefined;
+    task.toolCalls = 0;
+    task.retryAttempt = undefined;
+    task.startedAt = undefined;
+    task.finishedAt = undefined;
     this.persist(task);
     this.updateTaskWidget(ctx);
 
@@ -960,15 +1057,8 @@ export class SubagentRuntime {
     if (!input.background && signal?.aborted) controller.abort();
     if (!input.background) signal?.addEventListener('abort', abort, { once: true });
     if (!input.background) this.claimForeground(task.id);
-    const run = this.runTask(
-      task,
-      agent,
-      input.prompt,
-      catalog,
-      ctx,
-      controller.signal,
-      parentTask !== undefined && !input.background,
-      (text) => update(text, task.id),
+    const run = this.runTask(task, agent, input.prompt, catalog, ctx, controller.signal, (text) =>
+      update(text, task),
     );
     this.runPromises.set(task.id, run);
     void run
@@ -982,13 +1072,17 @@ export class SubagentRuntime {
       task.background = true;
       this.persist(task);
       void this.notifyWhenDone(task, run, ctx);
-      return { task, text: renderTaskResult(task.id, 'running', 'Background task started') };
+      return {
+        task,
+        text: renderTaskResult(task.id, 'queued', 'Background task queued'),
+        state: 'queued',
+      };
     }
     try {
       const output = await run;
       task.delivered = true;
       this.persist(task);
-      return { task, text: renderTaskResult(task.id, 'completed', output) };
+      return { task, text: renderTaskResult(task.id, 'completed', output), state: 'completed' };
     } finally {
       this.releaseForeground(task.id);
     }
@@ -1037,21 +1131,15 @@ export class SubagentRuntime {
     catalog: AgentCatalog,
     ctx: ExtensionContext,
     signal: AbortSignal,
-    failIfBusy: boolean,
     update: (text: string) => void,
   ): Promise<string> {
     let worker: WorkerHandle | undefined;
     try {
-      const release = failIfBusy
-        ? this.semaphore.tryAcquire()
-        : await this.semaphore.acquire(signal);
-      if (!release) {
-        throw new Error(
-          'No subagent capacity for a nested foreground task; use background: true or increase maxSubagents',
-        );
-      }
+      const release = await this.semaphore.acquire(signal);
       this.leases.set(task.id, { release });
       task.state = 'running';
+      task.startedAt = Date.now();
+      task.finishedAt = undefined;
       task.error = undefined;
       this.persist(task);
       this.updateTaskWidget(ctx);
@@ -1093,6 +1181,31 @@ export class SubagentRuntime {
             update(streamedText);
           }
         }
+        if (event.type === 'tool_execution_start' && typeof event.toolName === 'string') {
+          task.currentTool = event.toolName;
+          task.toolCalls = (task.toolCalls ?? 0) + 1;
+          this.persist(task);
+          this.updateTaskWidget(ctx);
+          update(streamedText || `Running ${event.toolName}`);
+        }
+        if (event.type === 'tool_execution_end') {
+          task.currentTool = undefined;
+          this.persist(task);
+          this.updateTaskWidget(ctx);
+          update(streamedText || 'Subagent running');
+        }
+        if (event.type === 'auto_retry_start' && typeof event.attempt === 'number') {
+          task.retryAttempt = event.attempt;
+          this.persist(task);
+          this.updateTaskWidget(ctx);
+          update(streamedText || `Retry ${event.attempt}`);
+        }
+        if (event.type === 'auto_retry_end') {
+          task.retryAttempt = undefined;
+          this.persist(task);
+          this.updateTaskWidget(ctx);
+          update(streamedText || 'Subagent running');
+        }
         if (event.type === 'turn_end') {
           turns += 1;
           if (agent.steps && turns >= agent.steps) void worker?.rpc.abort().catch(() => undefined);
@@ -1115,6 +1228,9 @@ export class SubagentRuntime {
         if (signal.aborted) throw new Error('Task cancelled');
         task.state = 'completed';
         task.output = this.storeTaskText(task, output, 'output');
+        task.currentTool = undefined;
+        task.retryAttempt = undefined;
+        task.finishedAt = Date.now();
         this.persist(task);
         this.updateTaskWidget(ctx);
         return task.output;
@@ -1125,6 +1241,9 @@ export class SubagentRuntime {
       task.state = signal.aborted ? 'cancelled' : 'error';
       const message = error instanceof Error ? error.message : String(error);
       task.error = this.storeTaskText(task, message, 'error');
+      task.currentTool = undefined;
+      task.retryAttempt = undefined;
+      task.finishedAt = Date.now();
       this.persist(task);
       this.updateTaskWidget(ctx);
       if (task.error === message) throw error;
@@ -1336,18 +1455,19 @@ export class SubagentRuntime {
           response = { ok: true };
         } else {
           if (!isRecord(control.input)) throw new Error('Invalid nested task request');
-          const result = await this.execute(
-            control.input as unknown as TaskInput,
-            ctx,
-            this.controllers.get(task.id)?.signal,
-            task,
-            rules,
-            () => undefined,
-          );
+          const input = control.input as unknown as TaskInput;
+          const signal = this.controllers.get(task.id)?.signal;
+          const handedOff = input.background !== true && this.releaseLease(task.id);
+          let result: { task: TaskRecord; text: string; state: TaskState };
+          try {
+            result = await this.execute(input, ctx, signal, task, rules, () => undefined);
+          } finally {
+            if (handedOff) await this.restoreLease(task.id, signal);
+          }
           response = {
             ok: true,
             value: result.text,
-            task: { taskId: result.task.id, state: result.task.state, agent: result.task.agent },
+            task: taskDetails(result.task, result.state),
           };
         }
       } catch (error) {
@@ -1619,10 +1739,24 @@ export class SubagentRuntime {
     else this.foregroundClaims.set(taskId, claims - 1);
   }
 
-  private releaseLease(taskId: string): void {
+  private releaseLease(taskId: string): boolean {
     const lease = this.leases.get(taskId);
-    lease?.release?.();
-    if (lease) lease.release = undefined;
+    if (!lease?.release) return false;
+    lease.release();
+    lease.release = undefined;
+    return true;
+  }
+
+  private async restoreLease(taskId: string, signal?: AbortSignal): Promise<void> {
+    const lease = this.leases.get(taskId);
+    if (!lease || lease.release) return;
+    const release = await this.semaphore.acquire(signal);
+    const current = this.leases.get(taskId);
+    if (!current || current.release) {
+      release();
+      return;
+    }
+    current.release = release;
   }
 }
 

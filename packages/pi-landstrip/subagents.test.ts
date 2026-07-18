@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import {
   type ExtensionAPI,
   type ExtensionContext,
+  initTheme,
   SessionManager,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
@@ -50,6 +51,7 @@ test('renders OpenCode-compatible task result envelopes', () => {
     '<task id="task-1" state="completed">\n<task_result>\nResult text\n</task_result>\n</task>',
   );
   expect(renderTaskResult('task-2', 'error', 'Failure')).toContain('<task_error>\nFailure');
+  expect(renderTaskResult('task-3', 'queued', 'Waiting')).toContain('state="queued"');
 });
 
 test('bounds task output and preserves the full artifact', () => {
@@ -371,17 +373,19 @@ test('runs a foreground task in an injected RPC worker', async () => {
       return () => {};
     },
     async prompt() {
+      emit?.({ type: 'tool_execution_start', toolCallId: 'tool-1', toolName: 'read' });
       emit?.({
         type: 'message_update',
         assistantMessageEvent: { type: 'text_delta', delta: 'Review' },
       });
+      emit?.({ type: 'tool_execution_end', toolCallId: 'tool-1', toolName: 'read' });
       emit?.({
         type: 'message_update',
         assistantMessageEvent: { type: 'text_delta', delta: 'ed.' },
       });
     },
     async getLastAssistantText() {
-      return 'Reviewed.';
+      return 'Reviewed.\nline 2\nline 3\nline 4';
     },
     async request() {},
     async abort() {},
@@ -427,7 +431,56 @@ test('runs a foreground task in an injected RPC worker', async () => {
     onUpdate.mock.calls.map(
       ([update]) => (update as { content: Array<{ type: string; text: string }> }).content[0]?.text,
     ),
-  ).toEqual(['Review', 'Reviewed.']);
+  ).toEqual(['Running read', 'Review', 'Review', 'Reviewed.']);
+  expect(onUpdate.mock.calls[0]?.[0]).toMatchObject({
+    details: { currentTool: 'read', toolCalls: 1, state: 'running' },
+  });
+  expect(result?.details).toMatchObject({
+    description: 'Review implementation',
+    state: 'completed',
+    toolCalls: 1,
+    output: 'Reviewed.\nline 2\nline 3\nline 4',
+  });
+  initTheme('dark', false);
+  const theme = {
+    fg: (_color: string, value: string) => value,
+    bold: (value: string) => value,
+  };
+  const callLines = taskTool
+    ?.renderCall?.(
+      {
+        description: 'Review implementation',
+        prompt: 'Review this implementation.',
+        subagent_type: 'review',
+        background: true,
+      },
+      theme as never,
+      {} as never,
+    )
+    .render(100);
+  expect(callLines?.join('\n')).toContain('Agent Task (background) — Review implementation');
+
+  const collapsedLines = taskTool
+    ?.renderResult?.(
+      result as never,
+      { expanded: false, isPartial: false },
+      theme as never,
+      {} as never,
+    )
+    .render(100);
+  expect(collapsedLines?.join('\n')).toContain('completed');
+  expect(collapsedLines?.join('\n')).toContain('1 tool call');
+  expect(collapsedLines?.join('\n')).not.toContain('line 4');
+
+  const expandedLines = taskTool
+    ?.renderResult?.(
+      result as never,
+      { expanded: true, isPartial: false },
+      theme as never,
+      {} as never,
+    )
+    .render(100);
+  expect(expandedLines?.join('\n')).toContain('line 4');
   expect(createdAgent).toBe('review');
   expect(sentMessages).toEqual([]);
   const widget = widgets.find((value) => typeof value === 'function') as
@@ -562,6 +615,11 @@ test('sends a continuation queued during worker startup once RPC is available', 
     undefined,
     ctx,
   );
+  expect(started?.details).toMatchObject({ state: 'queued' });
+  expect(started?.content[0]).toMatchObject({
+    type: 'text',
+    text: expect.stringContaining('state="queued"'),
+  });
   const taskId = (started?.details as { taskId?: string } | undefined)?.taskId;
   expect(taskId).toBeTruthy();
   await taskTool?.execute(
@@ -755,7 +813,7 @@ test('delivers a completed task when it is continued in background', async () =>
     undefined,
     ctx,
   );
-  expect(second?.details).toMatchObject({ taskId, state: 'running' });
+  expect(second?.details).toMatchObject({ taskId, state: 'queued' });
   await vi.waitFor(() => expect(createWorker).toHaveBeenCalledTimes(2));
   completeContinuation?.();
 
@@ -890,7 +948,109 @@ test('worker mode enforces permissions and sends nested tasks over reserved UI i
   expect(JSON.parse(requests[0]?.placeholder ?? '{}')).toMatchObject({ type: 'task' });
 });
 
-test('semaphore enforces the configured worker-process capacity', async () => {
+test('hands a foreground scheduler permit to a nested task at capacity one', async () => {
+  const cwd = temporaryDirectory();
+  const piAgentDir = temporaryDirectory();
+  mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(join(cwd, '.pi', 'subagents.json'), JSON.stringify({ maxSubagents: 1 }));
+
+  let taskTool: ToolDefinition | undefined;
+  const parentManager = SessionManager.create(cwd, join(cwd, 'sessions'));
+  const pi = {
+    registerTool(tool: ToolDefinition) {
+      taskTool = tool;
+    },
+    registerCommand() {},
+    on() {},
+    appendEntry() {},
+    sendMessage() {},
+  } as unknown as ExtensionAPI;
+  let workerCount = 0;
+  let nestedResponse: { value?: string } | undefined;
+  const createWorker = vi.fn(
+    async (
+      _task: unknown,
+      _agent: unknown,
+      _rules: unknown,
+      _ctx: unknown,
+      _signal: AbortSignal,
+      onRequest: (request: {
+        method: 'input';
+        title: string;
+        placeholder: string;
+      }) => Promise<{ value?: string }>,
+    ) => {
+      const workerNumber = ++workerCount;
+      return {
+        rpc: {
+          onEvent: () => () => {},
+          async prompt() {
+            if (workerNumber !== 1) return;
+            nestedResponse = await onRequest({
+              method: 'input',
+              title: 'pi-landstrip:control:v1',
+              placeholder: JSON.stringify({
+                type: 'task',
+                input: {
+                  description: 'Nested work',
+                  prompt: 'Complete nested work.',
+                  subagent_type: 'general',
+                },
+              }),
+            });
+          },
+          async getLastAssistantText() {
+            return workerNumber === 1 ? 'Parent complete.' : 'Child complete.';
+          },
+          async request() {},
+          async abort() {},
+          async stop() {},
+        },
+        async dispose() {},
+      };
+    },
+  );
+  new SubagentRuntime(
+    pi,
+    { createTools: () => [] } as unknown as LandstripIntegration,
+    createWorker as never,
+    (projectCwd) => loadAgentCatalog(projectCwd, piAgentDir),
+  ).register();
+  const ctx = {
+    cwd,
+    hasUI: false,
+    mode: 'tui',
+    isProjectTrusted: () => true,
+    sessionManager: parentManager,
+    model: undefined,
+    modelRegistry: { authStorage: {} },
+    ui: { notify() {}, setWidget() {} },
+  } as unknown as ExtensionContext;
+
+  const result = await taskTool?.execute(
+    'parent-call',
+    {
+      description: 'Parent work',
+      prompt: 'Delegate nested work.',
+      subagent_type: 'general',
+    },
+    undefined,
+    undefined,
+    ctx,
+  );
+
+  expect(workerCount).toBe(2);
+  expect(result?.content[0]).toMatchObject({
+    type: 'text',
+    text: expect.stringContaining('Parent complete.'),
+  });
+  expect(JSON.parse(nestedResponse?.value ?? '{}')).toMatchObject({
+    ok: true,
+    value: expect.stringContaining('Child complete.'),
+  });
+});
+
+test('semaphore enforces the configured scheduler-permit capacity', async () => {
   const runtime = new SubagentRuntime({} as ExtensionAPI, {} as LandstripIntegration);
   const semaphore = (
     runtime as unknown as {
