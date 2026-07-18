@@ -122,6 +122,27 @@ test('disabled sandbox reports its configuration state', async () => {
   });
 });
 
+test('disabled sandbox allows permissions without prompting', async () => {
+  await withPlugin({ enabled: false }, async ({ hooks }) => {
+    const output = { status: 'ask' };
+    await hooks['permission.ask'](
+      {
+        id: 'permission-disabled',
+        type: 'edit',
+        callID: 'edit-call',
+        sessionID: 'session',
+        messageID: 'message',
+        title: 'Edit file',
+        metadata: { filepath: '/tmp/test.txt' },
+        time: { created: 0 },
+      },
+      output,
+    );
+
+    assert.equal(output.status, 'allow');
+  });
+});
+
 test('setSandboxConfigEnabled toggles persisted enabled and the server honors it', async () => {
   await withPlugin(
     {

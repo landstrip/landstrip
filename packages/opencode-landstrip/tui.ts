@@ -444,7 +444,8 @@ const tui: TuiPlugin = async (api, options, meta) => {
   }
 
   const unsubscribeAsked = api.event.on('permission.asked', (event) => {
-    const directory = api.state.path.directory || process.cwd();
+    const directory = api.state.path.directory;
+    if (!directory) return;
     if (!loadConfig(directory, optionOverrides).enabled) return;
     const pending = event.properties as PendingPermission;
     enqueue(pending);
