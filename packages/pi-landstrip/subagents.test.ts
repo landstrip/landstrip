@@ -350,6 +350,7 @@ test('runs a foreground task in an injected RPC worker', async () => {
   const parentManager = SessionManager.create(cwd, join(cwd, 'sessions'));
   const sentMessages: unknown[] = [];
   const widgets: unknown[] = [];
+  const dialogTitles: string[] = [];
   const pi = {
     registerTool(tool: ToolDefinition) {
       taskTool = tool;
@@ -367,6 +368,7 @@ test('runs a foreground task in an injected RPC worker', async () => {
   let createdAgent: string | undefined;
   let emit: ((event: Record<string, unknown>) => void) | undefined;
   const onUpdate = vi.fn();
+  let forwardRequest: ((request: Record<string, unknown>) => Promise<unknown>) | undefined;
   const fakeRpc = {
     onEvent(listener: (event: Record<string, unknown>) => void) {
       emit = listener;
@@ -383,6 +385,10 @@ test('runs a foreground task in an injected RPC worker', async () => {
         type: 'message_update',
         assistantMessageEvent: { type: 'text_delta', delta: 'ed.' },
       });
+      await forwardRequest?.({ method: 'select', title: 'Choose item', options: ['one'] });
+      await forwardRequest?.({ method: 'confirm', title: 'Confirm action', message: 'Proceed?' });
+      await forwardRequest?.({ method: 'input', title: 'Enter value', placeholder: 'value' });
+      await forwardRequest?.({ method: 'editor', title: 'Edit value', prefill: 'value' });
     },
     async getLastAssistantText() {
       return 'Reviewed.\nline 2\nline 3\nline 4';
@@ -391,8 +397,16 @@ test('runs a foreground task in an injected RPC worker', async () => {
     async abort() {},
     async stop() {},
   };
-  const createWorker = async (_task: unknown, agent: { name: string }) => {
+  const createWorker = async (
+    _task: unknown,
+    agent: { name: string },
+    _rules: unknown,
+    _ctx: unknown,
+    _signal: AbortSignal,
+    onRequest: (request: Record<string, unknown>) => Promise<unknown>,
+  ) => {
     createdAgent = agent.name;
+    forwardRequest = onRequest;
     return { rpc: fakeRpc, async dispose() {} };
   };
   new SubagentRuntime(pi, integration, createWorker as never, (projectCwd) =>
@@ -408,6 +422,22 @@ test('runs a foreground task in an injected RPC worker', async () => {
     modelRegistry: { authStorage: {} },
     ui: {
       notify() {},
+      async select(title: string) {
+        dialogTitles.push(title);
+        return 'one';
+      },
+      async confirm(title: string) {
+        dialogTitles.push(title);
+        return true;
+      },
+      async input(title: string) {
+        dialogTitles.push(title);
+        return 'value';
+      },
+      async editor(title: string) {
+        dialogTitles.push(title);
+        return 'value';
+      },
       setWidget(_key: string, value: unknown) {
         widgets.push(value);
       },
@@ -483,6 +513,18 @@ test('runs a foreground task in an injected RPC worker', async () => {
   expect(expandedLines?.join('\n')).toContain('line 4');
   expect(createdAgent).toBe('review');
   expect(sentMessages).toEqual([]);
+  expect(dialogTitles).toHaveLength(4);
+  for (const title of dialogTitles) {
+    expect(title).toMatch(/^@review · Review implementation · [0-9a-f]{8}\n/);
+  }
+  expect(dialogTitles).toEqual(
+    expect.arrayContaining([
+      expect.stringContaining('\nChoose item'),
+      expect.stringContaining('\nConfirm action'),
+      expect.stringContaining('\nEnter value'),
+      expect.stringContaining('\nEdit value'),
+    ]),
+  );
   const widget = widgets.find((value) => typeof value === 'function') as
     | ((
         tui: unknown,
@@ -496,6 +538,127 @@ test('runs a foreground task in an injected RPC worker', async () => {
   expect(lines?.join('\n')).toContain('Subagents  1 active');
   expect(lines?.join('\n')).toContain('@review  Review implementation');
   expect(widgets.at(-1)).toBeUndefined();
+});
+
+test('inspects and navigates persisted child sessions without switching sessions', async () => {
+  const cwd = temporaryDirectory();
+  const parentManager = SessionManager.create(cwd, join(cwd, 'parent-sessions'));
+  const childManager = SessionManager.create(cwd, join(cwd, 'child-sessions'));
+  childManager.appendMessage({
+    role: 'user',
+    content: 'Inspect this child session.',
+    timestamp: Date.now(),
+  });
+  childManager.appendMessage({
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Child response.' }],
+    api: 'anthropic-messages',
+    provider: 'test',
+    model: 'test',
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: 'stop',
+    timestamp: Date.now(),
+  } as never);
+  parentManager.appendCustomEntry('landstrip.task', {
+    version: 1,
+    id: 'task-12345678',
+    parentSessionId: parentManager.getSessionId(),
+    sessionDir: childManager.getSessionDir(),
+    sessionFile: childManager.getSessionFile(),
+    agent: 'review',
+    description: 'Inspect child',
+    depth: 1,
+    state: 'completed',
+    output: 'Done',
+    toolCalls: 2,
+    startedAt: 1,
+    finishedAt: 1001,
+  });
+  parentManager.appendCustomEntry('landstrip.task', {
+    version: 1,
+    id: 'task-87654321',
+    parentSessionId: parentManager.getSessionId(),
+    agent: 'review',
+    description: 'Failed child',
+    depth: 1,
+    state: 'error',
+    error: 'Child failed visibly',
+  });
+
+  let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<void>) | undefined;
+  let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  let finishCustom: (() => void) | undefined;
+  const pi = {
+    registerTool() {},
+    registerCommand(
+      name: string,
+      definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+    ) {
+      if (name === 'subagents') command = definition.handler;
+    },
+    on(event: string, handler: unknown) {
+      if (event === 'session_start') sessionStart = handler as typeof sessionStart;
+    },
+    getActiveTools: () => ['task'],
+    setActiveTools() {},
+    sendMessage() {},
+    appendEntry() {},
+  } as unknown as ExtensionAPI;
+  new SubagentRuntime(pi, {} as LandstripIntegration, undefined, () => ({
+    maxSubagents: 1,
+    agents: new Map(),
+    permissions: [],
+    warnings: [],
+    diagnostics: [],
+  })).register();
+  const theme = {
+    fg: (_color: string, value: string) => value,
+    bold: (value: string) => value,
+  };
+  const ctx = {
+    cwd,
+    hasUI: true,
+    mode: 'tui',
+    sessionManager: parentManager,
+    ui: {
+      notify() {},
+      setWidget() {},
+      custom(
+        factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => typeof component,
+      ) {
+        return new Promise<void>((resolve) => {
+          finishCustom = resolve;
+          component = factory({ requestRender() {} }, theme, undefined, resolve);
+        });
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  await sessionStart?.({}, ctx);
+  const running = command?.('', ctx);
+  expect(component?.render(96).join('\n')).toContain('Subagent sessions');
+  expect(component?.render(96).join('\n')).toContain('task-123');
+  expect(component?.render(96).join('\n')).toContain('Failed child');
+  component?.handleInput('\r');
+  const detail = component?.render(96).join('\n');
+  expect(detail).toContain('Inspect this child session.');
+  expect(detail).toContain('Parent p/backspace  Prev ←  Next →');
+  component?.handleInput('\x1b[C');
+  expect(component?.render(96).join('\n')).toContain('Child failed visibly');
+  component?.handleInput('\x1b[D');
+  expect(component?.render(96).join('\n')).toContain('Inspect child');
+  component?.handleInput('\x1b');
+  expect(component?.render(96).join('\n')).toContain('Subagent sessions');
+  finishCustom?.();
+  await running;
 });
 
 test('cancels worker startup promptly and disposes a worker created afterward', async () => {

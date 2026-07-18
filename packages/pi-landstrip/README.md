@@ -129,10 +129,14 @@ The tool accepts the OpenCode task fields:
 Foreground tasks return the child result directly. Background tasks return a
 queued result while the worker continues, then deliver completion to the
 parent automatically. Task rows show lifecycle state, the current child tool or
-retry, tool-call count, elapsed time, and expandable output. The process exits
-when the run settles; its Pi session remains on disk and can be continued with
-`task_id`. While tasks are active, Pi shows their parent-child tree automatically
-above the editor.
+retry, tool-call count, elapsed time, and expandable output. Use `/subagents` or
+the task row's displayed `/subagents <id>` command to inspect a child transcript;
+the inspector provides Parent, Prev, and Next navigation without replacing the
+root Pi session. Completed and failed task IDs, summaries, and child-session
+links remain available there after reload. The process exits when the run
+settles; its Pi session remains on disk and can be continued with `task_id`.
+While tasks are active, Pi shows their parent-child tree automatically above
+the editor.
 Session switching or shutdown stops live workers. After an unclean restart,
 unfinished work is marked interrupted rather than silently rerun; a completed
 but undelivered background result is delivered when the root session resumes.
@@ -140,10 +144,12 @@ but undelivered background result is delivered when the root session resumes.
 OpenCode-style worker permissions are enforced around the worker's composed
 tools: `deny` blocks a call, `ask` suspends that worker and asks in the root UI,
 and `allow` lets the tool run. Other workers may continue while a prompt is
-open. An "Allow for this session" worker-permission decision applies to the
-root session and its descendants. These permissions are separate from the
-outer Landstrip policy and cannot widen it. Sandbox approvals continue to use
-`.pi/sandbox.json` and `~/.pi/agent/sandbox.json`.
+open. Forwarded worker select, confirm, input, and editor dialogs are prefixed
+with the worker agent, task summary, and task ID. An "Allow for this session"
+worker-permission decision applies to the root session and its descendants.
+These permissions are separate from the outer Landstrip policy and cannot widen
+it. Sandbox approvals continue to use `.pi/sandbox.json` and
+`~/.pi/agent/sandbox.json`.
 
 Subagents fail closed when sandboxing is expected but unavailable, unsupported,
 or missing. An explicit `--no-sandbox` flag or `enabled: false` configuration is
@@ -250,7 +256,7 @@ preventing nested-task deadlocks. A worker receives a nested `task` tool only
 when its agent has an explicit `task` permission. Nested tasks are separate Pi
 processes supervised by the root and Landstrip-wrapped unless sandboxing is
 explicitly disabled, so an inactive parent process can remain alive during the
-handoff.  Persisted sessions remain resumable by `task_id`.
+handoff. Persisted sessions remain resumable by `task_id`.
 
 ## License
 

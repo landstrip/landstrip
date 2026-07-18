@@ -22,10 +22,11 @@ import {
   type ExtensionContext,
   getAgentDir,
   keyHint,
+  SessionManager,
   type Theme,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
-import { Text, truncateToWidth } from '@earendil-works/pi-tui';
+import { matchesKey, Text, truncateToWidth } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 
 import {
@@ -50,6 +51,7 @@ const CONTROL_TITLE = 'pi-landstrip:control:v1';
 const MAX_DEPTH = 3;
 const packageDir = dirname(fileURLToPath(import.meta.url));
 const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
+const INSPECTOR_BODY_LINES = 16;
 interface PiPackage {
   readonly cliEntry: string;
   readonly version: readonly [number, number, number];
@@ -240,6 +242,54 @@ function taskDuration(details: TaskDetails): string | undefined {
 
 function taskOutput(details: TaskDetails, fallback: string): string {
   return details.error ?? details.output ?? fallback;
+}
+
+function workerDialogTitle(task: TaskRecord, title: string): string {
+  return `@${task.agent} · ${task.description} · ${task.id.slice(0, 8)}\n${title}`;
+}
+
+function messageContentText(message: unknown): string {
+  if (!isRecord(message)) return '';
+  const content = message.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((part) => {
+      if (!isRecord(part)) return '';
+      if (part.type === 'text' && typeof part.text === 'string') return part.text;
+      if (part.type === 'toolCall' && typeof part.name === 'string') return `→ ${part.name}`;
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function taskTranscript(task: TaskRecord): string[] {
+  if (!task.sessionFile || !existsSync(task.sessionFile)) {
+    const fallback = task.error ?? task.output ?? 'Child session is not available yet.';
+    return fallback.split('\n');
+  }
+  try {
+    const session = SessionManager.open(task.sessionFile, task.sessionDir);
+    const lines: string[] = [];
+    for (const entry of session.buildContextEntries()) {
+      if (entry.type !== 'message') continue;
+      const message = entry.message as unknown;
+      if (!isRecord(message) || typeof message.role !== 'string') continue;
+      const content = messageContentText(message);
+      if (!content) continue;
+      const role =
+        message.role === 'toolResult' && typeof message.toolName === 'string'
+          ? `tool:${message.toolName}`
+          : message.role;
+      lines.push(`${role}: ${content}`);
+    }
+    return lines.length > 0 ? lines : ['Child session has no messages yet.'];
+  } catch (error) {
+    return [
+      `Could not read child session: ${error instanceof Error ? error.message : String(error)}`,
+    ];
+  }
 }
 
 interface RunningTask {
@@ -734,6 +784,10 @@ export class SubagentRuntime {
 
   register(): void {
     this.pi.registerTool(this.createTaskTool());
+    this.pi.registerCommand('subagents', {
+      description: 'Inspect and navigate subagent sessions',
+      handler: async (args, ctx) => this.openTaskInspector(args, ctx),
+    });
     this.pi.on('session_start', async (_event, ctx) => {
       this.activeSessionId = undefined;
       await this.dispose();
@@ -814,6 +868,133 @@ export class SubagentRuntime {
     const withoutTask = activeTools.filter((tool) => tool !== 'task');
     const nextTools = maxSubagents > 0 ? [...withoutTask, 'task'] : withoutTask;
     if (nextTools.join('\0') !== activeTools.join('\0')) this.pi.setActiveTools(nextTools);
+  }
+
+  private async openTaskInspector(args: string, ctx: ExtensionContext): Promise<void> {
+    if (ctx.mode !== 'tui') {
+      ctx.ui.notify('Subagent inspection is available in TUI mode', 'warning');
+      return;
+    }
+    const tasks = [...this.tasks.values()];
+    if (tasks.length === 0) {
+      ctx.ui.notify('No subagent sessions in this session', 'info');
+      return;
+    }
+
+    const requested = args.trim();
+    let selected = requested
+      ? tasks.findIndex((task) => task.id === requested || task.id.startsWith(requested))
+      : 0;
+    if (selected < 0) {
+      ctx.ui.notify(`Unknown subagent task: ${requested}`, 'error');
+      return;
+    }
+    let detail = requested.length > 0;
+    let scroll = 0;
+
+    await ctx.ui.custom<void>(
+      (tui, theme, _keybindings, done) => ({
+        render: (width: number) => {
+          const fit = (line: string) => truncateToWidth(line, Math.max(1, width));
+          if (!detail) {
+            const start = Math.max(0, Math.min(selected - 6, tasks.length - 12));
+            const shown = tasks.slice(start, start + 12);
+            const lines = [theme.fg('accent', theme.bold('Subagent sessions'))];
+            for (const [offset, task] of shown.entries()) {
+              const index = start + offset;
+              const cursor = index === selected ? theme.fg('accent', '›') : ' ';
+              const indent = '  '.repeat(Math.max(0, task.depth - 1));
+              lines.push(
+                `${cursor} ${indent}${taskState(theme, task)} ${theme.fg('accent', `@${task.agent}`)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
+              );
+            }
+            lines.push('', theme.fg('dim', '↑↓ select  enter inspect  esc close'));
+            return lines.map(fit);
+          }
+
+          const task = tasks[selected];
+          if (!task) return [];
+          const siblings = tasks.filter(
+            (candidate) => candidate.parentTaskId === task.parentTaskId,
+          );
+          const siblingIndex = siblings.findIndex((candidate) => candidate.id === task.id);
+          const transcript = taskTranscript(task).flatMap((line) => line.split('\n'));
+          const maxScroll = Math.max(0, transcript.length - INSPECTOR_BODY_LINES);
+          scroll = Math.min(scroll, maxScroll);
+          const shown = transcript.slice(scroll, scroll + INSPECTOR_BODY_LINES);
+          const duration = taskDuration(taskDetails(task));
+          const metrics = [
+            task.id,
+            `${siblingIndex + 1} of ${siblings.length}`,
+            task.toolCalls === undefined
+              ? undefined
+              : `${task.toolCalls} tool call${task.toolCalls === 1 ? '' : 's'}`,
+            duration,
+          ].filter(Boolean);
+          const lines = [
+            `${theme.fg('accent', theme.bold(`@${task.agent}`))} ${theme.fg('text', task.description)}`,
+            `${taskState(theme, task)} ${theme.fg('dim', metrics.join(' · '))}`,
+            '',
+            ...shown.map((line) => theme.fg('toolOutput', line)),
+          ];
+          while (lines.length < INSPECTOR_BODY_LINES + 3) lines.push('');
+          if (transcript.length > INSPECTOR_BODY_LINES) {
+            lines.push(
+              theme.fg('dim', `${scroll + 1}-${scroll + shown.length} of ${transcript.length}`),
+            );
+          }
+          lines.push(
+            theme.fg('dim', 'Parent p/backspace  Prev ←  Next →  ↑↓ scroll  r refresh  esc back'),
+          );
+          return lines.map(fit);
+        },
+        handleInput: (data: string) => {
+          if (!detail) {
+            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
+            else if (matchesKey(data, 'up')) selected = Math.max(0, selected - 1);
+            else if (matchesKey(data, 'down')) selected = Math.min(tasks.length - 1, selected + 1);
+            else if (matchesKey(data, 'return')) {
+              detail = true;
+              scroll = 0;
+            } else return;
+            tui.requestRender();
+            return;
+          }
+
+          const task = tasks[selected];
+          if (!task) return;
+          if (matchesKey(data, 'escape')) {
+            detail = false;
+            scroll = 0;
+          } else if (matchesKey(data, 'ctrl+c')) {
+            done();
+          } else if (matchesKey(data, 'up')) {
+            scroll = Math.max(0, scroll - 1);
+          } else if (matchesKey(data, 'down')) {
+            scroll += 1;
+          } else if (data === 'p' || matchesKey(data, 'backspace')) {
+            const parentIndex = task.parentTaskId
+              ? tasks.findIndex((candidate) => candidate.id === task.parentTaskId)
+              : -1;
+            if (parentIndex >= 0) selected = parentIndex;
+            else detail = false;
+            scroll = 0;
+          } else if (matchesKey(data, 'left') || matchesKey(data, 'right')) {
+            const siblings = tasks.filter(
+              (candidate) => candidate.parentTaskId === task.parentTaskId,
+            );
+            const siblingIndex = siblings.findIndex((candidate) => candidate.id === task.id);
+            const offset = matchesKey(data, 'left') ? -1 : 1;
+            const sibling = siblings[siblingIndex + offset];
+            if (sibling) selected = tasks.indexOf(sibling);
+            scroll = 0;
+          } else if (data !== 'r') return;
+          tui.requestRender();
+        },
+        invalidate() {},
+      }),
+      { overlay: true, overlayOptions: { anchor: 'center', width: 96, margin: 2 } },
+    );
   }
 
   selectPrimaryAgent(name: string, ctx: ExtensionContext): boolean {
@@ -927,6 +1108,7 @@ export class SubagentRuntime {
             text += `\n${theme.fg('muted', `… ${keyHint('app.tools.expand', 'to expand')}`)}`;
           }
         }
+        text += `\n${theme.fg('dim', `↳ /subagents ${details.taskId.slice(0, 8)} to inspect`)}`;
         return new Text(text, 0, 0);
       },
     };
@@ -1475,11 +1657,12 @@ export class SubagentRuntime {
       }
       return { value: JSON.stringify(response) };
     }
-    return this.forwardWorkerUi(ctx, request, this.controllers.get(task.id)?.signal);
+    return this.forwardWorkerUi(ctx, task, request, this.controllers.get(task.id)?.signal);
   }
 
   private async forwardWorkerUi(
     ctx: ExtensionContext,
+    task: TaskRecord,
     request: ExtensionUiRequest,
     signal?: AbortSignal,
   ): Promise<ExtensionUiResult> {
@@ -1489,13 +1672,15 @@ export class SubagentRuntime {
       Array.isArray(request.options)
     ) {
       const options = request.options.filter((value): value is string => typeof value === 'string');
-      const value = await ctx.ui.select(request.title, options, { signal });
+      const value = await ctx.ui.select(workerDialogTitle(task, request.title), options, {
+        signal,
+      });
       return value === undefined ? { cancelled: true } : { value };
     }
     if (request.method === 'confirm' && typeof request.title === 'string') {
       return {
         confirmed: await ctx.ui.confirm(
-          request.title,
+          workerDialogTitle(task, request.title),
           typeof request.message === 'string' ? request.message : '',
           { signal },
         ),
@@ -1503,7 +1688,7 @@ export class SubagentRuntime {
     }
     if (request.method === 'input' && typeof request.title === 'string') {
       const value = await ctx.ui.input(
-        request.title,
+        workerDialogTitle(task, request.title),
         typeof request.placeholder === 'string' ? request.placeholder : undefined,
         { signal },
       );
@@ -1511,7 +1696,7 @@ export class SubagentRuntime {
     }
     if (request.method === 'editor' && typeof request.title === 'string') {
       const value = await ctx.ui.editor(
-        request.title,
+        workerDialogTitle(task, request.title),
         typeof request.prefill === 'string' ? request.prefill : undefined,
       );
       return value === undefined ? { cancelled: true } : { value };
