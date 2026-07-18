@@ -26,7 +26,7 @@ import {
   type Theme,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
-import { matchesKey, Text, truncateToWidth } from '@earendil-works/pi-tui';
+import { matchesKey, Text, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 
 import {
@@ -52,6 +52,28 @@ const MAX_DEPTH = 3;
 const packageDir = dirname(fileURLToPath(import.meta.url));
 const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
 const INSPECTOR_BODY_LINES = 16;
+
+function boxTop(theme: Theme, width: number, title: string): string {
+  if (width < 5) return truncateToWidth(theme.fg('accent', title), Math.max(1, width));
+  const label = theme.fg('accent', ` ${title} `);
+  const fill = theme.fg('border', '─'.repeat(Math.max(0, width - 4 - visibleWidth(label))));
+  return `${theme.fg('border', '╭─')}${label}${fill}${theme.fg('border', '─╮')}`;
+}
+
+function boxRow(theme: Theme, width: number, content = ''): string {
+  if (width < 5) return truncateToWidth(content, Math.max(1, width));
+  const innerWidth = Math.max(1, width - 4);
+  const border = theme.fg('border', '│');
+  const line = truncateToWidth(content, innerWidth);
+  return `${border} ${line}${' '.repeat(Math.max(0, innerWidth - visibleWidth(line)))} ${border}`;
+}
+
+function boxBottom(theme: Theme, width: number): string {
+  if (width < 5) return '';
+  const border = (value: string) => theme.fg('border', value);
+  return `${border('╰')}${border('─'.repeat(Math.max(0, width - 2)))}${border('╯')}`;
+}
+
 interface PiPackage {
   readonly cliEntry: string;
   readonly version: readonly [number, number, number];
@@ -895,11 +917,16 @@ export class SubagentRuntime {
     await ctx.ui.custom<void>(
       (tui, theme, _keybindings, done) => ({
         render: (width: number) => {
-          const fit = (line: string) => truncateToWidth(line, Math.max(1, width));
+          const contentWidth = Math.max(1, width - 4);
+          const box = (title: string, lines: string[]) => [
+            boxTop(theme, width, title),
+            ...lines.map((line) => boxRow(theme, width, line)),
+            boxBottom(theme, width),
+          ];
           if (!detail) {
             const start = Math.max(0, Math.min(selected - 6, tasks.length - 12));
             const shown = tasks.slice(start, start + 12);
-            const lines = [theme.fg('accent', theme.bold('Subagent sessions'))];
+            const lines: string[] = [];
             for (const [offset, task] of shown.entries()) {
               const index = start + offset;
               const cursor = index === selected ? theme.fg('accent', '›') : ' ';
@@ -909,7 +936,7 @@ export class SubagentRuntime {
               );
             }
             lines.push('', theme.fg('dim', '↑↓ select  enter inspect  esc close'));
-            return lines.map(fit);
+            return box('Subagent Sessions', lines);
           }
 
           const task = tasks[selected];
@@ -946,7 +973,10 @@ export class SubagentRuntime {
           lines.push(
             theme.fg('dim', 'Parent p/backspace  Prev ←  Next →  ↑↓ scroll  r refresh  esc back'),
           );
-          return lines.map(fit);
+          return box(
+            'Subagent Session',
+            lines.map((line) => truncateToWidth(line, contentWidth)),
+          );
         },
         handleInput: (data: string) => {
           if (!detail) {

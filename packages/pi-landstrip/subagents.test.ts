@@ -644,7 +644,7 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   await sessionStart?.({}, ctx);
   const running = command?.('', ctx);
-  expect(component?.render(96).join('\n')).toContain('Subagent sessions');
+  expect(component?.render(96).join('\n')).toContain('Subagent Sessions');
   expect(component?.render(96).join('\n')).toContain('task-123');
   expect(component?.render(96).join('\n')).toContain('Failed child');
   component?.handleInput('\r');
@@ -656,7 +656,7 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('\x1b[D');
   expect(component?.render(96).join('\n')).toContain('Inspect child');
   component?.handleInput('\x1b');
-  expect(component?.render(96).join('\n')).toContain('Subagent sessions');
+  expect(component?.render(96).join('\n')).toContain('Subagent Sessions');
   finishCustom?.();
   await running;
 });
