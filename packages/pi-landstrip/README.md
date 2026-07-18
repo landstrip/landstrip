@@ -1,26 +1,26 @@
 # pi-landstrip
 
-`pi-landstrip` is an extension for [pi](https://pi.dev/) providing sandbox-aware
-subagents and a sandbox defined with a policy compatible with Anthropic's JSON
-format. It uses [`landstrip`](https://github.com/landstrip/landstrip) to
-implement the sandbox.
+`pi-landstrip` is a [Pi](https://pi.dev/) extension that provides sandboxed Bash
+execution, OpenCode-compatible primary agents, and sandbox-aware subagents. It
+uses an Anthropic-compatible policy and delegates OS-level enforcement to
+[`landstrip`](https://github.com/landstrip/landstrip).
 
-`pi-landstrip` has a shared sandbox policy [sandbox.json](./sandbox.json) and a
-separate [subagents.json](./subagents.json) for primary-agent and subagent
-configuration. Global and trusted project files can override both.
+The extension includes a shared [sandbox policy](./sandbox.json) and separate
+[agent configuration](./subagents.json). Global and trusted-project files can
+override both.
 
-Pi >=0.80.6 <0.81.0 and Node.js >=22.19.0 are required for process-backed subagents.
+Process-backed subagents require Pi >= 0.80.6 and < 0.81.0, and Node.js >= 22.19.0.
 
-## Installing the extension
+## Installation
 
 ### Automatic install
 
-```
+```sh
 pi install npm:pi-landstrip
 ```
 
 This installs `pi-landstrip` and its `@landstrip/landstrip` dependency. Native
-binaries are currently published for Linux x64, Windows x64, and macOS x64/arm64.
+binaries are published for Linux, macOS, and Windows on x64 and Arm64.
 
 ### Manual install
 
@@ -33,13 +33,13 @@ Add the extension to `~/.pi/agent/settings.json` (global) or
 }
 ```
 
-Alternatively, drop the extension under `~/.pi/agent/extensions/` (global) or
-`.pi/extensions/` (project). See the pi
-[extensions](https://pi.dev/docs/latest/extensions) documentation for details.
+Alternatively, place the extension under `~/.pi/agent/extensions/` (global) or
+`.pi/extensions/` (project). See Pi's
+[extension documentation](https://pi.dev/docs/latest/extensions) for details.
 
 On unsupported platforms the extension loads but leaves sandboxing disabled.
 
-## Disable
+## Disabling
 
 Use the `--no-sandbox` flag, or set `enabled` to `false` in `sandbox.json`:
 
@@ -60,23 +60,23 @@ without a project-trust API use only global configuration.
 
 ## Behavior
 
-When pi asks for a sandboxed permission, the extension emits a host
-notification. After that the extension opens a dialog with the choices to allow
-once, allow for the session, persist for the project, persist globally, or
-reject. The dialog shows the exact path or domain being approved.
+When Pi requests a sandboxed permission, the extension sends a host notification
+and opens a dialog. The user can allow once, allow for the session, persist for
+the project or globally, or reject. The dialog shows the exact path or domain
+being approved.
 
 Project approvals are written to `.pi/sandbox.json`; global approvals are
 written to `~/.pi/agent/sandbox.json`.
 
-The main agent remains a normal Pi process. Pi performs its usual filesystem
-tool and plugin composition; `pi-landstrip` replaces Bash execution, including
-AI `bash` calls and manually typed shell-mode commands (`!` and `!!`), with a
-Landstrip-wrapped implementation. Network traffic is routed through an
-allowlist proxy when network access is off. Main-agent filesystem tools and
-plugin callbacks remain trusted Pi code and are not confined by Landstrip. The
-default policy for Bash and subagent processes is strict: network access is off
-unless domains are allowed, reads are limited to the project, `~/.gitconfig`,
-and `/dev/null`, and writes are limited to the project and `/dev/null`.
+The main agent remains a normal Pi process. `pi-landstrip` replaces Bash
+execution, including AI `bash` calls and manually typed shell commands (`!` and
+`!!`), with a Landstrip-wrapped implementation. Network traffic uses an
+allowlist proxy when direct access is disabled. Pi's filesystem tools and plugin
+callbacks remain trusted code outside the Landstrip sandbox.
+
+By default, Bash and subagent processes have no direct network access. Reads are
+limited to the project, Git configuration, and `/dev/null`; writes are limited
+to the project and `/dev/null`.
 
 Subagent startup adds read-only bootstrap access to the selected Pi runtime,
 global settings, model/auth configuration, installed plugins, skills, and the
@@ -84,34 +84,30 @@ task's dedicated session directory. These paths are required to construct a
 normal Pi worker and are not persisted into `sandbox.json`. The worker receives
 write access only to its own session and temporary directories.
 
-Use `/sandbox` inside Pi to inspect the active policy and toggle sandboxing. Use
-`/agents` to select the primary role. Its Subagents tab shows configured workers,
-models, effective permissions, unsupported RPC options, and catalog diagnostics;
-its Settings tab controls the global and trusted-project maximum number of
-concurrent subagents.
+Use `/sandbox` to inspect the active policy and toggle sandboxing. Use `/agents`
+to select the primary role, inspect worker configuration and status, and set the
+global or trusted-project concurrency limit.
 
 ## Primary agents
 
-The `/agents` selector provides OpenCode-compatible `build` and `plan` roles by default.
-Build has normal development access; plan asks before shell commands and file
-changes. The selection controls the root system prompt and permissions and is
-restored with the session.
+The `/agents` selector provides OpenCode-compatible `build` and `plan` roles by
+default. Build has normal development access; plan asks before shell commands
+and file changes. The selection controls the root system prompt and permissions
+and is restored with the session.
 
 ## Subagents
 
-Landstrip provides an OpenCode-compatible `task` tool. Each active task is a
-full `pi --mode rpc` process under one outer Landstrip instance. The sandbox
-covers Pi itself, its plugins and tools, model requests, and every descendant
-process. The root Pi supervises RPC, permissions, nesting, persistence, and
-completion delivery.
+Landstrip provides an OpenCode-compatible `task` tool. Each active task runs as a
+full `pi --mode rpc` process inside an outer Landstrip sandbox. The sandbox
+covers Pi, its plugins and tools, model requests, and descendant processes. The
+root Pi process supervises RPC, permissions, nesting, persistence, and result
+delivery.
 
-The worker uses normal Pi resource discovery and plugin loading from the Pi
-filesystem, plus the pi-landstrip worker extension. Its requested active tool
-names come from the parent, but their implementations are composed normally in
-the worker: plugins can add or replace tools, including replacements such as
-`pi-readseek`. Every task run starts a fresh Pi process and fresh plugin
-instances. Continuing a `task_id` restores its persisted Pi session in a new
-worker process.
+Workers use normal Pi resource discovery and plugin loading, plus the
+`pi-landstrip` worker extension. Requested tools are composed inside the worker,
+so plugins can add or replace implementations. Each task starts a fresh Pi
+process and plugin instances; continuing a `task_id` restores its persisted Pi
+session in a new process.
 
 The tool accepts the OpenCode task fields:
 
@@ -127,29 +123,24 @@ The tool accepts the OpenCode task fields:
 ```
 
 Foreground tasks return the child result directly. Background tasks return a
-queued result while the worker continues, then deliver completion to the
-parent automatically. Task rows show lifecycle state, the current child tool or
-retry, tool-call count, elapsed time, and expandable output. Use `/subagents` or
-the task row's displayed `/subagents <id>` command to inspect a child transcript;
-the inspector provides Parent, Prev, and Next navigation without replacing the
-root Pi session. Completed and failed task IDs, summaries, and child-session
-links remain available there after reload. The process exits when the run
-settles; its Pi session remains on disk and can be continued with `task_id`.
-While tasks are active, Pi shows their parent-child tree automatically above
-the editor.
-Session switching or shutdown stops live workers. After an unclean restart,
-unfinished work is marked interrupted rather than silently rerun; a completed
-but undelivered background result is delivered when the root session resumes.
+queued result and deliver completion automatically. Task rows show lifecycle
+state, current activity, tool-call count, elapsed time, and expandable output.
+Use `/subagents` or the task row's `/subagents <id>` command to inspect a child
+transcript. Completed and failed task metadata remains available after reload,
+and persisted sessions can be continued with `task_id`.
 
-OpenCode-style worker permissions are enforced around the worker's composed
-tools: `deny` blocks a call, `ask` suspends that worker and asks in the root UI,
-and `allow` lets the tool run. Other workers may continue while a prompt is
-open. Forwarded worker select, confirm, input, and editor dialogs are prefixed
-with the worker agent, task summary, and task ID. An "Allow for this session"
-worker-permission decision applies to the root session and its descendants.
-These permissions are separate from the outer Landstrip policy and cannot widen
-it. Sandbox approvals continue to use `.pi/sandbox.json` and
-`~/.pi/agent/sandbox.json`.
+Session switching or shutdown stops live workers. After an unclean restart,
+unfinished work is marked interrupted; completed but undelivered background
+results are delivered when the root session resumes.
+
+OpenCode-style permissions wrap each worker's composed tools: `deny` blocks,
+`ask` prompts in the root UI, and `allow` runs the tool. Other workers may
+continue while a prompt is open. Forwarded worker dialogs identify the agent,
+task summary, and task ID. An "Allow for this session" decision applies to the
+root session and its descendants.
+
+Tool permissions cannot widen the outer Landstrip policy. Sandbox approvals
+continue to use `.pi/sandbox.json` and `~/.pi/agent/sandbox.json`.
 
 Subagents fail closed when sandboxing is expected but unavailable, unsupported,
 or missing. An explicit `--no-sandbox` flag or `enabled: false` configuration is
@@ -182,13 +173,14 @@ first.
 
 ## Configuration
 
-Subagent configuration is read from `~/.pi/agent/subagents.json` and, for
-trusted projects, `.pi/subagents.json`. Project values override global values;
-both are merged over the packaged [default](./subagents.json). Sandbox policy
-continues to use `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi's
-`settings.json` contains only normal Pi settings such as the `pi-landstrip`
-package entry. `subagents.json` accepts only top-level `maxSubagents` and
-`subagents`; sandbox fields belong only in `sandbox.json`.
+Subagent configuration is read from `~/.pi/agent/subagents.json` and, for trusted
+projects, `.pi/subagents.json`. Project values override global values; both are
+merged over the packaged [defaults](./subagents.json). Sandbox policy remains in
+`~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi's `settings.json` contains
+only normal Pi settings, such as the `pi-landstrip` package entry.
+
+`subagents.json` accepts only top-level `maxSubagents` and `subagents`; sandbox
+fields belong in `sandbox.json`.
 
 ```json
 {
@@ -215,10 +207,10 @@ package entry. `subagents.json` accepts only top-level `maxSubagents` and
 }
 ```
 
-`maxSubagents` is an integer from 0 through 16 controlling concurrent worker
-processes. Setting it to zero removes the `task` tool while retaining the primary
-roles. There is no separate subagent enable switch. The Settings tab in `/agents`
-edits this limit separately for global and trusted-project configuration.
+`maxSubagents` is an integer from 0 through 16 controlling concurrent workers.
+The packaged default is 0, which removes the `task` tool while retaining primary
+roles. There is no separate subagent enable switch. The Settings tab in
+`/agents` edits this limit for global and trusted-project configuration.
 
 Agent modes, hidden/disabled agents, prompts, and ordered `allow`/`ask`/`deny`
 permissions apply to primary agents and subagents. Subagent workers also honor
@@ -228,7 +220,7 @@ matching permission rules win. Put provider-specific values under `options`;
 unknown agent fields are rejected. Agent permissions cannot weaken an enabled
 OS sandbox, grant filesystem access, or grant network access.
 
-## Migrating configuration
+## Configuration migration
 
 There is no compatibility loader for previous subagent configuration sources.
 Legacy keys in `settings.json` produce a migration warning. Move configuration as
@@ -244,12 +236,12 @@ follows, then remove the old fields:
 - Leave sandbox policy in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`;
   those files are unchanged.
 
-Do not put `subagents`, `agent`, `permission`, or `maxSubagents` in Pi's
-`settings.json`; Pi-Landstrip does not read them there.
+Do not put these fields in Pi's `settings.json`; `pi-landstrip` does not read
+them there.
 
 ## Limits
 
-`pi-Landstrip` grants at most `maxSubagents` scheduler permits to active
+`pi-landstrip` grants at most `maxSubagents` scheduler permits to active
 subagent work and allows nesting to three levels. A foreground parent returns
 its permit while waiting for a child and reacquires it before resuming,
 preventing nested-task deadlocks. A worker receives a nested `task` tool only
@@ -260,8 +252,7 @@ handoff. Persisted sessions remain resumable by `task_id`.
 
 ## License
 
-`pi-landstrip` is licensed under `Apache-2.0`. See [LICENSE](LICENSE) for more
-information.
+`pi-landstrip` is licensed under `Apache-2.0`. See [LICENSE](LICENSE).
 
 The bundled `@landstrip/landstrip` package is licensed separately as
 `Apache-2.0 AND LGPL-2.1-or-later`.

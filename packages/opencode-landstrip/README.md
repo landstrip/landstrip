@@ -1,31 +1,31 @@
 # opencode-landstrip
 
-`opencode-landstrip` is a plugin for [OpenCode](https://opencode.ai/) providing
-a sandbox defined with a policy compatible with Anthropic's JSON format. It uses
-[`landstrip`](https://github.com/landstrip/landstrip) to implement the sandbox.
+`opencode-landstrip` is an [OpenCode](https://opencode.ai/) plugin that sandboxes
+commands using an Anthropic-compatible policy. It delegates OS-level enforcement
+to [`landstrip`](https://github.com/landstrip/landstrip).
 
-`opencode-landstrip` has a default policy [sandbox.json](./sandbox.json), and
-allows the define either or both global or project specific policies.
+The plugin includes a default [sandbox policy](./sandbox.json). Global and
+project-specific policies can override it.
 
-## Installing the plugin
+## Installation
 
 ### Automatic install
 
-Project specific install:
+Install for the current project:
 
-```
+```sh
 opencode plugin install opencode-landstrip
 ```
 
-Global install:
+Install globally:
 
-```
+```sh
 opencode plugin install opencode-landstrip --global
 ```
 
 ### Manual install
 
-These changes are applied to OpenCode's configuration directories
+For a manual installation, update OpenCode's configuration files.
 
 Add the plugin to `opencode.json`:
 
@@ -45,7 +45,7 @@ Add TUI entry point to `tui.json`:
 }
 ```
 
-The plugin can be later on disabled as follows:
+To disable the plugin later:
 
 ```json
 {
@@ -60,24 +60,22 @@ sets it, otherwise to the global config.
 
 ## Behavior
 
-When OpenCode asks for a sandboxed permission, the plugin emits a host
-notification. After that the plugin opens a dialog with the choices to allow
-once, allow for the session, persist for the project, persist globally, or
-reject. The dialog shows the exact path or domain being approved.
+When OpenCode requests a sandboxed permission, the plugin sends a host
+notification and opens a dialog. The user can allow once, allow for the session,
+persist for the project or globally, or reject. The dialog shows the exact path
+or domain being approved.
 
-Project approvals are written to `.opencode/sandbox.json`; global approvals are
-written to `~/.config/opencode/sandbox.json`. When the global configuration is
-initially written it acquires the copy of the default sandbox configuration.
+Project approvals are written to `.opencode/sandbox.json`; global approvals go
+to `~/.config/opencode/sandbox.json`. A newly created global file starts with the
+default sandbox policy.
 
-OpenCode's current plugin API allows wrapping AI `bash` tool calls, but does not
-allow a plugin to replace manually typed shell-mode commands with a landstrip
-wrapper. Those commands can still receive the proxy environment from OpenCode,
-but they are not process-sandboxed by this plugin.
+OpenCode's plugin API can wrap AI `bash` tool calls, but cannot replace manually
+typed shell-mode commands with a Landstrip wrapper. Those commands can inherit
+OpenCode's proxy environment, but this plugin does not process-sandbox them.
 
 ## License
 
-`opencode-landstrip` is licensed under `Apache-2.0`. See [LICENSE](LICENSE) for more
-information.
+`opencode-landstrip` is licensed under `Apache-2.0`. See [LICENSE](LICENSE).
 
 The bundled `@landstrip/landstrip` package is licensed separately as
 `Apache-2.0 AND LGPL-2.1-or-later`.

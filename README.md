@@ -3,9 +3,9 @@
 
 # landstrip
 
-`landstrip` runs a tool in an OS-level sandbox using Landlock LSM on Linux,
-Seatbelt on macOS, and LPAC AppContainer on Windows.  It accepts the Anthropic
-Sandbox Runtime JSON subset as the policy, in JSON or YAML syntax.
+`landstrip` runs commands in an OS-level sandbox using Landlock LSM on Linux,
+Seatbelt on macOS, and LPAC AppContainer on Windows. It accepts the Anthropic
+Sandbox Runtime policy subset in JSON or YAML.
 
 ## Installation
 
@@ -25,10 +25,10 @@ binary package.
 ### Agent extensions
 
 The bundled extensions integrate Landstrip with Pi and OpenCode. The Pi
-extension sandboxes the main agent's Bash execution, provides OpenCode-compatible
-primary agent selection, and runs subagents as full Pi RPC processes. Subagents
-normally receive an outer Landstrip sandbox; explicitly disabling sandboxing
-uses a warned process-only fallback:
+extension sandboxes Bash execution, provides OpenCode-compatible primary-agent
+selection, and runs subagents as full Pi RPC processes. Subagents normally run
+inside an outer Landstrip sandbox; explicitly disabling sandboxing emits a
+warning and uses a process-only fallback:
 
 ```sh
 pi install npm:pi-landstrip
@@ -41,12 +41,12 @@ details.
 
 ## Platforms
 
-| Area         | macOS                    | Linux                        | Windows                         |
-| ------------ | ------------------------ | ---------------------------- | ------------------------------- |
-| Policy       | path based rules         | file based rules             | per-run AppContainer ACLs       |
-| Timing       | dynamic subset of paths  | file based static ruleset    | per-run ACL grants              |
-| TCP          | proxy or loopback        | proxy or loopback            | allow all or deny all           |
-| Unix sockets | allowlist                | allowlist via seccomp broker | allow all or deny all           |
+| Area         | macOS                   | Linux                       | Windows                   |
+| ------------ | ----------------------- | --------------------------- | ------------------------- |
+| Policy       | path-based rules        | file-based rules            | per-run AppContainer ACLs |
+| Timing       | dynamic path subset     | static file-based ruleset   | per-run ACL grants        |
+| TCP          | proxy or loopback       | proxy or loopback           | allow all or deny all     |
+| Unix sockets | allowlist               | seccomp-brokered allowlist  | allow all or deny all     |
 
 ### Linux
 
@@ -55,9 +55,9 @@ Landlock carves the denied subtrees out of the allowed roots, and then grants
 added to the ruleset, and the kernel enforces the path directly.
 
 Seccomp is applied when a policy needs more than Landlock can express
-statically, e.g. for many filesystem mutator syscalls, or when denials must be
-reported back to the launcher. The broker intercepts `openat`/`openat2` via
-seccomp user-notifications, resolves the real path, and validates it
+statically, such as filesystem mutator filtering or denial reporting. The broker
+intercepts `openat` and `openat2` through seccomp user notifications, resolves
+the real path, and validates it.
 
 Landlock and seccomp cover mostly disjoint filesystem operations: Landlock
 handles kernel-enforced path access, while seccomp mediates unsupported mutators
@@ -65,7 +65,7 @@ and reports broker decisions.
 
 ### Windows
 
-Win32 API provides AppContainer for application level sandboxing. The platform
+Windows provides AppContainer for application-level sandboxing. Landstrip
 creates a per-run LPAC AppContainer profile, grants its SID access to the lowered
 read and write roots, and removes those grants after the sandboxed process tree
 exits. Windows policies must use explicit read allowlists.
@@ -78,12 +78,11 @@ are terminated when the launcher exits.
 capabilities, while the default container holds none and denies all network
 access.
 
-AppContainer capabilities are coarse: fine-grained TCP policies by host or port
-require Windows Filtering Platform rules keyed by the AppContainer SID. I.e.,
-this would require elevated privileges, which is not sustainable for a agent
-sandbox runtime, which should rely on unprivileged tools and techniques.
+AppContainer capabilities are coarse. Fine-grained TCP policies by host or port
+require elevated Windows Filtering Platform rules keyed by the AppContainer SID,
+which is unsuitable for an unprivileged agent sandbox runtime.
 
-## Policy Format
+## Policy format
 
 JSON is the default policy format. Use `--format yaml` for YAML policy files or
 YAML read from standard input.
@@ -107,34 +106,31 @@ network:
   allowNetwork: true
 ```
 
-## Filesystem Policy
+## Filesystem policy
 
-Write access is denied by default.  `allowWrite` paths grant write access and
-`denyWrite` paths subtract from them, with the most specific rule winning where
-an allow and a deny overlap. Read access is unrestricted by default; setting
+Write access is denied by default. `allowWrite` paths grant write access and
+`denyWrite` paths subtract from them, with the most specific rule winning when
+allow and deny rules overlap. Read access is unrestricted by default; setting
 `denyRead` lowers it to an allowlist, and `allowRead` adds paths back.
 
-### Write Denial Semantics
+### Write-denial semantics
 
 Concrete (non-glob) `denyWrite` paths are canonicalized and enforced
 eagerly on all platforms.
 
-Glob `denyWrite` patterns (`**/.env`, `**/*.pem`, etc.) behave differently
+Glob `denyWrite` patterns (`**/.env`, `**/*.pem`, and so on) behave differently
 by platform:
 
 - **Linux**: Globs are evaluated dynamically by the seccomp broker at each write
-  attempt. Files created after sandbox startup that match a denyWrite glob are
-  blocked. The glob is never walked at startup, so large trees do not cause
-  startup latency.
+  attempt. Files created after sandbox startup that match a `denyWrite` glob are
+  blocked. Globs are not walked at startup, avoiding latency on large trees.
 - **macOS**: Globs are snapshot-expanded when the Seatbelt profile is compiled.
-  Files created after `sandbox_init` are not protected by glob denies — use
-  concrete paths for those. A warning is logged when glob deny patterns are
-  used.
-- **Windows**: Glob denyWrite entries are not enforced by the AppContainer
+  Files created after `sandbox_init` are not protected by glob denies; use
+  concrete paths for them. A warning is logged when glob deny patterns are used.
+- **Windows**: Glob `denyWrite` entries are not enforced by the AppContainer
   backend.
 
-
-## Network Policy
+## Network policy
 
 Sandbox mode denies direct network access by default. Proxy ports, loopback TCP
 binding and connections, and Unix sockets can be allowed with the Anthropic
@@ -154,18 +150,18 @@ For a filesystem-only sandbox with unrestricted direct network access, set:
 }
 ```
 
-`allowNetwork` disables landstrip network enforcement while leaving filesystem
+`allowNetwork` disables Landstrip network enforcement while leaving filesystem
 policy enforcement in place. On Windows this grants the AppContainer its network
 capabilities; without it the container denies all network access.
 
 ## Traps
 
-Every landstrip event — a sandbox denial, and every failure that keeps the tool
-from running — is reported as a JSON object, one per line, with a fixed `kind`
-discriminant and a stable `code`. Consumers route on `kind` for the shape of the
-record and on `code` for what happened. Failure traps and completed denial traps
-go to standard error by default. On Linux, pending query traps go only to
-`--trap-fd FD`, which writes them to an already-open descriptor.
+Every Landstrip event, whether a sandbox denial or a failure that prevents the
+tool from running, is reported as one JSON object per line, with a fixed `kind`
+discriminant and stable `code`. Consumers route on `kind` for the record shape
+and `code` for the event. Failures and completed denials go to standard error by
+default. On Linux, pending query traps go only to `--trap-fd FD`, which must name
+an already-open descriptor.
 
 ```sh
 landstrip --trap-fd 3 -p policy.json cargo test 3>landstrip-traps.txt
@@ -254,12 +250,11 @@ derived from the policy and the requested path:
 }
 ```
 
-Denial traps are informational; the configured policy always applies. landstrip
-is otherwise quiet on success — standard error belongs to landstrip, standard
-output to the sandboxed tool. Failure traps are accompanied by a human-readable
-log line; the JSON is what machines should read. Usage errors exit with status 2,
-every other landstrip failure with 1; the tool's own status is passed through
-otherwise.
+Denial traps are informational; the configured policy always applies. Landstrip
+is otherwise quiet on success: standard error belongs to Landstrip and standard
+output to the sandboxed tool. Failure traps include a human-readable log line;
+machines should read the JSON. Usage errors exit with status 2, other Landstrip
+failures with 1, and the tool's own status is otherwise passed through.
 
 Writing to `--trap-fd` is best-effort: it needs an already-open descriptor (3 or
 greater; 0-2 are reserved), and if the write fails the trap is dropped while the
@@ -270,21 +265,20 @@ policy stays in effect. On Linux, a broker launch failure also reaches
 
 ### Commit messages
 
-- **`<subsystem>: <message>`**
-- Long description for non-trivial changes.
-- Kernel style commit messages.
-- **`Signed-off-by`**
+- Use `<subsystem>: <message>` as the subject.
+- Add a body for non-trivial changes.
+- Follow kernel-style commit message conventions.
+- Include a `Signed-off-by:` trailer.
 
 ### Documenting errors
 
 The following snippet demonstrates the recommended pattern for documenting
 the return values on error:
 
-```
+```rust
 /// # Errors
 ///
-/// Returns [`<variant's unqualified name>`](<variant's unqualified name>)
-/// Returns ...
+/// Returns [`Variant`] when ...
 ```
 
 ## Licensing

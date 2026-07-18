@@ -16,16 +16,14 @@
 .Fl V
 .Sh DESCRIPTION
 .Nm
-loads a policy, lowers the sandbox configuration into the platform sandbox
-model, applies that sandbox, and then executes
+loads a policy, translates it into the platform sandbox model, applies the
+sandbox, and executes
 .Ar command .
-If no policy file is specified, the policy document is read from standard
-input.
+If no policy file is specified, the policy is read from standard input.
 .Pp
-The accepted policy format is the subset of Anthropic Sandbox Runtime
-settings that
-.Nm
-uses. Unknown fields are ignored.
+The accepted policy is the subset of Anthropic Sandbox Runtime settings used by
+.Nm .
+Unknown fields are ignored.
 .Sh OPTIONS
 .Bl -tag -width Ds
 .It Fl -debug
@@ -38,12 +36,11 @@ and
 The default is
 .Va json .
 .It Fl -trap-fd Ar fd
-Write landstrip trap responses to the already-open file descriptor
-.Ar fd
-in JSON format. The descriptor must be 3 or greater. On Linux, filesystem denials
-observed by the seccomp broker are emitted as JSON objects with the same field
-names as trap responses. The option is best-effort on backends that do not
-expose per-access denial callbacks.
+Write Landstrip trap events as JSON to the already-open file descriptor
+.Ar fd .
+The descriptor must be 3 or greater. On Linux, the seccomp broker emits
+filesystem denials with the same fields as other trap events. This option is
+best-effort on backends without per-access denial callbacks.
 .It Fl p Ar policy , Fl -policy Ar policy
 Read a policy file. This option may be repeated. Later policy arguments
 are merged over earlier policy arguments. Object values are merged recursively,
@@ -98,28 +95,21 @@ was started. Absolute paths are used as-is. The
 and
 .Sq ~/
 prefixes resolve to the current user's home directory.
-Path entries use the same syntax as the macOS sandbox runtime: absolute paths,
-relative paths, and gitignore-style
+Path entries accept absolute paths, relative paths, and gitignore-style
 .Sq * ,
 .Sq ** ,
 .Sq ? ,
-and character-class globs.
-Concrete (non-glob) paths are resolved when the sandbox is created.
-On Linux,
-.Va denyWrite
-glob patterns are evaluated dynamically by the seccomp broker at each write
-attempt, so files created after sandbox startup are also blocked.
-On macOS, glob patterns are snapshot-expanded when the Seatbelt profile is
-compiled and do not protect future matching files; a warning is logged.
+and character-class globs. Concrete paths are resolved when the sandbox is
+created. Concrete deny paths are enforced on all platforms.
 .Pp
-Write access is denied by default. The
+Write access is denied by default.
 .Va allowWrite
-paths are granted. The
+paths grant access, while
 .Va denyWrite
-paths are subtracted: on Linux, the seccomp broker checks each write
-against both concrete deny paths and glob patterns dynamically; on macOS,
-denied subtrees are carved out of the allowed roots at sandbox creation time.
-Non-glob deny paths are canonicalized and enforced on all platforms.
+paths subtract from them. On Linux, the seccomp broker evaluates concrete and
+glob deny rules on each write, including writes to files created after startup.
+On macOS, glob rules are snapshot-expanded when the Seatbelt profile is compiled
+and do not protect future matching files; a warning is logged.
 .Pp
 Read access remains unrestricted when
 .Va denyRead
@@ -131,11 +121,10 @@ and subtracting denied paths. Entries in
 .Va allowRead
 are then added back to the read allowlist.
 .Pp
-For TCP port rules,
+On Linux,
 .Nm
 uses Landlock TCP port rules and a seccomp user-notification broker for
-address-level decisions. When the sandbox is applied, direct TCP connections are
-denied by default.
+address-level decisions. Direct TCP connections are denied by default.
 .Pp
 .Va httpProxyPort
 and
@@ -242,27 +231,24 @@ uses Seatbelt path rules.
 On Windows,
 .Nm
 uses a Less-Privileged AppContainer. The backend creates or reuses a
-deterministic AppContainer profile and grants that AppContainer SID access to
-the lowered read and write roots with Windows ACL entries. Because LPAC has no
-broad filesystem read capability, Windows policies must use explicit read
-allowlists; unrestricted read policy is rejected. The profile and the ACL grants
-are released when
+deterministic profile and grants its SID access to the lowered read and write
+roots through Windows ACL entries. Because LPAC has no broad filesystem read
+capability, Windows policies must use explicit read allowlists; unrestricted
+reads are rejected. The profile and ACL grants are released when
 .Nm
-exits, so the container keeps no access to the policy roots once the tool is
-done; they can outlive a
+exits. The grants may remain if
 .Nm
-that is killed outright.
+is killed outright.
 .Sh OUTPUT
 .Nm
-reports failure and completed-denial events as JSON objects on standard error,
-one object per line. Pending Linux query events go only to
+reports failures and completed denials as one JSON object per line on standard
+error. Pending Linux query events go only to
 .Fl -trap-fd Ar fd . Each object has a fixed
 .Va kind
-discriminant and a stable
-.Va code
-naming the stage that failed, not the operating system that reported it: the
-same code is raised by every backend that has that stage, and the platform
-detail rides along in the record. The trap kinds are:
+discriminant and stable
+.Va code .
+Codes identify the failed stage rather than the reporting operating system; the
+record carries platform-specific details. The trap kinds are:
 .Bl -tag -width Ds
 .It Va filesystem
 A filesystem access denial, with
@@ -339,11 +325,10 @@ accompanies
 .Va SANDBOX_SETUP_FAILED .
 .El
 .Pp
-Failure traps are accompanied by a human-readable log line; the JSON is what
-machines should read. Logs and sandboxed command output are not part of the trap
-response. Normal successful command execution does not print a trap because
-standard error belongs to landstrip and standard output belongs to the sandboxed
-command.
+Failure traps include a human-readable log line; machines should read the JSON.
+Logs and sandboxed command output are not part of the trap event. Successful
+commands produce no trap: standard error belongs to Landstrip and standard
+output to the sandboxed command.
 .Pp
 When
 .Fl -trap-fd Ar fd
