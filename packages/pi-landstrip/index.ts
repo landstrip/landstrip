@@ -1839,7 +1839,10 @@ export function createLandstripIntegration(
         let landstripArgs: string[];
         try {
           policy = writePolicyFile(cwd, proxy?.port ?? null, allowances);
-          envFile = writeEnvFile({ ...process.env, ...env }, proxy?.port ?? null);
+          envFile = writeEnvFile(
+            { ...process.env, ...env, PWD: resolve(cwd) },
+            proxy?.port ?? null,
+          );
           const wrappedCommand = `source '${envFile.path}' && ${command}`;
           landstripArgs = ['--trap-fd', '3', '-p', policy.path, shell, ...args, wrappedCommand];
         } catch (error) {
