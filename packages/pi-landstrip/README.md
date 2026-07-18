@@ -1,5 +1,12 @@
 # pi-landstrip
 
+```
+Subagents  3 active
+├─ ● running  @explore  Design Pi entry parsing
+├─ ● running  @general  Design trigger serialization
+└─ ● running  @general  Design bounded summaries
+```
+
 `pi-landstrip` is a [Pi](https://pi.dev/) extension that provides sandboxed Bash
 execution, OpenCode-compatible primary agents, and sandbox-aware subagents. It
 uses an Anthropic-compatible policy and delegates OS-level enforcement to
