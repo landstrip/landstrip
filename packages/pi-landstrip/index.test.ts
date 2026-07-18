@@ -41,7 +41,7 @@ describe('main Pi tool composition', () => {
   });
 });
 
-it('registers separate sandbox and agents commands', async () => {
+it('registers the sandbox dashboard and separate agents command', async () => {
   const commandNames: string[] = [];
   const commandHandlers = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
   let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
@@ -81,14 +81,28 @@ it('registers separate sandbox and agents commands', async () => {
         providerOptions: {},
       },
     ],
+    [
+      'review',
+      {
+        name: 'review',
+        description: 'Review code',
+        mode: 'subagent' as const,
+        prompt: 'Review.',
+        model: 'anthropic/claude-test',
+        variant: 'turbo',
+        hidden: false,
+        permissions: [{ permission: 'read', pattern: '*', action: 'allow' as const }],
+        providerOptions: { temperature: 0.2 },
+      },
+    ],
   ]);
   let maxSubagents = 0;
   const runtime = {
     getAgentCatalog: () => ({
       agents,
-      permissions: [],
-      diagnostics: [],
-      warnings: [],
+      permissions: [{ permission: 'bash', pattern: '*', action: 'deny' as const }],
+      diagnostics: ['agent broken has an unknown field'],
+      warnings: ['legacy configuration is ignored'],
       maxSubagents: 0,
     }),
     getPrimaryAgent: () => agents.get(selected ?? 'build'),
@@ -102,41 +116,56 @@ it('registers separate sandbox and agents commands', async () => {
     },
   } as unknown as SubagentRuntime;
   createLandstripIntegration({ registerBashTool: false }).register(pi, runtime);
-  let sandboxMessage = '';
+  let customResult: unknown;
   const ctx = {
     cwd: join(tmpdir(), 'pi-landstrip-overlay-test'),
     hasUI: true,
     mode: 'tui',
     isProjectTrusted: () => false,
     ui: {
-      async confirm(_title: string, message: string) {
-        sandboxMessage = message;
-        return false;
-      },
       async custom(factory: (...args: unknown[]) => unknown) {
         component = factory(
           { requestRender() {} },
           { fg: (_color: string, value: string) => value },
           undefined,
-          () => {},
+          (value: unknown) => {
+            customResult = value;
+          },
         ) as typeof component;
       },
     },
   } as unknown as ExtensionContext;
 
   await commandHandlers.get('sandbox')?.('', ctx);
-  expect(sandboxMessage).toContain('Config files');
-  expect(sandboxMessage).toContain('Filesystem');
-  expect(sandboxMessage).toMatch(/(?:Enable|Disable) the sandbox\?/);
+  const sandboxView = component?.render(78).join('\n') ?? '';
+  expect(sandboxView).toContain('Sandbox');
+  expect(sandboxView).toContain('Config');
+  expect(sandboxView).toContain('Network');
+  expect(sandboxView).toContain('Filesystem');
+  expect(sandboxView).toMatch(/enter (?:enable|disable)  esc close/);
+  component?.handleInput('\r');
+  expect(customResult).toBe(true);
+  component?.handleInput('\x1b');
+  expect(customResult).toBe(false);
+
   await commandHandlers.get('agents')?.('', ctx);
   expect(commandNames).toEqual(['sandbox', 'agents']);
   expect(commandNames).not.toContain('landstrip');
   const agentsView = component?.render(78).join('\n') ?? '';
-  expect(agentsView).toContain('Agents │ Settings');
+  expect(agentsView).toContain('Agents │ Subagents │ Settings');
   expect(agentsView).toContain('build');
   component?.handleInput('\x1b[B');
   component?.handleInput('\r');
   expect(selected).toBe('plan');
+  component?.handleInput('\t');
+  const subagentsView = component?.render(78).join('\n') ?? '';
+  expect(subagentsView).toContain('@review');
+  expect(subagentsView).toContain('anthropic/claude-test');
+  expect(subagentsView).toContain('bash:*');
+  expect(subagentsView).toContain('read:*');
+  expect(subagentsView).toContain('temperature, variant=turbo');
+  expect(subagentsView).toContain('agent broken has an unknown field');
+  expect(subagentsView).toContain('legacy configuration is ignored');
   component?.handleInput('\t');
   expect(component?.render(78).join('\n')).toContain('Global');
   expect(component?.render(78).join('\n')).toContain('Project (project not trusted)');

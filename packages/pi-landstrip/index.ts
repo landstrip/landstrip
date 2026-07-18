@@ -60,7 +60,7 @@ import {
   registerSubagentWorker,
   workerConfigFromEnvironment,
 } from './subagents.ts';
-import { availablePrimaryAgents } from './agents.ts';
+import { availablePrimaryAgents, availableSubagents } from './agents.ts';
 import { loadLandstripConfig, MAX_SUBAGENTS, setMaxSubagentsConfigForScope } from './config.ts';
 
 interface SandboxFilesystemConfig {
@@ -2366,41 +2366,116 @@ export function createLandstripIntegration(
         if (!ctx.hasUI) return;
         const config = loadConfig(ctx.cwd);
         const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
-        const status = noSandboxFlag
-          ? 'disabled by --no-sandbox'
-          : config.enabled && sandboxEnabled && sandboxReady
-            ? 'active'
-            : config.enabled
-              ? 'inactive'
-              : 'disabled by config';
-        const list = (values: string[]): string => values.join(', ') || 'none';
-        const summary = [
-          `Status: ${status}`,
-          `landstrip package binary: ${landstripDisplayPath()}`,
-          '',
-          'Config files',
-          `${projectPath} ${existsSync(projectPath) ? '(found)' : '(missing)'}`,
-          `${globalPath} ${existsSync(globalPath) ? '(found)' : '(missing)'}`,
-          '',
-          `Network: ${config.network.allowNetwork ? 'unrestricted' : 'proxied'}`,
-          `allow network: ${config.network.allowNetwork ? 'yes' : 'no'}`,
-          `allowed: ${list(config.network.allowedDomains)}`,
-          `denied: ${list(config.network.deniedDomains)}`,
-          `unix sockets: ${config.network.allowAllUnixSockets ? 'all' : list(config.network.allowUnixSockets)}`,
-          '',
-          'Filesystem',
-          `deny read: ${list(config.filesystem.denyRead)}`,
-          `allow read: ${list(config.filesystem.allowRead)}`,
-          `allow write: ${list(config.filesystem.allowWrite)}`,
-          `deny write: ${list(config.filesystem.denyWrite)}`,
-        ].join('\n');
-        const enabled = !config.enabled;
-        const confirmed = await ctx.ui.confirm(
-          'Sandbox',
-          `${summary}\n\n${enabled ? 'Enable' : 'Disable'} the sandbox?`,
-        );
-        if (!confirmed) return;
+        const shouldToggle = await ctx.ui.custom<boolean>(
+          (_tui, theme, _kb, done) => {
+            const dim = (value: string) => theme.fg('dim', value);
+            const muted = (value: string) => theme.fg('muted', value);
+            const accent = (value: string) => theme.fg('accent', value);
+            const text = (value: string) => theme.fg('text', value);
 
+            function sandboxStatus(): { color: 'success' | 'warning'; label: string } {
+              if (noSandboxFlag) return { color: 'warning', label: 'Disabled (--no-sandbox)' };
+              if (!config.enabled) return { color: 'warning', label: 'Disabled' };
+              if (!sandboxEnabled || !sandboxReady) return { color: 'warning', label: 'Inactive' };
+              return { color: 'success', label: 'Active' };
+            }
+
+            function boolValue(value: boolean): string {
+              return value ? theme.fg('warning', 'yes') : theme.fg('success', 'no');
+            }
+
+            return {
+              render(width: number): string[] {
+                const innerWidth = Math.max(1, width - 4);
+                const row = (content = '') => boxRow(theme, width, content);
+                const lines = [boxTop(theme, width, 'Sandbox')];
+                const status = sandboxStatus();
+                const statusDot = theme.fg(status.color, '●');
+                const pathSnippet = text(
+                  truncateToWidth(landstripDisplayPath(), Math.max(20, innerWidth - 28)),
+                );
+                const section = (title: string, detail?: string): void => {
+                  lines.push(row(''));
+                  lines.push(row(`${accent(title)}${detail ? dim(` · ${detail}`) : ''}`));
+                };
+                const item = (label: string, value: string): void => {
+                  lines.push(row(`  ${dim('•')} ${muted(label.padEnd(13))} ${value}`));
+                };
+                const listValue = (values: string[]): string => {
+                  const value = values.join(', ') || 'none';
+                  return text(truncateToWidth(value, Math.max(10, innerWidth - 17)));
+                };
+
+                lines.push(
+                  row(
+                    `${statusDot} ${text(status.label)} ${dim('·')} ${muted('landstrip')} ${pathSnippet}`,
+                  ),
+                );
+
+                section('Config');
+                item('project', text(projectPath));
+                item('global', text(globalPath));
+
+                const networkMode = config.network.allowNetwork ? 'unrestricted' : 'proxied';
+                section('Network', networkMode);
+                item('allow network', boolValue(config.network.allowNetwork));
+                item('allowed', listValue(config.network.allowedDomains));
+                item('denied', listValue(config.network.deniedDomains));
+                item(
+                  'unix sockets',
+                  config.network.allowAllUnixSockets
+                    ? text('all')
+                    : listValue(config.network.allowUnixSockets),
+                );
+                if (sessionAllowedDomains.length > 0) {
+                  item('session', theme.fg('accent', sessionAllowedDomains.join(', ')));
+                }
+
+                section('Filesystem');
+                item('deny read', listValue(config.filesystem.denyRead));
+                item('allow read', listValue(config.filesystem.allowRead));
+                item('allow write', listValue(config.filesystem.allowWrite));
+                item('deny write', listValue(config.filesystem.denyWrite));
+
+                if (sessionAllowedReadPaths.length > 0 || sessionAllowedWritePaths.length > 0) {
+                  section('Session grants');
+                  if (sessionAllowedReadPaths.length > 0) {
+                    item('read', theme.fg('accent', sessionAllowedReadPaths.join(', ')));
+                  }
+                  if (sessionAllowedWritePaths.length > 0) {
+                    item('write', theme.fg('accent', sessionAllowedWritePaths.join(', ')));
+                  }
+                }
+
+                lines.push(
+                  row(''),
+                  row(
+                    `${dim('enter')} ${muted(config.enabled ? 'disable' : 'enable')}  ${dim('esc')} ${muted('close')}`,
+                  ),
+                  boxBottom(theme, width),
+                );
+                return lines;
+              },
+
+              handleInput(data: string): void {
+                if (matchesKey(data, 'return')) {
+                  done(true);
+                  return;
+                }
+                if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done(false);
+              },
+
+              invalidate(): void {},
+            };
+          },
+          {
+            overlay: true,
+            overlayOptions: { anchor: 'center', width: 78, margin: 2 },
+          },
+        );
+        if (!shouldToggle) return;
+
+        const enabled = !config.enabled;
         try {
           const scope = await setSandboxConfigEnabled(ctx.cwd, enabled, projectConfigTrusted);
           if (!enabled) {
@@ -2425,7 +2500,7 @@ export function createLandstripIntegration(
         if (!ctx.hasUI) return;
         await ctx.ui.custom(
           (tui, theme, _kb, done) => {
-            let tab: 'agents' | 'settings' = 'agents';
+            let tab: 'agents' | 'subagents' | 'settings' = 'agents';
             const initialAgents = runtime
               ? availablePrimaryAgents(runtime.getAgentCatalog(ctx))
               : [];
@@ -2433,12 +2508,22 @@ export function createLandstripIntegration(
               0,
               initialAgents.findIndex((agent) => agent.name === runtime?.getPrimaryAgent()?.name),
             );
+            let selectedSubagent = 0;
             let selectedSetting = 0;
             let values = [
               loadLandstripConfig(ctx.cwd, false).maxSubagents,
               loadLandstripConfig(ctx.cwd, projectConfigTrusted).maxSubagents,
             ];
             let editing = false;
+            const supportedVariants = new Set([
+              'off',
+              'minimal',
+              'low',
+              'medium',
+              'high',
+              'xhigh',
+              'max',
+            ]);
             const dim = (value: string) => theme.fg('dim', value);
             const muted = (value: string) => theme.fg('muted', value);
             const accent = (value: string) => theme.fg('accent', value);
@@ -2450,7 +2535,7 @@ export function createLandstripIntegration(
                 const lines = [boxTop(theme, width, 'Agents')];
                 lines.push(
                   row(
-                    ` ${tab === 'agents' ? accent('Agents') : muted('Agents')} ${dim('│')} ${tab === 'settings' ? accent('Settings') : muted('Settings')}`,
+                    ` ${tab === 'agents' ? accent('Agents') : muted('Agents')} ${dim('│')} ${tab === 'subagents' ? accent('Subagents') : muted('Subagents')} ${dim('│')} ${tab === 'settings' ? accent('Settings') : muted('Settings')}`,
                   ),
                   row(''),
                 );
@@ -2466,8 +2551,73 @@ export function createLandstripIntegration(
                     const cursor = selected ? accent('›') : ' ';
                     const active = agent.name === activeAgent ? theme.fg('success', '●') : dim('○');
                     const name = selected ? accent(agent.name) : text(agent.name);
+                    const model = dim(`  ${agent.model ?? 'current model'}`);
                     const description = agent.description ? dim(`  ${agent.description}`) : '';
-                    lines.push(row(`${cursor} ${active} ${name}${description}`));
+                    lines.push(row(`${cursor} ${active} ${name}${model}${description}`));
+                  }
+                } else if (tab === 'subagents') {
+                  const catalog = runtime?.getAgentCatalog(ctx);
+                  const agents = catalog ? availableSubagents(catalog) : [];
+                  selectedSubagent = Math.min(selectedSubagent, Math.max(0, agents.length - 1));
+                  if (agents.length === 0) lines.push(row(muted('No subagents configured')));
+                  const start = Math.max(0, Math.min(selectedSubagent - 3, agents.length - 7));
+                  for (const [offset, agent] of agents.slice(start, start + 7).entries()) {
+                    const index = start + offset;
+                    const selected = index === selectedSubagent;
+                    const cursor = selected ? accent('›') : ' ';
+                    const name = selected ? accent(`@${agent.name}`) : text(`@${agent.name}`);
+                    const flags = [agent.model ?? 'current model', agent.mode];
+                    if (agent.hidden) flags.push('hidden');
+                    lines.push(row(`${cursor} ${name} ${dim(flags.join(' · '))}`));
+                  }
+
+                  const agent = agents[selectedSubagent];
+                  if (agent) {
+                    lines.push(row(''));
+                    const details = [
+                      `model ${agent.model ?? 'current model'}`,
+                      agent.variant ? `variant ${agent.variant}` : undefined,
+                      agent.steps ? `${agent.steps} steps` : undefined,
+                    ].filter(Boolean);
+                    lines.push(row(`  ${text(details.join(' · '))}`));
+                    const permissions = [...(catalog?.permissions ?? []), ...agent.permissions];
+                    lines.push(row(`  ${dim('Permissions')}`));
+                    if (permissions.length === 0) lines.push(row(`    ${muted('default: ask')}`));
+                    for (const rule of permissions.slice(0, 4)) {
+                      lines.push(
+                        row(
+                          `    ${text(`${rule.permission}:${rule.pattern}`)} ${dim('→')} ${theme.fg(
+                            rule.action === 'deny'
+                              ? 'error'
+                              : rule.action === 'allow'
+                                ? 'success'
+                                : 'warning',
+                            rule.action,
+                          )}`,
+                        ),
+                      );
+                    }
+                    if (permissions.length > 4) {
+                      lines.push(row(`    ${muted(`… ${permissions.length - 4} more`)}`));
+                    }
+                    const unsupported = Object.keys(agent.providerOptions);
+                    if (agent.variant && !supportedVariants.has(agent.variant)) {
+                      unsupported.push(`variant=${agent.variant}`);
+                    }
+                    const unsupportedText =
+                      unsupported.length > 0 ? unsupported.join(', ') : 'none';
+                    lines.push(
+                      row(`  ${dim('Unsupported RPC options:')} ${text(unsupportedText)}`),
+                    );
+                  }
+                  if ((catalog?.diagnostics.length ?? 0) > 0) {
+                    lines.push(row(`  ${theme.fg('error', 'Catalog diagnostics')}`));
+                    for (const diagnostic of catalog?.diagnostics.slice(0, 3) ?? []) {
+                      lines.push(row(`    ${theme.fg('error', diagnostic)}`));
+                    }
+                  }
+                  for (const warning of catalog?.warnings.slice(0, 2) ?? []) {
+                    lines.push(row(`  ${theme.fg('warning', warning)}`));
                   }
                 } else {
                   const scopes = ['Global', 'Project'] as const;
@@ -2492,8 +2642,10 @@ export function createLandstripIntegration(
                   row(''),
                   row(
                     tab === 'agents'
-                      ? `${dim('↑↓')} ${muted('select')}  ${dim('enter')} ${muted('activate')}  ${dim('tab')} ${muted('settings')}  ${dim('esc')} ${muted('close')}`
-                      : `${dim('↑↓')} ${muted('scope')}  ${dim('0-9/+/-')} ${muted('change')}  ${dim('enter')} ${muted('save')}  ${dim('tab')} ${muted('agents')}  ${dim('esc')} ${muted('close')}`,
+                      ? `${dim('↑↓')} ${muted('select')}  ${dim('enter')} ${muted('activate')}  ${dim('tab')} ${muted('subagents')}  ${dim('esc')} ${muted('close')}`
+                      : tab === 'subagents'
+                        ? `${dim('↑↓')} ${muted('inspect')}  ${dim('tab')} ${muted('settings')}  ${dim('esc')} ${muted('close')}`
+                        : `${dim('↑↓')} ${muted('scope')}  ${dim('0-9/+/-')} ${muted('change')}  ${dim('enter')} ${muted('save')}  ${dim('tab')} ${muted('agents')}  ${dim('esc')} ${muted('close')}`,
                   ),
                   boxBottom(theme, width),
                 );
@@ -2510,7 +2662,10 @@ export function createLandstripIntegration(
                   matchesKey(data, 'left') ||
                   matchesKey(data, 'right')
                 ) {
-                  tab = tab === 'agents' ? 'settings' : 'agents';
+                  const tabs = ['agents', 'subagents', 'settings'] as const;
+                  const current = tabs.indexOf(tab);
+                  const offset = matchesKey(data, 'left') ? -1 : 1;
+                  tab = tabs[(current + offset + tabs.length) % tabs.length] ?? 'agents';
                   editing = false;
                   tui.requestRender();
                   return;
@@ -2524,6 +2679,20 @@ export function createLandstripIntegration(
                   } else if (matchesKey(data, 'return')) {
                     const agent = agents[selectedAgent];
                     if (agent) runtime?.selectPrimaryAgent(agent.name, ctx);
+                  } else return;
+                  tui.requestRender();
+                  return;
+                }
+                if (tab === 'subagents') {
+                  const catalog = runtime?.getAgentCatalog(ctx);
+                  const agents = catalog ? availableSubagents(catalog) : [];
+                  if (matchesKey(data, 'up')) {
+                    selectedSubagent = Math.max(0, selectedSubagent - 1);
+                  } else if (matchesKey(data, 'down')) {
+                    selectedSubagent = Math.min(
+                      Math.max(0, agents.length - 1),
+                      selectedSubagent + 1,
+                    );
                   } else return;
                   tui.requestRender();
                   return;

@@ -85,8 +85,10 @@ normal Pi worker and are not persisted into `sandbox.json`. The worker receives
 write access only to its own session and temporary directories.
 
 Use `/sandbox` inside Pi to inspect the active policy and toggle sandboxing. Use
-`/agents` to select the primary role; its Settings tab controls the global and
-trusted-project maximum number of concurrent subagents.
+`/agents` to select the primary role. Its Subagents tab shows configured workers,
+models, effective permissions, unsupported RPC options, and catalog diagnostics;
+its Settings tab controls the global and trusted-project maximum number of
+concurrent subagents.
 
 ## Primary agents
 
