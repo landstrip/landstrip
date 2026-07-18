@@ -1,6 +1,6 @@
 {
   "name": "pi-landstrip",
-  "version": "0.17.23",
+  "version": "0.17.24",
   "description": "Sandbox-aware Pi subagents and interactive command permissions",
   "keywords": [
     "landstrip",
@@ -46,7 +46,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-tui": "^0.80.6",
-    "@landstrip/landstrip": "^0.17.23",
+    "@landstrip/landstrip": "^0.17.24",
     "minimatch": "^10.2.5"
   },
   "devDependencies": {
