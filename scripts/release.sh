@@ -35,6 +35,7 @@ release_files=(
 	Cargo.toml
 	Cargo.lock
 	package.json
+	package-lock.json
 	npm/darwin-arm64/package.json
 	npm/darwin-x64/package.json
 	npm/linux-x64/package.json
@@ -47,16 +48,22 @@ for package_dir in "${extension_dirs[@]}"; do
 	release_files+=("$package_dir/package.json" "$package_dir/package-lock.json")
 done
 committed=0
+signing_check_tag=""
 
 cleanup() {
 	local status=$?
 
+	if [[ -n "$signing_check_tag" ]] \
+		&& git rev-parse --verify --quiet "refs/tags/$signing_check_tag" >/dev/null; then
+		git tag -d "$signing_check_tag" >/dev/null 2>&1 || true
+	fi
 	if (( status != 0 && !committed )); then
 		git restore --staged -- "${release_files[@]}" 2>/dev/null || true
 		git restore -- "${release_files[@]}" 2>/dev/null || true
 	fi
 	return "$status"
 }
+
 trap cleanup EXIT
 
 next_ver="${1:-}"
@@ -72,6 +79,14 @@ branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" \
 	|| die "working directory is not clean"
 [[ -z "$(git tag -l "$next_ver")" ]] \
 	|| die "tag $next_ver already exists"
+
+signing_check_tag="landstrip-signing-check-$next_ver-$$"
+[[ -z "$(git tag -l "$signing_check_tag")" ]] \
+	|| die "temporary signing-check tag already exists: $signing_check_tag"
+git tag -s "$signing_check_tag" -m "landstrip release signing check" \
+	|| die "cannot sign release tags; renew or configure the Git signing key"
+git tag -d "$signing_check_tag" >/dev/null
+signing_check_tag=""
 
 core_ver="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' Cargo.toml | head -1)"
 [[ -n "$core_ver" ]] || die "cannot find version in Cargo.toml"
@@ -94,10 +109,10 @@ done
 core_log="$(git log --first-parent --format='- %s (%an)' --no-merges "$core_ver"..HEAD -- "${core_log_args[@]}")"
 [[ -n "$core_log" ]] || core_log='- No source changes.'
 
-node - "$next_ver" <<'NODE'
+node - "$next_ver" "${extension_dirs[@]}" <<'NODE'
 const fs = require('node:fs');
 
-const [nextVersion] = process.argv.slice(2);
+const [nextVersion, ...packageDirs] = process.argv.slice(2);
 const corePackagePaths = [
   'package.json',
   'npm/darwin-arm64/package.json',
@@ -149,19 +164,15 @@ function updateExtensionLock(lock) {
   }
 }
 
-const { workspaces } = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-if (!Array.isArray(workspaces)) {
-  throw new Error('package.json workspaces must be an array');
+const rootLockPath = 'package-lock.json';
+const rootLock = JSON.parse(fs.readFileSync(rootLockPath, 'utf8'));
+rootLock.version = nextVersion;
+rootLock.packages[''].version = nextVersion;
+for (const packageName of platformDependencies) {
+  rootLock.packages[''].optionalDependencies[packageName] = nextVersion;
+  updateLockedPackage(rootLock, packageName);
 }
-const packageDirs = workspaces.flatMap((workspace) => {
-  if (!workspace.endsWith('/*')) {
-    throw new Error(`unsupported workspace pattern: ${workspace}`);
-  }
-  const parent = workspace.slice(0, -2);
-  return fs.readdirSync(parent, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && fs.existsSync(`${parent}/${entry.name}/package.json`))
-    .map((entry) => `${parent}/${entry.name}`);
-});
+fs.writeFileSync(rootLockPath, `${JSON.stringify(rootLock, null, 2)}\n`);
 
 for (const packageDir of packageDirs) {
   const packagePath = `${packageDir}/package.json`;
@@ -197,16 +208,17 @@ grep -Fxq ".Dd $date" man/man1/landstrip.1 \
 npm run ci:extensions:local
 
 cargo fmt --all --check
+cargo build --locked
+cargo test --all --locked
 cargo clippy --all-targets --locked -- -D warnings
-cargo test --all
 
 git add -- "${release_files[@]}"
 git commit -s -m "Bump the version to $next_ver"
 committed=1
 
 sob="Signed-off-by: $(git config user.name) <$(git config user.email)>"
-tag_message=".git/landstrip-$next_ver-tag-message.txt"
-cat >"$tag_message" <<EOF
+release_notes="$(git rev-parse --git-path "landstrip-$next_ver-tag-message.txt")"
+cat >"$release_notes" <<EOF
 Landstrip $next_ver
 
 landstrip:
@@ -219,11 +231,12 @@ for package_dir in "${extension_dirs[@]}"; do
 	[[ -n "$package_log" ]] || package_log="- Merged $package_name into this repository."
 	{
 		printf '\n%s:\n%s\n' "$package_name" "$package_log"
-	} >>"$tag_message"
+	} >>"$release_notes"
 done
 
-printf '\n%s\n' "$sob" >>"$tag_message"
+printf '\n%s\n' "$sob" >>"$release_notes"
 
-git tag -s "$next_ver" -F "$tag_message"
+git tag -s "$next_ver" -F "$release_notes"
 
-echo "tagged $next_ver"
+printf 'tagged %s\n' "$next_ver"
+printf 'push the commit and tag, wait for CI, then run make publish\n'

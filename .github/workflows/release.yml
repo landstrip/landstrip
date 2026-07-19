@@ -1,0 +1,262 @@
+name: Build release assets
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  metadata:
+    name: Validate metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Resolve release tag
+        id: version
+        run: |
+          node <<'NODE'
+          const { execFileSync } = require('node:child_process');
+          const fs = require('node:fs');
+
+          const tags = execFileSync('git', ['tag', '--list', '--sort=-v:refname'], {
+            encoding: 'utf8',
+          }).trim().split('\n').filter((tag) => /^\d+\.\d+\.\d+$/.test(tag));
+          const tag = process.env.GITHUB_REF_TYPE === 'tag'
+            ? process.env.GITHUB_REF_NAME
+            : tags[0];
+          if (!tag || !/^\d+\.\d+\.\d+$/.test(tag)) {
+            throw new Error('no exact non-v semantic release tag found');
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `tag=${tag}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${tag}\n`);
+          console.log(`release tag: ${tag}`);
+          NODE
+
+      - name: Validate package metadata
+        run: |
+          node <<'NODE'
+          const { execFileSync } = require('node:child_process');
+
+          const tag = process.env.TAG_REF;
+
+          function readTagFile(file) {
+            return execFileSync('git', ['show', `${tag}:${file}`], {
+              encoding: 'utf8',
+              stdio: ['ignore', 'pipe', 'inherit'],
+            });
+          }
+
+          function globToRegExp(pattern) {
+            let source = '^';
+            for (let index = 0; index < pattern.length; index += 1) {
+              const character = pattern[index];
+              if (character === '*' && pattern[index + 1] === '*') {
+                source += '.*';
+                index += 1;
+              } else if (character === '*') {
+                source += '[^/]*';
+              } else if (character === '?') {
+                source += '[^/]';
+              } else {
+                source += character.replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+              }
+            }
+            return new RegExp(`${source}$`);
+          }
+
+          function extensionPackageFiles(root) {
+            const workspaces = Array.isArray(root.workspaces)
+              ? root.workspaces
+              : root.workspaces?.packages;
+            if (!Array.isArray(workspaces)) {
+              throw new Error('package.json workspaces must be an array or contain packages');
+            }
+
+            const patterns = workspaces.map((pattern) => pattern.replace(/^\.\//, '').replace(/\/$/, ''));
+            const positive = patterns.filter((pattern) => !pattern.startsWith('!')).map(globToRegExp);
+            const negative = patterns.filter((pattern) => pattern.startsWith('!'))
+              .map((pattern) => globToRegExp(pattern.slice(1)));
+            const files = execFileSync('git', ['ls-tree', '-r', '--name-only', tag], {
+              encoding: 'utf8',
+            }).split('\n').filter((file) => file.endsWith('/package.json'));
+
+            return files.filter((file) => {
+              const packageDir = file.slice(0, -'/package.json'.length);
+              return positive.some((pattern) => pattern.test(packageDir))
+                && !negative.some((pattern) => pattern.test(packageDir));
+            }).sort();
+          }
+
+          const packageDirs = [
+            'npm/darwin-arm64',
+            'npm/darwin-x64',
+            'npm/linux-arm64',
+            'npm/linux-x64',
+            'npm/win32-arm64',
+            'npm/win32-x64',
+          ];
+          const root = JSON.parse(readTagFile('package.json'));
+          const cargoToml = readTagFile('Cargo.toml');
+          const cargoVersion = cargoToml.match(/^\s*version\s*=\s*"([^"]+)"/m)?.[1];
+
+          if (!cargoVersion) {
+            throw new Error('cannot find Cargo.toml package version');
+          }
+          if (root.version !== cargoVersion) {
+            throw new Error(`package.json version ${root.version} does not match Cargo.toml ${cargoVersion}`);
+          }
+          if (root.version !== process.env.TAG_VERSION) {
+            throw new Error(`package.json version ${root.version} does not match release tag ${process.env.TAG_VERSION}`);
+          }
+
+          for (const packageDir of packageDirs) {
+            const data = JSON.parse(readTagFile(`${packageDir}/package.json`));
+            if (data.version !== root.version) {
+              throw new Error(`${packageDir}/package.json version ${data.version} does not match ${root.version}`);
+            }
+            if (root.optionalDependencies?.[data.name] !== root.version) {
+              throw new Error(`package.json optional dependency ${data.name} does not match ${root.version}`);
+            }
+          }
+
+          const extensionFiles = extensionPackageFiles(root);
+          if (extensionFiles.length === 0) {
+            throw new Error('no extension workspace packages found');
+          }
+          for (const packageFile of extensionFiles) {
+            const data = JSON.parse(readTagFile(packageFile));
+            if (data.version !== root.version) {
+              throw new Error(`${packageFile} version ${data.version} does not match ${root.version}`);
+            }
+            if (data.dependencies?.['@landstrip/landstrip'] !== `^${root.version}`) {
+              throw new Error(`${packageFile} must depend on the synchronized landstrip version`);
+            }
+          }
+          NODE
+        env:
+          TAG_REF: ${{ steps.version.outputs.tag }}
+          TAG_VERSION: ${{ steps.version.outputs.version }}
+
+  build:
+    name: Build ${{ matrix.package }}
+    needs: metadata
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            package_dir: npm/darwin-arm64
+            binary: landstrip
+            smoke: true
+          - package: darwin-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            package_dir: npm/darwin-x64
+            binary: landstrip
+            rustflags: ''
+            smoke: true
+          - package: linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            package_dir: npm/linux-x64
+            binary: landstrip
+            rustflags: ''
+            smoke: true
+          - package: linux-arm64
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            package_dir: npm/linux-arm64
+            binary: landstrip
+            rustflags: ''
+            smoke: false
+          - package: win32-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            package_dir: npm/win32-x64
+            binary: landstrip.exe
+            rustflags: '-C target-feature=+crt-static'
+            smoke: true
+          - package: win32-arm64
+            runner: windows-2025
+            target: aarch64-pc-windows-msvc
+            package_dir: npm/win32-arm64
+            binary: landstrip.exe
+            rustflags: '-C target-feature=+crt-static'
+            smoke: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: 1.85.1
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Configure ARM64 musl linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc >> "$GITHUB_ENV"
+
+      - name: Build binary
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${{ matrix.package_dir }}/bin"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+            "${{ matrix.package_dir }}/bin/${{ matrix.binary }}"
+          if [[ "${{ matrix.binary }}" != *.exe ]]; then
+            chmod 755 "${{ matrix.package_dir }}/bin/${{ matrix.binary }}"
+          fi
+          mkdir -p artifacts
+          tar -C "${{ matrix.package_dir }}/bin" -czf \
+            "artifacts/${{ matrix.package }}.tar.gz" "${{ matrix.binary }}"
+
+      - name: Smoke test staged binary
+        if: matrix.smoke
+        shell: bash
+        run: "${{ matrix.package_dir }}/bin/${{ matrix.binary }} --version"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: artifacts/${{ matrix.package }}.tar.gz
+          if-no-files-found: error

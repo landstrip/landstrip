@@ -5,10 +5,13 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 MANDIR ?= $(PREFIX)/share/man
 CARGO ?= cargo
+GH ?= gh
+NODE ?= node
+NPM ?= npm
 INSTALL ?= install
 RM ?= rm -f
 
-.PHONY: all check test clippy install uninstall clean
+.PHONY: all check test clippy publish install uninstall clean
 
 all:
 	$(CARGO) build
@@ -16,13 +19,17 @@ all:
 check:
 	$(CARGO) build
 	$(CARGO) test
-	$(CARGO) clippy --all-targets --all-features
+	$(CARGO) clippy --all-targets
 
 test:
 	$(CARGO) test
 
 clippy:
-	$(CARGO) clippy --all-targets --all-features
+	$(CARGO) clippy --all-targets
+
+publish:
+	CARGO="$(CARGO)" GH="$(GH)" NODE="$(NODE)" NPM="$(NPM)" \
+		./scripts/publish.sh "$(VERSION)"
 
 install:
 	$(CARGO) build --release
