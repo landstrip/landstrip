@@ -64,8 +64,9 @@ jobs:
           mkdir -p npm/linux-arm64/bin
           cp target/aarch64-unknown-linux-musl/release/landstrip npm/linux-arm64/bin/landstrip
           chmod 755 npm/linux-arm64/bin/landstrip
-          npm install --workspaces=false --package-lock=false --ignore-scripts --no-save ./npm/linux-arm64
-          node bin/landstrip.js --version
+          smoke_dir="$RUNNER_TEMP/landstrip-smoke"
+          npm install --prefix "$smoke_dir" --package-lock=false --ignore-scripts --no-save "$GITHUB_WORKSPACE/npm/linux-arm64"
+          NODE_PATH="$smoke_dir/node_modules" node bin/landstrip.js --version
   extensions:
     name: Test extensions
     runs-on: ubuntu-latest
