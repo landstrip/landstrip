@@ -44,9 +44,7 @@ npm_package_exists() {
 	local package_name="$1"
 	local package_version
 
-	if package_version="$($NPM view "$package_name@$version" version --json 2>"$error_file")"; then
-		package_version="${package_version#\"}"
-		package_version="${package_version%\"}"
+	if package_version="$($NPM view "$package_name@$version" version 2>"$error_file")"; then
 		[[ "$package_version" == "$version" ]] \
 			|| die "npm returned version $package_version for $package_name@$version"
 		return 0
