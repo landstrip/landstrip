@@ -595,16 +595,16 @@ test('query-response: bash wrapping injects fd 3 and stays idempotent', linuxOnl
       network: { allowedDomains: ['*'], deniedDomains: [] },
     },
     async ({ hooks, tempDir }) => {
-      await withQueryServer(tempDir, async () => {
+      await withQueryServer(tempDir, async ({ port }) => {
         const input = { callID: 'query-a', tool: 'bash' };
         const output = { args: { command: 'git status --short', description: 'status' } };
         try {
           await hooks['tool.execute.before'](input, output);
           const wrapped = output.args.command;
 
-          // prepareBash starts its own in-process trap server and wraps against
-          // that port, so match any loopback /dev/tcp port rather than a fixed one.
-          assert.match(wrapped, /\/dev\/tcp\/127\.0\.0\.1\/\d+\b/);
+          // The server plugin must route query traps to the TUI's discovered
+          // endpoint so held filesystem operations can be approved interactively.
+          assert.match(wrapped, new RegExp(`/dev/tcp/127\\.0\\.0\\.1/${port}\\b`));
           assert.match(wrapped, /'--trap-fd' '3'/);
           assert.ok(wrapped.includes(' || '), 'has the plain fallback branch');
           // Two --trap-fd (native /dev/tcp + bash -c fallback), three -p (both

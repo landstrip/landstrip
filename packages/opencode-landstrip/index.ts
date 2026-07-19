@@ -27,6 +27,7 @@ import {
   permissionPatterns,
   permissionType,
   sandboxSummary,
+  readDiscoveryPort,
   sessionScopeFor,
 } from './shared.js';
 
@@ -1223,24 +1224,29 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
     const originalCommand = args.command as string;
 
-    // Start a local trap server so landstrip's query traps are answered
-    // in-process instead of relying on the TUI plugin's discovery port.
-    const trapServer = await startTrapServer(
-      effectiveConfig.filesystem.allowRead,
-      effectiveConfig.filesystem.allowWrite,
-      effectiveConfig.filesystem.denyRead,
-      effectiveConfig.filesystem.denyWrite,
-      directory,
-      sessionAllowedReadPaths,
-      sessionAllowedWritePaths,
-      sessionAllowedTargets,
-    );
+    // The TUI owns interactive query handling. Fall back to an in-process
+    // broker when no TUI endpoint is available (for example, in headless mode).
+    const tuiTrapPort = process.platform === 'linux' ? readDiscoveryPort(directory) : null;
+    const trapServer =
+      tuiTrapPort === null
+        ? await startTrapServer(
+            effectiveConfig.filesystem.allowRead,
+            effectiveConfig.filesystem.allowWrite,
+            effectiveConfig.filesystem.denyRead,
+            effectiveConfig.filesystem.denyWrite,
+            directory,
+            sessionAllowedReadPaths,
+            sessionAllowedWritePaths,
+            sessionAllowedTargets,
+          )
+        : null;
+    const trapPort = tuiTrapPort ?? trapServer?.port ?? null;
 
     const wrappedCommand = buildWrappedCommand(
       policy.path,
       configuredShell ?? process.env.SHELL ?? '/bin/sh',
       originalCommand,
-      trapServer.port,
+      trapPort,
     );
 
     activeBash.set(callID, {
@@ -1249,9 +1255,9 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       policyDir: policy.dir,
       port: proxyPort,
       stop: proxy ? proxy.stop : null,
-      trapServer: trapServer.server,
-      trapServerPort: trapServer.port,
-      trapLines: trapServer.trapLines,
+      trapServer: trapServer?.server ?? null,
+      trapServerPort: trapPort,
+      trapLines: trapServer?.trapLines ?? [],
     });
 
     args.command = wrappedCommand;
