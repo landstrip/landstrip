@@ -1,6 +1,6 @@
 {
   "name": "@landstrip/landstrip-linux-arm64",
-  "version": "0.17.27",
+  "version": "0.17.28",
   "description": "Linux arm64 binary for landstrip",
   "license": "Apache-2.0 AND LGPL-2.1-or-later",
   "homepage": "https://github.com/landstrip/landstrip#readme",
