@@ -4,8 +4,16 @@
 import type { Hooks, Plugin, PluginInput, PluginOptions } from '@opencode-ai/plugin';
 
 import { spawnSync } from 'node:child_process';
+import { lookup } from 'node:dns/promises';
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { type AddressInfo, connect as connectNet, createServer, type Socket } from 'node:net';
+import {
+  type AddressInfo,
+  BlockList,
+  connect as connectNet,
+  createServer,
+  isIP,
+  type Socket,
+} from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { URL } from 'node:url';
@@ -63,6 +71,33 @@ type ToastVariant = 'info' | 'success' | 'warning' | 'error';
 const LANDSTRIP_VERSION = [0, 17, 0] as const;
 const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
+
+const prohibitedProxyAddresses = new BlockList();
+
+for (const [network, prefix] of [
+  ['0.0.0.0', 8],
+  ['10.0.0.0', 8],
+  ['100.64.0.0', 10],
+  ['127.0.0.0', 8],
+  ['169.254.0.0', 16],
+  ['172.16.0.0', 12],
+  ['192.0.0.0', 24],
+  ['192.168.0.0', 16],
+  ['198.18.0.0', 15],
+  ['224.0.0.0', 4],
+  ['240.0.0.0', 4],
+] as const) {
+  prohibitedProxyAddresses.addSubnet(network, prefix, 'ipv4');
+}
+for (const [network, prefix] of [
+  ['::', 128],
+  ['::1', 128],
+  ['fc00::', 7],
+  ['fe80::', 10],
+  ['ff00::', 8],
+] as const) {
+  prohibitedProxyAddresses.addSubnet(network, prefix, 'ipv6');
+}
 
 function expandPath(filePath: string, baseDirectory: string): string {
   const expanded = filePath.replace(/^~(?=$|[/])/, homedir());
@@ -422,21 +457,26 @@ function hasMinimumVersion(version: string, minimum: readonly [number, number, n
   return true;
 }
 
+function parseProxyPort(value: string | undefined, defaultPort: number): number | null {
+  const rawPort = value ?? String(defaultPort);
+  if (!/^\d+$/.test(rawPort)) return null;
+
+  const port = Number(rawPort);
+  return port >= 1 && port <= 65535 ? port : null;
+}
+
 function splitHostPort(target: string, defaultPort: number): { host: string; port: number } | null {
-  const bracketMatch = target.match(/^\[([^\]]+)\](?::(\d+))?$/);
-  if (bracketMatch?.[1]) {
-    return {
-      host: bracketMatch[1],
-      port: bracketMatch[2] ? Number(bracketMatch[2]) : defaultPort,
-    };
+  const bracketMatch = target.match(/^\[([^\]]+)\](?::(.*))?$/);
+  const host = bracketMatch?.[1];
+  if (host) {
+    const port = parseProxyPort(bracketMatch?.[2], defaultPort);
+    return port === null ? null : { host, port };
   }
 
   const lastColon = target.lastIndexOf(':');
   if (lastColon > -1 && target.indexOf(':') === lastColon) {
-    return {
-      host: target.slice(0, lastColon),
-      port: Number(target.slice(lastColon + 1)),
-    };
+    const port = parseProxyPort(target.slice(lastColon + 1), defaultPort);
+    return port === null ? null : { host: target.slice(0, lastColon), port };
   }
 
   return { host: target, port: defaultPort };
@@ -445,6 +485,36 @@ function splitHostPort(target: string, defaultPort: number): { host: string; por
 function denyProxyRequest(client: Socket, status = '403 Forbidden'): void {
   client.write(`HTTP/1.1 ${status}\r\nContent-Length: 0\r\n\r\n`);
   client.end();
+}
+
+function isPublicProxyAddress(address: string, family = isIP(address)): boolean {
+  if (family === 4) return !prohibitedProxyAddresses.check(address, 'ipv4');
+  if (family === 6) return !prohibitedProxyAddresses.check(address, 'ipv6');
+  return false;
+}
+
+async function resolveProxyEndpoint(host: string): Promise<{ address: string; family: 4 | 6 }> {
+  const literalFamily = isIP(host);
+  if (literalFamily === 4 || literalFamily === 6) {
+    if (!isPublicProxyAddress(host, literalFamily)) {
+      throw new Error(`Proxy destination is not public: ${host}`);
+    }
+    return { address: host, family: literalFamily };
+  }
+
+  const addresses = await lookup(host, { all: true, verbatim: true });
+  if (
+    addresses.length === 0 ||
+    addresses.some(({ address, family }) => !isPublicProxyAddress(address, family))
+  ) {
+    throw new Error(`Proxy destination resolves to a non-public address: ${host}`);
+  }
+
+  const endpoint = addresses[0];
+  if (!endpoint || (endpoint.family !== 4 && endpoint.family !== 6)) {
+    throw new Error(`Proxy could not resolve destination: ${host}`);
+  }
+  return { address: endpoint.address, family: endpoint.family };
 }
 
 function pipeSockets(client: Socket, upstream: Socket, initialData?: Buffer): void {
@@ -494,7 +564,7 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
 
   async function handleConnect(client: Socket, target: string, rest: Buffer): Promise<void> {
     const endpoint = splitHostPort(target, 443);
-    if (!endpoint || !Number.isFinite(endpoint.port)) {
+    if (!endpoint) {
       denyProxyRequest(client, '400 Bad Request');
       return;
     }
@@ -504,12 +574,16 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
       return;
     }
 
+    const resolved = await resolveProxyEndpoint(endpoint.host);
     let connected = false;
-    const upstream = connectNet(endpoint.port, endpoint.host, () => {
-      connected = true;
-      client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      pipeSockets(client, upstream, rest);
-    });
+    const upstream = connectNet(
+      { host: resolved.address, port: endpoint.port, family: resolved.family },
+      () => {
+        connected = true;
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        pipeSockets(client, upstream, rest);
+      },
+    );
     upstream.on('error', () => {
       if (!connected) denyProxyRequest(client, '502 Bad Gateway');
     });
@@ -550,15 +624,21 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
       return;
     }
 
-    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+    const port = parseProxyPort(url.port || undefined, url.protocol === 'https:' ? 443 : 80);
+    if (port === null) {
+      denyProxyRequest(client, '400 Bad Request');
+      return;
+    }
+
     const path = `${url.pathname}${url.search}` || '/';
     lines[0] = `${method} ${path} ${version}`;
 
     const rewrittenHeader = lines
       .filter((line) => !line.toLowerCase().startsWith('proxy-connection:'))
       .join('\r\n');
+    const resolved = await resolveProxyEndpoint(url.hostname);
     let connected = false;
-    const upstream = connectNet(port, url.hostname, () => {
+    const upstream = connectNet({ host: resolved.address, port, family: resolved.family }, () => {
       connected = true;
       upstream.write(`${rewrittenHeader}\r\n\r\n`);
       pipeSockets(client, upstream, rest);

@@ -345,42 +345,57 @@ test('permission.ask can approve one bash domain for wrapping policy', async () 
   );
 });
 
-test('proxy answers 502 instead of crashing when upstream is unreachable', async () => {
-  await withPlugin(
-    {
-      enabled: true,
-      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
-      network: { allowNetwork: false, allowedDomains: ['*'], deniedDomains: [] },
-    },
-    async ({ hooks }) => {
-      const input = { callID: 'proxy-call', tool: 'bash' };
-      const args = { command: 'curl https://example.com' };
-      await hooks['tool.execute.before'](input, { args });
+test('proxy refuses private destinations without connecting', async () => {
+  let connections = 0;
+  const upstream = createServer(() => {
+    connections += 1;
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const address = upstream.address();
+  assert.ok(address && typeof address !== 'string');
 
-      const env = {};
-      await hooks['shell.env'](input, { env });
-      const port = Number(new URL(env.HTTP_PROXY).port);
+  try {
+    await withPlugin(
+      {
+        enabled: true,
+        filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+        network: { allowNetwork: false, allowedDomains: ['*'], deniedDomains: [] },
+      },
+      async ({ hooks }) => {
+        const input = { callID: 'proxy-call', tool: 'bash' };
+        const args = { command: 'curl https://example.com' };
+        await hooks['tool.execute.before'](input, { args });
 
-      try {
-        const response = await new Promise((resolveResponse, rejectResponse) => {
-          const socket = connect(port, '127.0.0.1', () => {
-            socket.write('CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n');
+        const env = {};
+        await hooks['shell.env'](input, { env });
+        const port = Number(new URL(env.HTTP_PROXY).port);
+
+        try {
+          const response = await new Promise((resolveResponse, rejectResponse) => {
+            const socket = connect(port, '127.0.0.1', () => {
+              socket.write(
+                `CONNECT 127.0.0.1:${address.port} HTTP/1.1\r\nHost: 127.0.0.1:${address.port}\r\n\r\n`,
+              );
+            });
+            let data = '';
+            socket.setEncoding('utf-8');
+            socket.on('data', (chunk) => {
+              data += chunk;
+            });
+            socket.on('close', () => resolveResponse(data));
+            socket.on('error', rejectResponse);
           });
-          let data = '';
-          socket.setEncoding('utf-8');
-          socket.on('data', (chunk) => {
-            data += chunk;
-          });
-          socket.on('close', () => resolveResponse(data));
-          socket.on('error', rejectResponse);
-        });
 
-        assert.match(response, /^HTTP\/1\.1 502 Bad Gateway/);
-      } finally {
-        await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
-      }
-    },
-  );
+          assert.match(response, /^HTTP\/1\.1 502 Bad Gateway/);
+          assert.equal(connections, 0);
+        } finally {
+          await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+        }
+      },
+    );
+  } finally {
+    await new Promise((resolve) => upstream.close(resolve));
+  }
 });
 
 test('deniedDomains override allowedDomains for bash permission', async () => {
