@@ -108,7 +108,7 @@ fn parse_cli_action(
     let mut tool_tail = tool_tail.into_iter();
     let tool = tool_tail
         .next()
-        .ok_or_else(|| tool_required_usage(PROGRAM_NAME))?;
+        .ok_or_else(|| tool_required_usage(&program_name))?;
 
     Ok(CliAction::Run(Cli {
         policy_paths: options.policy,

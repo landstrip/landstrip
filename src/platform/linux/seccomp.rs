@@ -1171,7 +1171,7 @@ fn handle_openat(
                 if query_enabled {
                     let qid = *next_query_id;
                     *next_query_id += 1;
-                    let grant = Grant::open(&resolved, flags, mode);
+                    let grant = OpenGrant::new(&resolved, flags, mode).map(Grant::Open);
                     return Ok(NotificationResult::query(
                         qid,
                         Trap::filesystem(
@@ -1212,7 +1212,7 @@ fn handle_openat(
             if query_enabled {
                 let qid = *next_query_id;
                 *next_query_id += 1;
-                let grant = Grant::open(&resolved, flags, mode);
+                let grant = OpenGrant::new(&resolved, flags, mode).map(Grant::Open);
                 return Ok(NotificationResult::query(
                     qid,
                     Trap::filesystem(
@@ -1250,7 +1250,7 @@ fn handle_openat(
     // Pure writes skip this: the brokered child still enforces Landlock write
     // rules, which catch a swapped write target.
     if wants_read {
-        if let Some(Grant::Open(grant)) = Grant::open(&resolved, flags, mode) {
+        if let Some(grant) = OpenGrant::new(&resolved, flags, mode) {
             return Ok(NotificationResult::Open(grant));
         }
     }
@@ -1569,20 +1569,6 @@ impl Grant {
         Grant::Socket(SocketGrant { sock, addr, call })
     }
 
-    fn open(resolved: &Path, flags: i32, mode: u32) -> Option<Grant> {
-        let kind = if let Some(handle) =
-            open_path(resolved, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        {
-            OpenKind::Reopen(handle)
-        } else {
-            OpenKind::Create {
-                anchor: Anchor::new(resolved)?,
-                mode,
-            }
-        };
-        Some(Grant::Open(OpenGrant { flags, kind }))
-    }
-
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn mutation(
         spec: &Syscall,
@@ -1593,14 +1579,7 @@ impl Grant {
         let args = &request.data.args;
 
         if spec.name == "creat" {
-            let Some((resolved, _)) = slots.first().and_then(Option::as_ref) else {
-                return Ok(None);
-            };
-            return Ok(Grant::open(
-                resolved,
-                libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
-                args[1] as u32,
-            ));
+            return Ok(creat_grant(slots, args[1] as u32));
         }
 
         let mut anchors = Vec::with_capacity(slots.len());
@@ -1697,13 +1676,25 @@ impl Grant {
     }
 }
 
+fn creat_grant(slots: &[Option<(PathBuf, PathBuf)>], mode: u32) -> Option<Grant> {
+    let (resolved, _) = slots.first()?.as_ref()?;
+    OpenGrant::new(
+        resolved,
+        libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
+        mode,
+    )
+    .map(Grant::Open)
+}
+
 fn read_child_target(pid: Pid, ptr: u64) -> SysResult<Option<CString>> {
     let addr = usize::try_from(ptr).map_err(|_| BrokerError::BadAddress)?;
     if addr == 0 {
         return Ok(None);
     }
     let buf = read_child_string(pid, addr, libc::PATH_MAX as usize)?;
-    Ok(CString::new(buf).ok())
+    CString::new(buf)
+        .map(Some)
+        .map_err(|_| BrokerError::InvalidAddress)
 }
 
 // Read utimensat's two timespecs from the child; a null pointer means "now".
@@ -1732,24 +1723,35 @@ fn read_child_times(pid: Pid, ptr: u64) -> SysResult<Option<[libc::timespec; 2]>
     Ok(Some(times))
 }
 
-// Read an extended-attribute value (capped) from the child.
+// Read an extended-attribute value from the child. Linux rejects values larger
+// than `XATTR_SIZE_MAX`, and the broker must not silently apply a truncated one.
 fn read_child_bytes(pid: Pid, ptr: u64, size: u64) -> SysResult<Vec<u8>> {
     const XATTR_MAX: usize = 65536;
-    let len = usize::try_from(size)
-        .map_err(|_| BrokerError::InvalidAddress)?
-        .min(XATTR_MAX);
-    let addr = usize::try_from(ptr).map_err(|_| BrokerError::BadAddress)?;
-    if len == 0 || addr == 0 {
+
+    let len = usize::try_from(size).map_err(|_| BrokerError::SystemCall { errno: libc::E2BIG })?;
+    if len > XATTR_MAX {
+        return Err(BrokerError::SystemCall { errno: libc::E2BIG });
+    }
+    if len == 0 {
         return Ok(Vec::new());
     }
-    let mut buf = vec![0u8; len];
+
+    let addr = usize::try_from(ptr).map_err(|_| BrokerError::BadAddress)?;
+    if addr == 0 {
+        return Err(BrokerError::BadAddress);
+    }
+
+    let mut buf = vec![0_u8; len];
     let mut local = [IoSliceMut::new(&mut buf)];
     let target = [RemoteIoVec { base: addr, len }];
     let n =
         process_vm_readv(pid, &mut local, &target).map_err(|error| BrokerError::SystemCall {
             errno: error as i32,
         })?;
-    buf.truncate(n);
+    if n != len {
+        return Err(BrokerError::BadAddress);
+    }
+
     Ok(buf)
 }
 
@@ -1778,8 +1780,12 @@ fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>
         process_vm_readv(pid, &mut local, &target).map_err(|error| BrokerError::SystemCall {
             errno: error as i32,
         })?;
-
-    let null_pos = buf[..n].iter().position(|b| *b == 0).unwrap_or(n);
+    if n == 0 {
+        return Err(BrokerError::BadAddress);
+    }
+    let Some(null_pos) = buf[..n].iter().position(|byte| *byte == 0) else {
+        return Err(BrokerError::NameTooLong);
+    };
     buf.truncate(null_pos);
     Ok(buf)
 }
@@ -2376,6 +2382,22 @@ struct Anchor {
 struct OpenGrant {
     flags: i32,
     kind: OpenKind,
+}
+
+impl OpenGrant {
+    fn new(resolved: &Path, flags: i32, mode: u32) -> Option<Self> {
+        let kind = if let Some(handle) =
+            open_path(resolved, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        {
+            OpenKind::Reopen(handle)
+        } else {
+            OpenKind::Create {
+                anchor: Anchor::new(resolved)?,
+                mode,
+            }
+        };
+        Some(Self { flags, kind })
+    }
 }
 
 enum OpenKind {
