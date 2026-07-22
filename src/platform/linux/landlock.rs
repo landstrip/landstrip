@@ -11,8 +11,8 @@ use crate::engine::error::{Cause, Error, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use landlock::{
-    ABI, AccessFs, AccessNet, BitFlags, NetPort, PathBeneath, Ruleset, RulesetAttr, RulesetCreated,
-    RulesetCreatedAttr, RulesetStatus,
+    ABI, Access, AccessFs, AccessNet, BitFlags, LandlockStatus, NetPort, PathBeneath, Ruleset,
+    RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
 };
 use std::ffi::CString;
 use std::io;
@@ -89,12 +89,10 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
     let status = created.restrict_self().map_err(setup_failed)?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => {}
-        RulesetStatus::PartiallyEnforced => {
-            log::warn!(
-                "landlock: kernel only partially enforced the policy; access bits missing from \
-                 its ABI stay enforced in user space only where a broker exists"
-            );
-        }
+        RulesetStatus::PartiallyEnforced => log::warn!(
+            "{}",
+            partial_enforcement_warning(status.landlock, handled_access_fs, handled_access_net,)
+        ),
         RulesetStatus::NotEnforced => {
             return Err(setup_failed(
                 "not enforced by the kernel (Linux 5.13+ with CONFIG_SECURITY_LANDLOCK required, \
@@ -105,6 +103,48 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
     }
 
     Ok(())
+}
+
+fn partial_enforcement_warning(
+    status: LandlockStatus,
+    handled_access_fs: BitFlags<AccessFs>,
+    handled_access_net: BitFlags<AccessNet>,
+) -> String {
+    let LandlockStatus::Available { effective_abi, .. } = status else {
+        return "landlock: kernel only partially enforced the policy".to_owned();
+    };
+    let supported_fs = AccessFs::from_all(effective_abi);
+    let supported_net = AccessNet::from_all(effective_abi);
+    let mut missing = Vec::new();
+
+    for (access, name) in [
+        (AccessFs::Refer, "filesystem REFER"),
+        (AccessFs::Truncate, "filesystem TRUNCATE"),
+        (AccessFs::IoctlDev, "filesystem IOCTL_DEV"),
+    ] {
+        if handled_access_fs.contains(access) && !supported_fs.contains(access) {
+            missing.push(name);
+        }
+    }
+    for (access, name) in [
+        (AccessNet::BindTcp, "network BIND_TCP"),
+        (AccessNet::ConnectTcp, "network CONNECT_TCP"),
+    ] {
+        if handled_access_net.contains(access) && !supported_net.contains(access) {
+            missing.push(name);
+        }
+    }
+
+    let details = if missing.is_empty() {
+        "some requested features".to_owned()
+    } else {
+        missing.join(", ")
+    };
+    format!(
+        "landlock: kernel ABI {effective_abi} only partially enforced the policy; unsupported \
+         access rights: {details}; supported rights remain enforced; Landlock ABI 5 or newer \
+         (upstream Linux 6.10+) is required for complete enforcement"
+    )
 }
 
 fn read_access_fs() -> BitFlags<AccessFs> {
@@ -222,4 +262,29 @@ fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {
     }
 
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFDIR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_enforcement_warning_identifies_missing_rights() {
+        let status = LandlockStatus::Available {
+            effective_abi: ABI::V4,
+            kernel_abi: None,
+        };
+        let warning = partial_enforcement_warning(
+            status,
+            AccessFs::from_write(TARGET_ABI),
+            BitFlags::empty(),
+        );
+
+        assert_eq!(
+            warning,
+            "landlock: kernel ABI 4 only partially enforced the policy; unsupported access rights: \
+             filesystem IOCTL_DEV; supported rights remain enforced; Landlock ABI 5 or newer \
+             (upstream Linux 6.10+) is required for complete enforcement"
+        );
+    }
 }
