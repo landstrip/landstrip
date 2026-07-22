@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
 
@@ -8,6 +8,9 @@ interface PackageJson {
   optionalDependencies?: Record<string, string>;
   peerDependencies?: Record<string, string>;
   resolved?: string;
+  exports?: Record<string, string>;
+  files?: string[];
+  pi?: { extensions?: string[] };
 }
 
 interface PackageLock extends PackageJson {
@@ -56,5 +59,20 @@ describe('package metadata', () => {
       '@earendil-works/pi-tui': '*',
       typebox: '*',
     });
+  });
+
+  it('ships bundled extension entries', () => {
+    const extensionPackage = readJson<PackageJson>(new URL('./package.json', import.meta.url));
+
+    expect(extensionPackage.exports).toEqual({
+      '.': './dist/index.ts',
+      './api': './api.ts',
+    });
+    expect(extensionPackage.files).toContain('dist/');
+    expect(extensionPackage.files).toContain('api.ts');
+    expect(extensionPackage.pi?.extensions).toEqual(['./dist/index.ts']);
+    expect(existsSync(new URL('./dist/index.ts', import.meta.url))).toBe(true);
+    expect(existsSync(new URL('./dist/sandbox.json', import.meta.url))).toBe(true);
+    expect(existsSync(new URL('./dist/subagents.json', import.meta.url))).toBe(true);
   });
 });

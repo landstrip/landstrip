@@ -95,7 +95,7 @@ publish_cargo_package() {
 	$CARGO publish --locked
 }
 
-for command in "$CARGO" "$GH" "$NODE" "$NPM" tar; do
+for command in "$CARGO" "$GH" "$NODE" "$NPM" bun tar; do
 	require_command "$command"
 done
 
