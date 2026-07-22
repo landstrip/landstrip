@@ -20,7 +20,6 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{self, Command};
 
-#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn execute(
     policy: &AccessPolicy,
     tool: &OsStr,

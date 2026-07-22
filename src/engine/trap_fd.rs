@@ -66,8 +66,9 @@ impl TrapFd {
     /// Windows has no inherited landstrip descriptor: traps reach the launcher
     /// on stderr only.
     #[cfg(not(unix))]
-    #[allow(clippy::unused_self)]
-    pub(crate) fn write(&self, _trap: &Trap) {}
+    pub(crate) fn write(&self, _trap: &Trap) {
+        let _ = self;
+    }
 }
 
 #[cfg(target_os = "linux")]

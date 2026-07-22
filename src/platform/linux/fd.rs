@@ -125,8 +125,12 @@ fn set_cloexec(fd: RawFd) -> io::Result<()> {
 pub(crate) fn getsockopt_int(fd: i32, level: i32, name: i32) -> std::io::Result<i32> {
     // SAFETY: getsockopt writes a scalar into value; len bounds the storage.
     let mut value: i32 = 0;
-    #[allow(clippy::cast_possible_truncation)]
-    let mut len: libc::socklen_t = std::mem::size_of_val(&value) as libc::socklen_t;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of_val(&value)).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket option size exceeds socklen_t",
+        )
+    })?;
     let rc = unsafe {
         libc::getsockopt(
             fd,

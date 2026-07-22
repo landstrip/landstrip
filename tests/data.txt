@@ -24,6 +24,12 @@ name=allowWrite non-existent file permits creation in parent dir | os=linux | se
 name=allowWrite denies other root | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/nope.txt"' _ %TMP%/denied | status=!0
 name=allowWrite permits path with parentheses | os=macos | setup=mkdir:allowed (paren) | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed (paren)"]}} | cmd=%SHELL% -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ '%TMP%/allowed (paren)' | status=0
 
+# --- mkdir -p EEXIST handling (Linux) ---
+
+name=mkdir -p accepts an existing denied directory | os=linux | setup=mkdir:existing-dir | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'mkdir -p "$1"' _ %TMP%/existing-dir | status=0 | out!="kind":"filesystem"
+name=mkdir -p preserves EEXIST for an existing denied file | os=linux | setup=write:existing-file: | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'mkdir -p "$1"' _ %TMP%/existing-file | status=!0 | out!="kind":"filesystem"
+name=mkdir -p preserves EEXIST for a denied dangling symlink | os=linux | setup=symlink:missing:existing-link | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'mkdir -p "$1"' _ %TMP%/existing-link | status=!0 | out!="kind":"filesystem"
+
 # --- /dev/null and inherited descriptors ---
 
 name=dev null read and write are permitted | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'cat /dev/null >/dev/null' | status=0

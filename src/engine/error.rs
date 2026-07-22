@@ -131,8 +131,8 @@ impl Error {
     /// is `EIO`, and `ERROR_INVALID_DATA` is 13, which is `EACCES`, landstrip's
     /// own denial errno — so nothing is mapped here rather than mapped wrongly.
     #[cfg(not(unix))]
-    #[allow(clippy::unused_self)]
     pub(crate) fn errno(&self) -> Option<i32> {
+        let _ = self;
         None
     }
 

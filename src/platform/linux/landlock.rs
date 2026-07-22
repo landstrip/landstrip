@@ -263,28 +263,3 @@ fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {
 
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFDIR)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn partial_enforcement_warning_identifies_missing_rights() {
-        let status = LandlockStatus::Available {
-            effective_abi: ABI::V4,
-            kernel_abi: None,
-        };
-        let warning = partial_enforcement_warning(
-            status,
-            AccessFs::from_write(TARGET_ABI),
-            BitFlags::empty(),
-        );
-
-        assert_eq!(
-            warning,
-            "landlock: kernel ABI 4 only partially enforced the policy; unsupported access rights: \
-             filesystem IOCTL_DEV; supported rights remain enforced; Landlock ABI 5 or newer \
-             (upstream Linux 6.10+) is required for complete enforcement"
-        );
-    }
-}

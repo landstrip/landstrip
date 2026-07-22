@@ -102,6 +102,28 @@ impl BrokerError {
     }
 }
 
+/// Recover the low 32 bits of a syscall argument register as an unsigned C
+/// argument. Seccomp exposes every register as `u64`, including 32-bit values.
+fn syscall_u32(value: u64) -> u32 {
+    let bytes = value.to_ne_bytes();
+    if cfg!(target_endian = "little") {
+        u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    } else {
+        u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
+    }
+}
+
+/// Recover the low 32 bits of a syscall argument register as a signed C
+/// argument, preserving values such as `AT_FDCWD` that are sign-extended.
+fn syscall_i32(value: u64) -> i32 {
+    i32::from_ne_bytes(syscall_u32(value).to_ne_bytes())
+}
+
+/// Reinterpret a syscall argument register as its signed 64-bit C type.
+fn syscall_i64(value: u64) -> i64 {
+    i64::from_ne_bytes(value.to_ne_bytes())
+}
+
 /// A syscall that failed while supervising the sandboxed child.
 fn supervise_errno(errno: Errno) -> LandstripError {
     supervise_failed(io::Error::from_raw_os_error(errno as i32))
@@ -113,7 +135,6 @@ fn supervise_failed(source: impl Into<Cause>) -> LandstripError {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn run_broker(
     policy: &AccessPolicy,
     tool: &OsStr,
@@ -257,7 +278,6 @@ struct ControlResponse {
     action: ControlAction,
 }
 
-#[allow(clippy::too_many_lines)]
 fn supervise_child(
     policy: &AccessPolicy,
     child: Pid,
@@ -293,27 +313,8 @@ fn supervise_child(
             }
         }
 
-        let control = trap_fd.map(|cfd| unsafe { BorrowedFd::borrow_raw(cfd) });
-        let mut poll_fds = [
-            PollFd::new(notify, PollFlags::POLLIN),
-            PollFd::new(control.unwrap_or(notify), PollFlags::POLLIN),
-        ];
-        let len = if control.is_some() { 2 } else { 1 };
-        let revents = loop {
-            match poll(&mut poll_fds[..len], POLL_MS) {
-                Ok(0) => break [PollFlags::empty(); 2],
-                Ok(_) => {
-                    break [
-                        poll_fds[0].revents().unwrap_or_else(PollFlags::empty),
-                        poll_fds[1].revents().unwrap_or_else(PollFlags::empty),
-                    ];
-                }
-                Err(Errno::EINTR) => continue,
-                Err(error) => {
-                    return Err(supervise_errno(error).into());
-                }
-            }
-        };
+        let control = trap_fd.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+        let revents = poll_broker_fds(notify, control)?;
 
         if revents.iter().all(PollFlags::is_empty) {
             continue;
@@ -388,6 +389,30 @@ fn supervise_child(
                 // window. On failure grant_open responds with an errno itself.
                 grant_open(notify_fd, request.id, &grant);
             }
+        }
+    }
+}
+
+fn poll_broker_fds(
+    notify: BorrowedFd<'_>,
+    control: Option<BorrowedFd<'_>>,
+) -> Result<[PollFlags; 2]> {
+    let len = if control.is_some() { 2 } else { 1 };
+    let mut poll_fds = [
+        PollFd::new(notify, PollFlags::POLLIN),
+        PollFd::new(control.unwrap_or(notify), PollFlags::POLLIN),
+    ];
+    loop {
+        match poll(&mut poll_fds[..len], POLL_MS) {
+            Ok(0) => return Ok([PollFlags::empty(); 2]),
+            Ok(_) => {
+                return Ok([
+                    poll_fds[0].revents().unwrap_or_else(PollFlags::empty),
+                    poll_fds[1].revents().unwrap_or_else(PollFlags::empty),
+                ]);
+            }
+            Err(Errno::EINTR) => {}
+            Err(error) => return Err(supervise_errno(error).into()),
         }
     }
 }
@@ -1071,20 +1096,18 @@ struct Open {
 
 impl Open {
     // openat passes flags and mode as scalar arguments.
-    #[allow(clippy::cast_possible_truncation)]
     fn from_args(request: &libc::seccomp_notif) -> SysResult<Self> {
         let args = &request.data.args;
         let flags = i32::try_from(args[2]).map_err(|_| BrokerError::InvalidAddress)?;
         Ok(Self {
             flags,
-            mode: args[3] as u32,
+            mode: syscall_u32(args[3]),
         })
     }
 
     // openat2 passes a struct open_how { u64 flags; u64 mode; u64 resolve; } by
     // pointer; only the first two fields matter. The kernel requires size >= 24,
     // but read just the bytes we use.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn from_how(request: &libc::seccomp_notif, pid: Pid) -> SysResult<Self> {
         let args = &request.data.args;
         let addr = usize::try_from(args[2]).map_err(|_| BrokerError::BadAddress)?;
@@ -1107,16 +1130,82 @@ impl Open {
         if n < 16 {
             return Err(BrokerError::BadAddress);
         }
+        let flags = u64::from_ne_bytes(buf[0..8].try_into().map_err(|_| BrokerError::BadAddress)?);
+        let mode = u64::from_ne_bytes(buf[8..16].try_into().map_err(|_| BrokerError::BadAddress)?);
         Ok(Self {
-            flags: u64::from_ne_bytes(buf[0..8].try_into().map_err(|_| BrokerError::BadAddress)?)
-                as i32,
-            mode: u64::from_ne_bytes(buf[8..16].try_into().map_err(|_| BrokerError::BadAddress)?)
-                as u32,
+            flags: i32::try_from(flags).map_err(|_| BrokerError::InvalidAddress)?,
+            mode: u32::try_from(mode).map_err(|_| BrokerError::InvalidAddress)?,
         })
     }
 }
 
-#[allow(clippy::too_many_lines)]
+struct OpenDenial {
+    operation: TrapOperation,
+    path: PathBuf,
+    requested_path: PathBuf,
+    syscall: &'static str,
+    flags: i32,
+    mode: u32,
+    reason: &'static str,
+    pid: u32,
+    report: bool,
+}
+
+fn deny_open(
+    details: OpenDenial,
+    denials: &mut Denials,
+    query_enabled: bool,
+    next_query_id: &mut u64,
+) -> SysResult<NotificationResult> {
+    if !details.report {
+        return Err(BrokerError::PolicyDenied);
+    }
+
+    let OpenDenial {
+        operation,
+        path,
+        requested_path,
+        syscall,
+        flags,
+        mode,
+        reason,
+        pid,
+        ..
+    } = details;
+    if query_enabled {
+        let query_id = *next_query_id;
+        *next_query_id += 1;
+        let grant = OpenGrant::new(&path, flags, mode).map(Grant::Open);
+        return Ok(NotificationResult::query(
+            query_id,
+            Trap::filesystem(
+                FilesystemDenial {
+                    operation,
+                    path,
+                    requested_path,
+                    syscall,
+                    flags: open_flags(flags),
+                    reason,
+                    process: process_context(pid),
+                },
+                Some(query_id),
+            ),
+            grant,
+        ));
+    }
+
+    denials.record(Denial::Filesystem(FilesystemDenial {
+        operation,
+        path,
+        requested_path,
+        syscall,
+        flags: open_flags(flags),
+        reason,
+        process: process_context(pid),
+    }));
+    Err(BrokerError::PolicyDenied)
+}
+
 fn handle_openat(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
@@ -1125,8 +1214,7 @@ fn handle_openat(
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
     // args[0] is dirfd: an i32 (including AT_FDCWD=-100) stored as u64.
-    #[allow(clippy::cast_possible_truncation)]
-    let dirfd = request.data.args[0] as i32;
+    let dirfd = syscall_i32(request.data.args[0]);
     let path_ptr = usize::try_from(request.data.args[1]).map_err(|_| BrokerError::BadAddress)?;
     let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
     let openat2 = i64::from(request.data.nr) == libc::SYS_openat2;
@@ -1167,39 +1255,22 @@ fn handle_openat(
                     errno: libc::ENOENT,
                 });
             }
-            if reports_write {
-                if query_enabled {
-                    let qid = *next_query_id;
-                    *next_query_id += 1;
-                    let grant = OpenGrant::new(&resolved, flags, mode).map(Grant::Open);
-                    return Ok(NotificationResult::query(
-                        qid,
-                        Trap::filesystem(
-                            FilesystemDenial {
-                                operation: TrapOperation::Write,
-                                path: resolved,
-                                requested_path: path,
-                                syscall: syscall_name,
-                                flags: open_flags(flags),
-                                reason,
-                                process: process_context(request.pid),
-                            },
-                            Some(qid),
-                        ),
-                        grant,
-                    ));
-                }
-                denials.record(Denial::Filesystem(FilesystemDenial {
+            return deny_open(
+                OpenDenial {
                     operation: TrapOperation::Write,
-                    path: resolved.clone(),
-                    requested_path: path.clone(),
+                    path: resolved,
+                    requested_path: path,
                     syscall: syscall_name,
-                    flags: open_flags(flags),
+                    flags,
+                    mode,
                     reason,
-                    process: process_context(request.pid),
-                }));
-            }
-            return Err(BrokerError::PolicyDenied);
+                    pid: request.pid,
+                    report: reports_write,
+                },
+                denials,
+                query_enabled,
+                next_query_id,
+            );
         }
     }
     if wants_read {
@@ -1209,37 +1280,22 @@ fn handle_openat(
                     errno: libc::ENOENT,
                 });
             }
-            if query_enabled {
-                let qid = *next_query_id;
-                *next_query_id += 1;
-                let grant = OpenGrant::new(&resolved, flags, mode).map(Grant::Open);
-                return Ok(NotificationResult::query(
-                    qid,
-                    Trap::filesystem(
-                        FilesystemDenial {
-                            operation: TrapOperation::Read,
-                            path: resolved,
-                            requested_path: path,
-                            syscall: syscall_name,
-                            flags: open_flags(flags),
-                            reason,
-                            process: process_context(request.pid),
-                        },
-                        Some(qid),
-                    ),
-                    grant,
-                ));
-            }
-            denials.record(Denial::Filesystem(FilesystemDenial {
-                operation: TrapOperation::Read,
-                path: resolved,
-                requested_path: path,
-                syscall: syscall_name,
-                flags: open_flags(flags),
-                reason,
-                process: process_context(request.pid),
-            }));
-            return Err(BrokerError::PolicyDenied);
+            return deny_open(
+                OpenDenial {
+                    operation: TrapOperation::Read,
+                    path: resolved,
+                    requested_path: path,
+                    syscall: syscall_name,
+                    flags,
+                    mode,
+                    reason,
+                    pid: request.pid,
+                    report: true,
+                },
+                denials,
+                query_enabled,
+                next_query_id,
+            );
         }
     }
 
@@ -1303,10 +1359,8 @@ impl Syscall {
     fn no_follow(&self, args: &[u64; 6]) -> bool {
         // The flags argument is an int; truncating to i32 recovers it from the
         // u64 register slot the same way the dirfd arguments are read.
-        #[allow(clippy::cast_possible_truncation)]
-        let flag = |index: usize| args[index] as i32 & libc::AT_SYMLINK_NOFOLLOW != 0;
-        #[allow(clippy::cast_possible_truncation)]
-        let follow = |index: usize| args[index] as i32 & libc::AT_SYMLINK_FOLLOW != 0;
+        let flag = |index: usize| syscall_i32(args[index]) & libc::AT_SYMLINK_NOFOLLOW != 0;
+        let follow = |index: usize| syscall_i32(args[index]) & libc::AT_SYMLINK_FOLLOW != 0;
         match self.name {
             "lchown" | "lsetxattr" | "lremovexattr" | "link" => true,
             "fchownat" => flag(4),
@@ -1501,8 +1555,7 @@ fn handle_mutation(
     for (index, (dirfd_arg, path_arg)) in spec.paths.iter().enumerate() {
         let dirfd = match dirfd_arg {
             // args[i] is an i32 dirfd (including AT_FDCWD=-100) stored as u64.
-            #[allow(clippy::cast_possible_truncation)]
-            Some(arg) => request.data.args[*arg] as i32,
+            Some(arg) => syscall_i32(request.data.args[*arg]),
             None => libc::AT_FDCWD,
         };
         let path_ptr =
@@ -1581,7 +1634,6 @@ impl Grant {
         Grant::Socket(SocketGrant { sock, addr, call })
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn mutation(
         spec: &Syscall,
         request: &libc::seccomp_notif,
@@ -1591,7 +1643,7 @@ impl Grant {
         let args = &request.data.args;
 
         if spec.name == "creat" {
-            return Ok(creat_grant(slots, args[1] as u32));
+            return Ok(creat_grant(slots, syscall_u32(args[1])));
         }
 
         let mut anchors = Vec::with_capacity(slots.len());
@@ -1607,32 +1659,32 @@ impl Grant {
 
         let op = match spec.name {
             "mkdirat" => MutationOp::Mkdir {
-                mode: args[2] as u32,
+                mode: syscall_u32(args[2]),
             },
             "mkdir" => MutationOp::Mkdir {
-                mode: args[1] as u32,
+                mode: syscall_u32(args[1]),
             },
             "mknodat" => MutationOp::Mknod {
-                mode: args[2] as u32,
+                mode: syscall_u32(args[2]),
                 dev: args[3],
             },
             "mknod" => MutationOp::Mknod {
-                mode: args[1] as u32,
+                mode: syscall_u32(args[1]),
                 dev: args[2],
             },
             "unlinkat" => MutationOp::Unlink {
-                flags: args[2] as i32,
+                flags: syscall_i32(args[2]),
             },
             "unlink" => MutationOp::Unlink { flags: 0 },
             "rmdir" => MutationOp::Unlink {
                 flags: libc::AT_REMOVEDIR,
             },
             "renameat2" => MutationOp::Rename {
-                flags: args[4] as u32,
+                flags: syscall_u32(args[4]),
             },
             "renameat" | "rename" => MutationOp::Rename { flags: 0 },
             "linkat" => MutationOp::Link {
-                flags: args[4] as i32,
+                flags: syscall_i32(args[4]),
             },
             "link" => MutationOp::Link { flags: 0 },
             "symlinkat" | "symlink" => {
@@ -1642,21 +1694,21 @@ impl Grant {
                 MutationOp::Symlink { target }
             }
             "truncate" => MutationOp::Truncate {
-                length: args[1] as i64,
+                length: syscall_i64(args[1]),
             },
             "fchmodat" => MutationOp::Chmod {
-                mode: args[2] as u32,
+                mode: syscall_u32(args[2]),
             },
             "chmod" => MutationOp::Chmod {
-                mode: args[1] as u32,
+                mode: syscall_u32(args[1]),
             },
             "fchownat" => MutationOp::Chown {
-                uid: args[2] as u32,
-                gid: args[3] as u32,
+                uid: syscall_u32(args[2]),
+                gid: syscall_u32(args[3]),
             },
             "chown" | "lchown" => MutationOp::Chown {
-                uid: args[1] as u32,
-                gid: args[2] as u32,
+                uid: syscall_u32(args[1]),
+                gid: syscall_u32(args[2]),
             },
             "utimensat" => MutationOp::Utimes {
                 times: read_child_times(pid, args[2])?,
@@ -1668,7 +1720,7 @@ impl Grant {
                 MutationOp::SetXattr {
                     name,
                     value: read_child_bytes(pid, args[2], args[3])?,
-                    flags: args[4] as i32,
+                    flags: syscall_i32(args[4]),
                 }
             }
             "removexattr" | "lremovexattr" => {
@@ -2536,38 +2588,5 @@ fn exit_code(status: WaitStatus) -> i32 {
         WaitStatus::Exited(_, code) => code,
         WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
         _ => 1,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::symlink;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn mkdir_target_exists_recognizes_existing_entries()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let root = std::env::temp_dir().join(format!("landstrip-mkdir-exists-{nonce}"));
-        let directory = root.join("directory");
-        let file = root.join("file");
-        let link = root.join("link");
-
-        fs::create_dir_all(&directory)?;
-        fs::write(&file, [])?;
-        symlink("missing", &link)?;
-
-        assert!(mkdir_target_exists(&directory));
-        assert!(mkdir_target_exists(&file));
-        assert!(mkdir_target_exists(&link));
-        assert!(!mkdir_target_exists(&PathBuf::from(format!(
-            "{}/",
-            link.display()
-        ))));
-        assert!(!mkdir_target_exists(&root.join("missing")));
-
-        fs::remove_dir_all(root)?;
-        Ok(())
     }
 }

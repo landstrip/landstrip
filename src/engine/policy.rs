@@ -148,16 +148,6 @@ impl AccessPolicy {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-impl AccessPolicy {
-    /// The Linux broker enforces every supported policy shape, so nothing is
-    /// rejected ahead of time.
-    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
-    pub(crate) fn validate(&self) -> std::result::Result<(), Error> {
-        Ok(())
-    }
-}
-
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ReadAccess {
     Unrestricted,
@@ -277,6 +267,7 @@ pub(crate) fn resolve_policy(
         read_symlinks,
         network_access: lower_network_policy(network, &policy_base, home)?,
     };
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     policy.validate()?;
     Ok(policy)
 }
