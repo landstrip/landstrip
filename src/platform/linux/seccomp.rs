@@ -1317,6 +1317,10 @@ impl Syscall {
             _ => false,
         }
     }
+
+    fn is_mkdir(&self) -> bool {
+        matches!(self.name, "mkdir" | "mkdirat")
+    }
 }
 
 const MUTATION_SYSCALLS: &[Syscall] = &[
@@ -1508,6 +1512,14 @@ fn handle_mutation(
             continue;
         };
         let raw = resolve_child_path(pid, dirfd, &path)?;
+        // mkdir -p intentionally invokes mkdir for each existing path component.
+        // Return the syscall's EEXIST result without prompting instead of treating
+        // an operation that cannot mutate the filesystem as a permission request.
+        if spec.is_mkdir() && mkdir_target_exists(&raw) {
+            return Err(BrokerError::SystemCall {
+                errno: libc::EEXIST,
+            });
+        }
         // No-follow ops act on the link itself: canonicalize the parent but keep
         // the final component so the policy gates the symlink, not its target.
         let resolved = if no_follow {
@@ -2083,6 +2095,31 @@ fn open_path(path: &Path, flags: i32) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+// This is deliberately a preflight check: reissuing mkdir could create a path
+// after an entry is removed, while a stale EEXIST result cannot mutate it.
+fn mkdir_target_exists(path: &Path) -> bool {
+    let Some(anchor) = Anchor::new(&normalize_path_nofollow(path)) else {
+        return false;
+    };
+    // A trailing slash requires the kernel to follow a terminal symlink.
+    let flags = if path.as_os_str().as_bytes().ends_with(b"/") {
+        0
+    } else {
+        libc::AT_SYMLINK_NOFOLLOW
+    };
+    // SAFETY: stat points to initialized storage and anchor owns a valid parent fd.
+    let mut stat = unsafe { mem::zeroed::<libc::stat>() };
+    // fstatat reports the EEXIST condition without modifying the target.
+    unsafe {
+        libc::fstatat(
+            anchor.dir.as_raw_fd(),
+            anchor.name.as_ptr(),
+            ptr::addr_of_mut!(stat),
+            flags,
+        ) == 0
+    }
+}
+
 impl Anchor {
     fn new(resolved: &Path) -> Option<Self> {
         Some(Self {
@@ -2499,5 +2536,38 @@ fn exit_code(status: WaitStatus) -> i32 {
         WaitStatus::Exited(_, code) => code,
         WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
         _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn mkdir_target_exists_recognizes_existing_entries()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!("landstrip-mkdir-exists-{nonce}"));
+        let directory = root.join("directory");
+        let file = root.join("file");
+        let link = root.join("link");
+
+        fs::create_dir_all(&directory)?;
+        fs::write(&file, [])?;
+        symlink("missing", &link)?;
+
+        assert!(mkdir_target_exists(&directory));
+        assert!(mkdir_target_exists(&file));
+        assert!(mkdir_target_exists(&link));
+        assert!(!mkdir_target_exists(&PathBuf::from(format!(
+            "{}/",
+            link.display()
+        ))));
+        assert!(!mkdir_target_exists(&root.join("missing")));
+
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }
