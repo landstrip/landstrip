@@ -62,19 +62,23 @@ interface PiPackage {
 }
 
 const SUPPORTED_PI_MAJOR = 0;
-const SUPPORTED_PI_MINOR = 80;
+const MIN_SUPPORTED_PI_MINOR = 80;
 const MIN_SUPPORTED_PI_PATCH = 6;
-
+const MAX_SUPPORTED_PI_MINOR = 81;
 let cachedPiPackage: PiPackage | undefined;
 let piPackageResolved = false;
 
 export function isSupportedPiVersion(version: readonly number[]): boolean {
   const [major, minor = -1, patch = -1] = version;
   return (
+    version.length === 3 &&
     Number.isInteger(major) &&
+    Number.isInteger(minor) &&
+    Number.isInteger(patch) &&
     major === SUPPORTED_PI_MAJOR &&
-    minor === SUPPORTED_PI_MINOR &&
-    patch >= MIN_SUPPORTED_PI_PATCH
+    minor >= MIN_SUPPORTED_PI_MINOR &&
+    minor <= MAX_SUPPORTED_PI_MINOR &&
+    (minor > MIN_SUPPORTED_PI_MINOR || patch >= MIN_SUPPORTED_PI_PATCH)
   );
 }
 
@@ -1626,7 +1630,7 @@ export class SubagentRuntime {
     }
     if (!isSupportedPiVersion(pkg.version)) {
       throw new Error(
-        `Process-backed subagents require Pi >=0.80.6 <0.81.0; found ${pkg.version.join('.')}`,
+        `Process-backed subagents require Pi >=0.80.6 <0.82.0; found ${pkg.version.join('.')}`,
       );
     }
   }

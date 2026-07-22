@@ -6,6 +6,7 @@ interface PackageJson {
   version: string;
   dependencies?: Record<string, string>;
   optionalDependencies?: Record<string, string>;
+  peerDependencies?: Record<string, string>;
   resolved?: string;
 }
 
@@ -43,5 +44,17 @@ describe('package metadata', () => {
     expect(
       extensionLock.packages['node_modules/@landstrip/landstrip'].optionalDependencies,
     ).toEqual(landstripPackage.optionalDependencies);
+  });
+
+  it('uses host-provided Pi extension dependencies', () => {
+    const extensionPackage = readJson<PackageJson>(new URL('./package.json', import.meta.url));
+
+    expect(extensionPackage.dependencies?.['@earendil-works/pi-coding-agent']).toBeUndefined();
+    expect(extensionPackage.dependencies?.['@earendil-works/pi-tui']).toBeUndefined();
+    expect(extensionPackage.peerDependencies).toMatchObject({
+      '@earendil-works/pi-coding-agent': '*',
+      '@earendil-works/pi-tui': '*',
+      typebox: '*',
+    });
   });
 });

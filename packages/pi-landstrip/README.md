@@ -16,7 +16,7 @@ The extension includes a shared [sandbox policy](./sandbox.json) and separate
 [agent configuration](./subagents.json). Global and trusted-project files can
 override both.
 
-Process-backed subagents require Pi >= 0.80.6 and < 0.81.0, and Node.js >= 22.19.0.
+Process-backed subagents require Pi >= 0.80.6 and < 0.82.0, and Node.js >= 22.19.0.
 
 ## Installation
 

@@ -1345,13 +1345,16 @@ test('does not deliver old background results into a new session', async () => {
 
 test('classifies supported Pi versions', () => {
   expect(isSupportedPiVersion([0, 80, 6])).toBe(true);
-  expect(isSupportedPiVersion([0, 80, 7])).toBe(true);
   expect(isSupportedPiVersion([0, 80, 99])).toBe(true);
+  expect(isSupportedPiVersion([0, 81, 0])).toBe(true);
+  expect(isSupportedPiVersion([0, 81, 1])).toBe(true);
   expect(isSupportedPiVersion([0, 80, 5])).toBe(false);
   expect(isSupportedPiVersion([0, 79, 99])).toBe(false);
-  expect(isSupportedPiVersion([0, 81, 0])).toBe(false);
+  expect(isSupportedPiVersion([0, 82, 0])).toBe(false);
   expect(isSupportedPiVersion([1, 2, 3])).toBe(false);
   expect(isSupportedPiVersion([26, 4, 0])).toBe(false);
+  expect(isSupportedPiVersion([0, 81])).toBe(false);
+  expect(isSupportedPiVersion([0, 81, Number.NaN])).toBe(false);
 });
 
 test('resolves the running Pi package from the extension location', () => {
