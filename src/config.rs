@@ -16,6 +16,7 @@ use std::path::PathBuf;
 pub(crate) struct Settings {
     pub(crate) filesystem: SandboxFilesystem,
     pub(crate) network: SandboxNetwork,
+    pub(crate) windows: SandboxWindows,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -41,6 +42,20 @@ pub(crate) struct SandboxNetwork {
     pub(crate) allow_unix_sockets: Vec<String>,
     pub(crate) http_proxy_port: Option<u16>,
     pub(crate) socks_proxy_port: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum AppContainerMode {
+    #[default]
+    Lpac,
+    Standard,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct SandboxWindows {
+    pub(crate) app_container_mode: AppContainerMode,
 }
 
 pub(crate) fn load_settings(policy_paths: &[PathBuf], format: PolicyFormat) -> Result<Settings> {

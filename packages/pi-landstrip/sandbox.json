@@ -20,5 +20,8 @@
       ".pi/sandbox.json",
       "~/.pi/agent/sandbox.json"
     ]
+  },
+  "windows": {
+    "appContainerMode": "standard"
   }
 }

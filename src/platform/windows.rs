@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! Windows sandbox platform using LPAC `AppContainer`.
+//! Windows sandbox platform using `AppContainer`.
 
+use crate::config::AppContainerMode;
 use crate::engine::error::{Cause, Error as LandstripError, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
 use crate::engine::trap_fd::TrapFd;
@@ -114,7 +115,13 @@ pub(crate) fn execute(
             "windows: per-port TCP filtering is unavailable; running with no network access"
         );
     }
-    let exit_code = create_process_in_appcontainer(profile.sid(), tool, args, grant_network);
+    let exit_code = create_process_in_appcontainer(
+        profile.sid(),
+        tool,
+        args,
+        grant_network,
+        policy.app_container_mode,
+    );
 
     // The tool has exited, so the container's access to the policy roots is
     // released here. std::process::exit runs no destructors, and this is the
@@ -470,6 +477,7 @@ fn create_process_in_appcontainer(
     tool: &OsStr,
     args: &[OsString],
     grant_network: bool,
+    app_container_mode: AppContainerMode,
 ) -> Result<u32> {
     // Process mitigation policies not enabled:
     //
@@ -495,7 +503,11 @@ fn create_process_in_appcontainer(
     let job = SandboxJob::new()?;
     let mut job_handle = job.as_raw();
     let mut mitigation_policy = MITIGATION_POLICY;
-    let attribute_count = 5;
+    let attribute_count = if app_container_mode == AppContainerMode::Lpac {
+        5
+    } else {
+        4
+    };
     let mut attribute_list = ProcThreadAttributeList::new(attribute_count)?;
     let mut network_capabilities = NetworkCapabilities::new(grant_network)?;
     let mut capabilities = SECURITY_CAPABILITIES {
@@ -512,12 +524,14 @@ fn create_process_in_appcontainer(
         (&raw mut capabilities).cast(),
         mem::size_of::<SECURITY_CAPABILITIES>(),
     )?;
-    update_attribute(
-        attribute_list.as_mut_ptr(),
-        PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
-        (&raw mut all_packages_policy).cast(),
-        mem::size_of::<u32>(),
-    )?;
+    if app_container_mode == AppContainerMode::Lpac {
+        update_attribute(
+            attribute_list.as_mut_ptr(),
+            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY as usize,
+            (&raw mut all_packages_policy).cast(),
+            mem::size_of::<u32>(),
+        )?;
+    }
     update_attribute(
         attribute_list.as_mut_ptr(),
         PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,

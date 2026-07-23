@@ -98,19 +98,26 @@ interface SandboxNetworkConfig {
   deniedDomains: string[];
 }
 
+interface SandboxWindowsConfig {
+  appContainerMode: 'lpac' | 'standard';
+}
+
 interface SandboxConfig {
   enabled: boolean;
   network: SandboxNetworkConfig;
   filesystem: SandboxFilesystemConfig;
+  windows: SandboxWindowsConfig;
 }
 
 type SandboxFilesystemConfigFile = Partial<SandboxFilesystemConfig>;
 type SandboxNetworkConfigFile = Partial<SandboxNetworkConfig>;
+type SandboxWindowsConfigFile = Partial<SandboxWindowsConfig>;
 
 interface SandboxConfigFile {
   enabled?: boolean;
   network?: SandboxNetworkConfigFile;
   filesystem?: SandboxFilesystemConfigFile;
+  windows?: SandboxWindowsConfigFile;
 }
 
 type SandboxConfigScope = 'global' | 'project';
@@ -125,6 +132,7 @@ interface LandstripPolicy {
     socksProxyPort?: number;
   };
   filesystem: SandboxFilesystemConfig;
+  windows: SandboxWindowsConfig;
 }
 
 type LandstripDenialTrap = LandstripFilesystemTrap | LandstripNetworkTrap;
@@ -260,6 +268,7 @@ function mergeArray(base: string[], override?: string[]): string[] {
 function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxConfig {
   const network = overrides.network;
   const filesystem = overrides.filesystem;
+  const windows = overrides.windows;
 
   return {
     enabled: overrides.enabled ?? base.enabled,
@@ -276,6 +285,9 @@ function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxCo
       allowRead: mergeArray(base.filesystem.allowRead, filesystem?.allowRead),
       allowWrite: mergeArray(base.filesystem.allowWrite, filesystem?.allowWrite),
       denyWrite: mergeArray(base.filesystem.denyWrite, filesystem?.denyWrite),
+    },
+    windows: {
+      appContainerMode: windows?.appContainerMode ?? base.windows.appContainerMode,
     },
   };
 }
@@ -1303,6 +1315,7 @@ export function createLandstripIntegration(
         allowWrite: getEffectiveAllowWrite(config, allowances),
         denyWrite: config.filesystem.denyWrite,
       },
+      windows: config.windows,
     };
   }
 

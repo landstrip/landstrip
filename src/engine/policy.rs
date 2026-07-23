@@ -12,7 +12,7 @@
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
 //! while lowering the policy.
 
-use crate::config::{SandboxFilesystem, SandboxNetwork};
+use crate::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows};
 use crate::engine::error::Error;
 #[cfg(not(target_os = "macos"))]
 use crate::engine::paths::normalize_path;
@@ -37,6 +37,8 @@ pub(crate) struct AccessPolicy {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) read_symlinks: Vec<PathBuf>,
     pub(crate) network_access: NetworkAccess,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) app_container_mode: AppContainerMode,
 }
 
 // The write broker that consults these lives only in the Linux seccomp path.
@@ -192,6 +194,7 @@ pub(crate) enum UnixSocketAccess {
 pub(crate) fn resolve_policy(
     filesystem: &SandboxFilesystem,
     network: &SandboxNetwork,
+    windows: &SandboxWindows,
     policy_base: &Path,
 ) -> Result<AccessPolicy> {
     let home_dir = dirs::home_dir();
@@ -266,6 +269,7 @@ pub(crate) fn resolve_policy(
         read_denied_roots,
         read_symlinks,
         network_access: lower_network_policy(network, &policy_base, home)?,
+        app_container_mode: windows.app_container_mode,
     };
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     policy.validate()?;
