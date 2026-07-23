@@ -10,6 +10,7 @@ use crate::engine::trap_fd::TrapFd;
 use anyhow::Result;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString, c_void};
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::iter;
@@ -18,10 +19,16 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS,
-    ERROR_INSUFFICIENT_BUFFER, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE, LocalFree, WAIT_FAILED,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, GENERIC_READ,
+    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_ABANDONED,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
+    NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
 };
 use windows_sys::Win32::Security::Authorization::{
     ACCESS_MODE, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, REVOKE_ACCESS,
@@ -32,8 +39,8 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, FreeSid, PSID, SECURITY_ATTRIBUTES,
-    SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+    ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, FreeSid, PSID,
+    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
     SUB_CONTAINERS_AND_OBJECTS_INHERIT, WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid,
     WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
 };
@@ -45,13 +52,16 @@ use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
+use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetExitCodeProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    CreateMutexW, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, GetExitCodeProcess, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE,
+    ReleaseMutex, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
@@ -59,6 +69,9 @@ const INFINITE: u32 = 0xffff_ffff;
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 /// The `HRESULT` facility that wraps a Win32 error code.
 const FACILITY_WIN32: u32 = 7;
+const LOOPBACK_MUTEX_NAME: &str = "Global\\landstrip-loopback-config";
+const LOOPBACK_PROFILE_PREFIX: &str = "landstrip.loopback.";
+static NEXT_PROFILE_ID: AtomicU64 = AtomicU64::new(0);
 
 const NETWORK_CAPABILITY_SIDS: [WELL_KNOWN_SID_TYPE; 3] = [
     WinCapabilityInternetClientSid,
@@ -105,8 +118,14 @@ pub(crate) fn execute(
     args: &[OsString],
     _trap_fd: &TrapFd,
 ) -> Result<()> {
-    let moniker = appcontainer_moniker(tool, policy);
-    let profile = AppContainerProfile::new(&moniker)?;
+    let moniker = appcontainer_moniker(tool, policy, policy.allow_windows_loopback);
+    let profile = AppContainerProfile::new(&moniker, !policy.allow_windows_loopback)?;
+    let loopback = if policy.allow_windows_loopback {
+        log::warn!("windows: AppContainer loopback exemption permits all local loopback services");
+        Some(LoopbackExemption::new(&moniker, profile.sid())?)
+    } else {
+        None
+    };
     let grants = grant_policy_access(policy, profile.sid())?;
 
     let grant_network = policy.network_access.is_unrestricted();
@@ -129,29 +148,43 @@ pub(crate) fn execute(
     // container's ACEs on the user's files and its profile on the machine.
     // Grants go first — revoking an ACE needs the SID the profile owns.
     drop(grants);
+    drop(loopback);
     drop(profile);
 
     std::process::exit(i32::from_ne_bytes(exit_code?.to_ne_bytes()));
 }
 
-fn appcontainer_moniker(tool: &OsStr, policy: &AccessPolicy) -> String {
+fn appcontainer_moniker(tool: &OsStr, policy: &AccessPolicy, loopback: bool) -> String {
     let mut hasher = DefaultHasher::new();
     PathBuf::from(tool).hash(&mut hasher);
     policy.hash(&mut hasher);
-    format!(
-        "landstrip.{:016x}.{:x}",
-        hasher.finish(),
-        std::process::id()
-    )
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    NEXT_PROFILE_ID
+        .fetch_add(1, Ordering::Relaxed)
+        .hash(&mut hasher);
+    let profile_id = hasher.finish();
+    if loopback {
+        format!(
+            "{LOOPBACK_PROFILE_PREFIX}{:x}.{profile_id:016x}",
+            std::process::id()
+        )
+    } else {
+        format!("landstrip.{:x}.{profile_id:016x}", std::process::id())
+    }
 }
 
 struct AppContainerProfile {
     sid: PSID,
     moniker: Vec<u16>,
+    delete_on_drop: bool,
 }
 
 impl AppContainerProfile {
-    fn new(moniker: &str) -> Result<Self> {
+    fn new(moniker: &str, delete_on_drop: bool) -> Result<Self> {
         let moniker = wide_string(moniker);
         let display = wide_string("landstrip");
         let description = wide_string("landstrip sandbox");
@@ -168,7 +201,11 @@ impl AppContainerProfile {
         };
 
         if hr == 0 {
-            return Ok(Self { sid, moniker });
+            return Ok(Self {
+                sid,
+                moniker,
+                delete_on_drop,
+            });
         }
 
         if hresult_win32(hr).map(u32::from) != Some(ERROR_ALREADY_EXISTS) {
@@ -180,7 +217,11 @@ impl AppContainerProfile {
             return Err(setup_failed(hresult_cause(hr)).into());
         }
 
-        Ok(Self { sid, moniker })
+        Ok(Self {
+            sid,
+            moniker,
+            delete_on_drop,
+        })
     }
 
     fn sid(&self) -> PSID {
@@ -190,11 +231,279 @@ impl AppContainerProfile {
 
 impl Drop for AppContainerProfile {
     fn drop(&mut self) {
-        if !self.moniker.is_empty() {
+        if self.delete_on_drop && !self.moniker.is_empty() {
             unsafe { DeleteAppContainerProfile(self.moniker.as_ptr()) };
         }
         if !self.sid.is_null() {
             unsafe { FreeSid(self.sid) };
+        }
+    }
+}
+
+struct LoopbackExemption {
+    marker: PathBuf,
+    moniker: String,
+    sid: PSID,
+    active: bool,
+}
+
+impl LoopbackExemption {
+    fn new(moniker: &str, sid: PSID) -> Result<Self> {
+        let _mutex = LoopbackMutex::lock()?;
+        let state_dir = dirs::data_local_dir()
+            .ok_or_else(|| setup_failed("local data directory is unavailable"))?
+            .join("landstrip")
+            .join("loopback");
+        fs::create_dir_all(&state_dir).map_err(setup_failed)?;
+        cleanup_stale_loopback_profiles(&state_dir)?;
+
+        let marker = state_dir.join(moniker);
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker)
+            .map_err(setup_failed)?;
+        update_loopback_config(Some(sid), &[])?;
+
+        Ok(Self {
+            marker,
+            moniker: moniker.to_owned(),
+            sid,
+            active: true,
+        })
+    }
+
+    fn remove(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+
+        let _mutex = LoopbackMutex::lock()?;
+        update_loopback_config(None, &[self.sid])?;
+        delete_appcontainer_profile(&self.moniker)?;
+        remove_marker(&self.marker)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for LoopbackExemption {
+    fn drop(&mut self) {
+        if let Err(error) = self.remove() {
+            log::warn!("windows: could not remove AppContainer loopback exemption: {error:#}");
+        }
+    }
+}
+
+struct LoopbackMutex {
+    handle: Handle,
+}
+
+impl LoopbackMutex {
+    fn lock() -> Result<Self> {
+        let name = wide_string(LOOPBACK_MUTEX_NAME);
+        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(setup_failed(io::Error::last_os_error()).into());
+        }
+        let mutex = Self {
+            handle: Handle(handle),
+        };
+        match unsafe { WaitForSingleObject(mutex.handle.0, INFINITE) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(mutex),
+            WAIT_FAILED => Err(setup_failed(io::Error::last_os_error()).into()),
+            status => Err(setup_failed(format!("unexpected mutex wait status {status}")).into()),
+        }
+    }
+}
+
+impl Drop for LoopbackMutex {
+    fn drop(&mut self) {
+        unsafe { ReleaseMutex(self.handle.0) };
+    }
+}
+
+struct StaleLoopbackProfile {
+    marker: PathBuf,
+    moniker: String,
+    sid: OwnedSid,
+}
+
+fn cleanup_stale_loopback_profiles(state_dir: &Path) -> Result<()> {
+    let mut stale = Vec::new();
+    for entry in fs::read_dir(state_dir).map_err(setup_failed)? {
+        let entry = entry.map_err(setup_failed)?;
+        let Some(moniker) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(pid) = loopback_profile_pid(&moniker) else {
+            continue;
+        };
+        if process_is_running(pid) {
+            continue;
+        }
+        match derive_appcontainer_sid(&moniker) {
+            Ok(Some(sid)) => stale.push(StaleLoopbackProfile {
+                marker: entry.path(),
+                moniker,
+                sid,
+            }),
+            Ok(None) => remove_marker(&entry.path())?,
+            Err(error) => {
+                log::warn!("windows: could not inspect stale loopback profile: {error:#}");
+            }
+        }
+    }
+
+    if stale.is_empty() {
+        return Ok(());
+    }
+    let stale_sids = stale
+        .iter()
+        .map(|profile| profile.sid.0)
+        .collect::<Vec<_>>();
+    update_loopback_config(None, &stale_sids)?;
+    for profile in stale {
+        if let Err(error) = delete_appcontainer_profile(&profile.moniker) {
+            log::warn!("windows: could not delete stale loopback profile: {error:#}");
+            continue;
+        }
+        remove_marker(&profile.marker)?;
+    }
+    Ok(())
+}
+
+fn loopback_profile_pid(moniker: &str) -> Option<u32> {
+    let suffix = moniker.strip_prefix(LOOPBACK_PROFILE_PREFIX)?;
+    let (pid, _) = suffix.split_once('.')?;
+    u32::from_str_radix(pid, 16).ok()
+}
+
+fn process_is_running(pid: u32) -> bool {
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
+    }
+    let process = Handle(handle);
+    matches!(
+        unsafe { WaitForSingleObject(process.0, 0) },
+        WAIT_TIMEOUT | WAIT_FAILED
+    )
+}
+
+fn derive_appcontainer_sid(moniker: &str) -> Result<Option<OwnedSid>> {
+    let moniker = wide_string(moniker);
+    let mut sid = ptr::null_mut();
+    let hr = unsafe { DeriveAppContainerSidFromAppContainerName(moniker.as_ptr(), &mut sid) };
+    if hresult_win32(hr).map(u32::from) == Some(ERROR_NOT_FOUND) {
+        return Ok(None);
+    }
+    if hr != 0 {
+        return Err(setup_failed(hresult_cause(hr)).into());
+    }
+    Ok(Some(OwnedSid(sid)))
+}
+
+fn delete_appcontainer_profile(moniker: &str) -> Result<()> {
+    let moniker = wide_string(moniker);
+    let hr = unsafe { DeleteAppContainerProfile(moniker.as_ptr()) };
+    if hr != 0 {
+        return Err(setup_failed(hresult_cause(hr)).into());
+    }
+    Ok(())
+}
+
+fn remove_marker(marker: &Path) -> Result<()> {
+    match fs::remove_file(marker) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(setup_failed(error).into()),
+    }
+}
+
+fn update_loopback_config(add: Option<PSID>, remove: &[PSID]) -> Result<()> {
+    if add.is_none() && remove.is_empty() {
+        return Ok(());
+    }
+    let config = LoopbackConfig::get()?;
+    let mut entries = config
+        .entries()
+        .iter()
+        .filter(|entry| {
+            !remove
+                .iter()
+                .any(|sid| unsafe { EqualSid(entry.Sid, *sid) != 0 })
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if let Some(sid) = add {
+        if !entries
+            .iter()
+            .any(|entry| unsafe { EqualSid(entry.Sid, sid) != 0 })
+        {
+            entries.push(SID_AND_ATTRIBUTES {
+                Sid: sid,
+                Attributes: 0,
+            });
+        }
+    }
+    let count = u32::try_from(entries.len()).map_err(|_| LandstripError::IntegerTooLarge)?;
+    let entries_ptr = if entries.is_empty() {
+        ptr::null()
+    } else {
+        entries.as_ptr()
+    };
+    let status = unsafe { NetworkIsolationSetAppContainerConfig(count, entries_ptr) };
+    if status != 0 {
+        return Err(setup_failed(win32_error(status)).into());
+    }
+    Ok(())
+}
+
+struct OwnedSid(PSID);
+
+impl Drop for OwnedSid {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { FreeSid(self.0) };
+        }
+    }
+}
+
+struct LoopbackConfig {
+    count: u32,
+    entries: *mut SID_AND_ATTRIBUTES,
+}
+
+impl LoopbackConfig {
+    fn get() -> Result<Self> {
+        let mut count = 0;
+        let mut entries = ptr::null_mut();
+        let status = unsafe { NetworkIsolationGetAppContainerConfig(&mut count, &mut entries) };
+        if status != 0 {
+            return Err(setup_failed(win32_error(status)).into());
+        }
+        Ok(Self { count, entries })
+    }
+
+    fn entries(&self) -> &[SID_AND_ATTRIBUTES] {
+        if self.entries.is_null() {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.entries, self.count as usize) }
+    }
+}
+
+impl Drop for LoopbackConfig {
+    fn drop(&mut self) {
+        let heap = unsafe { GetProcessHeap() };
+        for entry in self.entries() {
+            if !entry.Sid.is_null() {
+                unsafe { HeapFree(heap, 0, entry.Sid.cast()) };
+            }
+        }
+        if !self.entries.is_null() {
+            unsafe { HeapFree(heap, 0, self.entries.cast()) };
         }
     }
 }

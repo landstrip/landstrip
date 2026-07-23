@@ -100,6 +100,7 @@ interface SandboxNetworkConfig {
 
 interface SandboxWindowsConfig {
   appContainerMode: 'lpac' | 'standard';
+  allowLoopback: boolean;
 }
 
 interface SandboxConfig {
@@ -288,6 +289,7 @@ function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxCo
     },
     windows: {
       appContainerMode: windows?.appContainerMode ?? base.windows.appContainerMode,
+      allowLoopback: windows?.allowLoopback ?? base.windows.allowLoopback,
     },
   };
 }

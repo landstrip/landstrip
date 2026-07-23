@@ -39,6 +39,8 @@ pub(crate) struct AccessPolicy {
     pub(crate) network_access: NetworkAccess,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) app_container_mode: AppContainerMode,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub(crate) allow_windows_loopback: bool,
 }
 
 // The write broker that consults these lives only in the Linux seccomp path.
@@ -270,6 +272,7 @@ pub(crate) fn resolve_policy(
         read_symlinks,
         network_access: lower_network_policy(network, &policy_base, home)?,
         app_container_mode: windows.app_container_mode,
+        allow_windows_loopback: windows.allow_loopback,
     };
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     policy.validate()?;

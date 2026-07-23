@@ -56,6 +56,7 @@ pub(crate) enum AppContainerMode {
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct SandboxWindows {
     pub(crate) app_container_mode: AppContainerMode,
+    pub(crate) allow_loopback: bool,
 }
 
 pub(crate) fn load_settings(policy_paths: &[PathBuf], format: PolicyFormat) -> Result<Settings> {
