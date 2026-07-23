@@ -94,6 +94,11 @@ pub(crate) enum Error {
         tool: PathBuf,
         source: Cause,
     },
+    /// The host Job Object rejected both nested assignment and safe breakaway.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    HostJobIncompatible {
+        source: Cause,
+    },
     /// A value the kernel interface cannot represent.
     #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     IntegerTooLarge,
@@ -142,6 +147,10 @@ impl Error {
         match self {
             Self::Usage { message } => Some(message.clone()),
             Self::LaunchFailed { tool, .. } => Some(tool.display().to_string()),
+            Self::HostJobIncompatible { .. } => Some(
+                "Landstrip is running inside a Job Object that prevents creating the sandbox job; start Pi outside the debugger or configure it to permit child-process breakaway"
+                    .to_owned(),
+            ),
             _ => None,
         }
     }
@@ -188,7 +197,8 @@ impl StdError for Error {
             Self::PolicyParseFailed { source }
             | Self::SandboxSetupFailed { source, .. }
             | Self::SuperviseFailed { source }
-            | Self::LaunchFailed { source, .. } => Some(&**source),
+            | Self::LaunchFailed { source, .. }
+            | Self::HostJobIncompatible { source } => Some(&**source),
             _ => None,
         }
     }

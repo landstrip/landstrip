@@ -22,7 +22,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS,
+    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
     ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, GENERIC_READ,
     GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_ABANDONED,
     WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -49,14 +49,15 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectExtendedLimitInformation, SetInformationJobObject,
+    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
 };
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, GetExitCodeProcess, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+    CREATE_BREAKAWAY_FROM_JOB, CreateMutexW, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE,
@@ -819,7 +820,6 @@ fn create_process_in_appcontainer(
         | (1u64 << 52)  // ImageLoadNoRemote
         | (1u64 << 56); // ImageLoadNoLowLabel
     let command_line = command_line(tool, args)?;
-    let mut command_line = wide_string(&command_line);
     let mut startup_info = unsafe { mem::zeroed::<STARTUPINFOEXW>() };
     startup_info.StartupInfo.cb = u32::try_from(mem::size_of::<STARTUPINFOEXW>())
         .map_err(|_| LandstripError::IntegerTooLarge)?;
@@ -885,6 +885,67 @@ fn create_process_in_appcontainer(
     }
 
     startup_info.lpAttributeList = attribute_list.as_mut_ptr();
+    let process_info = launch_process(
+        &command_line,
+        tool,
+        &mut startup_info,
+        current_process_in_job()?,
+    )?;
+    drop(standard_handles);
+
+    supervise_process(process_info)
+}
+
+fn current_process_in_job() -> Result<bool> {
+    let mut in_job = 0;
+    let ok = unsafe { IsProcessInJob(GetCurrentProcess(), ptr::null_mut(), &mut in_job) };
+    if ok == 0 {
+        return Err(setup_failed(io::Error::last_os_error()).into());
+    }
+    Ok(in_job != 0)
+}
+
+fn launch_process(
+    command_line: &str,
+    tool: &OsStr,
+    startup_info: &mut STARTUPINFOEXW,
+    in_host_job: bool,
+) -> Result<PROCESS_INFORMATION> {
+    match create_process(command_line, startup_info, EXTENDED_STARTUPINFO_PRESENT) {
+        Ok(process_info) => Ok(process_info),
+        Err(source) if in_host_job && is_access_denied(&source) => create_process(
+            command_line,
+            startup_info,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_BREAKAWAY_FROM_JOB,
+        )
+        .map_err(|source| {
+            if is_access_denied(&source) {
+                LandstripError::HostJobIncompatible {
+                    source: source.into(),
+                }
+                .into()
+            } else {
+                LandstripError::LaunchFailed {
+                    tool: PathBuf::from(tool),
+                    source: source.into(),
+                }
+                .into()
+            }
+        }),
+        Err(source) => Err(LandstripError::LaunchFailed {
+            tool: PathBuf::from(tool),
+            source: source.into(),
+        }
+        .into()),
+    }
+}
+
+fn create_process(
+    command_line: &str,
+    startup_info: &mut STARTUPINFOEXW,
+    creation_flags: u32,
+) -> io::Result<PROCESS_INFORMATION> {
+    let mut command_line = wide_string(command_line);
     let mut process_info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
     let created = unsafe {
         CreateProcessW(
@@ -893,25 +954,24 @@ fn create_process_in_appcontainer(
             ptr::null(),
             ptr::null(),
             1,
-            EXTENDED_STARTUPINFO_PRESENT,
+            creation_flags,
             ptr::null(),
             ptr::null(),
-            (&raw mut startup_info).cast(),
+            (&raw mut *startup_info).cast(),
             &mut process_info,
         )
     };
-    let launch_error = (created == 0).then(io::Error::last_os_error);
-    drop(standard_handles);
-
-    if let Some(source) = launch_error {
-        return Err(LandstripError::LaunchFailed {
-            tool: PathBuf::from(tool),
-            source: source.into(),
-        }
-        .into());
+    if created == 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(process_info)
+}
 
-    supervise_process(process_info)
+fn is_access_denied(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        == Some(ERROR_ACCESS_DENIED)
 }
 
 fn supervise_process(process_info: PROCESS_INFORMATION) -> Result<u32> {
@@ -1156,5 +1216,11 @@ mod tests {
             StandardHandleDirection::Output.desired_access(),
             GENERIC_WRITE
         );
+    }
+
+    #[test]
+    fn access_denied_detection_uses_the_win32_error_code() {
+        assert!(is_access_denied(&io::Error::from_raw_os_error(5)));
+        assert!(!is_access_denied(&io::Error::from_raw_os_error(2)));
     }
 }
