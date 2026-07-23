@@ -289,7 +289,7 @@ describe('RpcProcess', () => {
   });
 });
 
-it.runIf(process.platform === 'linux' || process.platform === 'darwin')(
+it.runIf(['linux', 'darwin', 'win32'].includes(process.platform))(
   'starts a real Pi RPC worker inside Landstrip',
   async () => {
     const root = mkdtempSync(join(tmpdir(), 'pi-landstrip-rpc-'));
@@ -301,7 +301,13 @@ it.runIf(process.platform === 'linux' || process.platform === 'darwin')(
       policyPath,
       JSON.stringify({
         network: { allowNetwork: false },
-        filesystem: { denyRead: [], allowRead: [], allowWrite: [root], denyWrite: [] },
+        filesystem: {
+          denyRead: [],
+          allowRead: [process.cwd()],
+          allowWrite: [root],
+          denyWrite: [],
+        },
+        windows: { appContainerMode: 'standard', allowLoopback: false },
       }),
     );
     const packageDir = dirname(fileURLToPath(import.meta.url));

@@ -4,8 +4,8 @@
 # landstrip
 
 `landstrip` runs commands in an OS-level sandbox using Landlock LSM on Linux,
-Seatbelt on macOS, and LPAC AppContainer on Windows. It accepts the Anthropic
-Sandbox Runtime policy subset in JSON or YAML.
+Seatbelt on macOS, and LPAC or standard AppContainer on Windows. It accepts the
+Anthropic Sandbox Runtime policy subset in JSON or YAML.
 
 ## Installation
 
@@ -45,7 +45,7 @@ details.
 | ------------ | ----------------------- | --------------------------- | ------------------------- |
 | Policy       | path-based rules        | file-based rules            | per-run AppContainer ACLs |
 | Timing       | dynamic path subset     | static file-based ruleset   | per-run ACL grants        |
-| TCP          | proxy or loopback       | proxy or loopback           | allow all or deny all     |
+| TCP          | proxy or loopback       | proxy or loopback           | capabilities or loopback  |
 | Unix sockets | allowlist               | seccomp-brokered allowlist  | allow all or deny all     |
 
 ### Linux
@@ -65,22 +65,31 @@ and reports broker decisions.
 
 ### Windows
 
-Windows provides AppContainer for application-level sandboxing. Landstrip
-creates a per-run LPAC AppContainer profile, grants its SID access to the lowered
-read and write roots, and removes those grants after the sandboxed process tree
-exits. Windows policies must use explicit read allowlists.
+Windows provides AppContainer for application-level sandboxing. Landstrip creates a
+per-run profile, grants its SID access to the lowered read and write roots, and
+removes those grants after the sandboxed process tree exits. Windows policies must
+use explicit read allowlists. Ancestors receive traversal-only, non-inheriting access;
+unrelated siblings are not exposed.
 
-Landstrip assigns the sandboxed process to a Job Object with
-`KILL_ON_JOB_CLOSE`, so child processes are kept in the sandbox process tree and
-are terminated when the launcher exits.
+`windows.appContainerMode` selects `"lpac"` (the default) or `"standard"`. LPAC
+provides the stricter boundary. Standard AppContainer can also access resources
+already granted to `ALL APPLICATION PACKAGES`, so selecting it is an explicit
+security downgrade. Landstrip never retries an LPAC launch in standard mode.
 
-`allowNetwork` grants the internet and private-network AppContainer
-capabilities, while the default container holds none and denies all network
-access.
+Landstrip assigns the sandboxed process to a Job Object with `KILL_ON_JOB_CLOSE`, so
+child processes are kept in the sandbox process tree and terminated when the
+launcher exits. When a restrictive host Job Object prevents safe breakaway,
+Landstrip fails with `HOST_JOB_INCOMPATIBLE`; it never launches without its own job.
 
-AppContainer capabilities are coarse. Fine-grained TCP policies by host or port
-require elevated Windows Filtering Platform rules keyed by the AppContainer SID,
-which is unsuitable for an unprivileged agent sandbox runtime.
+`allowNetwork` grants the internet and private-network AppContainer capabilities,
+while the default container holds none. `windows.allowLoopback` is a separate,
+explicit opt-in that temporarily exempts only the per-run AppContainer SID. The
+exemption permits every local loopback service, not a single proxy port. Existing
+system exemptions are preserved and the per-run exemption is removed at exit.
+
+AppContainer capabilities are coarse. Fine-grained direct TCP policies by host or
+port require elevated Windows Filtering Platform rules keyed by the AppContainer
+SID, which is unsuitable for an unprivileged agent sandbox runtime.
 
 ## Policy format
 
@@ -152,7 +161,23 @@ For a filesystem-only sandbox with unrestricted direct network access, set:
 
 `allowNetwork` disables Landstrip network enforcement while leaving filesystem
 policy enforcement in place. On Windows this grants the AppContainer its network
-capabilities; without it the container denies all network access.
+capabilities. With `allowNetwork: false`, network is denied unless
+`windows.allowLoopback` explicitly enables the all-loopback exemption described
+above.
+
+A Windows runtime that requires standard AppContainer and loopback can opt in with
+the following policy:
+
+```json
+{
+  "windows": {
+    "appContainerMode": "standard",
+    "allowLoopback": true
+  }
+}
+```
+
+Core Landstrip defaults to LPAC with loopback disabled.
 
 ## Traps
 

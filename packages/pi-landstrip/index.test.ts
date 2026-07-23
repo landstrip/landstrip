@@ -480,6 +480,8 @@ import {
   controlResponseLine,
   domainMatchesAny,
   formatLandstripTraps,
+  extractNativeDeniedPath,
+  extractNativeWriteDeniedPath,
   isQueryTrap,
   parseTrapLine,
 } from './index.ts';
@@ -564,6 +566,34 @@ describe('parseTrapLine', () => {
     expect(parseTrapLine('cat: /etc/passwd: Permission denied')).toBeNull();
     expect(parseTrapLine('')).toBeNull();
     expect(parseTrapLine(line({ kind: 'future', message: 'x' }))).toBeNull();
+  });
+});
+
+describe('native Windows denial extraction', () => {
+  it('extracts drive-qualified, UNC, and MSYS paths', () => {
+    const cwd = process.cwd();
+    expect(
+      extractNativeDeniedPath(`cat: 'C:\\Users\\me\\secret.txt': Permission denied`, cwd),
+    ).toContain('C:\\Users\\me\\secret.txt');
+    expect(
+      extractNativeDeniedPath(`type: '\\\\server\\share\\secret.txt': Access is denied.`, cwd),
+    ).toContain('server');
+    const msysPath = extractNativeDeniedPath('cat: /c/Users/me/secret.txt: Permission denied', cwd);
+    expect(msysPath).toContain(process.platform === 'win32' ? 'C:\\Users\\me' : '/c/Users/me');
+    expect(extractNativeDeniedPath('type: ..\\secret.txt: Access is denied.', cwd)).toContain(
+      'secret.txt',
+    );
+  });
+
+  it('extracts write denials only when they identify a concrete path', () => {
+    const cwd = process.cwd();
+    expect(
+      extractNativeWriteDeniedPath(
+        `touch: cannot create 'C:\\Users\\me\\output.txt': Access is denied.`,
+        cwd,
+      ),
+    ).toContain('C:\\Users\\me\\output.txt');
+    expect(extractNativeDeniedPath('Access is denied.', cwd)).toBeNull();
   });
 });
 

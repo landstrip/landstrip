@@ -294,6 +294,11 @@ function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxCo
   };
 }
 
+function shouldStartProxy(config: SandboxConfig): boolean {
+  if (config.network.allowNetwork) return false;
+  return process.platform !== 'win32' || config.windows.allowLoopback;
+}
+
 function getConfigPaths(cwd: string): { globalPath: string; projectPath: string } {
   return getPiConfigPaths(cwd, 'sandbox.json');
 }
@@ -480,7 +485,11 @@ export function matchesPattern(filePath: string, patterns: string[], cwd: string
 }
 
 function normalizeBlockedPath(path: string, cwd: string): string {
-  return canonicalizePath(isAbsolute(path) ? path : join(cwd, path), cwd);
+  const nativePath =
+    process.platform === 'win32' && /^\/[a-zA-Z](?:\/|$)/.test(path)
+      ? `${path[1]}:${path.slice(2)}`
+      : path;
+  return canonicalizePath(isAbsolute(nativePath) ? nativePath : join(cwd, nativePath), cwd);
 }
 
 // Breadth-first filesystem approval: when the user allows a blocked read/write,
@@ -559,11 +568,17 @@ function isPathLike(value: string): boolean {
   return (
     trimmed === '~' ||
     trimmed.startsWith('/') ||
+    trimmed.startsWith('\\\\') ||
+    /^[a-zA-Z]:[\\/]/.test(trimmed) ||
     trimmed.startsWith('~/') ||
+    trimmed.startsWith('~\\') ||
     trimmed.startsWith('./') ||
+    trimmed.startsWith('.\\') ||
     trimmed.startsWith('../') ||
+    trimmed.startsWith('..\\') ||
     trimmed.startsWith('.') ||
-    trimmed.includes('/')
+    trimmed.includes('/') ||
+    trimmed.includes('\\')
   );
 }
 
@@ -601,44 +616,56 @@ function extractBlockedPath(trapOutput: string, cwd: string): string | null {
   return null;
 }
 
-function extractNativeDeniedPath(output: string, cwd: string): string | null {
-  let match = output.match(/['"]([^'"\n]+)['"]:\s+(?:Operation not permitted|Permission denied)/);
+export function extractNativeDeniedPath(output: string, cwd: string): string | null {
+  const denial = String.raw`(?:Access is denied\.?|Operation not permitted|Permission denied)`;
+  let match = output.match(new RegExp(String.raw`['"]([^'"\n]+)['"][^\r\n]{0,120}${denial}`, 'i'));
   if (match) return normalizePathMatch(match[1], cwd);
 
-  // bash/sh: line X: /path: Permission denied
+  // bash/sh and native Windows tools: line X: /path: Permission denied,
+  // or cmd: C:\path: Access is denied.
   match = output.match(
-    /(?:\/bin\/bash|bash|sh): (?:line \d+: )?([^:\n]+): (?:Operation not permitted|Permission denied)/,
+    new RegExp(
+      String.raw`(?:^|:\s+)((?:[a-zA-Z]:[\\/]|\\\\|/|\.{1,2}[\\/])[^\r\n]*?):\s+${denial}$`,
+      'im',
+    ),
   );
   if (match) return normalizePathMatch(match[1], cwd);
 
   // ls/cat/cp: cannot open/access/stat '/path': Permission denied
   match = output.match(
-    /^[a-zA-Z0-9_-]+: cannot (?:open|access|stat|create)(?: directory)? '?([^'\n]+?)'?(?: for (?:reading|writing))?: (?:Operation not permitted|Permission denied)$/m,
+    new RegExp(
+      String.raw`^[a-zA-Z0-9_-]+: cannot (?:open|access|stat|create)(?: directory)? '?([^'\n]+?)'?(?: for (?:reading|writing))?: ${denial}$`,
+      'im',
+    ),
   );
   if (match) return normalizePathMatch(match[1], cwd);
-
-  // Generic: cmd: /absolute/path: Permission denied or Operation not permitted
-  match = output.match(
-    /^[a-zA-Z0-9_-]+: (\/[^:\n]+): (?:Operation not permitted|Permission denied)$/m,
-  );
-  if (match) return normalizeBlockedPath(match[1], cwd);
 
   return null;
 }
 
-function extractNativeWriteDeniedPath(output: string, cwd: string): string | null {
+export function extractNativeWriteDeniedPath(output: string, cwd: string): string | null {
+  const denial = String.raw`(?:Access is denied\.?|Operation not permitted|Permission denied)`;
   let match = output.match(
-    /(?:[Uu]nable to create|cannot (?:create|touch|mkdir|remove|unlink|rename)|for writing)[^'"\n]*['"]([^'"\n]+)['"]:\s+(?:Operation not permitted|Permission denied)/m,
+    new RegExp(
+      String.raw`(?:[Uu]nable to create|cannot (?:create|touch|mkdir|remove|unlink|rename)|for writing)[^'"\n]*['"]([^'"\n]+)['"][^\r\n]{0,120}${denial}`,
+      'im',
+    ),
   );
   if (match) return normalizePathMatch(match[1], cwd);
 
   match = output.match(
-    /^[a-zA-Z0-9_-]+: cannot create(?: directory)? '?([^'\n]+?)'?(?: for writing)?: (?:Operation not permitted|Permission denied)$/m,
+    new RegExp(
+      String.raw`^[a-zA-Z0-9_-]+: cannot create(?: directory)? '?([^'\n]+?)'?(?: for writing)?: ${denial}$`,
+      'im',
+    ),
   );
   if (match) return normalizePathMatch(match[1], cwd);
 
   match = output.match(
-    /^[a-zA-Z0-9_-]+: couldn't open temporary file (\/[^:\n]+): (?:Operation not permitted|Permission denied)$/m,
+    new RegExp(
+      String.raw`^[a-zA-Z0-9_-]+: couldn't open temporary file ((?:[a-zA-Z]:[\\/]|\\\\|/)[^\r\n]*?): ${denial}$`,
+      'im',
+    ),
   );
   if (match) return normalizePathMatch(match[1], cwd);
 
@@ -1732,9 +1759,9 @@ export function createLandstripIntegration(
     const config = loadConfig(options.cwd);
     const proxyToken = randomBytes(32).toString('base64url');
     const proxyAuthorization = `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
-    const proxy = config.network.allowNetwork
-      ? null
-      : await startProxy(options.ctx, allowances, options.signal, proxyAuthorization);
+    const proxy = shouldStartProxy(config)
+      ? await startProxy(options.ctx, allowances, options.signal, proxyAuthorization)
+      : null;
     let policy: ReturnType<typeof writePolicyFile> | undefined;
     let trapSocket: NetSocket | undefined;
     let childEnd: NetSocket | undefined;
@@ -1837,8 +1864,7 @@ export function createLandstripIntegration(
 
         const { shell, args } = getShellConfig(SettingsManager.create(cwd).getShellPath());
         const config = loadConfig(cwd);
-        const allowNetwork = config.network.allowNetwork;
-        const proxy = allowNetwork ? null : await startProxy(ctx, allowances, signal);
+        const proxy = shouldStartProxy(config) ? await startProxy(ctx, allowances, signal) : null;
 
         // Started/created before the child exists, so tear them down on any early
         // failure too — the env file holds a copy of the environment (secrets),
@@ -2254,6 +2280,24 @@ export function createLandstripIntegration(
     );
   }
 
+  function warnIfWindowsSecurityDowngraded(ctx: ExtensionContext, config: SandboxConfig): void {
+    if (process.platform !== 'win32') return;
+    if (config.windows.appContainerMode === 'standard') {
+      notify(
+        ctx,
+        'Windows uses standard AppContainer mode, which is weaker than LPAC isolation.',
+        'warning',
+      );
+    }
+    if (config.windows.allowLoopback) {
+      notify(
+        ctx,
+        'Windows loopback access includes all local loopback services, not only the Landstrip proxy.',
+        'warning',
+      );
+    }
+  }
+
   function enableStatus(ctx: ExtensionContext, config: SandboxConfig): void {
     if (!hasTuiStatus(ctx)) return;
     const theme = ctx.ui.theme;
@@ -2265,6 +2309,9 @@ export function createLandstripIntegration(
     if (config.network.allowNetwork) {
       networkLabel = 'unrestricted';
       networkColor = 'warning';
+    } else if (process.platform === 'win32' && !config.windows.allowLoopback) {
+      networkLabel = 'blocked';
+      networkColor = 'accent';
     } else if (allowsAllDomains(config.network.allowedDomains)) {
       networkLabel = 'any domain';
       networkColor = 'warning';
@@ -2276,8 +2323,13 @@ export function createLandstripIntegration(
     const sep = theme.fg('dim', '·');
     const net = theme.fg(networkColor, networkLabel);
     const write = theme.fg('accent', `${config.filesystem.allowWrite.length} write paths`);
+    const fields = [`${dot} ${label}`, net, write];
+    if (process.platform === 'win32') {
+      const color = config.windows.appContainerMode === 'standard' ? 'warning' : 'accent';
+      fields.splice(1, 0, theme.fg(color, `${config.windows.appContainerMode} AppContainer`));
+    }
 
-    setTuiStatus(ctx, 'sandbox', `${dot} ${label}  ${sep}  ${net}  ${sep}  ${write}`);
+    setTuiStatus(ctx, 'sandbox', fields.join(`  ${sep}  `));
   }
 
   const headlessWarnings = new Set<string>();
@@ -2324,6 +2376,7 @@ export function createLandstripIntegration(
     sandboxReady = true;
     setSandboxState('enabled', ctx);
     warnIfAllDomainsAllowed(ctx, config);
+    warnIfWindowsSecurityDowngraded(ctx, config);
     enableStatus(ctx, config);
     return true;
   }
@@ -2481,7 +2534,11 @@ export function createLandstripIntegration(
                 item('project', text(projectPath));
                 item('global', text(globalPath));
 
-                const networkMode = config.network.allowNetwork ? 'unrestricted' : 'proxied';
+                const networkMode = config.network.allowNetwork
+                  ? 'unrestricted'
+                  : process.platform === 'win32' && !config.windows.allowLoopback
+                    ? 'blocked'
+                    : 'proxied';
                 section('Network', networkMode);
                 item('allow network', boolValue(config.network.allowNetwork));
                 item('allowed', listValue(config.network.allowedDomains));
@@ -2501,6 +2558,16 @@ export function createLandstripIntegration(
                 item('allow read', listValue(config.filesystem.allowRead));
                 item('allow write', listValue(config.filesystem.allowWrite));
                 item('deny write', listValue(config.filesystem.denyWrite));
+
+                if (process.platform === 'win32') {
+                  section('Windows');
+                  const mode = config.windows.appContainerMode;
+                  item(
+                    'container',
+                    mode === 'standard' ? theme.fg('warning', `${mode} (weaker)`) : text(mode),
+                  );
+                  item('loopback', boolValue(config.windows.allowLoopback));
+                }
 
                 if (sessionAllowedReadPaths.length > 0 || sessionAllowedWritePaths.length > 0) {
                   section('Session grants');

@@ -90,3 +90,30 @@ jobs:
 
       - name: Install dependencies
         run: npm run ci:extensions:local
+
+  extensions-windows:
+    name: Test Windows Pi extension
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/*/package-lock.json
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test extensions with Git Bash
+        run: npm run ci:extensions:local

@@ -46,6 +46,11 @@ Alternatively, place the extension under `~/.pi/agent/extensions/` (global) or
 
 On unsupported platforms the extension loads but leaves sandboxing disabled.
 
+On Windows, Pi's Git Bash/MSYS shell cannot run under LPAC. The packaged policy
+therefore selects standard AppContainer explicitly. This is weaker than LPAC because
+resources granted to `ALL APPLICATION PACKAGES` remain visible; `/sandbox` and the
+status line report the active mode. There is no silent LPAC-to-standard fallback.
+
 ## Disabling
 
 Use the `--no-sandbox` flag, or set `enabled` to `false` in `sandbox.json`:
@@ -75,11 +80,12 @@ being approved.
 Project approvals are written to `.pi/sandbox.json`; global approvals are
 written to `~/.pi/agent/sandbox.json`.
 
-The main agent remains a normal Pi process. `pi-landstrip` replaces Bash
-execution, including AI `bash` calls and manually typed shell commands (`!` and
-`!!`), with a Landstrip-wrapped implementation. Network traffic uses an
-allowlist proxy when direct access is disabled. Pi's filesystem tools and plugin
-callbacks remain trusted code outside the Landstrip sandbox.
+The main agent remains a normal Pi process. `pi-landstrip` replaces Bash execution,
+including AI `bash` calls and manually typed shell commands (`!` and `!!`), with a
+Landstrip-wrapped implementation. Network traffic uses an allowlist proxy when
+direct access is disabled and the platform policy permits loopback; otherwise it is
+blocked. Pi's filesystem tools and plugin callbacks remain trusted code outside the
+Landstrip sandbox.
 
 By default, Bash and subagent processes have no direct network access. Reads are
 limited to the project, Git configuration, and `/dev/null`; writes are limited
@@ -164,11 +170,14 @@ Unsupported Pi versions still fail task startup.
   `sandbox.json`, then restart or continue the task in a fresh worker to apply
   additional filesystem access. Main-agent Bash can retry a command, but there
   is no live worker-policy update.
-- **Windows**: AppContainer cannot permit only the loopback proxy port, so
-  domain-proxied worker networking is unavailable and the worker has no network.
-  Setting `network.allowNetwork` to `true` is a degraded mode that permits model
-  access but gives the entire worker unrestricted network access; domain lists
-  are then not a boundary.
+- **Windows**: the packaged policy selects standard AppContainer for Pi's Git
+  Bash/MSYS runtime. With `windows.allowLoopback: false` (the default), the extension
+  does not start an unreachable proxy and the worker has no network. Setting
+  `windows.allowLoopback` to `true` enables the domain proxy, but also gives the
+  AppContainer access to every local loopback service, not only the proxy port.
+  Setting `network.allowNetwork` to `true` instead gives the entire worker
+  unrestricted network access; domain lists are then not a boundary. Both opt-ins
+  are explicit security downgrades and produce warnings.
 
 ### Credentials
 
@@ -184,14 +193,30 @@ first.
 
 Subagent configuration is read from `~/.pi/agent/subagents.json` and, for trusted
 projects, `.pi/subagents.json`. Project values override global values; both are
-merged over the packaged [defaults](./subagents.json). Sandbox policy remains in
-The packaged subagent types are `explore`, `general`, and the OpenCode-compatible
-`scout` reconnaissance agent.
-`~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi's `settings.json` contains
-only normal Pi settings, such as the `pi-landstrip` package entry.
+merged over the packaged [defaults](./subagents.json). The packaged subagent types
+are `explore`, `general`, and the OpenCode-compatible `scout` reconnaissance agent.
+
+Sandbox policy remains in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi's
+`settings.json` contains only normal Pi settings, such as the `pi-landstrip` package
+entry.
 
 `subagents.json` accepts only top-level `maxSubagents` and `subagents`; sandbox
 fields belong in `sandbox.json`.
+
+The Windows sandbox fields are:
+
+```json
+{
+  "windows": {
+    "appContainerMode": "standard",
+    "allowLoopback": false
+  }
+}
+```
+
+`appContainerMode` is `"lpac"` or `"standard"`. Core Landstrip defaults to LPAC;
+the Pi package defaults to standard mode for Git Bash compatibility. Loopback is
+independently opt-in.
 
 ```json
 {
