@@ -852,17 +852,19 @@ export class SubagentRuntime {
       ctx.ui.notify('Subagent inspection is available in TUI mode', 'warning');
       return;
     }
-    const tasks = [...this.tasks.values()];
-    if (tasks.length === 0) {
-      ctx.ui.notify('No subagent sessions in this session', 'info');
-      return;
-    }
 
+    const catalog = this.getAgentCatalog(ctx);
+    for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
+    for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
+    const agents = availableSubagents(catalog).sort((a, b) => a.name.localeCompare(b.name));
+    const tasks = [...this.tasks.values()];
     const requested = args.trim();
-    let selected = requested
+    let tab: 'agents' | 'sessions' = requested ? 'sessions' : 'agents';
+    let selectedAgent = 0;
+    let selectedTask = requested
       ? tasks.findIndex((task) => task.id === requested || task.id.startsWith(requested))
       : 0;
-    if (selected < 0) {
+    if (selectedTask < 0) {
       ctx.ui.notify(`Unknown subagent task: ${requested}`, 'error');
       return;
     }
@@ -873,29 +875,68 @@ export class SubagentRuntime {
       (tui, theme, _keybindings, done) => ({
         render: (width: number) => {
           const contentWidth = Math.max(1, width - 4);
-          const box = (title: string, lines: string[]) => [
-            boxTop(theme, width, title),
+          const box = (lines: string[]) => [
+            boxTop(theme, width, 'Subagents'),
             ...lines.map((line) => boxRow(theme, width, line)),
             boxBottom(theme, width),
           ];
-          if (!detail) {
-            const start = Math.max(0, Math.min(selected - 6, tasks.length - 12));
-            const shown = tasks.slice(start, start + 12);
-            const lines: string[] = [];
-            for (const [offset, task] of shown.entries()) {
+          const tabLabel = (label: string, active: boolean) =>
+            active ? theme.fg('accent', theme.bold(`[${label}]`)) : theme.fg('muted', label);
+          const tabs = `${tabLabel('Agents', tab === 'agents')}  ${tabLabel(
+            `Sessions ${tasks.length}`,
+            tab === 'sessions',
+          )}`;
+
+          if (tab === 'agents') {
+            const start = Math.max(0, Math.min(selectedAgent - 5, agents.length - 11));
+            const shown = agents.slice(start, start + 11);
+            const nameWidth = Math.min(
+              24,
+              Math.max(5, ...agents.map((agent) => agent.name.length + 1)),
+            );
+            const lines = [
+              tabs,
+              '',
+              `  ${'AGENT'.padEnd(nameWidth)} ${'SOURCE'.padEnd(8)} DESCRIPTION`,
+            ];
+            for (const [offset, agent] of shown.entries()) {
               const index = start + offset;
-              const cursor = index === selected ? theme.fg('accent', '›') : ' ';
-              const indent = '  '.repeat(Math.max(0, task.depth - 1));
+              const cursor = index === selectedAgent ? theme.fg('accent', '›') : ' ';
+              const name = `@${agent.name}`.padEnd(nameWidth);
+              const description = `${agent.description ?? 'No description'}${
+                agent.hidden ? ' [hidden]' : ''
+              }`;
               lines.push(
-                `${cursor} ${indent}${taskState(theme, task)} ${theme.fg('accent', `@${task.agent}`)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
+                `${cursor} ${theme.fg('accent', name)} ${theme.fg('dim', agent.source.padEnd(8))} ${theme.fg('text', description)}`,
               );
             }
-            lines.push('', theme.fg('dim', '↑↓ select  enter inspect  esc close'));
-            return box('Subagent Sessions', lines);
+            if (agents.length === 0) lines.push('  No subagent types are configured.');
+            lines.push('', theme.fg('dim', '↑↓ select  tab/→ sessions  esc close'));
+            return box(lines);
           }
 
-          const task = tasks[selected];
-          if (!task) return [];
+          if (!detail) {
+            const lines = [tabs, ''];
+            if (tasks.length === 0) {
+              lines.push('No subagent sessions in this session.');
+            } else {
+              const start = Math.max(0, Math.min(selectedTask - 5, tasks.length - 11));
+              const shown = tasks.slice(start, start + 11);
+              for (const [offset, task] of shown.entries()) {
+                const index = start + offset;
+                const cursor = index === selectedTask ? theme.fg('accent', '›') : ' ';
+                const indent = '  '.repeat(Math.max(0, task.depth - 1));
+                lines.push(
+                  `${cursor} ${indent}${taskState(theme, task)} ${theme.fg('accent', `@${task.agent}`)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
+                );
+              }
+            }
+            lines.push('', theme.fg('dim', '↑↓ select  enter inspect  tab/← agents  esc close'));
+            return box(lines);
+          }
+
+          const task = tasks[selectedTask];
+          if (!task) return box([tabs, '', 'No subagent sessions in this session.']);
           const siblings = tasks.filter(
             (candidate) => candidate.parentTaskId === task.parentTaskId,
           );
@@ -914,31 +955,52 @@ export class SubagentRuntime {
             duration,
           ].filter(Boolean);
           const lines = [
+            tabs,
+            '',
             `${theme.fg('accent', theme.bold(`@${task.agent}`))} ${theme.fg('text', task.description)}`,
             `${taskState(theme, task)} ${theme.fg('dim', metrics.join(' · '))}`,
             '',
             ...shown.map((line) => theme.fg('toolOutput', line)),
           ];
-          while (lines.length < INSPECTOR_BODY_LINES + 3) lines.push('');
+          while (lines.length < INSPECTOR_BODY_LINES + 5) lines.push('');
           if (transcript.length > INSPECTOR_BODY_LINES) {
             lines.push(
               theme.fg('dim', `${scroll + 1}-${scroll + shown.length} of ${transcript.length}`),
             );
           }
           lines.push(
-            theme.fg('dim', 'Parent p/backspace  Prev ←  Next →  ↑↓ scroll  r refresh  esc back'),
+            theme.fg('dim', 'Parent p/backspace  Prev ←  Next →  ↑↓ scroll  tab agents  esc back'),
           );
-          return box(
-            'Subagent Session',
-            lines.map((line) => truncateToWidth(line, contentWidth)),
-          );
+          return box(lines.map((line) => truncateToWidth(line, contentWidth)));
         },
         handleInput: (data: string) => {
+          if (matchesKey(data, 'tab')) {
+            tab = tab === 'agents' ? 'sessions' : 'agents';
+            detail = false;
+            scroll = 0;
+            tui.requestRender();
+            return;
+          }
+
+          if (tab === 'agents') {
+            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
+            else if (matchesKey(data, 'up')) selectedAgent = Math.max(0, selectedAgent - 1);
+            else if (matchesKey(data, 'down') && agents.length > 0) {
+              selectedAgent = Math.min(agents.length - 1, selectedAgent + 1);
+            } else if (matchesKey(data, 'right')) {
+              tab = 'sessions';
+            } else return;
+            tui.requestRender();
+            return;
+          }
+
           if (!detail) {
             if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
-            else if (matchesKey(data, 'up')) selected = Math.max(0, selected - 1);
-            else if (matchesKey(data, 'down')) selected = Math.min(tasks.length - 1, selected + 1);
-            else if (matchesKey(data, 'return')) {
+            else if (matchesKey(data, 'left')) tab = 'agents';
+            else if (matchesKey(data, 'up')) selectedTask = Math.max(0, selectedTask - 1);
+            else if (matchesKey(data, 'down') && tasks.length > 0) {
+              selectedTask = Math.min(tasks.length - 1, selectedTask + 1);
+            } else if (matchesKey(data, 'return') && tasks.length > 0) {
               detail = true;
               scroll = 0;
             } else return;
@@ -946,7 +1008,7 @@ export class SubagentRuntime {
             return;
           }
 
-          const task = tasks[selected];
+          const task = tasks[selectedTask];
           if (!task) return;
           if (matchesKey(data, 'escape')) {
             detail = false;
@@ -961,7 +1023,7 @@ export class SubagentRuntime {
             const parentIndex = task.parentTaskId
               ? tasks.findIndex((candidate) => candidate.id === task.parentTaskId)
               : -1;
-            if (parentIndex >= 0) selected = parentIndex;
+            if (parentIndex >= 0) selectedTask = parentIndex;
             else detail = false;
             scroll = 0;
           } else if (matchesKey(data, 'left') || matchesKey(data, 'right')) {
@@ -971,7 +1033,7 @@ export class SubagentRuntime {
             const siblingIndex = siblings.findIndex((candidate) => candidate.id === task.id);
             const offset = matchesKey(data, 'left') ? -1 : 1;
             const sibling = siblings[siblingIndex + offset];
-            if (sibling) selected = tasks.indexOf(sibling);
+            if (sibling) selectedTask = tasks.indexOf(sibling);
             scroll = 0;
           } else if (data !== 'r') return;
           tui.requestRender();

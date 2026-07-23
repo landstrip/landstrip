@@ -13,6 +13,8 @@ export type ConfigObject = Record<string, unknown>;
 
 export const MAX_SUBAGENTS = 16;
 
+export type AgentSource = 'built-in' | 'global' | 'local';
+
 export interface LandstripConfigFile {
   maxSubagents?: number;
   subagents?: ConfigObject;
@@ -21,6 +23,7 @@ export interface LandstripConfigFile {
 export interface LandstripConfig extends LandstripConfigFile {
   maxSubagents: number;
   subagents: ConfigObject;
+  agentSources: ReadonlyMap<string, AgentSource>;
 }
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
@@ -56,6 +59,15 @@ function mergeValue(base: unknown, override: unknown): unknown {
     return result;
   }
   return override;
+}
+
+function recordAgentSources(
+  sources: Map<string, AgentSource>,
+  config: LandstripConfigFile,
+  source: AgentSource,
+): void {
+  if (!isRecord(config.subagents) || !isRecord(config.subagents.agent)) return;
+  for (const name of Object.keys(config.subagents.agent)) sources.set(name, source);
 }
 
 export function getPiConfigPaths(
@@ -106,11 +118,15 @@ export function loadLandstripConfig(
   agentDir = getAgentDir(),
 ): LandstripConfig {
   const { globalPath, projectPath } = getPiConfigPaths(cwd, 'subagents.json', agentDir);
-  let config = readConfig(join(packageDir, 'subagents.json'));
-  config = mergeValue(config, readConfig(globalPath)) as LandstripConfigFile;
-  if (includeProject) {
-    config = mergeValue(config, readConfig(projectPath)) as LandstripConfigFile;
-  }
+  const builtInConfig = readConfig(join(packageDir, 'subagents.json'));
+  const globalConfig = readConfig(globalPath);
+  const projectConfig = includeProject ? readConfig(projectPath) : undefined;
+  const agentSources = new Map<string, AgentSource>();
+  recordAgentSources(agentSources, builtInConfig, 'built-in');
+  recordAgentSources(agentSources, globalConfig, 'global');
+  if (projectConfig) recordAgentSources(agentSources, projectConfig, 'local');
+  let config = mergeValue(builtInConfig, globalConfig) as LandstripConfigFile;
+  if (projectConfig) config = mergeValue(config, projectConfig) as LandstripConfigFile;
   if (
     !Number.isInteger(config.maxSubagents) ||
     (config.maxSubagents ?? -1) < 0 ||
@@ -119,5 +135,5 @@ export function loadLandstripConfig(
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
   }
   if (!isRecord(config.subagents)) throw new Error('subagents must be an object');
-  return config as LandstripConfig;
+  return { ...config, agentSources } as LandstripConfig;
 }

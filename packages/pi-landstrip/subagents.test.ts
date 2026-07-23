@@ -699,7 +699,21 @@ test('inspects and navigates persisted child sessions without switching sessions
   } as unknown as ExtensionAPI;
   new SubagentRuntime(pi, {} as LandstripIntegration, undefined, () => ({
     maxSubagents: 1,
-    agents: new Map(),
+    agents: new Map([
+      [
+        'review',
+        {
+          name: 'review',
+          source: 'local',
+          description: 'Review code',
+          prompt: 'Review.',
+          mode: 'subagent' as const,
+          hidden: false,
+          permissions: [],
+          providerOptions: {},
+        },
+      ],
+    ]),
     permissions: [],
     warnings: [],
     diagnostics: [],
@@ -729,7 +743,12 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   await sessionStart?.({}, ctx);
   const running = command?.('', ctx);
-  expect(component?.render(96).join('\n')).toContain('Subagent Sessions');
+  const agents = component?.render(96).join('\n');
+  expect(agents).toContain('Agents');
+  expect(agents).toContain('@review');
+  expect(agents).toContain('local');
+  component?.handleInput('\t');
+  expect(component?.render(96).join('\n')).toContain('Sessions 2');
   expect(component?.render(96).join('\n')).toContain('task-123');
   expect(component?.render(96).join('\n')).toContain('Failed child');
   component?.handleInput('\r');
@@ -741,7 +760,7 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('\x1b[D');
   expect(component?.render(96).join('\n')).toContain('Inspect child');
   component?.handleInput('\x1b');
-  expect(component?.render(96).join('\n')).toContain('Subagent Sessions');
+  expect(component?.render(96).join('\n')).toContain('Sessions 2');
   finishCustom?.();
   await running;
 });

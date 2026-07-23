@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { minimatch } from 'minimatch';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 
-import { loadLandstripConfig, type ConfigObject } from './config.ts';
+import { loadLandstripConfig, type AgentSource, type ConfigObject } from './config.ts';
 import { expandHomePath, formatError, isRecord } from './util.ts';
 
 export type PermissionAction = 'allow' | 'ask' | 'deny';
@@ -22,6 +22,7 @@ export type PermissionRules = readonly PermissionRule[];
 
 export interface AgentDefinition {
   readonly name: string;
+  readonly source: AgentSource;
   readonly description?: string;
   readonly prompt: string;
   readonly mode: 'primary' | 'subagent' | 'all';
@@ -110,7 +111,11 @@ function legacyConfigWarnings(piAgentDir: string): string[] {
   }
 }
 
-function normalizeAgent(name: string, raw: ConfigObject): AgentDefinition | undefined {
+function normalizeAgent(
+  name: string,
+  raw: ConfigObject,
+  source: AgentSource,
+): AgentDefinition | undefined {
   for (const field of ['description', 'prompt', 'model', 'variant'] as const) {
     if (raw[field] !== undefined && typeof raw[field] !== 'string') {
       throw new Error(`agent ${name} ${field} must be a string`);
@@ -149,6 +154,7 @@ function normalizeAgent(name: string, raw: ConfigObject): AgentDefinition | unde
   }
   return {
     name,
+    source,
     description: typeof raw.description === 'string' ? raw.description : undefined,
     prompt: typeof raw.prompt === 'string' ? raw.prompt : '',
     mode: raw.mode ?? 'all',
@@ -173,10 +179,12 @@ export function loadAgentCatalog(
   const diagnostics: string[] = [];
   let maxSubagents = 0;
   let subagents: ConfigObject = {};
+  let agentSources = new Map<string, AgentSource>();
   try {
     const config = loadLandstripConfig(cwd, includeProject, piAgentDir);
     maxSubagents = config.maxSubagents;
     subagents = config.subagents;
+    agentSources = new Map(config.agentSources);
   } catch (error) {
     diagnostics.push(formatError(error));
   }
@@ -192,7 +200,7 @@ export function loadAgentCatalog(
         continue;
       }
       try {
-        const agent = normalizeAgent(name, value);
+        const agent = normalizeAgent(name, value, agentSources.get(name) ?? 'built-in');
         if (agent) normalized.set(name, agent);
       } catch (error) {
         diagnostics.push(formatError(error));

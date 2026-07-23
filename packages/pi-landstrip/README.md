@@ -132,9 +132,11 @@ The tool accepts the OpenCode task fields:
 Foreground tasks return the child result directly. Background tasks return a
 queued result and deliver completion automatically. Task rows show lifecycle
 state, current activity, tool-call count, elapsed time, and expandable output.
-Use `/subagents` or the task row's `/subagents <id>` command to inspect a child
-transcript. Completed and failed task metadata remains available after reload,
-and persisted sessions can be continued with `task_id`.
+Use `/subagents` to open an inspector with **Agents** and **Sessions** tabs. The
+Agents tab lists every available subagent type and its `built-in`, `global`, or
+`local` source. The Sessions tab inspects child transcripts; task rows can open a
+specific one with `/subagents <id>`. Completed and failed task metadata remains
+available after reload, and persisted sessions can be continued with `task_id`.
 
 Session switching or shutdown stops live workers. After an unclean restart,
 unfinished work is marked interrupted; completed but undelivered background
@@ -183,6 +185,8 @@ first.
 Subagent configuration is read from `~/.pi/agent/subagents.json` and, for trusted
 projects, `.pi/subagents.json`. Project values override global values; both are
 merged over the packaged [defaults](./subagents.json). Sandbox policy remains in
+The packaged subagent types are `explore`, `general`, and the OpenCode-compatible
+`scout` reconnaissance agent.
 `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi's `settings.json` contains
 only normal Pi settings, such as the `pi-landstrip` package entry.
 

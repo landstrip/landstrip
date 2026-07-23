@@ -32,7 +32,15 @@ describe('landstrip agent configuration', () => {
 
     expect(catalog.maxSubagents).toBe(0);
     expect(availablePrimaryAgents(catalog).map((agent) => agent.name)).toEqual(['build', 'plan']);
-    expect(availableSubagents(catalog).map((agent) => agent.name)).toEqual(['explore', 'general']);
+    expect(availableSubagents(catalog).map((agent) => agent.name)).toEqual([
+      'explore',
+      'general',
+      'scout',
+    ]);
+    expect(catalog.agents.get('scout')).toMatchObject({
+      source: 'built-in',
+      mode: 'subagent',
+    });
     expect(permissionDecision(catalog.permissions, 'bash')).toBe('allow');
     expect(permissionDecision(catalog.agents.get('plan')?.permissions ?? [], 'edit')).toBe('ask');
     expect(permissionDecision(catalog.agents.get('plan')?.permissions ?? [], 'task')).toBe('ask');
@@ -70,8 +78,36 @@ describe('landstrip agent configuration', () => {
       prompt: 'Review globally.',
       mode: 'subagent',
     });
+    expect(catalog.agents.get('review')?.source).toBe('local');
     expect(permissionDecision(catalog.permissions, 'bash', 'rm -rf build')).toBe('ask');
     expect(permissionDecision(catalog.permissions, 'bash', 'git status')).toBe('allow');
+  });
+
+  test('tracks the effective built-in, global, and local agent sources', () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    write(join(agentDir, 'subagents.json'), {
+      subagents: {
+        agent: {
+          global: { mode: 'subagent' },
+          general: { description: 'Customized globally' },
+        },
+      },
+    });
+    write(join(cwd, '.pi', 'subagents.json'), {
+      subagents: {
+        agent: {
+          local: { mode: 'subagent' },
+          global: { description: 'Customized locally' },
+        },
+      },
+    });
+
+    const catalog = loadAgentCatalog(cwd, agentDir);
+    expect(catalog.agents.get('explore')?.source).toBe('built-in');
+    expect(catalog.agents.get('general')?.source).toBe('global');
+    expect(catalog.agents.get('global')?.source).toBe('local');
+    expect(catalog.agents.get('local')?.source).toBe('local');
   });
 
   test('ignores project subagents.json when the project is untrusted', () => {

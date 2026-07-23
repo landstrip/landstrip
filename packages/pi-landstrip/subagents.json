@@ -19,6 +19,23 @@
         "prompt": "Complete the delegated task autonomously. Return one concise result to the parent.",
         "permission": { "todowrite": "deny" }
       },
+      "scout": {
+        "description": "Fast codebase reconnaissance with concise handoff findings",
+        "mode": "subagent",
+        "prompt": "Scout the codebase without modifying it. Return concise findings with exact file references, key code, architecture, and a recommended starting point.",
+        "permission": {
+          "*": "deny",
+          "read": {
+            "*": "allow",
+            "**/*.env": "ask",
+            "**/*.env.*": "ask",
+            "**/*.env.example": "allow"
+          },
+          "glob": "allow",
+          "grep": "allow",
+          "list": "allow"
+        }
+      },
       "explore": {
         "description": "Fast read-focused agent for exploring codebases",
         "mode": "subagent",
