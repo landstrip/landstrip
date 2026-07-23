@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
+import { type ChildProcess, spawn, spawnSync, type StdioOptions } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import {
@@ -1727,9 +1727,11 @@ export function createLandstripIntegration(
     try {
       if (options.signal?.aborted) throw new Error('Task cancelled');
       policy = writePolicyFile(options.cwd, proxy?.port ?? null, allowances);
-      [trapSocket, childEnd] = await createSocketPair();
-      if (options.signal?.aborted) throw new Error('Task cancelled');
-      attachWorkerTrap(trapSocket, options.ctx, options.cwd, allowances, options.signal);
+      if (process.platform !== 'win32') {
+        [trapSocket, childEnd] = await createSocketPair();
+        if (options.signal?.aborted) throw new Error('Task cancelled');
+        attachWorkerTrap(trapSocket, options.ctx, options.cwd, allowances, options.signal);
+      }
     } catch (error) {
       trapSocket?.destroy();
       childEnd?.destroy();
@@ -1739,6 +1741,7 @@ export function createLandstripIntegration(
     }
 
     const workerPolicy = policy;
+    const workerTrapSocket = trapSocket;
     const workerChildEnd = childEnd;
     const workerEnv = { ...options.env };
     if (proxy) {
@@ -1756,18 +1759,19 @@ export function createLandstripIntegration(
       if (disposed) throw new Error('Prepared process has been disposed');
       if (spawned) throw new Error('Prepared process can only be spawned once');
       spawned = true;
-      const child = spawn(
-        binaryPath(),
-        ['--trap-fd', '3', '-p', workerPolicy.path, options.command, ...options.args],
-        {
-          ...spawnOptions,
-          cwd: options.cwd,
-          env: workerEnv,
-          detached: true,
-          stdio: ['pipe', 'pipe', 'pipe', workerChildEnd],
-        },
-      );
-      workerChildEnd.destroy();
+      const landstripArgs = ['-p', workerPolicy.path, options.command, ...options.args];
+      const stdio: StdioOptions = workerChildEnd
+        ? ['pipe', 'pipe', 'pipe', workerChildEnd]
+        : ['pipe', 'pipe', 'pipe'];
+      if (workerChildEnd) landstripArgs.unshift('--trap-fd', '3');
+      const child = spawn(binaryPath(), landstripArgs, {
+        ...spawnOptions,
+        cwd: options.cwd,
+        env: workerEnv,
+        detached: true,
+        stdio,
+      });
+      workerChildEnd?.destroy();
       patchProcessGroupKill(child);
       preparedChild = child;
       return child as ReturnType<RpcSpawn>;
@@ -1783,8 +1787,8 @@ export function createLandstripIntegration(
         disposePromise ??= (async () => {
           disposed = true;
           await stopPreparedChild(preparedChild);
-          trapSocket.destroy();
-          workerChildEnd.destroy();
+          workerTrapSocket?.destroy();
+          workerChildEnd?.destroy();
           rmSync(workerPolicy.dir, { recursive: true, force: true });
           await proxy?.stop();
         })();
@@ -1844,7 +1848,8 @@ export function createLandstripIntegration(
             proxy?.port ?? null,
           );
           const wrappedCommand = `source '${envFile.path}' && ${command}`;
-          landstripArgs = ['--trap-fd', '3', '-p', policy.path, shell, ...args, wrappedCommand];
+          landstripArgs = ['-p', policy.path, shell, ...args, wrappedCommand];
+          if (process.platform !== 'win32') landstripArgs.unshift('--trap-fd', '3');
         } catch (error) {
           await teardownResources();
           throw error;
@@ -1855,35 +1860,35 @@ export function createLandstripIntegration(
             let timeoutHandle: NodeJS.Timeout | undefined;
             let timedOut = false;
             let cleaned = false;
-
-            const [trapSocket, childEnd] = await createSocketPair();
+            let trapSocket: NetSocket | undefined;
+            let childEnd: NetSocket | undefined;
+            if (process.platform !== 'win32') [trapSocket, childEnd] = await createSocketPair();
 
             const cleanup = async () => {
               if (cleaned) return;
               cleaned = true;
               if (timeoutHandle) clearTimeout(timeoutHandle);
               signal?.removeEventListener('abort', onAbort);
-              trapSocket.destroy();
+              trapSocket?.destroy();
               await teardownResources();
             };
 
-            const child = spawn(binaryPath(), landstripArgs, {
+            const stdio: StdioOptions = childEnd
+              ? ['ignore', 'pipe', 'pipe', childEnd]
+              : ['ignore', 'pipe', 'pipe'];
+            const child: ChildProcess = spawn(binaryPath(), landstripArgs, {
               cwd,
               env: { PATH: process.env.PATH, HOME: process.env.HOME },
               detached: true,
-              stdio: ['ignore', 'pipe', 'pipe', childEnd],
+              stdio,
             });
+            patchProcessGroupKill(child);
 
             // Child has dup'd its end; parent can close its copy.
-            childEnd.destroy();
+            childEnd?.destroy();
 
             function killChild(): void {
-              if (child.pid === undefined) return;
-              try {
-                process.kill(-child.pid, 'SIGKILL');
-              } catch {
-                child.kill('SIGKILL');
-              }
+              child.kill('SIGKILL');
             }
 
             function onAbort(): void {
@@ -1928,9 +1933,9 @@ export function createLandstripIntegration(
                   return;
                 }
 
-                // Structured traps are trusted only from the trap socket (fd 3);
-                // the command's own stderr is read with the native regexes, which
-                // reflect a real kernel denial rather than a forgeable JSON line.
+                // Structured traps are trusted only from the trap socket; on
+                // Windows, where trap-fd inheritance is unsupported, use native
+                // kernel-denial text from stderr.
                 const blockedPath =
                   extractBlockedPath(errorFdAcc, cwd) ?? extractNativeDeniedPath(stderrAcc, cwd);
                 if (!blockedPath && ctx.hasUI) {
@@ -1979,7 +1984,7 @@ export function createLandstripIntegration(
               queryId: string,
               action: LandstripControlResponse['action'],
             ): void => {
-              if (trapSocket.destroyed) return;
+              if (!trapSocket || trapSocket.destroyed) return;
               trapSocket.write(controlResponseLine(queryId, action));
             };
 
@@ -1991,7 +1996,7 @@ export function createLandstripIntegration(
               callbacks.onErrorFd?.(Buffer.from(infoLine, 'utf8'));
             };
 
-            trapSocket.on('data', (data: Buffer) => {
+            trapSocket?.on('data', (data: Buffer) => {
               trapBuffer += trapDecoder.write(data);
               let nl = trapBuffer.indexOf('\n');
               while (nl !== -1) {
@@ -2057,8 +2062,8 @@ export function createLandstripIntegration(
             });
             child.once('close', (code) => finalizeExec(code));
           })().catch(async (error: unknown) => {
-            // A failure before the child is wired (e.g. createSocketPair) never
-            // reaches cleanup(); free the proxy and temp dirs here too.
+            // A failure before the child is wired (for example, creating the trap
+            // channel) never reaches cleanup(), so free temporary resources here.
             await teardownResources();
             reject(error);
           });
