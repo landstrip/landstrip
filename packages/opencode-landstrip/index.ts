@@ -431,7 +431,10 @@ function evaluateCommandDomains(
 }
 
 function landstripVersion(): string | null {
-  const result = spawnSync(landstripBinaryPath(), ['--version'], { encoding: 'utf-8' });
+  const result = spawnSync(landstripBinaryPath(), ['--version'], {
+    encoding: 'utf-8',
+    shell: process.platform === 'win32',
+  });
   if (result.status !== 0) return null;
   return result.stdout.trim();
 }
