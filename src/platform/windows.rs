@@ -208,24 +208,36 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess
     };
     let mut granted = GrantedAccess {
         sid,
-        paths: Vec::with_capacity(read_roots.len() + policy.write_roots.len()),
+        paths: Vec::new(),
     };
 
     for path in read_roots {
-        grant_path_access(path, sid, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
-        granted.paths.push(path.clone());
+        grant_root_access(&mut granted, path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
     }
 
     for path in &policy.write_roots {
-        grant_path_access(
+        grant_root_access(
+            &mut granted,
             path,
-            sid,
             FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
         )?;
-        granted.paths.push(path.clone());
     }
 
     Ok(granted)
+}
+
+fn grant_root_access(granted: &mut GrantedAccess, path: &Path, access: u32) -> Result<()> {
+    // Parent ACEs grant only traversal plus metadata on each directory itself.
+    // This includes the drive root, but does not expose its contents or propagate
+    // access into unrelated subtrees.
+    for ancestor in path.ancestors().skip(1) {
+        grant_path_access(ancestor, granted.sid, FILE_GENERIC_EXECUTE, false)?;
+        granted.paths.push(ancestor.to_path_buf());
+    }
+
+    grant_path_access(path, granted.sid, access, true)?;
+    granted.paths.push(path.to_path_buf());
+    Ok(())
 }
 
 struct GrantedAccess {
@@ -241,15 +253,21 @@ impl Drop for GrantedAccess {
     }
 }
 
-fn grant_path_access(path: &Path, sid: PSID, access: u32) -> Result<()> {
-    set_path_access(path, sid, access, GRANT_ACCESS)
+fn grant_path_access(path: &Path, sid: PSID, access: u32, inherit: bool) -> Result<()> {
+    set_path_access(path, sid, access, GRANT_ACCESS, inherit)
 }
 
 fn revoke_path_access(path: &Path, sid: PSID) -> Result<()> {
-    set_path_access(path, sid, 0, REVOKE_ACCESS)
+    set_path_access(path, sid, 0, REVOKE_ACCESS, false)
 }
 
-fn set_path_access(path: &Path, sid: PSID, access: u32, mode: ACCESS_MODE) -> Result<()> {
+fn set_path_access(
+    path: &Path,
+    sid: PSID,
+    access: u32,
+    mode: ACCESS_MODE,
+    inherit: bool,
+) -> Result<()> {
     let path = path
         .as_os_str()
         .encode_wide()
@@ -277,7 +295,11 @@ fn set_path_access(path: &Path, sid: PSID, access: u32, mode: ACCESS_MODE) -> Re
     let explicit_access = EXPLICIT_ACCESS_W {
         grfAccessPermissions: access,
         grfAccessMode: mode,
-        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        grfInheritance: if inherit {
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        } else {
+            0
+        },
         Trustee: TRUSTEE_W {
             pMultipleTrustee: ptr::null_mut(),
             MultipleTrusteeOperation: 0,
