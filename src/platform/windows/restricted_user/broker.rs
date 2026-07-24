@@ -68,7 +68,7 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
         )
     };
     if ok == 0 {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!("CreateProcessWithLogonW: {}", io::Error::last_os_error())).into());
     }
     let process = Handle(process_info.hProcess);
     let thread = Handle(process_info.hThread);
@@ -77,10 +77,10 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
         unsafe {
             TerminateProcess(process.0, 1);
         }
-        return Err(setup_failed(error).into());
+        return Err(setup_failed(format!("AssignProcessToJobObject: {error}")).into());
     }
     if unsafe { ResumeThread(thread.0) } == u32::MAX {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!("ResumeThread: {}", io::Error::last_os_error())).into());
     }
     let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
     if wait == WAIT_FAILED {
@@ -102,7 +102,7 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
 fn create_job() -> Result<Handle> {
     let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
     if job.is_null() {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!("CreateJobObjectW: {}", io::Error::last_os_error())).into());
     }
     let job = Handle(job);
     let mut limits = unsafe { mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
@@ -116,7 +116,7 @@ fn create_job() -> Result<Handle> {
         )
     } == 0
     {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!("SetInformationJobObject: {}", io::Error::last_os_error())).into());
     }
     Ok(job)
 }

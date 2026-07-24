@@ -247,7 +247,7 @@ fn set_path_access(
         LocalFree(new_dacl.cast());
         LocalFree(security_descriptor);
     }
-    result.map_err(setup_failed)?;
+    result.map_err(|e| setup_failed(format!("apply_path_dacl: {e}")))?;
     Ok(())
 }
 
