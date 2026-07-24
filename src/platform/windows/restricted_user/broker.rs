@@ -39,7 +39,7 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
     );
     let mut command_line = wide(&command_line);
     let username = wide(&account.name);
-    let domain = wide("");
+    let domain = wide(".");
     let password = state::unprotect_password(&account.encrypted_password)?;
     let current_directory = std::env::current_dir()?;
     let current_directory = wide_os(current_directory.as_os_str());
