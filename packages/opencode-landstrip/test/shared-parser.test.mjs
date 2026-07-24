@@ -59,6 +59,25 @@ test('shared parser agrees across server and TUI permission shapes', async () =>
   }
 });
 
+test('path scopes use platform-native containment semantics', async () => {
+  const { mod, cleanup } = await loadShared();
+  try {
+    const project = join(tmpdir(), 'opencode-landstrip-project');
+    const filePath = join(project, 'src', 'file.txt');
+
+    assert.equal(mod.pathUnderDirectory(filePath, project), true);
+    assert.equal(mod.pathUnderDirectory(`${project}-other`, project), false);
+    assert.equal(mod.sessionAllows(new Set([project]), filePath), true);
+    assert.equal(mod.sessionScopeFor(filePath, project), project);
+
+    if (process.platform === 'win32') {
+      assert.equal(mod.pathUnderDirectory(filePath.toUpperCase(), project.toLowerCase()), true);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
 test('sandbox summary reports an unavailable landstrip binary', async () => {
   const { mod, cleanup } = await loadShared();
   try {

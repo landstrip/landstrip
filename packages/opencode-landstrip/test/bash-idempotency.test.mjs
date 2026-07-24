@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
+
+import { binaryPath as installedLandstripBinaryPath } from '@landstrip/landstrip';
 
 import { installLandstripMock, packageRoot, transpile } from './helper.mjs';
 
@@ -13,6 +15,7 @@ async function withPlugin(options, run, mock = {}) {
   const modulePath = join(tempDir, 'plugin.mjs');
   const home = join(tempDir, 'home');
   const originalHome = process.env.HOME;
+  const originalUserProfile = process.env.USERPROFILE;
 
   try {
     const compiled = transpile(await readFile(join(packageRoot, 'index.ts'), 'utf8'));
@@ -26,23 +29,13 @@ async function withPlugin(options, run, mock = {}) {
     );
     await writeFile(modulePath, compiled);
     process.env.HOME = home;
+    process.env.USERPROFILE = home;
 
-    const landstripMockDir = join(tempDir, 'node_modules', '@landstrip', 'landstrip');
-    const fakeLandstrip = join(
-      mock.externalBinary ? tempDir : landstripMockDir,
-      process.platform === 'win32' ? 'landstrip.cmd' : 'landstrip',
-    );
+    const landstrip = mock.externalBinary ? modulePath : installedLandstripBinaryPath();
     await installLandstripMock(
       tempDir,
-      `export function binaryPath() { return ${JSON.stringify(fakeLandstrip)}; }`,
+      `export function binaryPath() { return ${JSON.stringify(landstrip)}; }`,
     );
-    await writeFile(
-      fakeLandstrip,
-      process.platform === 'win32'
-        ? '@echo landstrip 0.17.0\r\n'
-        : '#!/bin/sh\nprintf "landstrip 0.17.0\\n"\n',
-    );
-    if (process.platform !== 'win32') await chmod(fakeLandstrip, 0o755);
 
     const {
       default: { server: plugin },
@@ -67,6 +60,8 @@ async function withPlugin(options, run, mock = {}) {
   } finally {
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
     await rm(tempDir, { force: true, recursive: true });
   }
 }

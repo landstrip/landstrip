@@ -15,7 +15,7 @@ import {
   type Socket,
 } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 import { URL } from 'node:url';
 
 import {
@@ -138,9 +138,16 @@ function canonicalizeGlobPath(pattern: string, baseDirectory: string): string {
   const wildcardIndex = abs.indexOf('*');
   if (wildcardIndex === -1) return canonicalizePath(abs, baseDirectory);
 
-  const prefixEnd = abs.lastIndexOf('/', wildcardIndex);
-  const prefix = prefixEnd === 0 ? '/' : abs.slice(0, prefixEnd);
-  return canonicalizePath(prefix, baseDirectory) + abs.slice(prefixEnd);
+  const prefixEnd = abs.lastIndexOf(sep, wildcardIndex);
+  const root = parse(abs).root;
+  const wildcardAtRoot = prefixEnd < root.length;
+  const prefix = wildcardAtRoot ? root : abs.slice(0, prefixEnd);
+  const suffixStart = wildcardAtRoot ? root.length : prefixEnd;
+  return canonicalizePath(prefix, baseDirectory) + abs.slice(suffixStart);
+}
+
+function normalizePathForMatch(filePath: string): string {
+  return process.platform === 'win32' ? filePath.replaceAll('\\', '/').toLowerCase() : filePath;
 }
 
 const globRegExpCache = new Map<string, RegExp>();
@@ -192,17 +199,17 @@ function pathDepth(absolutePath: string): number {
 // none match. A glob is anchored to the whole path, so it ranks at the path's
 // own depth; a literal pattern ranks at the depth of the prefix it covers.
 function matchDepth(filePath: string, patterns: string[], baseDirectory: string): number {
-  const abs = canonicalizePath(filePath, baseDirectory);
+  const abs = normalizePathForMatch(canonicalizePath(filePath, baseDirectory));
   let depth = -1;
 
   for (const pattern of patterns) {
     if (pattern.includes('*')) {
-      const absPattern = canonicalizeGlobPath(pattern, baseDirectory);
+      const absPattern = normalizePathForMatch(canonicalizeGlobPath(pattern, baseDirectory));
       if (globToRegExp(absPattern).test(abs)) depth = Math.max(depth, pathDepth(abs));
     } else {
-      const absPattern = canonicalizePath(pattern, baseDirectory);
-      const sep = absPattern.endsWith('/') ? '' : '/';
-      if (abs === absPattern || abs.startsWith(absPattern + sep)) {
+      const absPattern = normalizePathForMatch(canonicalizePath(pattern, baseDirectory));
+      const separator = absPattern.endsWith('/') ? '' : '/';
+      if (abs === absPattern || abs.startsWith(absPattern + separator)) {
         depth = Math.max(depth, pathDepth(absPattern));
       }
     }
@@ -431,10 +438,7 @@ function evaluateCommandDomains(
 }
 
 function landstripVersion(): string | null {
-  const result = spawnSync(landstripBinaryPath(), ['--version'], {
-    encoding: 'utf-8',
-    shell: process.platform === 'win32',
-  });
+  const result = spawnSync(landstripBinaryPath(), ['--version'], { encoding: 'utf-8' });
   if (result.status !== 0) return null;
   return result.stdout.trim();
 }

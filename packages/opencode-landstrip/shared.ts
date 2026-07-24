@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 
 export interface SandboxFilesystemConfig {
   denyRead: string[];
@@ -61,9 +61,8 @@ const LANDSTRIP_PACKAGE_NAMES = new Set([
 // is approved for the broadest reasonable ancestor (e.g. `~/.cargo`, not each
 // subcrate file), so a single approval covers sibling files under the same tree.
 export function pathUnderDirectory(filePath: string, dir: string): boolean {
-  if (filePath === dir) return true;
-  const sep = dir.endsWith('/') ? '' : '/';
-  return filePath.startsWith(dir + sep);
+  const child = relative(dir, filePath);
+  return child === '' || (!isAbsolute(child) && child !== '..' && !child.startsWith(`..${sep}`));
 }
 
 export function sessionAllows(prefixes: Set<string>, filePath: string): boolean {
@@ -81,25 +80,32 @@ export function sessionAllows(prefixes: Set<string>, filePath: string): boolean 
 export function sessionScopeFor(filePath: string, baseDirectory: string): string {
   const dir = dirname(filePath);
   const home = homedir();
-  const boundaries = new Set<string>();
-  if (home) boundaries.add(home);
+  const homeBoundaries = new Set<string>([home]);
   try {
-    const realHome = realpathSync.native(home);
-    if (realHome) boundaries.add(realHome);
+    homeBoundaries.add(realpathSync.native(home));
   } catch {
     // $HOME not resolvable — fall back to the raw value only.
   }
 
-  for (const boundary of boundaries) {
+  for (const boundary of homeBoundaries) {
     if (pathUnderDirectory(dir, boundary)) {
-      const rest = dir.slice(boundary.length).replace(/^\/+/, '');
-      const first = rest.split('/')[0];
+      const first = relative(boundary, dir).split(sep)[0];
       if (!first) return filePath;
-      return boundary.endsWith('/') ? boundary + first : `${boundary}/${first}`;
+      return join(boundary, first);
     }
   }
 
-  if (pathUnderDirectory(dir, baseDirectory)) return baseDirectory;
+  const projectBoundaries = new Set<string>([baseDirectory]);
+  try {
+    projectBoundaries.add(realpathSync.native(baseDirectory));
+  } catch {
+    // Project directory not resolvable — fall back to the raw value only.
+  }
+
+  for (const boundary of projectBoundaries) {
+    if (pathUnderDirectory(dir, boundary)) return boundary;
+  }
+
   return dir;
 }
 
