@@ -1,6 +1,6 @@
 {
   "name": "pi-landstrip",
-  "version": "0.17.34",
+  "version": "0.17.35",
   "description": "Sandbox-aware Pi subagents and interactive command permissions",
   "keywords": [
     "landstrip",
@@ -40,7 +40,7 @@
     "ci:test": "npm run test"
   },
   "dependencies": {
-    "@landstrip/landstrip": "^0.17.34",
+    "@landstrip/landstrip": "^0.17.35",
     "minimatch": "^10.2.5"
   },
   "devDependencies": {
