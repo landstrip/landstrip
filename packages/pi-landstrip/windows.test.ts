@@ -4,7 +4,7 @@
 import { type ChildProcess, execFile } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { dirname, join, parse } from 'node:path';
+import { join, parse } from 'node:path';
 import { promisify } from 'node:util';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
@@ -173,7 +173,7 @@ windowsIt('does not silently downgrade LPAC when Git Bash cannot start', async (
     directory,
     {
       network: { allowNetwork: false },
-      filesystem: filesystemPolicy(directory, [dirname(dirname(shell))]),
+      filesystem: filesystemPolicy(directory),
       windows: { appContainerMode: 'lpac', allowLoopback: false },
     },
     shell,

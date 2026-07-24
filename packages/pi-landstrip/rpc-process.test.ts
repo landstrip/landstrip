@@ -323,6 +323,7 @@ it.runIf(['linux', 'darwin', 'win32'].includes(process.platform))(
         taskEnabled: false,
       }),
     ).toString('base64url');
+    // Windows AppContainer setup and teardown propagate ACLs through the package tree.
     const rpc = new RpcProcess({
       command: binaryPath(),
       args: [
@@ -348,7 +349,8 @@ it.runIf(['linux', 'darwin', 'win32'].includes(process.platform))(
         PI_OFFLINE: '1',
         JITI_FS_CACHE: 'false',
       },
-      requestTimeoutMs: 20_000,
+      requestTimeoutMs: process.platform === 'win32' ? 60_000 : 20_000,
+      stopTimeoutMs: process.platform === 'win32' ? 60_000 : 1_000,
     });
     try {
       await rpc.start();
@@ -359,5 +361,5 @@ it.runIf(['linux', 'darwin', 'win32'].includes(process.platform))(
       rmSync(root, { recursive: true, force: true });
     }
   },
-  30_000,
+  process.platform === 'win32' ? 130_000 : 30_000,
 );

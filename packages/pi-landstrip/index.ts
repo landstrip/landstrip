@@ -1278,20 +1278,9 @@ export function createLandstripIntegration(
     if (process.platform !== 'win32') return allowances;
 
     const executable = resolve(cwd, command);
-    const executableDirectory = dirname(executable);
-    // Git Bash/MSYS loads its runtime and standard tools from sibling directories.
-    // Grant that installation only; never widen a root-level bin directory to the volume.
-    const binParent = dirname(executableDirectory);
-    const bashRoot = basename(binParent).toLowerCase() === 'usr' ? dirname(binParent) : binParent;
-    const executableRoot =
-      basename(executable).toLowerCase() === 'bash.exe' &&
-      basename(executableDirectory).toLowerCase() === 'bin' &&
-      bashRoot !== parse(bashRoot).root
-        ? bashRoot
-        : executable;
     return {
       ...allowances,
-      readPaths: [...new Set([...allowances.readPaths, executableRoot, ...additionalPaths])],
+      readPaths: [...new Set([...allowances.readPaths, executable, ...additionalPaths])],
     };
   }
 
