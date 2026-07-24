@@ -39,10 +39,12 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, FreeSid, PSID,
-    SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT, WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid,
-    WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
+    ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, FreeSid,
+    InitializeSecurityDescriptor, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+    SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+    SUB_CONTAINERS_AND_OBJECTS_INHERIT, SetFileSecurityW, SetSecurityDescriptorDacl,
+    WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
+    WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
@@ -68,6 +70,7 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICA
 
 const INFINITE: u32 = 0xffff_ffff;
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 /// The `HRESULT` facility that wraps a Win32 error code.
 const FACILITY_WIN32: u32 = 7;
 const LOOPBACK_MUTEX_NAME: &str = "Global\\landstrip-loopback-config";
@@ -537,38 +540,55 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess
 }
 
 fn grant_root_access(granted: &mut GrantedAccess, path: &Path, access: u32) -> Result<()> {
-    // Parent ACEs grant only traversal plus metadata on each directory itself.
-    // This includes the drive root, but does not expose its contents or propagate
-    // access into unrelated subtrees.
+    // Ancestors grant only traversal plus metadata on each directory itself.
+    // SetFileSecurityW keeps these ACEs local: SetNamedSecurityInfoW would
+    // re-propagate every existing inheritable ACE through each ancestor tree.
     for ancestor in path.ancestors().skip(1) {
-        grant_path_access(ancestor, granted.sid, FILE_GENERIC_EXECUTE, false)?;
-        granted.paths.push(ancestor.to_path_buf());
+        grant_path_access(ancestor, granted.sid, FILE_GENERIC_EXECUTE, false, false)?;
+        granted.paths.push(GrantedPath {
+            path: ancestor.to_path_buf(),
+            propagate: false,
+        });
     }
 
-    grant_path_access(path, granted.sid, access, true)?;
-    granted.paths.push(path.to_path_buf());
+    grant_path_access(path, granted.sid, access, true, true)?;
+    granted.paths.push(GrantedPath {
+        path: path.to_path_buf(),
+        propagate: true,
+    });
     Ok(())
+}
+
+struct GrantedPath {
+    path: PathBuf,
+    propagate: bool,
 }
 
 struct GrantedAccess {
     sid: PSID,
-    paths: Vec<PathBuf>,
+    paths: Vec<GrantedPath>,
 }
 
 impl Drop for GrantedAccess {
     fn drop(&mut self) {
-        for path in self.paths.iter().rev() {
-            let _ = revoke_path_access(path, self.sid);
+        for granted in self.paths.iter().rev() {
+            let _ = revoke_path_access(&granted.path, self.sid, granted.propagate);
         }
     }
 }
 
-fn grant_path_access(path: &Path, sid: PSID, access: u32, inherit: bool) -> Result<()> {
-    set_path_access(path, sid, access, GRANT_ACCESS, inherit)
+fn grant_path_access(
+    path: &Path,
+    sid: PSID,
+    access: u32,
+    inherit: bool,
+    propagate: bool,
+) -> Result<()> {
+    set_path_access(path, sid, access, GRANT_ACCESS, inherit, propagate)
 }
 
-fn revoke_path_access(path: &Path, sid: PSID) -> Result<()> {
-    set_path_access(path, sid, 0, REVOKE_ACCESS, false)
+fn revoke_path_access(path: &Path, sid: PSID, propagate: bool) -> Result<()> {
+    set_path_access(path, sid, 0, REVOKE_ACCESS, false, propagate)
 }
 
 fn set_path_access(
@@ -577,6 +597,7 @@ fn set_path_access(
     access: u32,
     mode: ACCESS_MODE,
     inherit: bool,
+    propagate: bool,
 ) -> Result<()> {
     let path = path
         .as_os_str()
@@ -626,25 +647,55 @@ fn set_path_access(
         return Err(setup_failed(win32_error(status)).into());
     }
 
-    let status = unsafe {
-        SetNamedSecurityInfoW(
-            path.as_ptr().cast_mut(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            new_dacl,
-            ptr::null_mut(),
-        )
-    };
-
+    let result = apply_path_dacl(&path, new_dacl, propagate);
     unsafe {
         LocalFree(new_dacl.cast());
         LocalFree(security_descriptor);
     }
+    result.map_err(setup_failed)?;
 
-    if status != 0 {
-        return Err(setup_failed(win32_error(status)).into());
+    Ok(())
+}
+
+fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> io::Result<()> {
+    if propagate {
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                path.as_ptr().cast_mut(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(win32_error(status));
+        }
+        return Ok(());
+    }
+
+    let mut descriptor = unsafe { mem::zeroed::<SECURITY_DESCRIPTOR>() };
+    let initialized = unsafe {
+        InitializeSecurityDescriptor((&raw mut descriptor).cast(), SECURITY_DESCRIPTOR_REVISION)
+    };
+    if initialized == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let dacl_set = unsafe { SetSecurityDescriptorDacl((&raw mut descriptor).cast(), 1, dacl, 0) };
+    if dacl_set == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let applied = unsafe {
+        SetFileSecurityW(
+            path.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            (&raw mut descriptor).cast(),
+        )
+    };
+    if applied == 0 {
+        return Err(io::Error::last_os_error());
     }
 
     Ok(())
