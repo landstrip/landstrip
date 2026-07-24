@@ -20,10 +20,9 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
 };
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, CreateWellKnownSid, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
-    GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SetKernelObjectSecurity, TOKEN_ASSIGN_PRIMARY,
-    TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAnyPackageSid,
+    CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, GetTokenInformation,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -164,35 +163,15 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
 }
 
 fn create_restricted_token() -> Result<Handle> {
+    // Strip all privileges from the worker's own primary token. landstrip's
+    // filesystem write boundary is the dedicated SAM user's DACL (apply() in
+    // access.rs), not the token's restricting-SID list: the DACL grants the
+    // user, so restricting SIDs would deny the worker its own workspace under
+    // DISABLE_MAX_PRIVILEGE (which gates reads as well as writes). Keep only
+    // the privilege-stripping, which defends the DACL against
+    // SeBackupPrivilege / SeRestorePrivilege bypass. An empty restricting-SID
+    // list (count 0, pointer NULL) is the textbook-valid minimal call.
     let process_token = current_process_token()?;
-    let token_user = token_user(process_token.0)?;
-    let mut application_package_sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
-    let mut application_package_sid_size = SECURITY_MAX_SID_SIZE;
-    if unsafe {
-        CreateWellKnownSid(
-            WinBuiltinAnyPackageSid,
-            ptr::null_mut(),
-            application_package_sid.as_mut_ptr().cast(),
-            &mut application_package_sid_size,
-        )
-    } == 0
-    {
-        return Err(setup_failed(format!(
-            "CreateWellKnownSid: {}",
-            io::Error::last_os_error()
-        ))
-        .into());
-    }
-    let restricted_sids = [
-        SID_AND_ATTRIBUTES {
-            Sid: token_user.User.Sid,
-            Attributes: 0,
-        },
-        SID_AND_ATTRIBUTES {
-            Sid: application_package_sid.as_mut_ptr().cast(),
-            Attributes: 0,
-        },
-    ];
     let mut restricted_token = ptr::null_mut();
     let ok = unsafe {
         CreateRestrictedToken(
@@ -202,8 +181,8 @@ fn create_restricted_token() -> Result<Handle> {
             ptr::null(),
             0,
             ptr::null(),
-            u32::try_from(restricted_sids.len())?,
-            restricted_sids.as_ptr(),
+            0,
+            ptr::null(),
             &mut restricted_token,
         )
     };
