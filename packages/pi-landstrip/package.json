@@ -30,7 +30,7 @@
     "build": "node -e \"const fs = require('node:fs'); fs.rmSync('dist', { recursive: true, force: true }); fs.mkdirSync('dist'); for (const file of ['sandbox.json', 'subagents.json']) fs.copyFileSync(file, 'dist/' + file)\" && bun build index.ts --outfile dist/index.ts --target=node --packages=external",
     "prepack": "npm run build",
     "fmt": "oxfmt *.ts package.json tsconfig.json subagents.json sandbox.json .oxfmtrc.json README.md",
-    "lint": "oxlint *.ts",
+    "lint": "oxlint .",
     "check": "tsc --noEmit",
     "test": "npm run build && vitest run",
     "all": "npm run fmt && npm run lint && npm run check && npm run test",
