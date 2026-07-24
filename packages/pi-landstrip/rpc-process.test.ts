@@ -3,8 +3,8 @@
 
 import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { dirname, join, parse } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
@@ -302,8 +302,11 @@ it.runIf(['linux', 'darwin', 'win32'].includes(process.platform))(
       JSON.stringify({
         network: { allowNetwork: false },
         filesystem: {
-          denyRead: process.platform === 'win32' ? [homedir()] : [],
-          allowRead: process.platform === 'win32' ? [process.cwd(), root] : [process.cwd()],
+          denyRead: process.platform === 'win32' ? [parse(root).root] : [],
+          allowRead:
+            process.platform === 'win32'
+              ? [process.cwd(), root, process.execPath]
+              : [process.cwd()],
           allowWrite: [root],
           denyWrite: [],
         },

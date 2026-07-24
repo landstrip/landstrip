@@ -4,8 +4,7 @@
 import { type ChildProcess, execFile } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, parse } from 'node:path';
 import { promisify } from 'node:util';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
@@ -32,10 +31,10 @@ function gitBash(): string {
   return shell;
 }
 
-function filesystemPolicy(directory: string) {
+function filesystemPolicy(directory: string, readPaths: string[] = []) {
   return {
-    denyRead: [homedir()],
-    allowRead: [directory],
+    denyRead: [parse(directory).root],
+    allowRead: [directory, ...readPaths],
     allowWrite: [directory],
     denyWrite: [],
   };
@@ -174,7 +173,7 @@ windowsIt('does not silently downgrade LPAC when Git Bash cannot start', async (
     directory,
     {
       network: { allowNetwork: false },
-      filesystem: filesystemPolicy(directory),
+      filesystem: filesystemPolicy(directory, [dirname(dirname(shell))]),
       windows: { appContainerMode: 'lpac', allowLoopback: false },
     },
     shell,
@@ -196,7 +195,7 @@ windowsIt('keeps loopback blocked unless its explicit exemption is enabled', asy
   const script = `fetch('http://127.0.0.1:${address.port}', { signal: AbortSignal.timeout(3000) }).then(async response => process.stdout.write(await response.text()))`;
   const policy = (allowLoopback: boolean) => ({
     network: { allowNetwork: false },
-    filesystem: filesystemPolicy(directory),
+    filesystem: filesystemPolicy(directory, [process.execPath]),
     windows: { appContainerMode: 'standard', allowLoopback },
   });
 

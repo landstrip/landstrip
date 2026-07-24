@@ -23,7 +23,7 @@ import {
   Socket as NetSocket,
 } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath, URL } from 'node:url';
 
@@ -1233,12 +1233,18 @@ export function createLandstripIntegration(
 
   function getEffectiveAllowRead(
     config: SandboxConfig,
+    cwd: string,
     allowances?: ExecutionAllowances,
   ): string[] {
-    return mergeAllowances(
+    const paths = mergeAllowances(
       config.filesystem.allowRead,
       sessionAllowedReadPaths,
       allowances?.readPaths,
+    );
+    if (process.platform !== 'win32') return paths;
+
+    return paths.filter(
+      (path) => !path.startsWith('/') && (path.includes('*') || existsSync(expandPath(path, cwd))),
     );
   }
 
@@ -1246,11 +1252,47 @@ export function createLandstripIntegration(
     config: SandboxConfig,
     allowances?: ExecutionAllowances,
   ): string[] {
-    return mergeAllowances(
+    const paths = mergeAllowances(
       config.filesystem.allowWrite,
       sessionAllowedWritePaths,
       allowances?.writePaths,
     );
+    return process.platform === 'win32' ? paths.filter((path) => !path.startsWith('/')) : paths;
+  }
+
+  function getEffectiveDenyRead(config: SandboxConfig, cwd: string): string[] {
+    if (process.platform !== 'win32') return config.filesystem.denyRead;
+
+    // AppContainer ACLs propagate to existing descendants, so make Windows read
+    // policy an explicit allowlist instead of scanning and granting a volume tree.
+    const volumeRoot = parse(resolve(cwd)).root;
+    return [...new Set([...config.filesystem.denyRead, volumeRoot])];
+  }
+
+  function withWindowsProcessReadAccess(
+    allowances: ExecutionAllowances,
+    command: string,
+    cwd: string,
+    additionalPaths: string[] = [],
+  ): ExecutionAllowances {
+    if (process.platform !== 'win32') return allowances;
+
+    const executable = resolve(cwd, command);
+    const executableDirectory = dirname(executable);
+    // Git Bash/MSYS loads its runtime and standard tools from sibling directories.
+    // Grant that installation only; never widen a root-level bin directory to the volume.
+    const binParent = dirname(executableDirectory);
+    const bashRoot = basename(binParent).toLowerCase() === 'usr' ? dirname(binParent) : binParent;
+    const executableRoot =
+      basename(executable).toLowerCase() === 'bash.exe' &&
+      basename(executableDirectory).toLowerCase() === 'bin' &&
+      bashRoot !== parse(bashRoot).root
+        ? bashRoot
+        : executable;
+    return {
+      ...allowances,
+      readPaths: [...new Set([...allowances.readPaths, executableRoot, ...additionalPaths])],
+    };
   }
 
   async function applyDomainChoice(
@@ -1347,8 +1389,8 @@ export function createLandstripIntegration(
         ...(proxyPort !== null ? { httpProxyPort: proxyPort } : {}),
       },
       filesystem: {
-        denyRead: config.filesystem.denyRead,
-        allowRead: getEffectiveAllowRead(config, allowances),
+        denyRead: getEffectiveDenyRead(config, cwd),
+        allowRead: getEffectiveAllowRead(config, cwd, allowances),
         allowWrite: getEffectiveAllowWrite(config, allowances),
         denyWrite: config.filesystem.denyWrite,
       },
@@ -1617,7 +1659,7 @@ export function createLandstripIntegration(
       trap.operation === 'read'
         ? readAllowed(
             path,
-            getEffectiveAllowRead(config, allowances),
+            getEffectiveAllowRead(config, cwd, allowances),
             config.filesystem.denyRead,
             cwd,
           )
@@ -1764,11 +1806,16 @@ export function createLandstripIntegration(
       writePaths: [...options.writePaths],
       targets: [],
     };
+    const processAllowances = withWindowsProcessReadAccess(
+      allowances,
+      options.command,
+      options.cwd,
+    );
     const config = loadConfig(options.cwd);
     const proxyToken = randomBytes(32).toString('base64url');
     const proxyAuthorization = `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
     const proxy = shouldStartProxy(config)
-      ? await startProxy(options.ctx, allowances, options.signal, proxyAuthorization)
+      ? await startProxy(options.ctx, processAllowances, options.signal, proxyAuthorization)
       : null;
     let policy: ReturnType<typeof writePolicyFile> | undefined;
     let trapSocket: NetSocket | undefined;
@@ -1776,11 +1823,11 @@ export function createLandstripIntegration(
     let disposed = false;
     try {
       if (options.signal?.aborted) throw new Error('Task cancelled');
-      policy = writePolicyFile(options.cwd, proxy?.port ?? null, allowances);
+      policy = writePolicyFile(options.cwd, proxy?.port ?? null, processAllowances);
       if (process.platform !== 'win32') {
         [trapSocket, childEnd] = await createSocketPair();
         if (options.signal?.aborted) throw new Error('Task cancelled');
-        attachWorkerTrap(trapSocket, options.ctx, options.cwd, allowances, options.signal);
+        attachWorkerTrap(trapSocket, options.ctx, options.cwd, processAllowances, options.signal);
       }
     } catch (error) {
       trapSocket?.destroy();
@@ -1879,6 +1926,7 @@ export function createLandstripIntegration(
         // and the proxy keeps a listening socket. Idempotent: safe to call twice.
         let policy: ReturnType<typeof writePolicyFile> | undefined;
         let envFile: ReturnType<typeof writeEnvFile> | undefined;
+        let processAllowances = allowances;
         let teardownPromise: Promise<void> | undefined;
         const teardownResources = (): Promise<void> => {
           teardownPromise ??= (async () => {
@@ -1891,11 +1939,12 @@ export function createLandstripIntegration(
 
         let landstripArgs: string[];
         try {
-          policy = writePolicyFile(cwd, proxy?.port ?? null, allowances);
           envFile = writeEnvFile(
             { ...process.env, ...env, PWD: resolve(cwd) },
             proxy?.port ?? null,
           );
+          processAllowances = withWindowsProcessReadAccess(allowances, shell, cwd, [envFile.path]);
+          policy = writePolicyFile(cwd, proxy?.port ?? null, processAllowances);
           const wrappedCommand = `source '${envFile.path}' && ${command}`;
           landstripArgs = ['-p', policy.path, shell, ...args, wrappedCommand];
           if (process.platform !== 'win32') landstripArgs.unshift('--trap-fd', '3');
@@ -2064,7 +2113,7 @@ export function createLandstripIntegration(
                         trap,
                         ctx,
                         cwd,
-                        allowances,
+                        processAllowances,
                         callbacks.promptOnBlock === true,
                         signal,
                       );
@@ -2176,7 +2225,11 @@ export function createLandstripIntegration(
 
       const needsPrompt =
         operation === 'read'
-          ? !matchesPattern(blockedPath, getEffectiveAllowRead(config, allowances), ctx.cwd)
+          ? !matchesPattern(
+              blockedPath,
+              getEffectiveAllowRead(config, ctx.cwd, allowances),
+              ctx.cwd,
+            )
           : shouldPromptForWrite(blockedPath, getEffectiveAllowWrite(config, allowances), ctx.cwd);
       if (needsPrompt) {
         const choice =
