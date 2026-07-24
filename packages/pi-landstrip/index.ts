@@ -1269,6 +1269,24 @@ export function createLandstripIntegration(
     return [...new Set([...config.filesystem.denyRead, volumeRoot])];
   }
 
+  function hasBaselineWindowsAppContainerAccess(filePath: string): boolean {
+    const normalizedPath = normalizePathSeparators(resolve(filePath)).toLowerCase();
+    const systemRoots = [
+      process.env.ProgramFiles,
+      process.env['ProgramFiles(x86)'],
+      process.env.ProgramW6432,
+      process.env.SystemRoot,
+    ];
+
+    return systemRoots.some((root) => {
+      if (!root) return false;
+      return pathUnderDirectory(
+        normalizedPath,
+        normalizePathSeparators(resolve(root)).toLowerCase(),
+      );
+    });
+  }
+
   function withWindowsProcessReadAccess(
     allowances: ExecutionAllowances,
     command: string,
@@ -1278,9 +1296,13 @@ export function createLandstripIntegration(
     if (process.platform !== 'win32') return allowances;
 
     const executable = resolve(cwd, command);
+    // Standard AppContainers already receive read/execute access to Windows and
+    // Program Files through ALL APPLICATION PACKAGES. Adding a profile-specific
+    // ACE there requires WRITE_DAC, which unprivileged callers do not have.
+    const executablePaths = hasBaselineWindowsAppContainerAccess(executable) ? [] : [executable];
     return {
       ...allowances,
-      readPaths: [...new Set([...allowances.readPaths, executable, ...additionalPaths])],
+      readPaths: [...new Set([...allowances.readPaths, ...executablePaths, ...additionalPaths])],
     };
   }
 
