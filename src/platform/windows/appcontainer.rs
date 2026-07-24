@@ -866,10 +866,10 @@ fn create_process_in_appcontainer(
     //
     // - `IMAGE_LOAD_PREFER_SYSTEM32` (required for MinGW/Cygwin DLL resolution)
     // - `PROCESS_WIN32K_SYSCALL_DISABLE` (required for GUI tooling)
+    // - `IMAGE_LOAD_NO_LOW_LABEL` (required for MinGW/Cygwin/MSYS2 DLL resolution)
     const MITIGATION_POLICY: u64 = (1u64 << 32)  // DisableExtensionPoints
         | (1u64 << 48)  // FontDisable
-        | (1u64 << 52)  // ImageLoadNoRemote
-        | (1u64 << 56); // ImageLoadNoLowLabel
+        | (1u64 << 52); // ImageLoadNoRemote
     let command_line = command_line(tool, args)?;
     let mut startup_info = unsafe { mem::zeroed::<STARTUPINFOEXW>() };
     startup_info.StartupInfo.cb = u32::try_from(mem::size_of::<STARTUPINFOEXW>())
