@@ -119,7 +119,11 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
         )
     } == 0
     {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!(
+            "CreateWellKnownSid: {}",
+            io::Error::last_os_error()
+        ))
+        .into());
     }
     let restricted_sids = [
         SID_AND_ATTRIBUTES {
@@ -146,7 +150,11 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
         )
     };
     if ok == 0 {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!(
+            "CreateRestrictedToken: {}",
+            io::Error::last_os_error()
+        ))
+        .into());
     }
     let restricted_token = Handle(restricted_token);
 
@@ -186,7 +194,7 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
     let process = Handle(process_info.hProcess);
     let thread = Handle(process_info.hThread);
     if unsafe { ResumeThread(thread.0) } == u32::MAX {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!("ResumeThread: {}", io::Error::last_os_error())).into());
     }
     let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
     if wait == WAIT_FAILED {
@@ -217,7 +225,11 @@ fn harden_worker_objects() -> Result<()> {
         )
     } == 0
     {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!(
+            "ConvertStringSecurityDescriptorToSecurityDescriptorW: {}",
+            io::Error::last_os_error()
+        ))
+        .into());
     }
 
     let result = (|| {
@@ -233,8 +245,11 @@ fn harden_worker_objects() -> Result<()> {
                 )
             } == 0
             {
-                return Err(setup_failed(io::Error::last_os_error()))
-                    .with_context(|| format!("protect restricted-user {object}"));
+                return Err(setup_failed(format!(
+                    "SetKernelObjectSecurity ({object}): {}",
+                    io::Error::last_os_error()
+                ))
+                .into());
             }
         }
         Ok(())
@@ -248,7 +263,11 @@ fn harden_worker_objects() -> Result<()> {
 fn current_environment() -> Result<Vec<u16>> {
     let environment = unsafe { GetEnvironmentStringsW() };
     if environment.is_null() {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!(
+            "GetEnvironmentStringsW: {}",
+            io::Error::last_os_error()
+        ))
+        .into());
     }
     let mut length = 0;
     while unsafe { *environment.add(length) } != 0 || unsafe { *environment.add(length + 1) } != 0 {
@@ -257,7 +276,11 @@ fn current_environment() -> Result<Vec<u16>> {
     length += 2;
     let result = unsafe { std::slice::from_raw_parts(environment, length) }.to_vec();
     if unsafe { FreeEnvironmentStringsW(environment) } == 0 {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!(
+            "FreeEnvironmentStringsW: {}",
+            io::Error::last_os_error()
+        ))
+        .into());
     }
     Ok(result)
 }
@@ -282,7 +305,9 @@ fn current_process_token() -> Result<Handle> {
         )
     } == 0
     {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(
+            setup_failed(format!("OpenProcessToken: {}", io::Error::last_os_error())).into(),
+        );
     }
     Ok(Handle(token))
 }
@@ -293,7 +318,11 @@ fn token_user(token: HANDLE) -> Result<TokenUserBuffer> {
         GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut size);
     }
     if size == 0 {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!(
+            "GetTokenInformation (probe): {}",
+            io::Error::last_os_error()
+        ))
+        .into());
     }
     let word_size = mem::size_of::<usize>();
     let word_count = usize::try_from(size)?.div_ceil(word_size);
@@ -301,7 +330,11 @@ fn token_user(token: HANDLE) -> Result<TokenUserBuffer> {
     if unsafe { GetTokenInformation(token, TokenUser, words.as_mut_ptr().cast(), size, &mut size) }
         == 0
     {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!(
+            "GetTokenInformation: {}",
+            io::Error::last_os_error()
+        ))
+        .into());
     }
     Ok(TokenUserBuffer { words })
 }
@@ -323,7 +356,11 @@ fn verify_current_sid(expected: &str) -> Result<()> {
     let user = token_user(token.0)?;
     let mut sid_string = ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_string) } == 0 {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(setup_failed(format!(
+            "ConvertSidToStringSidW: {}",
+            io::Error::last_os_error()
+        ))
+        .into());
     }
     let actual = wide_ptr_to_string(sid_string);
     unsafe {
