@@ -99,6 +99,7 @@ interface SandboxNetworkConfig {
 }
 
 interface SandboxWindowsConfig {
+  backend: 'appContainer' | 'restrictedUser';
   appContainerMode: 'lpac' | 'standard';
   allowLoopback: boolean;
 }
@@ -252,7 +253,11 @@ function loadSandboxConfig(cwd: string, includeProject: boolean): SandboxConfig 
   if (includeProject && existsSync(projectConfigPath)) {
     try {
       const projectConfig = JSON.parse(readFileSync(projectConfigPath, 'utf-8'));
-      return deepMerge(globalConfig, projectConfig);
+      const merged = deepMerge(globalConfig, projectConfig);
+      // Backend selection is a trusted host setting. A repository must not be
+      // able to switch the Windows isolation mechanism.
+      merged.windows.backend = globalConfig.windows.backend;
+      return merged;
     } catch (error) {
       console.error(`Warning: Could not parse ${projectConfigPath}: ${error}`);
     }
@@ -288,15 +293,64 @@ function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxCo
       denyWrite: mergeArray(base.filesystem.denyWrite, filesystem?.denyWrite),
     },
     windows: {
+      backend: windows?.backend ?? base.windows.backend,
       appContainerMode: windows?.appContainerMode ?? base.windows.appContainerMode,
       allowLoopback: windows?.allowLoopback ?? base.windows.allowLoopback,
     },
   };
 }
 
+function windowsBackendArgs(config: SandboxConfig): string[] {
+  if (process.platform !== 'win32') return [];
+  const backend = config.windows.backend === 'restrictedUser' ? 'restricted-user' : 'app-container';
+  return ['--windows-backend', backend];
+}
+
 function shouldStartProxy(config: SandboxConfig): boolean {
   if (config.network.allowNetwork) return false;
-  return process.platform !== 'win32' || config.windows.allowLoopback;
+  return (
+    process.platform !== 'win32' ||
+    config.windows.backend === 'restrictedUser' ||
+    config.windows.allowLoopback
+  );
+}
+
+interface ProxyPortRange {
+  low: number;
+  high: number;
+}
+
+function restrictedUserProxyPortRange(config: SandboxConfig): ProxyPortRange | undefined {
+  if (process.platform !== 'win32' || config.windows.backend !== 'restrictedUser') return undefined;
+
+  const result = spawnSync(binaryPath(), ['windows', 'status'], {
+    encoding: 'utf-8',
+    windowsHide: true,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || 'Restricted-user backend status check failed');
+  }
+
+  const status = JSON.parse(result.stdout) as {
+    installed?: boolean;
+    healthy?: boolean;
+    proxyPortLow?: number;
+    proxyPortHigh?: number;
+  };
+  if (
+    status.installed !== true ||
+    status.healthy !== true ||
+    !Number.isInteger(status.proxyPortLow) ||
+    !Number.isInteger(status.proxyPortHigh) ||
+    status.proxyPortLow! < 1 ||
+    status.proxyPortHigh! < status.proxyPortLow!
+  ) {
+    throw new Error(
+      'The Windows restricted-user backend is not installed or healthy. Run "landstrip windows setup".',
+    );
+  }
+  return { low: status.proxyPortLow!, high: status.proxyPortHigh! };
 }
 
 function getConfigPaths(cwd: string): { globalPath: string; projectPath: string } {
@@ -961,6 +1015,7 @@ function landstripDisplayPath(): string {
 export function writeEnvFile(
   env: NodeJS.ProcessEnv,
   proxyPort: number | null,
+  proxyToken?: string,
 ): { dir: string; path: string } {
   const lines: string[] = [];
   for (const [key, value] of Object.entries(env)) {
@@ -975,7 +1030,8 @@ export function writeEnvFile(
     lines.push(`export ${key}='${escaped}'`);
   }
   if (proxyPort !== null) {
-    const url = `http://127.0.0.1:${proxyPort}`;
+    const credentials = proxyToken === undefined ? '' : `landstrip:${proxyToken}@`;
+    const url = `http://${credentials}127.0.0.1:${proxyPort}`;
     for (const name of PROXY_ENVIRONMENT_VARIABLES) {
       lines.push(`export ${name}='${url}'`);
     }
@@ -1263,13 +1319,13 @@ export function createLandstripIntegration(
   function getEffectiveDenyRead(config: SandboxConfig, cwd: string): string[] {
     if (process.platform !== 'win32') return config.filesystem.denyRead;
 
-    // AppContainer ACLs propagate to existing descendants, so make Windows read
-    // policy an explicit allowlist instead of scanning and granting a volume tree.
+    // Windows sandbox ACLs propagate to existing descendants, so make read policy
+    // an explicit allowlist instead of scanning and granting a volume tree.
     const volumeRoot = parse(resolve(cwd)).root;
     return [...new Set([...config.filesystem.denyRead, volumeRoot])];
   }
 
-  function hasBaselineWindowsAppContainerAccess(filePath: string): boolean {
+  function hasBaselineWindowsApplicationAccess(filePath: string): boolean {
     const normalizedPath = normalizePathSeparators(resolve(filePath)).toLowerCase();
     const systemRoots = [
       process.env.ProgramFiles,
@@ -1296,10 +1352,10 @@ export function createLandstripIntegration(
     if (process.platform !== 'win32') return allowances;
 
     const executable = resolve(cwd, command);
-    // Standard AppContainers already receive read/execute access to Windows and
-    // Program Files through ALL APPLICATION PACKAGES. Adding a profile-specific
-    // ACE there requires WRITE_DAC, which unprivileged callers do not have.
-    const executablePaths = hasBaselineWindowsAppContainerAccess(executable) ? [] : [executable];
+    // Both standard AppContainers and restricted-user tokens receive baseline
+    // read/execute access to Windows and Program Files through ALL APPLICATION
+    // PACKAGES. Adding a sandbox-specific ACE there requires elevated WRITE_DAC.
+    const executablePaths = hasBaselineWindowsApplicationAccess(executable) ? [] : [executable];
     return {
       ...allowances,
       readPaths: [...new Set([...allowances.readPaths, ...executablePaths, ...additionalPaths])],
@@ -1430,6 +1486,7 @@ export function createLandstripIntegration(
     allowances: ExecutionAllowances,
     signal?: AbortSignal,
     authorization?: string,
+    portRange?: ProxyPortRange,
   ): Promise<{ port: number; stop: () => Promise<void> }> {
     const sockets = new Set<Socket>();
 
@@ -1593,25 +1650,34 @@ export function createLandstripIntegration(
     let stopped = false;
 
     return new Promise((resolve, reject) => {
-      server.on('error', reject);
-      server.listen(0, '127.0.0.1', () => {
-        server.removeListener('error', reject);
-        const address = server.address() as AddressInfo;
-
-        resolve({
-          port: address.port,
-          stop: () =>
-            new Promise<void>((done) => {
-              if (stopped) {
-                done();
-                return;
-              }
-              stopped = true;
-              for (const socket of sockets) socket.destroy();
-              server.close(() => done());
-            }),
+      const listen = (port: number): void => {
+        server.once('error', (error: NodeJS.ErrnoException) => {
+          if (error.code === 'EADDRINUSE' && portRange && port < portRange.high) {
+            listen(port + 1);
+            return;
+          }
+          reject(error);
         });
-      });
+        server.listen(port, '127.0.0.1', () => {
+          server.removeAllListeners('error');
+          const address = server.address() as AddressInfo;
+
+          resolve({
+            port: address.port,
+            stop: () =>
+              new Promise<void>((done) => {
+                if (stopped) {
+                  done();
+                  return;
+                }
+                stopped = true;
+                for (const socket of sockets) socket.destroy();
+                server.close(() => done());
+              }),
+          });
+        });
+      };
+      listen(portRange?.low ?? 0);
     });
   }
 
@@ -1826,7 +1892,13 @@ export function createLandstripIntegration(
     const proxyToken = randomBytes(32).toString('base64url');
     const proxyAuthorization = `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
     const proxy = shouldStartProxy(config)
-      ? await startProxy(options.ctx, processAllowances, options.signal, proxyAuthorization)
+      ? await startProxy(
+          options.ctx,
+          processAllowances,
+          options.signal,
+          proxyAuthorization,
+          restrictedUserProxyPortRange(config),
+        )
       : null;
     let policy: ReturnType<typeof writePolicyFile> | undefined;
     let trapSocket: NetSocket | undefined;
@@ -1867,7 +1939,13 @@ export function createLandstripIntegration(
       if (disposed) throw new Error('Prepared process has been disposed');
       if (spawned) throw new Error('Prepared process can only be spawned once');
       spawned = true;
-      const landstripArgs = ['-p', workerPolicy.path, options.command, ...options.args];
+      const landstripArgs = [
+        ...windowsBackendArgs(config),
+        '-p',
+        workerPolicy.path,
+        options.command,
+        ...options.args,
+      ];
       const stdio: StdioOptions = workerChildEnd
         ? ['pipe', 'pipe', 'pipe', workerChildEnd]
         : ['pipe', 'pipe', 'pipe'];
@@ -1930,7 +2008,17 @@ export function createLandstripIntegration(
 
         const { shell, args } = getShellConfig(SettingsManager.create(cwd).getShellPath());
         const config = loadConfig(cwd);
-        const proxy = shouldStartProxy(config) ? await startProxy(ctx, allowances, signal) : null;
+        const proxyToken = randomBytes(32).toString('base64url');
+        const proxyAuthorization = `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
+        const proxy = shouldStartProxy(config)
+          ? await startProxy(
+              ctx,
+              allowances,
+              signal,
+              proxyAuthorization,
+              restrictedUserProxyPortRange(config),
+            )
+          : null;
 
         // Started/created before the child exists, so tear them down on any early
         // failure too — the env file holds a copy of the environment (secrets),
@@ -1953,11 +2041,19 @@ export function createLandstripIntegration(
           envFile = writeEnvFile(
             { ...process.env, ...env, PWD: resolve(cwd) },
             proxy?.port ?? null,
+            proxy ? proxyToken : undefined,
           );
           processAllowances = withWindowsProcessReadAccess(allowances, shell, cwd, [envFile.path]);
           policy = writePolicyFile(cwd, proxy?.port ?? null, processAllowances);
           const wrappedCommand = `source '${envFile.path}' && ${command}`;
-          landstripArgs = ['-p', policy.path, shell, ...args, wrappedCommand];
+          landstripArgs = [
+            ...windowsBackendArgs(config),
+            '-p',
+            policy.path,
+            shell,
+            ...args,
+            wrappedCommand,
+          ];
           if (process.platform !== 'win32') landstripArgs.unshift('--trap-fd', '3');
         } catch (error) {
           await teardownResources();
@@ -2353,7 +2449,7 @@ export function createLandstripIntegration(
   }
 
   function warnIfWindowsSecurityDowngraded(ctx: ExtensionContext, config: SandboxConfig): void {
-    if (process.platform !== 'win32') return;
+    if (process.platform !== 'win32' || config.windows.backend !== 'appContainer') return;
     if (config.windows.appContainerMode === 'standard') {
       notify(
         ctx,
@@ -2381,7 +2477,11 @@ export function createLandstripIntegration(
     if (config.network.allowNetwork) {
       networkLabel = 'unrestricted';
       networkColor = 'warning';
-    } else if (process.platform === 'win32' && !config.windows.allowLoopback) {
+    } else if (
+      process.platform === 'win32' &&
+      config.windows.backend === 'appContainer' &&
+      !config.windows.allowLoopback
+    ) {
       networkLabel = 'blocked';
       networkColor = 'accent';
     } else if (allowsAllDomains(config.network.allowedDomains)) {
@@ -2397,8 +2497,13 @@ export function createLandstripIntegration(
     const write = theme.fg('accent', `${config.filesystem.allowWrite.length} write paths`);
     const fields = [`${dot} ${label}`, net, write];
     if (process.platform === 'win32') {
-      const color = config.windows.appContainerMode === 'standard' ? 'warning' : 'accent';
-      fields.splice(1, 0, theme.fg(color, `${config.windows.appContainerMode} AppContainer`));
+      const backend = config.windows.backend;
+      const standard = backend === 'appContainer' && config.windows.appContainerMode === 'standard';
+      const label =
+        backend === 'restrictedUser'
+          ? 'restricted user'
+          : `${config.windows.appContainerMode} AppContainer`;
+      fields.splice(1, 0, theme.fg(standard ? 'warning' : 'accent', label));
     }
 
     setTuiStatus(ctx, 'sandbox', fields.join(`  ${sep}  `));
@@ -2608,7 +2713,9 @@ export function createLandstripIntegration(
 
                 const networkMode = config.network.allowNetwork
                   ? 'unrestricted'
-                  : process.platform === 'win32' && !config.windows.allowLoopback
+                  : process.platform === 'win32' &&
+                      config.windows.backend === 'appContainer' &&
+                      !config.windows.allowLoopback
                     ? 'blocked'
                     : 'proxied';
                 section('Network', networkMode);
@@ -2633,12 +2740,19 @@ export function createLandstripIntegration(
 
                 if (process.platform === 'win32') {
                   section('Windows');
-                  const mode = config.windows.appContainerMode;
+                  const backend = config.windows.backend;
                   item(
-                    'container',
-                    mode === 'standard' ? theme.fg('warning', `${mode} (weaker)`) : text(mode),
+                    'backend',
+                    text(backend === 'restrictedUser' ? 'restricted user' : 'AppContainer'),
                   );
-                  item('loopback', boolValue(config.windows.allowLoopback));
+                  if (backend === 'appContainer') {
+                    const mode = config.windows.appContainerMode;
+                    item(
+                      'container',
+                      mode === 'standard' ? theme.fg('warning', `${mode} (weaker)`) : text(mode),
+                    );
+                    item('loopback', boolValue(config.windows.allowLoopback));
+                  }
                 }
 
                 if (sessionAllowedReadPaths.length > 0 || sessionAllowedWritePaths.length > 0) {

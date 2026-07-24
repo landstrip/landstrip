@@ -18,6 +18,10 @@ import { temporaryDirectory } from './test-util.ts';
 const execFileAsync = promisify(execFile);
 const windowsIt = it.runIf(process.platform === 'win32');
 
+const restrictedWindowsIt = it.runIf(
+  process.platform === 'win32' && process.env.LANDSTRIP_TEST_RESTRICTED_USER === '1',
+);
+
 interface ProcessResult {
   code: number | null;
   stdout: string;
@@ -82,15 +86,20 @@ async function runPolicy(
   policy: object,
   command: string,
   args: string[],
+  landstripArgs: string[] = [],
 ): Promise<ProcessResult> {
   const policyPath = join(directory, 'policy.json');
   writeFileSync(policyPath, JSON.stringify(policy));
   try {
-    const result = await execFileAsync(binaryPath(), ['-p', policyPath, command, ...args], {
-      cwd: directory,
-      timeout: 20_000,
-      windowsHide: true,
-    });
+    const result = await execFileAsync(
+      binaryPath(),
+      [...landstripArgs, '-p', policyPath, command, ...args],
+      {
+        cwd: directory,
+        timeout: 20_000,
+        windowsHide: true,
+      },
+    );
     return { code: 0, stdout: result.stdout, stderr: result.stderr };
   } catch (cause) {
     const error = cause as Error & { code?: number; stdout?: string; stderr?: string };
@@ -162,6 +171,45 @@ windowsIt(
     } finally {
       await launch.dispose();
     }
+  },
+  30_000,
+);
+
+restrictedWindowsIt(
+  'runs Git Bash with restricted-user filesystem isolation',
+  async () => {
+    const root = temporaryDirectory('landstrip-windows-user-');
+    const workspace = join(root, 'work', 'project');
+    mkdirSync(workspace, { recursive: true });
+    writeFileSync(join(workspace, 'input.txt'), 'allowed');
+    writeFileSync(join(root, 'work', 'secret.txt'), 'secret');
+    const { shell, args } = getShellConfig(gitBash());
+    const policy = {
+      network: { allowNetwork: false },
+      filesystem: filesystemPolicy(workspace),
+    };
+
+    const allowed = await runPolicy(
+      workspace,
+      policy,
+      shell,
+      [...args, 'cat input.txt && printf written > output.txt && cat output.txt'],
+      ['--windows-backend', 'restricted-user'],
+    );
+    expect(allowed.code, allowed.stderr).toBe(0);
+    expect(allowed.stdout).toContain('allowed');
+    expect(allowed.stdout).toContain('written');
+
+    const denied = await runPolicy(
+      workspace,
+      policy,
+      shell,
+      [...args, 'cat ../secret.txt'],
+      ['--windows-backend', 'restricted-user'],
+    );
+    expect(denied.code).not.toBe(0);
+    expect(denied.stdout).not.toContain('secret');
+    expect(denied.stderr).toMatch(/Access is denied|Permission denied/i);
   },
   30_000,
 );

@@ -49,7 +49,12 @@ On unsupported platforms the extension loads but leaves sandboxing disabled.
 On Windows, Pi's Git Bash/MSYS shell cannot run under LPAC. The packaged policy
 therefore selects standard AppContainer explicitly. This is weaker than LPAC because
 resources granted to `ALL APPLICATION PACKAGES` remain visible; `/sandbox` and the
-status line report the active mode. There is no silent LPAC-to-standard fallback.
+status line report the active backend and mode. There is no silent
+LPAC-to-standard fallback.
+
+An optional restricted-user backend supports Git Bash without AppContainer. It
+requires one-time elevated host setup and persistent local accounts and WFP rules;
+see [Windows restricted-user setup](#windows-restricted-user-setup).
 
 ## Disabling
 
@@ -66,9 +71,10 @@ processes, but without the outer Landstrip OS sandbox. The extension warns once
 per session. Agent tool permissions still apply, but they are not an OS isolation
 boundary.
 
-Trusted project config overrides global config. `/sandbox` updates a trusted
-project sandbox file when present, otherwise the global file. Pi versions
-without a project-trust API use only global configuration.
+Trusted project config overrides global config except for the Windows backend,
+which can be selected only in the trusted global file. `/sandbox` updates a trusted
+project sandbox file when present, otherwise the global file. Pi versions without a
+project-trust API use only global configuration.
 
 ## Behavior
 
@@ -170,14 +176,19 @@ Unsupported Pi versions still fail task startup.
   `sandbox.json`, then restart or continue the task in a fresh worker to apply
   additional filesystem access. Main-agent Bash can retry a command, but there
   is no live worker-policy update.
-- **Windows**: the packaged policy selects standard AppContainer for Pi's Git
-  Bash/MSYS runtime. With `windows.allowLoopback: false` (the default), the extension
-  does not start an unreachable proxy and the worker has no network. Setting
-  `windows.allowLoopback` to `true` enables the domain proxy, but also gives the
-  AppContainer access to every local loopback service, not only the proxy port.
+- **Windows AppContainer**: the packaged policy selects standard AppContainer for
+  Pi's Git Bash/MSYS runtime. With `windows.allowLoopback: false` (the default), the
+  extension does not start an unreachable proxy and the worker has no network.
+  Setting `windows.allowLoopback` to `true` enables the domain proxy, but also gives
+  the AppContainer access to every local loopback service, not only the proxy port.
   Setting `network.allowNetwork` to `true` instead gives the entire worker
   unrestricted network access; domain lists are then not a boundary. Both opt-ins
   are explicit security downgrades and produce warnings.
+- **Windows restricted user**: WFP blocks restricted accounts except for the
+  installed proxy port range, so domain-filtered proxying works without a broad
+  loopback exemption. `network.allowNetwork: true` leases a separately provisioned
+  unrestricted account. Filesystem grants are journaled and revoked after every
+  process tree exits.
 
 ### Credentials
 
@@ -208,15 +219,43 @@ The Windows sandbox fields are:
 ```json
 {
   "windows": {
+    "backend": "appContainer",
     "appContainerMode": "standard",
     "allowLoopback": false
   }
 }
 ```
 
-`appContainerMode` is `"lpac"` or `"standard"`. Core Landstrip defaults to LPAC;
-the Pi package defaults to standard mode for Git Bash compatibility. Loopback is
-independently opt-in.
+`backend` is `"appContainer"` or `"restrictedUser"`. It is a trusted host setting:
+only `~/.pi/agent/sandbox.json` can change it, and project configuration cannot
+override it. `appContainerMode` is `"lpac"` or `"standard"`; core Landstrip defaults
+to LPAC, while the Pi package defaults to standard mode for Git Bash compatibility.
+`allowLoopback` is independently opt-in and applies only to AppContainer.
+
+### Windows restricted-user setup
+
+Provision the backend once before selecting it in global configuration:
+
+```powershell
+npx @landstrip/landstrip windows setup
+npx @landstrip/landstrip windows status
+```
+
+Setup requests UAC elevation and defaults to eight restricted-network accounts, two
+unrestricted-network accounts, and proxy ports 60080-60111. Run
+`npx @landstrip/landstrip windows setup --help` for pool and port options. Then set
+`"backend": "restrictedUser"` in `~/.pi/agent/sandbox.json` and restart Pi.
+
+The extension checks installation health and reads the configured proxy range before
+launching a restricted worker. Restricted-user mode does not support
+`windows.allowLoopback` or `network.allowLocalBinding`. Remove the persistent
+accounts, WFP rules, runner, and recovered per-run ACL grants with:
+
+```powershell
+npx @landstrip/landstrip windows uninstall
+```
+
+A subagent configuration example follows:
 
 ```json
 {

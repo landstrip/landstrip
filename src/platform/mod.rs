@@ -27,3 +27,13 @@ pub(crate) use windows::execute;
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::fd;
+
+#[cfg(target_os = "windows")]
+pub(crate) fn manage_windows(command: &crate::cli::WindowsCommand) -> anyhow::Result<()> {
+    windows::manage(command)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn manage_windows(_command: &crate::cli::WindowsCommand) -> anyhow::Result<()> {
+    Err(crate::engine::error::Error::PlatformUnsupported.into())
+}

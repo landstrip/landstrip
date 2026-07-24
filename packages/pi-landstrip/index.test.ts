@@ -468,6 +468,13 @@ describe('writeEnvFile', () => {
     expect(content).toContain("export NO_PROXY=''");
   });
 
+  it('adds proxy credentials when a token is provided', () => {
+    const { dir, path } = writeEnvFile({}, 8080, 'secret');
+    const content = readFileSync(path, 'utf-8');
+    rmSync(dir, { recursive: true, force: true });
+    expect(content).toContain("export HTTP_PROXY='http://landstrip:secret@127.0.0.1:8080'");
+  });
+
   it('does not add proxy vars when proxyPort is null', () => {
     const { dir, path } = writeEnvFile({ FOO: 'bar' }, null);
     const content = readFileSync(path, 'utf-8');

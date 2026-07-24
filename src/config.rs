@@ -52,9 +52,18 @@ pub(crate) enum AppContainerMode {
     Standard,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum WindowsBackend {
+    #[default]
+    AppContainer,
+    RestrictedUser,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct SandboxWindows {
+    pub(crate) backend: WindowsBackend,
     pub(crate) app_container_mode: AppContainerMode,
     pub(crate) allow_loopback: bool,
 }

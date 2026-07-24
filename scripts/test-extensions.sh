@@ -55,7 +55,16 @@ done < <(list_extensions)
 	exit 1
 }
 
-if (( local_root )); then
+restricted_user_setup=0
+
+cleanup_local_root() {
+	if ((restricted_user_setup)); then
+		"target/debug/$binary" windows uninstall >/dev/null 2>&1 || true
+	fi
+	[[ -z "${tarball:-}" ]] || rm -f "$tarball"
+}
+
+if ((local_root)); then
 	tarball="$(npm pack . --silent)"
 	platform_package="npm/$(node -p '`${process.platform}-${process.arch}`')"
 	[[ -d "$platform_package" ]] || {
@@ -67,7 +76,14 @@ if (( local_root )); then
 	cargo build --locked
 	mkdir -p "$platform_package/bin"
 	install -m 755 "target/debug/$binary" "$platform_package/bin/$binary"
-	trap 'rm -f "$tarball"' EXIT
+	trap cleanup_local_root EXIT
+
+	if [[ "$platform_package" == npm/win32-* && "${CI:-}" == true ]]; then
+		"target/debug/$binary" windows setup \
+			--restricted-accounts 2 --unrestricted-accounts 0
+		restricted_user_setup=1
+		export LANDSTRIP_TEST_RESTRICTED_USER=1
+	fi
 fi
 
 for package_dir in "${extension_dirs[@]}"; do
@@ -82,3 +98,9 @@ for package_dir in "${extension_dirs[@]}"; do
 	npm --prefix "$package_dir" run ci:check
 	npm --prefix "$package_dir" run ci:test
 done
+
+
+if ((restricted_user_setup)); then
+	"target/debug/$binary" windows uninstall
+	restricted_user_setup=0
+fi

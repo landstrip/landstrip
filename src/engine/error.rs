@@ -28,6 +28,8 @@ pub(crate) enum Mechanism {
     Seatbelt,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Appcontainer,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Windowsuser,
 }
 
 /// A landstrip error identified by a stable, machine-routable code.

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::engine::error::Error;
-use argh::FromArgs;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process;
+
+use argh::FromArgs;
+
+use crate::config::WindowsBackend;
+use crate::engine::error::Error;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -18,8 +21,34 @@ pub(crate) struct Cli {
     pub(crate) format: PolicyFormat,
     pub(crate) debug: bool,
     pub(crate) trap_fd: Option<i32>,
+    pub(crate) windows_backend: WindowsBackend,
     pub(crate) tool: OsString,
     pub(crate) tool_args: Vec<OsString>,
+}
+
+#[derive(Debug)]
+pub(crate) enum Invocation {
+    Run(Cli),
+    Windows(WindowsCommand),
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) enum WindowsCommand {
+    Setup {
+        restricted_accounts: u16,
+        unrestricted_accounts: u16,
+        proxy_port_low: u16,
+        proxy_port_high: u16,
+        elevated: bool,
+    },
+    Status,
+    Uninstall {
+        elevated: bool,
+    },
+    Worker {
+        request: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, strum_macros::EnumString)]
@@ -57,20 +86,26 @@ struct CliOptions {
     /// write landstrip trap responses to an already-open file descriptor
     #[argh(option, from_str_fn(parse_trap_fd))]
     trap_fd: Option<i32>,
+
+    /// windows sandbox backend: app-container or restricted-user
+    #[argh(option, from_str_fn(parse_windows_backend))]
+    windows_backend: Option<WindowsBackend>,
 }
 
 #[derive(Debug)]
 enum CliAction {
     Run(Cli),
+    Windows(WindowsCommand),
     Exit(String),
 }
 
-pub(crate) fn parse_cli() -> std::result::Result<Cli, Error> {
+pub(crate) fn parse_cli() -> std::result::Result<Invocation, Error> {
     let mut env_args = env::args_os();
     let program = env_args.next().unwrap_or(OsString::from(PROGRAM_NAME));
 
     match parse_cli_action(&program, env_args) {
-        Ok(CliAction::Run(cli)) => Ok(cli),
+        Ok(CliAction::Run(cli)) => Ok(Invocation::Run(cli)),
+        Ok(CliAction::Windows(command)) => Ok(Invocation::Windows(command)),
         Ok(CliAction::Exit(output)) => {
             print!("{output}");
             process::exit(0);
@@ -88,6 +123,10 @@ fn parse_cli_action(
         .and_then(|name| name.to_str())
         .unwrap_or(PROGRAM_NAME)
         .to_owned();
+    let args = args.into_iter().collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == OsStr::new("windows")) {
+        return parse_windows_action(&program_name, &args[1..]);
+    }
     let (option_args, tool_tail) = split_cli_args(args);
     let options = match parse_cli_options(&program_name, option_args)? {
         ParsedOptions::Options(options) => options,
@@ -115,9 +154,135 @@ fn parse_cli_action(
         format: options.format.unwrap_or(PolicyFormat::Json),
         debug: options.debug,
         trap_fd: options.trap_fd,
+        windows_backend: options.windows_backend.unwrap_or_default(),
         tool,
         tool_args: tool_tail.collect(),
     }))
+}
+
+fn parse_windows_action(program_name: &str, args: &[OsString]) -> Result<CliAction> {
+    let Some(command) = args.first().and_then(|arg| arg.to_str()) else {
+        return Err(windows_usage(program_name));
+    };
+    if command == "--help" || command == "-h" {
+        return Ok(CliAction::Exit(windows_usage(program_name)));
+    }
+
+    match command {
+        "status" if args.len() == 1 => Ok(CliAction::Windows(WindowsCommand::Status)),
+        "uninstall"
+            if args.get(1).is_some_and(|option| {
+                option == OsStr::new("--help") || option == OsStr::new("-h")
+            }) =>
+        {
+            Ok(CliAction::Exit(format!(
+                "Usage: {program_name} windows uninstall\n"
+            )))
+        }
+        "uninstall" => {
+            let elevated = parse_elevated_only(program_name, "uninstall", &args[1..])?;
+            Ok(CliAction::Windows(WindowsCommand::Uninstall { elevated }))
+        }
+        "setup" => parse_windows_setup(program_name, &args[1..]),
+        "worker" if args.len() == 2 => Ok(CliAction::Windows(WindowsCommand::Worker {
+            request: PathBuf::from(&args[1]),
+        })),
+        _ => Err(windows_usage(program_name)),
+    }
+}
+
+fn parse_windows_setup(program_name: &str, args: &[OsString]) -> Result<CliAction> {
+    const DEFAULT_RESTRICTED_ACCOUNTS: u16 = 8;
+    const DEFAULT_UNRESTRICTED_ACCOUNTS: u16 = 2;
+    const DEFAULT_PROXY_PORT_LOW: u16 = 60_080;
+    const DEFAULT_PROXY_PORT_HIGH: u16 = 60_111;
+
+    let mut restricted_accounts = DEFAULT_RESTRICTED_ACCOUNTS;
+    let mut unrestricted_accounts = DEFAULT_UNRESTRICTED_ACCOUNTS;
+    let mut proxy_port_low = DEFAULT_PROXY_PORT_LOW;
+    let mut proxy_port_high = DEFAULT_PROXY_PORT_HIGH;
+    let mut elevated = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let option = args[index]
+            .to_str()
+            .ok_or_else(|| "argument encoding".to_owned())?;
+        match option {
+            "--elevated" => elevated = true,
+            "--restricted-accounts" => {
+                restricted_accounts = parse_windows_number(args, &mut index, option)?;
+            }
+            "--unrestricted-accounts" => {
+                unrestricted_accounts = parse_windows_number(args, &mut index, option)?;
+            }
+            "--proxy-port-low" => {
+                proxy_port_low = parse_windows_number(args, &mut index, option)?;
+            }
+            "--proxy-port-high" => {
+                proxy_port_high = parse_windows_number(args, &mut index, option)?;
+            }
+            "--help" | "-h" => {
+                return Ok(CliAction::Exit(windows_setup_usage(program_name)));
+            }
+            _ => return Err(windows_setup_usage(program_name)),
+        }
+        index += 1;
+    }
+
+    if restricted_accounts == 0 || restricted_accounts > 64 {
+        return Err("--restricted-accounts must be between 1 and 64".to_owned());
+    }
+    if unrestricted_accounts > 64 {
+        return Err("--unrestricted-accounts must be between 0 and 64".to_owned());
+    }
+    if proxy_port_low == 0 || proxy_port_low > proxy_port_high {
+        return Err("proxy port range must be non-zero and ordered".to_owned());
+    }
+    if proxy_port_high - proxy_port_low > 64 {
+        return Err("proxy port range may contain at most 65 ports".to_owned());
+    }
+
+    Ok(CliAction::Windows(WindowsCommand::Setup {
+        restricted_accounts,
+        unrestricted_accounts,
+        proxy_port_low,
+        proxy_port_high,
+        elevated,
+    }))
+}
+
+fn parse_elevated_only(program_name: &str, command: &str, args: &[OsString]) -> Result<bool> {
+    match args {
+        [] => Ok(false),
+        [option] if option == OsStr::new("--elevated") => Ok(true),
+        _ => Err(format!(
+            "Usage: {program_name} windows {command} [--elevated]\n"
+        )),
+    }
+}
+
+fn parse_windows_number(args: &[OsString], index: &mut usize, option: &str) -> Result<u16> {
+    *index += 1;
+    let value = args
+        .get(*index)
+        .and_then(|arg| arg.to_str())
+        .ok_or_else(|| format!("{option} requires an integer"))?;
+    value
+        .parse::<u16>()
+        .map_err(|_| format!("{option} requires an integer between 0 and 65535"))
+}
+
+fn windows_usage(program_name: &str) -> String {
+    format!(
+        "Usage: {program_name} windows <setup|status|uninstall> [OPTIONS]\n\nFor command help, run '{program_name} windows <COMMAND> --help'.\n"
+    )
+}
+
+fn windows_setup_usage(program_name: &str) -> String {
+    format!(
+        "Usage: {program_name} windows setup [OPTIONS]\n\nOptions:\n  --restricted-accounts N     Restricted-network account pool (default: 8)\n  --unrestricted-accounts N   Unrestricted-network account pool (default: 2)\n  --proxy-port-low PORT        First permitted loopback proxy port (default: 60080)\n  --proxy-port-high PORT       Last permitted loopback proxy port (default: 60111)\n"
+    )
 }
 
 fn split_cli_args(args: impl IntoIterator<Item = OsString>) -> (Vec<OsString>, Vec<OsString>) {
@@ -136,6 +301,9 @@ fn split_cli_args(args: impl IntoIterator<Item = OsString>) -> (Vec<OsString>, V
             continue;
         }
         if take_option_value(&["--trap-fd"], &arg, &mut option_args, &mut args) {
+            continue;
+        }
+        if take_option_value(&["--windows-backend"], &arg, &mut option_args, &mut args) {
             continue;
         }
 
@@ -190,6 +358,14 @@ fn parse_policy_format(format: &str) -> std::result::Result<PolicyFormat, String
     format
         .parse()
         .map_err(|_| "policy format must be json or yaml".to_owned())
+}
+
+fn parse_windows_backend(value: &str) -> std::result::Result<WindowsBackend, String> {
+    match value {
+        "app-container" => Ok(WindowsBackend::AppContainer),
+        "restricted-user" => Ok(WindowsBackend::RestrictedUser),
+        _ => Err("Windows backend must be app-container or restricted-user".to_owned()),
+    }
 }
 
 enum ParsedOptions {
