@@ -1367,9 +1367,10 @@ test('classifies supported Pi versions', () => {
   expect(isSupportedPiVersion([0, 80, 99])).toBe(true);
   expect(isSupportedPiVersion([0, 81, 0])).toBe(true);
   expect(isSupportedPiVersion([0, 81, 1])).toBe(true);
+  expect(isSupportedPiVersion([0, 82, 0])).toBe(true);
+  expect(isSupportedPiVersion([0, 90, 0])).toBe(true);
   expect(isSupportedPiVersion([0, 80, 5])).toBe(false);
   expect(isSupportedPiVersion([0, 79, 99])).toBe(false);
-  expect(isSupportedPiVersion([0, 82, 0])).toBe(false);
   expect(isSupportedPiVersion([1, 2, 3])).toBe(false);
   expect(isSupportedPiVersion([26, 4, 0])).toBe(false);
   expect(isSupportedPiVersion([0, 81])).toBe(false);

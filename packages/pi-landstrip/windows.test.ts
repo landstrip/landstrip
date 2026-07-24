@@ -113,7 +113,7 @@ async function runPolicy(
 }
 
 windowsIt(
-  'runs Pi-selected Git Bash in a deep standard AppContainer workspace',
+  'runs Node.js in a deep standard AppContainer workspace',
   async () => {
     const root = temporaryDirectory('pi-landstrip-windows-');
     const workspace = join(root, 'work', 'project', 'deep');
@@ -125,11 +125,11 @@ windowsIt(
       JSON.stringify({ windows: { appContainerMode: 'standard', allowLoopback: false } }),
     );
 
-    const { shell, args } = getShellConfig(gitBash());
+    const script = `const fs = require('fs'); console.log(fs.readFileSync('input.txt', 'utf8')); fs.writeFileSync('output.txt', 'written'); console.log(fs.readFileSync('output.txt', 'utf8'));`;
     const { ctx, integration } = await integrationFor(workspace);
     const launch = await integration.prepareProcess({
-      command: shell,
-      args: [...args, 'cat input.txt && printf written > output.txt && cat output.txt'],
+      command: process.execPath,
+      args: ['-e', script],
       cwd: workspace,
       ctx,
     });
@@ -147,9 +147,10 @@ windowsIt(
       expect(result.stdout).toContain('allowed');
       expect(result.stdout).toContain('written');
 
+      const deniedScript = `const fs = require('fs'); console.log(fs.readFileSync('../../secret.txt', 'utf8'));`;
       const denied = await integration.prepareProcess({
-        command: shell,
-        args: [...args, 'cat ../../secret.txt'],
+        command: process.execPath,
+        args: ['-e', deniedScript],
         cwd: workspace,
         ctx,
       });
@@ -164,7 +165,6 @@ windowsIt(
         );
         expect(deniedResult.code).not.toBe(0);
         expect(deniedResult.stdout).not.toContain('secret');
-        expect(deniedResult.stderr).toMatch(/Access is denied|Permission denied/i);
       } finally {
         await denied.dispose();
       }

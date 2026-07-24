@@ -14,14 +14,15 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT,
+    SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
@@ -307,19 +308,42 @@ pub(super) fn protect_path(path: &Path) -> Result<()> {
         return Err(io::Error::last_os_error()).context("build restricted-user state DACL");
     }
 
-    let path = wide_string(path.as_os_str());
-    let result = unsafe {
-        SetFileSecurityW(
-            path.as_ptr(),
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut dacl_present: i32 = 0;
+    let mut dacl_defaulted: i32 = 0;
+    if unsafe {
+        GetSecurityDescriptorDacl(
             security_descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+    } == 0
+    {
+        unsafe { LocalFree(security_descriptor.cast::<c_void>()) };
+        return Err(io::Error::last_os_error()).context("get restricted-user state DACL");
+    }
+
+    let path = wide_string(path.as_os_str());
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path.as_ptr().cast_mut(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            dacl,
+            ptr::null_mut(),
         )
     };
     unsafe {
         LocalFree(security_descriptor.cast::<c_void>());
     }
-    if result == 0 {
-        return Err(io::Error::last_os_error()).context("protect restricted-user state DACL");
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(i32::from_ne_bytes(
+            status.to_ne_bytes(),
+        )))
+        .context("protect restricted-user state DACL");
     }
     Ok(())
 }
