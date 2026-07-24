@@ -106,57 +106,7 @@ pub(super) fn run(path: &Path) -> Result<()> {
 
 fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> Result<u32> {
     harden_worker_objects()?;
-    let process_token = current_process_token()?;
-    let token_user = token_user(process_token.0)?;
-    let mut application_package_sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
-    let mut application_package_sid_size = SECURITY_MAX_SID_SIZE;
-    if unsafe {
-        CreateWellKnownSid(
-            WinBuiltinAnyPackageSid,
-            ptr::null_mut(),
-            application_package_sid.as_mut_ptr().cast(),
-            &mut application_package_sid_size,
-        )
-    } == 0
-    {
-        return Err(setup_failed(format!(
-            "CreateWellKnownSid: {}",
-            io::Error::last_os_error()
-        ))
-        .into());
-    }
-    let restricted_sids = [
-        SID_AND_ATTRIBUTES {
-            Sid: token_user.User.Sid,
-            Attributes: 0,
-        },
-        SID_AND_ATTRIBUTES {
-            Sid: application_package_sid.as_mut_ptr().cast(),
-            Attributes: 0,
-        },
-    ];
-    let mut restricted_token = ptr::null_mut();
-    let ok = unsafe {
-        CreateRestrictedToken(
-            process_token.0,
-            DISABLE_MAX_PRIVILEGE,
-            0,
-            ptr::null(),
-            0,
-            ptr::null(),
-            u32::try_from(restricted_sids.len())?,
-            restricted_sids.as_ptr(),
-            &mut restricted_token,
-        )
-    };
-    if ok == 0 {
-        return Err(setup_failed(format!(
-            "CreateRestrictedToken: {}",
-            io::Error::last_os_error()
-        ))
-        .into());
-    }
-    let restricted_token = Handle(restricted_token);
+    let restricted_token = create_restricted_token()?;
 
     let command_line = command_line(tool, args)?;
     let mut command_line = wide(&command_line);
@@ -213,6 +163,59 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
     Ok(exit_code)
 }
 
+fn create_restricted_token() -> Result<Handle> {
+    let process_token = current_process_token()?;
+    let token_user = token_user(process_token.0)?;
+    let mut application_package_sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut application_package_sid_size = SECURITY_MAX_SID_SIZE;
+    if unsafe {
+        CreateWellKnownSid(
+            WinBuiltinAnyPackageSid,
+            ptr::null_mut(),
+            application_package_sid.as_mut_ptr().cast(),
+            &mut application_package_sid_size,
+        )
+    } == 0
+    {
+        return Err(setup_failed(format!(
+            "CreateWellKnownSid: {}",
+            io::Error::last_os_error()
+        ))
+        .into());
+    }
+    let restricted_sids = [
+        SID_AND_ATTRIBUTES {
+            Sid: token_user.User.Sid,
+            Attributes: 0,
+        },
+        SID_AND_ATTRIBUTES {
+            Sid: application_package_sid.as_mut_ptr().cast(),
+            Attributes: 0,
+        },
+    ];
+    let mut restricted_token = ptr::null_mut();
+    let ok = unsafe {
+        CreateRestrictedToken(
+            process_token.0,
+            DISABLE_MAX_PRIVILEGE,
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            u32::try_from(restricted_sids.len())?,
+            restricted_sids.as_ptr(),
+            &mut restricted_token,
+        )
+    };
+    if ok == 0 {
+        return Err(setup_failed(format!(
+            "CreateRestrictedToken: {}",
+            io::Error::last_os_error()
+        ))
+        .into());
+    }
+    Ok(Handle(restricted_token))
+}
 fn harden_worker_objects() -> Result<()> {
     let descriptor = wide("D:P(A;;GA;;;SY)");
     let mut security_descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
