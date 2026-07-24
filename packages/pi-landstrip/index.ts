@@ -459,13 +459,17 @@ function canonicalizePath(filePath: string, cwd: string): string {
   }
 }
 
+function normalizePathSeparators(path: string): string {
+  return process.platform === 'win32' ? path.replaceAll('\\', '/') : path;
+}
+
 export function matchesPattern(filePath: string, patterns: string[], cwd: string): boolean {
-  const abs = canonicalizePath(filePath, cwd);
+  const abs = normalizePathSeparators(canonicalizePath(filePath, cwd));
 
   return patterns.some((pattern) => {
-    const absPattern = pattern.includes('*')
-      ? expandPath(pattern, cwd)
-      : canonicalizePath(pattern, cwd);
+    const absPattern = normalizePathSeparators(
+      pattern.includes('*') ? expandPath(pattern, cwd) : canonicalizePath(pattern, cwd),
+    );
 
     if (pattern.includes('*')) {
       // Mirror landstrip's matcher: `**/` spans directories, `**` spans any run,
@@ -498,9 +502,11 @@ function normalizeBlockedPath(path: string, cwd: string): string {
 // already treats a bare directory entry as covering everything beneath it, so
 // storing the scope is enough for sibling files to auto-allow.
 function pathUnderDirectory(filePath: string, dir: string): boolean {
-  if (filePath === dir) return true;
-  const sep = dir.endsWith('/') ? '' : '/';
-  return filePath.startsWith(dir + sep);
+  const normalizedFilePath = normalizePathSeparators(filePath);
+  const normalizedDir = normalizePathSeparators(dir);
+  if (normalizedFilePath === normalizedDir) return true;
+  const sep = normalizedDir.endsWith('/') ? '' : '/';
+  return normalizedFilePath.startsWith(normalizedDir + sep);
 }
 
 // The broadest ancestor worth approving in one action: the immediate child of
@@ -510,6 +516,7 @@ function pathUnderDirectory(filePath: string, dir: string): boolean {
 // over-broaden), fall back to the exact file so nothing widens silently.
 export function sessionScopeFor(filePath: string, baseDirectory: string): string {
   const dir = dirname(filePath);
+  const normalizedDir = normalizePathSeparators(dir);
   const home = homedir();
   const boundaries = new Set<string>();
   if (home) boundaries.add(home);
@@ -521,11 +528,12 @@ export function sessionScopeFor(filePath: string, baseDirectory: string): string
   }
 
   for (const boundary of boundaries) {
+    const normalizedBoundary = normalizePathSeparators(boundary);
     if (pathUnderDirectory(dir, boundary)) {
-      const rest = dir.slice(boundary.length).replace(/^\/+/, '');
+      const rest = normalizedDir.slice(normalizedBoundary.length).replace(/^\/+/, '');
       const first = rest.split('/')[0];
       if (!first) return filePath;
-      return boundary.endsWith('/') ? boundary + first : `${boundary}/${first}`;
+      return join(boundary, first);
     }
   }
 

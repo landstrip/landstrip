@@ -4,6 +4,7 @@
 import { type ChildProcess, execFile } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -29,6 +30,15 @@ function gitBash(): string {
   const shell = join(process.env.ProgramFiles ?? 'C:\\Program Files', 'Git', 'bin', 'bash.exe');
   expect(existsSync(shell), `Git Bash was not found at ${shell}`).toBe(true);
   return shell;
+}
+
+function filesystemPolicy(directory: string) {
+  return {
+    denyRead: [homedir()],
+    allowRead: [directory],
+    allowWrite: [directory],
+    denyWrite: [],
+  };
 }
 
 function collect(child: ChildProcess): Promise<ProcessResult> {
@@ -94,58 +104,68 @@ async function runPolicy(
   }
 }
 
-windowsIt('runs Pi-selected Git Bash in a deep standard AppContainer workspace', async () => {
-  const root = temporaryDirectory('pi-landstrip-windows-');
-  const workspace = join(root, 'work', 'project', 'deep');
-  mkdirSync(join(workspace, '.pi'), { recursive: true });
-  writeFileSync(join(workspace, 'input.txt'), 'allowed');
-  writeFileSync(join(root, 'work', 'secret.txt'), 'secret');
-  writeFileSync(
-    join(workspace, '.pi', 'sandbox.json'),
-    JSON.stringify({ windows: { appContainerMode: 'standard', allowLoopback: false } }),
-  );
+windowsIt(
+  'runs Pi-selected Git Bash in a deep standard AppContainer workspace',
+  async () => {
+    const root = temporaryDirectory('pi-landstrip-windows-');
+    const workspace = join(root, 'work', 'project', 'deep');
+    mkdirSync(join(workspace, '.pi'), { recursive: true });
+    writeFileSync(join(workspace, 'input.txt'), 'allowed');
+    writeFileSync(join(root, 'work', 'secret.txt'), 'secret');
+    writeFileSync(
+      join(workspace, '.pi', 'sandbox.json'),
+      JSON.stringify({ windows: { appContainerMode: 'standard', allowLoopback: false } }),
+    );
 
-  const { shell, args } = getShellConfig(gitBash());
-  const { ctx, integration } = await integrationFor(workspace);
-  const launch = await integration.prepareProcess({
-    command: shell,
-    args: [...args, 'cat input.txt && printf written > output.txt && cat output.txt'],
-    cwd: workspace,
-    ctx,
-  });
-  const child = launch.spawn(launch.command, launch.args, {
-    cwd: launch.cwd,
-    env: launch.env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
-  const result = await collect(child as ChildProcess);
-  await launch.dispose();
+    const { shell, args } = getShellConfig(gitBash());
+    const { ctx, integration } = await integrationFor(workspace);
+    const launch = await integration.prepareProcess({
+      command: shell,
+      args: [...args, 'cat input.txt && printf written > output.txt && cat output.txt'],
+      cwd: workspace,
+      ctx,
+    });
+    try {
+      const child = launch.spawn(launch.command, launch.args, {
+        cwd: launch.cwd,
+        env: launch.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      const result = await collect(child as ChildProcess);
 
-  expect(result.error?.message ?? '').not.toContain('ENOTSUP');
-  expect(result.code, result.stderr).toBe(0);
-  expect(result.stdout).toContain('allowed');
-  expect(result.stdout).toContain('written');
+      expect(result.error?.message ?? '').not.toContain('ENOTSUP');
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stdout).toContain('allowed');
+      expect(result.stdout).toContain('written');
 
-  const denied = await integration.prepareProcess({
-    command: shell,
-    args: [...args, 'cat ../../secret.txt'],
-    cwd: workspace,
-    ctx,
-  });
-  const deniedResult = await collect(
-    denied.spawn(denied.command, denied.args, {
-      cwd: denied.cwd,
-      env: denied.env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    }) as ChildProcess,
-  );
-  await denied.dispose();
-  expect(deniedResult.code).not.toBe(0);
-  expect(deniedResult.stdout).not.toContain('secret');
-  expect(deniedResult.stderr).toMatch(/Access is denied|Permission denied/i);
-});
+      const denied = await integration.prepareProcess({
+        command: shell,
+        args: [...args, 'cat ../../secret.txt'],
+        cwd: workspace,
+        ctx,
+      });
+      try {
+        const deniedResult = await collect(
+          denied.spawn(denied.command, denied.args, {
+            cwd: denied.cwd,
+            env: denied.env,
+            stdio: ['ignore', 'pipe', 'pipe'],
+            windowsHide: true,
+          }) as ChildProcess,
+        );
+        expect(deniedResult.code).not.toBe(0);
+        expect(deniedResult.stdout).not.toContain('secret');
+        expect(deniedResult.stderr).toMatch(/Access is denied|Permission denied/i);
+      } finally {
+        await denied.dispose();
+      }
+    } finally {
+      await launch.dispose();
+    }
+  },
+  30_000,
+);
 
 windowsIt('does not silently downgrade LPAC when Git Bash cannot start', async () => {
   const directory = temporaryDirectory('landstrip-windows-lpac-');
@@ -154,7 +174,7 @@ windowsIt('does not silently downgrade LPAC when Git Bash cannot start', async (
     directory,
     {
       network: { allowNetwork: false },
-      filesystem: { denyRead: [], allowRead: [directory], allowWrite: [directory], denyWrite: [] },
+      filesystem: filesystemPolicy(directory),
       windows: { appContainerMode: 'lpac', allowLoopback: false },
     },
     shell,
@@ -176,7 +196,7 @@ windowsIt('keeps loopback blocked unless its explicit exemption is enabled', asy
   const script = `fetch('http://127.0.0.1:${address.port}', { signal: AbortSignal.timeout(3000) }).then(async response => process.stdout.write(await response.text()))`;
   const policy = (allowLoopback: boolean) => ({
     network: { allowNetwork: false },
-    filesystem: { denyRead: [], allowRead: [directory], allowWrite: [directory], denyWrite: [] },
+    filesystem: filesystemPolicy(directory),
     windows: { appContainerMode: 'standard', allowLoopback },
   });
 

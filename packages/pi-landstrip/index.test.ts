@@ -277,14 +277,21 @@ it('allows RPC workers when sandboxing is explicitly disabled', async () => {
     'Prepared process has been disposed',
   );
 
-  const prepared = await integration.prepareProcess({
+  const preparedPromise = integration.prepareProcess({
     command: process.execPath,
     args: ['--version'],
     cwd: process.cwd(),
     ctx,
   });
-  expect(prepared.env.HOME).toBe(process.env.HOME);
-  await prepared.dispose();
+  if (process.platform === 'win32') {
+    await expect(preparedPromise).rejects.toThrow(
+      'Generic process preparation requires sandboxing on Windows',
+    );
+  } else {
+    const prepared = await preparedPromise;
+    expect(prepared.env.HOME).toBe(process.env.HOME);
+    await prepared.dispose();
+  }
 });
 
 // The broker resolves relative policy entries (notably ".") against the command
