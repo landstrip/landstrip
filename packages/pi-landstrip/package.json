@@ -41,7 +41,8 @@
   },
   "dependencies": {
     "@landstrip/landstrip": "^0.17.35",
-    "minimatch": "^10.2.5"
+    "minimatch": "^10.2.5",
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.82.0",

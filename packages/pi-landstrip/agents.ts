@@ -8,6 +8,8 @@ import { minimatch } from 'minimatch';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 
 import { loadLandstripConfig, type AgentSource, type ConfigObject } from './config.ts';
+import { loadOpenCodeAgents } from './opencode-agents.ts';
+import { resolveLandstripSettings } from './settings.ts';
 import { expandHomePath, formatError, isRecord } from './util.ts';
 
 export type PermissionAction = 'allow' | 'ask' | 'deny';
@@ -189,7 +191,32 @@ export function loadAgentCatalog(
     diagnostics.push(formatError(error));
   }
 
+  const { settings, warnings: settingsWarnings } = resolveLandstripSettings(
+    cwd,
+    includeProject,
+    piAgentDir,
+  );
+  warnings.push(...settingsWarnings);
+
+  // OpenCode agents fill gaps only. Pi definitions win silently on name conflict:
+  // OpenCode global < OpenCode project < Pi built-in/global/local.
+  const openCode = loadOpenCodeAgents({
+    cwd,
+    includeGlobal: settings.opencode.showGlobalAgents,
+    includeProject: settings.opencode.showLocalAgents && includeProject,
+  });
+  diagnostics.push(...openCode.diagnostics);
+
   const normalized = new Map<string, AgentDefinition>();
+  for (const imported of openCode.agents.values()) {
+    try {
+      const agent = normalizeAgent(imported.name, imported.raw, imported.source);
+      if (agent) normalized.set(imported.name, agent);
+    } catch (error) {
+      diagnostics.push(`${imported.path}: ${formatError(error)}`);
+    }
+  }
+
   if (subagents.agent !== undefined && !isRecord(subagents.agent)) {
     diagnostics.push('subagents.agent must be an object');
   } else if (isRecord(subagents.agent)) {
@@ -202,6 +229,7 @@ export function loadAgentCatalog(
       try {
         const agent = normalizeAgent(name, value, agentSources.get(name) ?? 'built-in');
         if (agent) normalized.set(name, agent);
+        else normalized.delete(name);
       } catch (error) {
         diagnostics.push(formatError(error));
       }

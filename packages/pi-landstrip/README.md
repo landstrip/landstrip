@@ -208,8 +208,33 @@ merged over the packaged [defaults](./subagents.json). The packaged subagent typ
 are `explore`, `general`, and the OpenCode-compatible `scout` reconnaissance agent.
 
 Sandbox policy remains in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi's
-`settings.json` contains only normal Pi settings, such as the `pi-landstrip` package
-entry.
+`settings.json` contains normal Pi settings, such as the `pi-landstrip` package
+entry, plus optional `landstrip.opencode` import flags:
+
+```json
+{
+  "packages": ["npm:pi-landstrip"],
+  "landstrip": {
+    "opencode": {
+      "showGlobalAgents": false,
+      "showLocalAgents": false
+    }
+  }
+}
+```
+
+Both flags default to `false`. When enabled:
+
+- `showGlobalAgents` imports Markdown agents from the OpenCode global config
+  directory (`$OPENCODE_CONFIG_DIR`, or `$XDG_CONFIG_HOME/opencode`, or
+  `~/.config/opencode`) under `agent/` and `agents/`.
+- `showLocalAgents` imports Markdown agents from the trusted project's
+  `.opencode/agent/` and `.opencode/agents/` directories.
+
+OpenCode local agents override OpenCode global agents. Pi agent definitions
+from `subagents.json` (built-in, global, and local) take precedence over OpenCode
+imports with the same name; conflicts are silent. Local OpenCode agents are
+skipped when the project is untrusted, regardless of the flag.
 
 `subagents.json` accepts only top-level `maxSubagents` and `subagents`; sandbox
 fields belong in `sandbox.json`.
