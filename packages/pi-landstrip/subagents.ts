@@ -66,10 +66,7 @@ let cachedPiPackage: PiPackage | undefined;
 let piPackageResolved = false;
 
 export function isSupportedPiVersion(version: readonly number[]): boolean {
-  if (
-    version.length !== 3 ||
-    !version.every((part) => Number.isInteger(part) && part >= 0)
-  ) {
+  if (version.length !== 3 || !version.every((part) => Number.isInteger(part) && part >= 0)) {
     return false;
   }
   for (let i = 0; i < 3; i++) {
