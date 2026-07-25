@@ -14,10 +14,10 @@ pub(crate) fn normalize_roots(paths: &mut Vec<PathBuf>) {
 }
 
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
-    if cfg!(not(target_os = "macos")) {
-        if let Ok(canonical) = fs::canonicalize(path) {
-            return canonical;
-        }
+    if cfg!(not(target_os = "macos"))
+        && let Ok(canonical) = fs::canonicalize(path)
+    {
+        return canonical;
     }
 
     normalize_path_lexically(path)

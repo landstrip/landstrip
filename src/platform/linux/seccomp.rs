@@ -221,7 +221,7 @@ pub(super) fn run_broker(
             if let Err(error) = result {
                 let trap = error
                     .chain()
-                    .find_map(<(dyn std::error::Error + 'static)>::downcast_ref::<LandstripError>)
+                    .find_map(<dyn std::error::Error + 'static>::downcast_ref::<LandstripError>)
                     .map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from_error);
                 if handed_off || send_trap(&mut child_sock, &trap).is_err() {
                     trap_fd.write(&trap);
@@ -306,7 +306,7 @@ fn supervise_child(
             match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::StillAlive) => break,
                 Ok(status) => return Ok(denials.emit(status)),
-                Err(Errno::EINTR) => continue,
+                Err(Errno::EINTR) => {}
                 Err(error) => {
                     return Err(supervise_errno(error).into());
                 }
@@ -324,7 +324,7 @@ fn supervise_child(
             loop {
                 match waitpid(child, None) {
                     Ok(status) => return Ok(denials.emit(status)),
-                    Err(Errno::EINTR) => continue,
+                    Err(Errno::EINTR) => {}
                     Err(error) => {
                         return Err(supervise_errno(error).into());
                     }
@@ -370,7 +370,7 @@ fn supervise_child(
                         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
                             Ok(WaitStatus::StillAlive) => break,
                             Ok(status) => return Ok(denials.emit(status)),
-                            Err(Errno::EINTR) => continue,
+                            Err(Errno::EINTR) => {}
                             Err(error) => {
                                 return Err(supervise_errno(error).into());
                             }
@@ -619,7 +619,7 @@ fn receive_notification(fd: RawFd) -> Result<libc::seccomp_notif> {
         // SAFETY: request points to writable storage for SECCOMP_IOCTL_NOTIF_RECV.
         match unsafe { seccomp_notif_recv(fd, ptr::addr_of_mut!(request)) } {
             Ok(_) => return Ok(request),
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) => {}
             Err(error) => {
                 return Err(supervise_errno(error).into());
             }
@@ -632,7 +632,7 @@ fn respond_notification(fd: RawFd, mut response: libc::seccomp_notif_resp) -> Re
         // SAFETY: response points to initialized storage for SECCOMP_IOCTL_NOTIF_SEND.
         match unsafe { seccomp_notif_send(fd, ptr::addr_of_mut!(response)) } {
             Ok(_) => return Ok(()),
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) => {}
             Err(error) => {
                 return Err(supervise_errno(error).into());
             }
@@ -645,7 +645,7 @@ fn validate_notification_id(fd: RawFd, id: u64) -> Result<bool> {
         // SAFETY: id points to initialized storage for SECCOMP_IOCTL_NOTIF_ID_VALID.
         match unsafe { seccomp_notif_id_valid(fd, ptr::addr_of!(id)) } {
             Ok(_) => return Ok(true),
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) => {}
             Err(Errno::ENOENT) => return Ok(false),
             Err(error) => {
                 return Err(supervise_errno(error).into());
@@ -1005,7 +1005,8 @@ fn duplicate_target_fd(pid: Pid, fd: RawFd) -> SysResult<OwnedFd> {
         });
     }
     // SAFETY: pidfd_open returned a new owned descriptor.
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) };
+    let pidfd = RawFd::try_from(pidfd).map_err(|_| BrokerError::BadFileDescriptor)?;
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
 
     // SAFETY: pidfd_getfd copies scalar arguments and returns a duplicated fd.
     let sock = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
@@ -1016,7 +1017,8 @@ fn duplicate_target_fd(pid: Pid, fd: RawFd) -> SysResult<OwnedFd> {
     }
 
     // SAFETY: pidfd_getfd returned a new owned descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(sock as RawFd) })
+    let sock = RawFd::try_from(sock).map_err(|_| BrokerError::BadFileDescriptor)?;
+    Ok(unsafe { OwnedFd::from_raw_fd(sock) })
 }
 
 fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> SysResult<i64> {
@@ -1273,30 +1275,28 @@ fn handle_openat(
             );
         }
     }
-    if wants_read {
-        if let Some(reason) = fs_read_denial_reason(policy, &resolved) {
-            if !path_exists(&resolved)? {
-                return Err(BrokerError::SystemCall {
-                    errno: libc::ENOENT,
-                });
-            }
-            return deny_open(
-                OpenDenial {
-                    operation: TrapOperation::Read,
-                    path: resolved,
-                    requested_path: path,
-                    syscall: syscall_name,
-                    flags,
-                    mode,
-                    reason,
-                    pid: request.pid,
-                    report: true,
-                },
-                denials,
-                query_enabled,
-                next_query_id,
-            );
+    if wants_read && let Some(reason) = fs_read_denial_reason(policy, &resolved) {
+        if !path_exists(&resolved)? {
+            return Err(BrokerError::SystemCall {
+                errno: libc::ENOENT,
+            });
         }
+        return deny_open(
+            OpenDenial {
+                operation: TrapOperation::Read,
+                path: resolved,
+                requested_path: path,
+                syscall: syscall_name,
+                flags,
+                mode,
+                reason,
+                pid: request.pid,
+                report: true,
+            },
+            denials,
+            query_enabled,
+            next_query_id,
+        );
     }
 
     // Reads are not Landlock-backed in the brokered child (f3f2105 dropped read
@@ -1305,10 +1305,8 @@ fn handle_openat(
     // TOCTOU, so have the broker open the allowed file itself and inject the fd.
     // Pure writes skip this: the brokered child still enforces Landlock write
     // rules, which catch a swapped write target.
-    if wants_read {
-        if let Some(grant) = OpenGrant::new(&resolved, flags, mode) {
-            return Ok(NotificationResult::Open(grant));
-        }
+    if wants_read && let Some(grant) = OpenGrant::new(&resolved, flags, mode) {
+        return Ok(NotificationResult::Open(grant));
     }
 
     Ok(NotificationResult::Continue)
@@ -2291,7 +2289,7 @@ fn send_fd(socket: &UnixStream, fd: RawFd) -> Result<()> {
         ) {
             Ok(_) => return Ok(()),
             // A signal during the fd transfer must not abort the broker setup.
-            Err(Errno::EINTR) => continue,
+            Err(Errno::EINTR) => {}
             Err(error) => return Err(supervise_errno(error).into()),
         }
     }

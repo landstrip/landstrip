@@ -76,10 +76,8 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
         "write",
     )?;
 
-    if restrict_read {
-        if let ReadAccess::AllowRoots(read_roots) = &policy.read_access {
-            created = add_path_rules(created, read_roots, read_access_fs(), "read")?;
-        }
+    if restrict_read && let ReadAccess::AllowRoots(read_roots) = &policy.read_access {
+        created = add_path_rules(created, read_roots, read_access_fs(), "read")?;
     }
 
     if !handled_access_net.is_empty() {
@@ -252,7 +250,7 @@ fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {
     // SAFETY: stat is initialized by fstat(2) on success.
     let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
     // SAFETY: fd is valid and stat points to writable storage.
-    let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) };
+    let rc = unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) };
     if rc != 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::EIO) || error.raw_os_error() == Some(libc::ENOTCONN) {

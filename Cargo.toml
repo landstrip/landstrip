@@ -8,7 +8,7 @@ homepage = "https://github.com/landstrip/landstrip"
 repository = "https://github.com/landstrip/landstrip"
 name = "landstrip"
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.95"
 version = "0.17.35"
 autotests = false
 

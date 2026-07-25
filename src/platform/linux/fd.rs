@@ -90,13 +90,12 @@ pub(super) fn close_inherited_fds(excluded: &[RawFd]) -> io::Result<()> {
     let mut limit = FALLBACK_FD_LIMIT;
 
     // SAFETY: rlimit points to initialized writable storage for getrlimit(2).
-    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlimit) };
-    if rc == 0 {
-        if let Ok(fallback) = libc::rlim_t::try_from(FALLBACK_FD_LIMIT) {
-            if let Ok(capped) = RawFd::try_from(rlimit.rlim_cur.min(fallback)) {
-                limit = capped;
-            }
-        }
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlimit) };
+    if rc == 0
+        && let Ok(fallback) = libc::rlim_t::try_from(FALLBACK_FD_LIMIT)
+        && let Ok(capped) = RawFd::try_from(rlimit.rlim_cur.min(fallback))
+    {
+        limit = capped;
     }
 
     for fd in FIRST_INHERITED_FD..limit {
@@ -137,7 +136,7 @@ pub(crate) fn getsockopt_int(fd: i32, level: i32, name: i32) -> std::io::Result<
             level,
             name,
             (&raw mut value).cast::<libc::c_void>(),
-            &mut len,
+            &raw mut len,
         )
     };
     if rc < 0 {

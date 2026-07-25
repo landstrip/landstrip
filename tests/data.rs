@@ -738,40 +738,40 @@ fn run_loopback_allowed(
         }
     }
 
-    if cfg!(target_os = "linux") {
-        if let Some(address) = non_loopback_ipv4() {
-            let listener = TcpListener::bind((address, 0))
-                .map_err(|error| format!("bind non-loopback listener: {error}"))?;
-            let denied_port = listener
-                .local_addr()
-                .map_err(|error| format!("read non-loopback listener address: {error}"))?
-                .port();
-            let output = landstrip_net(ctx, format, policies)
-                .args([
-                    &ctx.nc,
-                    "-z",
-                    "-w1",
-                    &address.to_string(),
-                    &denied_port.to_string(),
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .map_err(|error| format!("spawn non-loopback connect: {error}"))?;
-            let merged = merge(&output.stdout, &output.stderr);
-            if output.status.success() {
-                return Err(format!(
-                    "non-loopback connect to {address}:{denied_port} was allowed"
-                ));
-            }
-            if !merged.contains(r#""kind":"network","code":"NETWORK_DENIED""#)
-                || !merged.contains(&format!("\"{address}:{denied_port}\""))
-            {
-                return Err(format!(
-                    "non-loopback connect was not denied by policy; output={}",
-                    merged.trim()
-                ));
-            }
+    if cfg!(target_os = "linux")
+        && let Some(address) = non_loopback_ipv4()
+    {
+        let listener = TcpListener::bind((address, 0))
+            .map_err(|error| format!("bind non-loopback listener: {error}"))?;
+        let denied_port = listener
+            .local_addr()
+            .map_err(|error| format!("read non-loopback listener address: {error}"))?
+            .port();
+        let output = landstrip_net(ctx, format, policies)
+            .args([
+                &ctx.nc,
+                "-z",
+                "-w1",
+                &address.to_string(),
+                &denied_port.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("spawn non-loopback connect: {error}"))?;
+        let merged = merge(&output.stdout, &output.stderr);
+        if output.status.success() {
+            return Err(format!(
+                "non-loopback connect to {address}:{denied_port} was allowed"
+            ));
+        }
+        if !merged.contains(r#""kind":"network","code":"NETWORK_DENIED""#)
+            || !merged.contains(&format!("\"{address}:{denied_port}\""))
+        {
+            return Err(format!(
+                "non-loopback connect was not denied by policy; output={}",
+                merged.trim()
+            ));
         }
     }
 
