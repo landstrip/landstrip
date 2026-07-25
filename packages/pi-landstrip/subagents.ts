@@ -61,23 +61,24 @@ interface PiPackage {
   readonly version: readonly [number, number, number];
 }
 
-const SUPPORTED_PI_MAJOR = 0;
-const MIN_SUPPORTED_PI_MINOR = 80;
-const MIN_SUPPORTED_PI_PATCH = 6;
+const MIN_SUPPORTED_PI_VERSION = [0, 82, 0] as const;
 let cachedPiPackage: PiPackage | undefined;
 let piPackageResolved = false;
 
 export function isSupportedPiVersion(version: readonly number[]): boolean {
-  const [major, minor = -1, patch = -1] = version;
-  return (
-    version.length === 3 &&
-    Number.isInteger(major) &&
-    Number.isInteger(minor) &&
-    Number.isInteger(patch) &&
-    major === SUPPORTED_PI_MAJOR &&
-    (minor > MIN_SUPPORTED_PI_MINOR ||
-      (minor === MIN_SUPPORTED_PI_MINOR && patch >= MIN_SUPPORTED_PI_PATCH))
-  );
+  if (
+    version.length !== 3 ||
+    !version.every((part) => Number.isInteger(part) && part >= 0)
+  ) {
+    return false;
+  }
+  for (let i = 0; i < 3; i++) {
+    const part = version[i]!;
+    const min = MIN_SUPPORTED_PI_VERSION[i]!;
+    if (part > min) return true;
+    if (part < min) return false;
+  }
+  return true;
 }
 
 // Resolve the Pi package used by this extension import. Reading its
@@ -1690,7 +1691,7 @@ export class SubagentRuntime {
     }
     if (!isSupportedPiVersion(pkg.version)) {
       throw new Error(
-        `Process-backed subagents require Pi >=0.80.6; found ${pkg.version.join('.')}`,
+        `Process-backed subagents require Pi >=0.82.0; found ${pkg.version.join('.')}`,
       );
     }
   }
