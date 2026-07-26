@@ -7,9 +7,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::error::Error as StdError;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -68,10 +69,21 @@ pub(crate) struct SandboxWindows {
     pub(crate) allow_loopback: bool,
 }
 
-pub(crate) fn load_settings(policy_paths: &[PathBuf], format: PolicyFormat) -> Result<Settings> {
+pub(crate) fn load_settings(
+    policy_paths: &[PathBuf],
+    format: PolicyFormat,
+    tool: Option<&OsStr>,
+    cwd: &Path,
+) -> Result<Settings> {
     let mut merged = Value::Object(Map::new());
 
-    if policy_paths.is_empty() {
+    let mut paths_to_load = Vec::from(policy_paths);
+    if let Some(tool_name) = tool {
+        let exe_policy_paths = find_executable_policy_paths(tool_name, format, cwd);
+        paths_to_load.extend(exe_policy_paths);
+    }
+
+    if paths_to_load.is_empty() {
         let mut document = String::new();
         io::stdin()
             .read_to_string(&mut document)
@@ -81,8 +93,8 @@ pub(crate) fn load_settings(policy_paths: &[PathBuf], format: PolicyFormat) -> R
         merge_json(&mut merged, value);
         parse_settings(merged).context("policy stdin")
     } else {
-        let mut last_path = &policy_paths[0];
-        for path in policy_paths {
+        let mut last_path = &paths_to_load[0];
+        for path in &paths_to_load {
             log::debug!("config: {}", path.display());
 
             let document = fs::read_to_string(path)
@@ -95,6 +107,80 @@ pub(crate) fn load_settings(policy_paths: &[PathBuf], format: PolicyFormat) -> R
         }
         parse_settings(merged).with_context(|| format!("policy file {}", last_path.display()))
     }
+}
+
+pub(crate) fn find_executable_policy_paths(
+    tool: &OsStr,
+    format: PolicyFormat,
+    cwd: &Path,
+) -> Vec<PathBuf> {
+    let tool_path = Path::new(tool);
+    let Some(tool_file_name) = tool_path.file_name().and_then(OsStr::to_str) else {
+        return Vec::new();
+    };
+
+    let name = Path::new(tool_file_name)
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or(tool_file_name);
+
+    let ext = match format {
+        PolicyFormat::Json => "json",
+        PolicyFormat::Yaml => "yaml",
+    };
+
+    let filename = format!("sandbox.{name}.{ext}");
+    let mut candidates = Vec::new();
+
+    if let Some(parent) = tool_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        candidates.push(parent.join(".pi").join(&filename));
+        candidates.push(parent.join(".opencode").join(&filename));
+    }
+
+    candidates.push(PathBuf::from("/etc/landstrip").join(&filename));
+    candidates.push(cwd.join(".pi").join(&filename));
+    candidates.push(cwd.join(".opencode").join(&filename));
+    candidates.push(cwd.join(&filename));
+
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        candidates.push(home_path.join(".pi").join("agent").join(&filename));
+        candidates.push(home_path.join(".config").join("landstrip").join(&filename));
+    }
+
+    if matches!(format, PolicyFormat::Yaml) {
+        let yml_filename = format!("sandbox.{name}.yml");
+        if let Some(parent) = tool_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            candidates.push(parent.join(".pi").join(&yml_filename));
+            candidates.push(parent.join(".opencode").join(&yml_filename));
+        }
+        candidates.push(PathBuf::from("/etc/landstrip").join(&yml_filename));
+        candidates.push(cwd.join(".pi").join(&yml_filename));
+        candidates.push(cwd.join(".opencode").join(&yml_filename));
+        candidates.push(cwd.join(&yml_filename));
+        if let Ok(home) = std::env::var("HOME") {
+            let home_path = PathBuf::from(home);
+            candidates.push(home_path.join(".pi").join("agent").join(&yml_filename));
+            candidates.push(
+                home_path
+                    .join(".config")
+                    .join("landstrip")
+                    .join(&yml_filename),
+            );
+        }
+    }
+
+    let mut result = Vec::new();
+    for path in candidates {
+        if path.is_file() && !result.contains(&path) {
+            result.push(path);
+        }
+    }
+    result
 }
 
 fn parse_policy_document(

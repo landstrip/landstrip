@@ -62,7 +62,7 @@ fn run_with_cli(cli: &Cli) -> Result<()> {
     let cwd = std::env::current_dir().map_err(|source| Error::PolicyIoFailed { source })?;
 
     log::debug!("cli: cwd: {}", cwd.display());
-    let mut settings = load_settings(&cli.policy_paths, cli.format)?;
+    let mut settings = load_settings(&cli.policy_paths, cli.format, Some(&cli.tool), &cwd)?;
     // Backend selection belongs to the trusted host invocation, not to a
     // project-controlled policy file.
     settings.windows.backend = cli.windows_backend;
