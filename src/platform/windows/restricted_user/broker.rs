@@ -63,8 +63,8 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
             CREATE_SUSPENDED,
             ptr::null(),
             current_directory.as_ptr(),
-            &startup,
-            &mut process_info,
+            &raw const startup,
+            &raw mut process_info,
         )
     };
     if ok == 0 {
@@ -94,7 +94,7 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
         .into());
     }
     let mut exit_code = 0;
-    if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0 {
+    if unsafe { GetExitCodeProcess(process.0, &raw mut exit_code) } == 0 {
         return Err(LandstripError::SuperviseFailed {
             source: io::Error::last_os_error().into(),
         }

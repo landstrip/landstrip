@@ -171,7 +171,7 @@ impl OwnedSid {
     fn parse(value: &str) -> Result<Self> {
         let value = wide(value);
         let mut sid = ptr::null_mut();
-        if unsafe { ConvertStringSidToSidW(value.as_ptr(), &mut sid) } == 0 {
+        if unsafe { ConvertStringSidToSidW(value.as_ptr(), &raw mut sid) } == 0 {
             return Err(setup_failed(io::Error::last_os_error()).into());
         }
         Ok(Self(sid))
@@ -210,9 +210,9 @@ fn set_path_access(
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
-            &mut old_dacl,
+            &raw mut old_dacl,
             ptr::null_mut(),
-            &mut security_descriptor,
+            &raw mut security_descriptor,
         )
     };
     if status != 0 {
@@ -236,7 +236,8 @@ fn set_path_access(
         },
     };
     let mut new_dacl: *mut ACL = ptr::null_mut();
-    let status = unsafe { SetEntriesInAclW(1, &explicit_access, old_dacl, &mut new_dacl) };
+    let status =
+        unsafe { SetEntriesInAclW(1, &raw const explicit_access, old_dacl, &raw mut new_dacl) };
     if status != 0 {
         unsafe { LocalFree(security_descriptor) };
         return Err(setup_failed(win32_error(status)).into());

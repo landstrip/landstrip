@@ -335,7 +335,7 @@ fn elevate(parameters: &str) -> Result<()> {
         return Err(io::Error::last_os_error()).context("wait for elevated landstrip");
     }
     let mut exit_code = 0;
-    if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0 {
+    if unsafe { GetExitCodeProcess(process.0, &raw mut exit_code) } == 0 {
         return Err(io::Error::last_os_error()).context("query elevated landstrip exit code");
     }
     if exit_code != 0 {
@@ -346,7 +346,7 @@ fn elevate(parameters: &str) -> Result<()> {
 
 fn is_elevated() -> Result<bool> {
     let mut token = ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
         return Err(io::Error::last_os_error()).context("open current process token");
     }
     let token = Handle(token);
@@ -359,7 +359,7 @@ fn is_elevated() -> Result<bool> {
             (&raw mut elevation).cast(),
             u32::try_from(mem::size_of::<TOKEN_ELEVATION>())
                 .context("token elevation structure is too large")?,
-            &mut returned,
+            &raw mut returned,
         )
     } == 0
     {

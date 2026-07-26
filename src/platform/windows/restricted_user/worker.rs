@@ -129,8 +129,8 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
             environment.as_ptr().cast(),
             cwd.as_ptr(),
-            &startup,
-            &mut process_info,
+            &raw const startup,
+            &raw mut process_info,
         )
     };
     if ok == 0 {
@@ -153,7 +153,7 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
         .into());
     }
     let mut exit_code = 0;
-    if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0 {
+    if unsafe { GetExitCodeProcess(process.0, &raw mut exit_code) } == 0 {
         return Err(LandstripError::SuperviseFailed {
             source: io::Error::last_os_error().into(),
         }
@@ -183,7 +183,7 @@ fn create_restricted_token() -> Result<Handle> {
             ptr::null(),
             0,
             ptr::null(),
-            &mut restricted_token,
+            &raw mut restricted_token,
         )
     };
     if ok == 0 {
@@ -202,7 +202,7 @@ fn harden_worker_objects() -> Result<()> {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             descriptor.as_ptr(),
             SECURITY_DESCRIPTOR_REVISION,
-            &mut security_descriptor,
+            &raw mut security_descriptor,
             ptr::null_mut(),
         )
     } == 0
@@ -283,7 +283,7 @@ fn current_process_token() -> Result<Handle> {
         OpenProcessToken(
             GetCurrentProcess(),
             TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY,
-            &mut token,
+            &raw mut token,
         )
     } == 0
     {
@@ -297,7 +297,7 @@ fn current_process_token() -> Result<Handle> {
 fn token_user(token: HANDLE) -> Result<TokenUserBuffer> {
     let mut size = 0;
     unsafe {
-        GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut size);
+        GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &raw mut size);
     }
     if size == 0 {
         return Err(setup_failed(format!(
@@ -309,8 +309,15 @@ fn token_user(token: HANDLE) -> Result<TokenUserBuffer> {
     let word_size = mem::size_of::<usize>();
     let word_count = usize::try_from(size)?.div_ceil(word_size);
     let mut words = vec![0_usize; word_count];
-    if unsafe { GetTokenInformation(token, TokenUser, words.as_mut_ptr().cast(), size, &mut size) }
-        == 0
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            words.as_mut_ptr().cast(),
+            size,
+            &raw mut size,
+        )
+    } == 0
     {
         return Err(setup_failed(format!(
             "GetTokenInformation: {}",
@@ -337,7 +344,7 @@ fn verify_current_sid(expected: &str) -> Result<()> {
     let token = current_process_token()?;
     let user = token_user(token.0)?;
     let mut sid_string = ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_string) } == 0 {
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut sid_string) } == 0 {
         return Err(setup_failed(format!(
             "ConvertSidToStringSidW: {}",
             io::Error::last_os_error()

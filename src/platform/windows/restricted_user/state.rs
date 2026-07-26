@@ -229,13 +229,13 @@ pub(super) fn protect_password(password: &str) -> Result<String> {
     let mut output = CRYPT_INTEGER_BLOB::default();
     let result = unsafe {
         CryptProtectData(
-            &input,
+            &raw const input,
             ptr::null(),
             ptr::null(),
             ptr::null(),
             ptr::null(),
             CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
+            &raw mut output,
         )
     };
     clear.zeroize();
@@ -262,13 +262,13 @@ pub(super) fn unprotect_password(protected: &str) -> Result<SecretWide> {
     let mut output = CRYPT_INTEGER_BLOB::default();
     let result = unsafe {
         CryptUnprotectData(
-            &input,
+            &raw const input,
             ptr::null_mut(),
             ptr::null(),
             ptr::null(),
             ptr::null(),
             CRYPTPROTECT_UI_FORBIDDEN,
-            &mut output,
+            &raw mut output,
         )
     };
     protected.zeroize();
@@ -300,7 +300,7 @@ pub(super) fn protect_path(path: &Path) -> Result<()> {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             descriptor.as_ptr(),
             SECURITY_DESCRIPTOR_REVISION,
-            &mut security_descriptor,
+            &raw mut security_descriptor,
             ptr::null_mut(),
         )
     };
@@ -314,9 +314,9 @@ pub(super) fn protect_path(path: &Path) -> Result<()> {
     if unsafe {
         GetSecurityDescriptorDacl(
             security_descriptor,
-            &mut dacl_present,
-            &mut dacl,
-            &mut dacl_defaulted,
+            &raw mut dacl_present,
+            &raw mut dacl,
+            &raw mut dacl_defaulted,
         )
     } == 0
     {
@@ -350,14 +350,14 @@ pub(super) fn protect_path(path: &Path) -> Result<()> {
 
 fn current_user_sid_string() -> Result<String> {
     let mut token: HANDLE = ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
         return Err(io::Error::last_os_error()).context("open current process token");
     }
     let token = Handle(token);
 
     let mut required = 0;
     unsafe {
-        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required);
+        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &raw mut required);
     }
     let error = io::Error::last_os_error();
     if error.raw_os_error() != Some(i32::from_ne_bytes(ERROR_INSUFFICIENT_BUFFER.to_ne_bytes())) {
@@ -372,7 +372,7 @@ fn current_user_sid_string() -> Result<String> {
             TokenUser,
             buffer.as_mut_ptr().cast(),
             required,
-            &mut required,
+            &raw mut required,
         )
     } == 0
     {
@@ -380,7 +380,7 @@ fn current_user_sid_string() -> Result<String> {
     }
     let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
     let mut sid_string = ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string) } == 0 {
+    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &raw mut sid_string) } == 0 {
         return Err(io::Error::last_os_error()).context("format current user SID");
     }
     let value = unsafe { wide_ptr_to_string(sid_string) };
@@ -401,7 +401,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         bail!("protected password has an invalid length");
     }
     value

@@ -200,7 +200,7 @@ impl AppContainerProfile {
                 description.as_ptr(),
                 ptr::null_mut(),
                 0,
-                &mut sid,
+                &raw mut sid,
             )
         };
 
@@ -216,7 +216,8 @@ impl AppContainerProfile {
             return Err(setup_failed(hresult_cause(hr)).into());
         }
 
-        let hr = unsafe { DeriveAppContainerSidFromAppContainerName(moniker.as_ptr(), &mut sid) };
+        let hr =
+            unsafe { DeriveAppContainerSidFromAppContainerName(moniker.as_ptr(), &raw mut sid) };
         if hr != 0 {
             return Err(setup_failed(hresult_cause(hr)).into());
         }
@@ -398,7 +399,7 @@ fn process_is_running(pid: u32) -> bool {
 fn derive_appcontainer_sid(moniker: &str) -> Result<Option<OwnedSid>> {
     let moniker = wide_string(moniker);
     let mut sid = ptr::null_mut();
-    let hr = unsafe { DeriveAppContainerSidFromAppContainerName(moniker.as_ptr(), &mut sid) };
+    let hr = unsafe { DeriveAppContainerSidFromAppContainerName(moniker.as_ptr(), &raw mut sid) };
     if hresult_win32(hr).map(u32::from) == Some(ERROR_NOT_FOUND) {
         return Ok(None);
     }
@@ -440,16 +441,15 @@ fn update_loopback_config(add: Option<PSID>, remove: &[PSID]) -> Result<()> {
         })
         .copied()
         .collect::<Vec<_>>();
-    if let Some(sid) = add {
-        if !entries
+    if let Some(sid) = add
+        && !entries
             .iter()
             .any(|entry| unsafe { EqualSid(entry.Sid, sid) != 0 })
-        {
-            entries.push(SID_AND_ATTRIBUTES {
-                Sid: sid,
-                Attributes: 0,
-            });
-        }
+    {
+        entries.push(SID_AND_ATTRIBUTES {
+            Sid: sid,
+            Attributes: 0,
+        });
     }
     let count = u32::try_from(entries.len()).map_err(|_| LandstripError::IntegerTooLarge)?;
     let entries_ptr = if entries.is_empty() {
@@ -483,7 +483,8 @@ impl LoopbackConfig {
     fn get() -> Result<Self> {
         let mut count = 0;
         let mut entries = ptr::null_mut();
-        let status = unsafe { NetworkIsolationGetAppContainerConfig(&mut count, &mut entries) };
+        let status =
+            unsafe { NetworkIsolationGetAppContainerConfig(&raw mut count, &raw mut entries) };
         if status != 0 {
             return Err(setup_failed(win32_error(status)).into());
         }
@@ -614,9 +615,9 @@ fn set_path_access(
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
-            &mut old_dacl,
+            &raw mut old_dacl,
             ptr::null_mut(),
-            &mut security_descriptor,
+            &raw mut security_descriptor,
         )
     };
     if status != 0 {
@@ -641,7 +642,8 @@ fn set_path_access(
     };
     let mut new_dacl: *mut ACL = ptr::null_mut();
 
-    let status = unsafe { SetEntriesInAclW(1, &explicit_access, old_dacl, &mut new_dacl) };
+    let status =
+        unsafe { SetEntriesInAclW(1, &raw const explicit_access, old_dacl, &raw mut new_dacl) };
     if status != 0 {
         unsafe { LocalFree(security_descriptor) };
         return Err(setup_failed(win32_error(status)).into());
@@ -797,7 +799,7 @@ fn inheritable_standard_handle(
             process,
             source,
             process,
-            &mut duplicate,
+            &raw mut duplicate,
             0,
             1,
             DUPLICATE_SAME_ACCESS,
@@ -830,7 +832,7 @@ fn inheritable_null_handle(direction: StandardHandleDirection) -> Result<Handle>
             NUL.as_ptr(),
             direction.desired_access(),
             FILE_SHARE_READ | FILE_SHARE_WRITE,
-            &security_attributes,
+            &raw const security_attributes,
             OPEN_EXISTING,
             0,
             ptr::null_mut(),
@@ -949,7 +951,7 @@ fn create_process_in_appcontainer(
 
 fn current_process_in_job() -> Result<bool> {
     let mut in_job = 0;
-    let ok = unsafe { IsProcessInJob(GetCurrentProcess(), ptr::null_mut(), &mut in_job) };
+    let ok = unsafe { IsProcessInJob(GetCurrentProcess(), ptr::null_mut(), &raw mut in_job) };
     if ok == 0 {
         return Err(setup_failed(io::Error::last_os_error()).into());
     }
@@ -1009,7 +1011,7 @@ fn create_process(
             ptr::null(),
             ptr::null(),
             (&raw mut *startup_info).cast(),
-            &mut process_info,
+            &raw mut process_info,
         )
     };
     if created == 0 {
@@ -1037,7 +1039,7 @@ fn supervise_process(process_info: PROCESS_INFORMATION) -> Result<u32> {
     }
 
     let mut exit_code = 0;
-    let ok = unsafe { GetExitCodeProcess(process.0, &mut exit_code) };
+    let ok = unsafe { GetExitCodeProcess(process.0, &raw mut exit_code) };
     if ok == 0 {
         return Err(LandstripError::SuperviseFailed {
             source: io::Error::last_os_error().into(),
@@ -1080,7 +1082,8 @@ struct ProcThreadAttributeList {
 impl ProcThreadAttributeList {
     fn new(count: u32) -> Result<Self> {
         let mut size = 0;
-        let ok = unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), count, 0, &mut size) };
+        let ok =
+            unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), count, 0, &raw mut size) };
         let code = unsafe { GetLastError() };
         if ok != 0 || code != ERROR_INSUFFICIENT_BUFFER {
             return Err(setup_failed(io::Error::last_os_error()).into());
@@ -1088,7 +1091,7 @@ impl ProcThreadAttributeList {
 
         let mut storage = vec![0_u8; size];
         let list = storage.as_mut_ptr().cast();
-        let ok = unsafe { InitializeProcThreadAttributeList(list, count, 0, &mut size) };
+        let ok = unsafe { InitializeProcThreadAttributeList(list, count, 0, &raw mut size) };
         if ok == 0 {
             return Err(setup_failed(io::Error::last_os_error()).into());
         }
@@ -1128,7 +1131,12 @@ impl NetworkCapabilities {
             let mut sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
             let mut size = SECURITY_MAX_SID_SIZE;
             let ok = unsafe {
-                CreateWellKnownSid(kind, ptr::null_mut(), sid.as_mut_ptr().cast(), &mut size)
+                CreateWellKnownSid(
+                    kind,
+                    ptr::null_mut(),
+                    sid.as_mut_ptr().cast(),
+                    &raw mut size,
+                )
             };
             if ok == 0 {
                 return Err(setup_failed(io::Error::last_os_error()).into());
@@ -1209,18 +1217,18 @@ fn quote_command_arg(arg: &OsStr) -> std::result::Result<String, &'static str> {
         match ch {
             '\\' => backslashes += 1,
             '"' => {
-                quoted.extend(iter::repeat('\\').take(backslashes * 2 + 1));
+                quoted.extend(iter::repeat_n('\\', backslashes * 2 + 1));
                 quoted.push('"');
                 backslashes = 0;
             }
             _ => {
-                quoted.extend(iter::repeat('\\').take(backslashes));
+                quoted.extend(iter::repeat_n('\\', backslashes));
                 quoted.push(ch);
                 backslashes = 0;
             }
         }
     }
-    quoted.extend(iter::repeat('\\').take(backslashes * 2));
+    quoted.extend(iter::repeat_n('\\', backslashes * 2));
     quoted.push('"');
     Ok(quoted)
 }

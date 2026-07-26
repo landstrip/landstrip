@@ -82,19 +82,19 @@ pub(super) fn uninstall(installation: &Installation) -> Result<()> {
     for key in installation.wfp_filters.iter().rev() {
         let key = parse_key(key)?;
         allow_not_found(
-            unsafe { FwpmFilterDeleteByKey0(engine.handle, &key) },
+            unsafe { FwpmFilterDeleteByKey0(engine.handle, &raw const key) },
             "FwpmFilterDeleteByKey0",
         )?;
     }
 
     let sublayer = parse_key(&installation.wfp_sublayer)?;
     allow_not_found(
-        unsafe { FwpmSubLayerDeleteByKey0(engine.handle, &sublayer) },
+        unsafe { FwpmSubLayerDeleteByKey0(engine.handle, &raw const sublayer) },
         "FwpmSubLayerDeleteByKey0",
     )?;
     let provider = parse_key(&installation.wfp_provider)?;
     allow_not_found(
-        unsafe { FwpmProviderDeleteByKey0(engine.handle, &provider) },
+        unsafe { FwpmProviderDeleteByKey0(engine.handle, &raw const provider) },
         "FwpmProviderDeleteByKey0",
     )?;
 
@@ -161,7 +161,7 @@ fn add_provider(engine: HANDLE, key: GUID) -> Result<()> {
         serviceName: ptr::null_mut(),
     };
     ensure_success_or(
-        unsafe { FwpmProviderAdd0(engine, &provider, ptr::null_mut()) },
+        unsafe { FwpmProviderAdd0(engine, &raw const provider, ptr::null_mut()) },
         "FwpmProviderAdd0",
         &[u32::from_ne_bytes(FWP_E_ALREADY_EXISTS.to_ne_bytes())],
     )
@@ -179,7 +179,7 @@ fn add_sublayer(engine: HANDLE, provider: GUID, key: GUID) -> Result<()> {
         weight: u16::MAX,
     };
     ensure_success_or(
-        unsafe { FwpmSubLayerAdd0(engine, &sublayer, ptr::null_mut()) },
+        unsafe { FwpmSubLayerAdd0(engine, &raw const sublayer, ptr::null_mut()) },
         "FwpmSubLayerAdd0",
         &[u32::from_ne_bytes(FWP_E_ALREADY_EXISTS.to_ne_bytes())],
     )
@@ -322,7 +322,7 @@ fn add_filter(
     };
     let mut id = 0;
     ensure_success(
-        unsafe { FwpmFilterAdd0(engine, &filter, ptr::null_mut(), &mut id) },
+        unsafe { FwpmFilterAdd0(engine, &raw const filter, ptr::null_mut(), &raw mut id) },
         "FwpmFilterAdd0",
     )
 }
@@ -347,8 +347,8 @@ impl UserCondition {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
                 SECURITY_DESCRIPTOR_REVISION,
-                &mut descriptor,
-                &mut size,
+                &raw mut descriptor,
+                &raw mut size,
             )
         } == 0
         {
@@ -411,8 +411,8 @@ impl Engine {
                     ptr::null(),
                     u32::from_ne_bytes(RPC_C_AUTHN_DEFAULT.to_ne_bytes()),
                     ptr::null(),
-                    &session,
-                    &mut handle,
+                    &raw const session,
+                    &raw mut handle,
                 )
             },
             "FwpmEngineOpen0",

@@ -74,10 +74,10 @@ pub(super) fn lookup_sid(name: &str) -> Result<String> {
             ptr::null(),
             name.as_ptr(),
             ptr::null_mut(),
-            &mut sid_size,
+            &raw mut sid_size,
             ptr::null_mut(),
-            &mut domain_size,
-            &mut sid_use,
+            &raw mut domain_size,
+            &raw mut sid_use,
         );
     }
     let error = io::Error::last_os_error();
@@ -92,10 +92,10 @@ pub(super) fn lookup_sid(name: &str) -> Result<String> {
             ptr::null(),
             name.as_ptr(),
             sid.as_mut_ptr().cast(),
-            &mut sid_size,
+            &raw mut sid_size,
             domain.as_mut_ptr(),
-            &mut domain_size,
-            &mut sid_use,
+            &raw mut domain_size,
+            &raw mut sid_use,
         )
     } == 0
     {
@@ -103,7 +103,7 @@ pub(super) fn lookup_sid(name: &str) -> Result<String> {
     }
 
     let mut sid_string = ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(sid.as_mut_ptr().cast(), &mut sid_string) } == 0 {
+    if unsafe { ConvertSidToStringSidW(sid.as_mut_ptr().cast(), &raw mut sid_string) } == 0 {
         return Err(io::Error::last_os_error()).context("format sandbox account SID");
     }
     let value = unsafe { nul_terminated_to_string(sid_string) };
@@ -145,8 +145,14 @@ fn create(name: &str, password: &str) -> Result<()> {
         usri1_script_path: ptr::null_mut(),
     };
     let mut parameter_error = 0;
-    let status =
-        unsafe { NetUserAdd(ptr::null(), 1, (&raw mut user).cast(), &mut parameter_error) };
+    let status = unsafe {
+        NetUserAdd(
+            ptr::null(),
+            1,
+            (&raw mut user).cast(),
+            &raw mut parameter_error,
+        )
+    };
     password_wide.zeroize();
     if status != NERR_Success {
         return Err(net_error(status))
