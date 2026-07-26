@@ -9,7 +9,6 @@ import { getAgentDir } from '@earendil-works/pi-coding-agent';
 
 import { loadLandstripConfig, type AgentSource, type ConfigObject } from './config.ts';
 import { loadOpenCodeAgents } from './opencode-agents.ts';
-import { resolveLandstripSettings } from './settings.ts';
 import { expandHomePath, formatError, isRecord } from './util.ts';
 
 export type PermissionAction = 'allow' | 'ask' | 'deny';
@@ -101,7 +100,7 @@ function legacyConfigWarnings(piAgentDir: string): string[] {
   try {
     const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
     if (!isRecord(value)) return [];
-    const fields = ['agent', 'permission', 'subagents', 'maxSubagents'].filter(
+    const fields = ['agent', 'permission', 'subagents', 'maxSubagents', 'landstrip'].filter(
       (field) => value[field] !== undefined,
     );
     if (fields.length === 0) return [];
@@ -182,28 +181,25 @@ export function loadAgentCatalog(
   let maxSubagents = 0;
   let subagents: ConfigObject = {};
   let agentSources = new Map<string, AgentSource>();
+  let showGlobalAgents = false;
+  let showLocalAgents = false;
   try {
     const config = loadLandstripConfig(cwd, includeProject, piAgentDir);
     maxSubagents = config.maxSubagents;
     subagents = config.subagents;
     agentSources = new Map(config.agentSources);
+    showGlobalAgents = config.opencode.showGlobalAgents;
+    showLocalAgents = config.opencode.showLocalAgents;
   } catch (error) {
     diagnostics.push(formatError(error));
   }
-
-  const { settings, warnings: settingsWarnings } = resolveLandstripSettings(
-    cwd,
-    includeProject,
-    piAgentDir,
-  );
-  warnings.push(...settingsWarnings);
 
   // OpenCode agents fill gaps only. Pi definitions win silently on name conflict:
   // OpenCode global < OpenCode project < Pi built-in/global/local.
   const openCode = loadOpenCodeAgents({
     cwd,
-    includeGlobal: settings.opencode.showGlobalAgents,
-    includeProject: settings.opencode.showLocalAgents && includeProject,
+    includeGlobal: showGlobalAgents,
+    includeProject: showLocalAgents && includeProject,
   });
   diagnostics.push(...openCode.diagnostics);
 

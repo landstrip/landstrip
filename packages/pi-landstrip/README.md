@@ -208,17 +208,25 @@ merged over the packaged [defaults](./subagents.json). The packaged subagent typ
 are `explore`, `general`, and the OpenCode-compatible `scout` reconnaissance agent.
 
 Sandbox policy remains in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi's
-`settings.json` contains normal Pi settings, such as the `pi-landstrip` package
-entry, plus optional `landstrip.opencode` import flags:
+`settings.json` only needs the normal package entry for the extension:
 
 ```json
 {
-  "packages": ["npm:pi-landstrip"],
-  "landstrip": {
-    "opencode": {
-      "showGlobalAgents": false,
-      "showLocalAgents": false
-    }
+  "packages": ["npm:pi-landstrip"]
+}
+```
+
+Optional OpenCode import flags live in `subagents.json` as top-level `opencode`:
+
+```json
+{
+  "maxSubagents": 0,
+  "opencode": {
+    "showGlobalAgents": false,
+    "showLocalAgents": false
+  },
+  "subagents": {
+    "agent": {}
   }
 }
 ```
@@ -236,8 +244,8 @@ from `subagents.json` (built-in, global, and local) take precedence over OpenCod
 imports with the same name; conflicts are silent. Local OpenCode agents are
 skipped when the project is untrusted, regardless of the flag.
 
-`subagents.json` accepts only top-level `maxSubagents` and `subagents`; sandbox
-fields belong in `sandbox.json`.
+`subagents.json` accepts top-level `maxSubagents`, `opencode`, and `subagents`;
+sandbox fields belong in `sandbox.json`.
 
 The Windows sandbox fields are:
 
@@ -331,6 +339,8 @@ follows, then remove the old fields:
 - Convert legacy `tools` booleans to explicit `permission` rules.
 - Move Markdown agent prompts into each `subagents.agent.<name>.prompt` string.
 - Put the worker limit in top-level `maxSubagents`; zero disables delegation.
+- Move `landstrip.opencode` flags from Pi `settings.json` to top-level
+  `opencode` in `subagents.json`.
 - Use `~/.pi/agent/subagents.json` for global configuration and
   `.pi/subagents.json` for trusted project configuration.
 - Leave sandbox policy in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`;

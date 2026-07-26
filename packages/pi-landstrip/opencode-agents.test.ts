@@ -113,8 +113,8 @@ describe('OpenCode agent import', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     const globalDir = temporaryDirectory();
-    writeJson(join(agentDir, 'settings.json'), {
-      landstrip: { opencode: { showGlobalAgents: true, showLocalAgents: true } },
+    writeJson(join(agentDir, 'subagents.json'), {
+      opencode: { showGlobalAgents: true, showLocalAgents: true },
     });
     write(
       join(globalDir, 'agents', 'review.md'),
@@ -152,10 +152,8 @@ describe('OpenCode agent import', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     const globalDir = temporaryDirectory();
-    writeJson(join(agentDir, 'settings.json'), {
-      landstrip: { opencode: { showGlobalAgents: true, showLocalAgents: true } },
-    });
     writeJson(join(agentDir, 'subagents.json'), {
+      opencode: { showGlobalAgents: true, showLocalAgents: true },
       subagents: {
         agent: {
           review: { description: 'Pi review', mode: 'subagent', prompt: 'From Pi.' },
@@ -216,8 +214,8 @@ describe('OpenCode agent import', () => {
   test('skips project OpenCode agents when the project is untrusted', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    writeJson(join(agentDir, 'settings.json'), {
-      landstrip: { opencode: { showLocalAgents: true } },
+    writeJson(join(agentDir, 'subagents.json'), {
+      opencode: { showLocalAgents: true },
     });
     write(
       join(cwd, '.opencode', 'agent', 'local-only.md'),

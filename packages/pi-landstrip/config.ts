@@ -15,18 +15,59 @@ export const MAX_SUBAGENTS = 16;
 
 export type AgentSource = 'built-in' | 'global' | 'local';
 
+export interface OpenCodeConfig {
+  showGlobalAgents: boolean;
+  showLocalAgents: boolean;
+}
+
 export interface LandstripConfigFile {
   maxSubagents?: number;
+  opencode?: Partial<OpenCodeConfig>;
   subagents?: ConfigObject;
 }
 
 export interface LandstripConfig extends LandstripConfigFile {
   maxSubagents: number;
+  opencode: OpenCodeConfig;
   subagents: ConfigObject;
   agentSources: ReadonlyMap<string, AgentSource>;
 }
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
+
+const DEFAULT_OPENCODE: OpenCodeConfig = {
+  showGlobalAgents: false,
+  showLocalAgents: false,
+};
+
+const OPENCODE_KEYS = new Set(['showGlobalAgents', 'showLocalAgents']);
+
+function readBooleanField(
+  section: Record<string, unknown>,
+  key: string,
+  path: string,
+): boolean | undefined {
+  if (!(key in section)) return undefined;
+  const value = section[key];
+  if (typeof value === 'boolean') return value;
+  throw new Error(`${path}.${key} must be a boolean`);
+}
+
+function normalizeOpenCode(value: unknown, path: string): Partial<OpenCodeConfig> {
+  if (value === undefined) return {};
+  if (!isRecord(value)) throw new Error(`${path} must be a JSON object`);
+  for (const key of Object.keys(value)) {
+    if (!OPENCODE_KEYS.has(key)) {
+      throw new Error(`${path}: unknown field ${key}`);
+    }
+  }
+  const result: Partial<OpenCodeConfig> = {};
+  const showGlobalAgents = readBooleanField(value, 'showGlobalAgents', path);
+  if (showGlobalAgents !== undefined) result.showGlobalAgents = showGlobalAgents;
+  const showLocalAgents = readBooleanField(value, 'showLocalAgents', path);
+  if (showLocalAgents !== undefined) result.showLocalAgents = showLocalAgents;
+  return result;
+}
 
 function readConfig(path: string): LandstripConfigFile {
   if (!existsSync(path)) return {};
@@ -39,11 +80,27 @@ function readConfig(path: string): LandstripConfigFile {
   }
   if (!isRecord(value)) throw new Error(`${path} must contain a JSON object`);
   for (const key of Object.keys(value)) {
-    if (key !== 'maxSubagents' && key !== 'subagents') {
+    if (key !== 'maxSubagents' && key !== 'subagents' && key !== 'opencode') {
       throw new Error(`${path}: unknown top-level field ${key}`);
     }
   }
-  return value;
+  const config: LandstripConfigFile = {};
+  if ('maxSubagents' in value) {
+    if (typeof value.maxSubagents !== 'number') {
+      throw new Error(`${path}: maxSubagents must be a number`);
+    }
+    config.maxSubagents = value.maxSubagents;
+  }
+  if ('subagents' in value) {
+    if (!isRecord(value.subagents)) {
+      throw new Error(`${path}: subagents must be an object`);
+    }
+    config.subagents = value.subagents;
+  }
+  if ('opencode' in value) {
+    config.opencode = normalizeOpenCode(value.opencode, `${path}: opencode`);
+  }
+  return config;
 }
 
 function mergeValue(base: unknown, override: unknown): unknown {
@@ -135,5 +192,9 @@ export function loadLandstripConfig(
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
   }
   if (!isRecord(config.subagents)) throw new Error('subagents must be an object');
-  return { ...config, agentSources } as LandstripConfig;
+  const opencode: OpenCodeConfig = {
+    ...DEFAULT_OPENCODE,
+    ...config.opencode,
+  };
+  return { ...config, opencode, agentSources } as LandstripConfig;
 }
