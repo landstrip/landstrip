@@ -4,8 +4,10 @@
 
 set -euo pipefail
 
+export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--no-deprecation"
+
 list_extensions() {
-	node <<'NODE'
+  node <<'NODE'
 const fs = require('node:fs');
 const { workspaces } = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 
@@ -30,77 +32,76 @@ NODE
 }
 
 case "${1:-}" in
-	--list)
-		list_extensions
-		exit 0
-		;;
-	--local-root)
-		local_root=1
-		;;
-	'')
-		local_root=0
-		;;
-	*)
-		printf 'usage: %s [--list|--local-root]\n' "$0" >&2
-		exit 1
-		;;
+  --list)
+    list_extensions
+    exit 0
+    ;;
+  --local-root)
+    local_root=1
+    ;;
+  '')
+    local_root=0
+    ;;
+  *)
+    printf 'usage: %s [--list|--local-root]\n' "$0" >&2
+    exit 1
+    ;;
 esac
 
 extension_dirs=()
 while IFS= read -r extension_dir; do
-	extension_dirs+=("$extension_dir")
+  extension_dirs+=("$extension_dir")
 done < <(list_extensions)
 ((${#extension_dirs[@]} > 0)) || {
-	printf 'no extension workspaces found\n' >&2
-	exit 1
+  printf 'no extension workspaces found\n' >&2
+  exit 1
 }
 
 restricted_user_setup=0
 
 cleanup_local_root() {
-	if ((restricted_user_setup)); then
-		"target/debug/$binary" windows uninstall >/dev/null 2>&1 || true
-	fi
-	[[ -z "${tarball:-}" ]] || rm -f "$tarball"
+  if ((restricted_user_setup)); then
+    "target/debug/$binary" windows uninstall >/dev/null 2>&1 || true
+  fi
+  [[ -z "${tarball:-}" ]] || rm -f "$tarball"
 }
 
 if ((local_root)); then
-	tarball="$(npm pack . --silent)"
-	platform_package="npm/$(node -p '`${process.platform}-${process.arch}`')"
-	[[ -d "$platform_package" ]] || {
-		printf 'no local binary package for %s\n' "$platform_package" >&2
-		exit 1
-	}
-	binary="landstrip"
-	[[ "$platform_package" == npm/win32-* ]] && binary="landstrip.exe"
-	cargo build --locked
-	mkdir -p "$platform_package/bin"
-	install -m 755 "target/debug/$binary" "$platform_package/bin/$binary"
-	trap cleanup_local_root EXIT
+  tarball="$(npm pack . --silent)"
+  platform_package="npm/$(node -p '`${process.platform}-${process.arch}`')"
+  [[ -d "$platform_package" ]] || {
+    printf 'no local binary package for %s\n' "$platform_package" >&2
+    exit 1
+  }
+  binary="landstrip"
+  [[ "$platform_package" == npm/win32-* ]] && binary="landstrip.exe"
+  cargo build --locked
+  mkdir -p "$platform_package/bin"
+  install -m 755 "target/debug/$binary" "$platform_package/bin/$binary"
+  trap cleanup_local_root EXIT
 
-	if [[ "$platform_package" == npm/win32-* && "${CI:-}" == true ]]; then
-		"target/debug/$binary" windows setup \
-			--restricted-accounts 2 --unrestricted-accounts 0
-		restricted_user_setup=1
-		export LANDSTRIP_TEST_RESTRICTED_USER=1
-	fi
+  if [[ "$platform_package" == npm/win32-* && "${CI:-}" == true ]]; then
+    "target/debug/$binary" windows setup \
+      --restricted-accounts 2 --unrestricted-accounts 0
+    restricted_user_setup=1
+    export LANDSTRIP_TEST_RESTRICTED_USER=1
+  fi
 fi
 
 for package_dir in "${extension_dirs[@]}"; do
-	if (( local_root )); then
-		npm install --prefix "$package_dir" --workspaces=false --package-lock=false \
-			--ignore-scripts --no-save "./$tarball" "./$platform_package"
-	else
-		npm ci --prefix "$package_dir" --workspaces=false --ignore-scripts
-	fi
-	npm --prefix "$package_dir" run ci:fmt
-	npm --prefix "$package_dir" run ci:lint
-	npm --prefix "$package_dir" run ci:check
-	npm --prefix "$package_dir" run ci:test
+  if (( local_root )); then
+    npm install --prefix "$package_dir" --workspaces=false --package-lock=false \
+      --ignore-scripts --no-save "./$tarball" "./$platform_package"
+  else
+    npm ci --prefix "$package_dir" --workspaces=false --ignore-scripts
+  fi
+  npm --prefix "$package_dir" run ci:fmt
+  npm --prefix "$package_dir" run ci:lint
+  npm --prefix "$package_dir" run ci:check
+  npm --prefix "$package_dir" run ci:test
 done
 
-
 if ((restricted_user_setup)); then
-	"target/debug/$binary" windows uninstall
-	restricted_user_setup=0
+  "target/debug/$binary" windows uninstall
+  restricted_user_setup=0
 fi
