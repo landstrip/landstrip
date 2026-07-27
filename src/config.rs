@@ -139,7 +139,6 @@ pub(crate) fn find_executable_policy_paths(
         candidates.push(parent.join(".opencode").join(&filename));
     }
 
-    candidates.push(PathBuf::from("/etc/landstrip").join(&filename));
     candidates.push(cwd.join(".pi").join(&filename));
     candidates.push(cwd.join(".opencode").join(&filename));
     candidates.push(cwd.join(&filename));
@@ -158,7 +157,6 @@ pub(crate) fn find_executable_policy_paths(
             candidates.push(parent.join(".pi").join(&yml_filename));
             candidates.push(parent.join(".opencode").join(&yml_filename));
         }
-        candidates.push(PathBuf::from("/etc/landstrip").join(&yml_filename));
         candidates.push(cwd.join(".pi").join(&yml_filename));
         candidates.push(cwd.join(".opencode").join(&yml_filename));
         candidates.push(cwd.join(&yml_filename));
