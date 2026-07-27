@@ -358,6 +358,56 @@ test('registers task without spawning a worker process', async () => {
   expect(warnings).toEqual([]);
 });
 
+test('lists hidden agents in the task tool description', () => {
+  let taskTool: ToolDefinition | undefined;
+  const pi = {
+    registerTool(tool: ToolDefinition) {
+      taskTool = tool;
+    },
+    registerCommand() {},
+    on() {},
+    getActiveTools: () => ['task'],
+    setActiveTools() {},
+  } as unknown as ExtensionAPI;
+  new SubagentRuntime(pi, {} as LandstripIntegration, undefined, () => ({
+    maxSubagents: 1,
+    agents: new Map([
+      [
+        'visible',
+        {
+          name: 'visible',
+          source: 'local' as const,
+          description: 'Visible agent',
+          prompt: 'Visible.',
+          mode: 'subagent' as const,
+          hidden: false,
+          permissions: [],
+          providerOptions: {},
+        },
+      ],
+      [
+        'advisor',
+        {
+          name: 'advisor',
+          source: 'local' as const,
+          description: 'Hidden advisor',
+          prompt: 'Advise.',
+          mode: 'subagent' as const,
+          hidden: true,
+          permissions: [],
+          providerOptions: {},
+        },
+      ],
+    ]),
+    permissions: [],
+    warnings: [],
+    diagnostics: [],
+  })).register();
+
+  expect(taskTool?.description).toContain('visible: Visible agent');
+  expect(taskTool?.description).toContain('advisor: Hidden advisor');
+});
+
 test('removes the task tool when maxSubagents is zero', async () => {
   let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<void>) | undefined;
   let activeTools = ['read', 'task'];

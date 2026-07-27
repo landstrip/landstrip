@@ -1067,7 +1067,6 @@ export class SubagentRuntime {
     );
     const agents = availableSubagents(catalog).filter(
       (agent) =>
-        !agent.hidden &&
         permissionDecision(callerRules ?? catalog.permissions, 'task', agent.name) !== 'deny',
     );
     const descriptions = agents
