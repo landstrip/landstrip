@@ -111,8 +111,9 @@ global or trusted-project concurrency limit.
 
 The `/agents` selector provides OpenCode-compatible `build` and `plan` roles by
 default. Build has normal development access; plan asks before shell commands
-and file changes. Built-in colors match OpenCode's agent palette (`#034cff` for
-build, `#a753ae` for plan) and appear in the status line and agent selectors.
+and file changes. Built-in colors match OpenCode's TUI agent palette
+(`secondary` for build, `accent` for plan) and appear in the status line and
+agent selectors.
 The selection controls the root system prompt and permissions and is restored
 with the session.
 

@@ -66,12 +66,24 @@ const OPENCODE_THEME_COLORS = new Set([
 /** Map OpenCode theme color names onto Pi ThemeColor keys. */
 const THEME_COLOR_ALIASES: Record<string, string> = {
   primary: 'accent',
-  secondary: 'muted',
+  // OpenCode TUI secondary is magenta; Pi has no secondary slot.
+  secondary: 'customMessageLabel',
   accent: 'accent',
   success: 'success',
   warning: 'warning',
   error: 'error',
   info: 'accent',
+};
+
+/** ANSI fallbacks when no theme is available (e.g. status line). */
+const NAMED_COLOR_ANSI: Record<string, string> = {
+  primary: '\x1b[36m',
+  secondary: '\x1b[35m',
+  accent: '\x1b[36m',
+  success: '\x1b[32m',
+  warning: '\x1b[33m',
+  error: '\x1b[31m',
+  info: '\x1b[36m',
 };
 
 export function isAgentColor(value: string): boolean {
@@ -95,8 +107,9 @@ export function colorizeAgentText(
 ): string {
   if (!color) return themeFg ? themeFg(fallback, text) : text;
   if (color.startsWith('#')) return hexFg(color, text);
-  if (!themeFg) return text;
-  return themeFg(THEME_COLOR_ALIASES[color] ?? fallback, text);
+  if (themeFg) return themeFg(THEME_COLOR_ALIASES[color] ?? fallback, text);
+  const ansi = NAMED_COLOR_ANSI[color];
+  return ansi ? `${ansi}${text}\x1b[39m` : text;
 }
 
 export class AsyncQueue {
