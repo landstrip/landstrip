@@ -64,6 +64,11 @@ describe('landstrip agent configuration', () => {
     expect(permissionDecision(exploreRules, 'read', '.env')).toBe('ask');
     expect(permissionDecision(exploreRules, 'read', '.env.local')).toBe('ask');
     expect(permissionDecision(exploreRules, 'read', '.env.example')).toBe('allow');
+    expect(permissionDecision(exploreRules, 'bash')).toBe('allow');
+    expect(permissionDecision(exploreRules, 'webfetch')).toBe('allow');
+    expect(permissionDecision(exploreRules, 'websearch')).toBe('allow');
+    expect(permissionDecision(exploreRules, 'edit')).toBe('deny');
+    expect(permissionDecision(exploreRules, 'task')).toBe('deny');
   });
 
   test('merges global and project subagents.json sections', () => {

@@ -38,9 +38,9 @@
         }
       },
       "explore": {
-        "description": "Fast read-focused agent for exploring codebases",
+        "description": "Fast agent specialized for exploring codebases",
         "mode": "subagent",
-        "prompt": "Explore the codebase without modifying it. Report findings with file references.",
+        "prompt": "Explore the codebase without modifying it. Report findings with file references. Use bash and network fetch tools when needed for git, PR metadata, or remote docs; do not edit files.",
         "permission": {
           "*": "deny",
           "read": {
@@ -51,7 +51,10 @@
           },
           "glob": "allow",
           "grep": "allow",
-          "list": "allow"
+          "list": "allow",
+          "bash": "allow",
+          "webfetch": "allow",
+          "websearch": "allow"
         }
       }
     },
