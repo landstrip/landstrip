@@ -19,9 +19,9 @@ function write(path: string, value: unknown): void {
 }
 
 describe('opencode config in subagents.json', () => {
-  test('defaults both OpenCode agent imports to false', () => {
+  test('defaults both OpenCode agent imports to true', () => {
     const config = loadLandstripConfig(temporaryDirectory(), true, temporaryDirectory());
-    expect(config.opencode).toEqual({ showGlobalAgents: false, showLocalAgents: false });
+    expect(config.opencode).toEqual({ showGlobalAgents: true, showLocalAgents: true });
   });
 
   test('rejects opencode settings in project subagents.json', () => {

@@ -4,7 +4,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 
 import {
   availablePrimaryAgents,
@@ -27,6 +27,17 @@ function write(path: string, value: unknown): void {
 }
 
 describe('landstrip agent configuration', () => {
+  let previousOpenCodeConfigDir: string | undefined;
+
+  beforeEach(() => {
+    previousOpenCodeConfigDir = process.env.OPENCODE_CONFIG_DIR;
+    process.env.OPENCODE_CONFIG_DIR = temporaryDirectory();
+  });
+
+  afterEach(() => {
+    if (previousOpenCodeConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR;
+    else process.env.OPENCODE_CONFIG_DIR = previousOpenCodeConfigDir;
+  });
   test('provides default primary agents and subagents', () => {
     const catalog = loadAgentCatalog(temporaryDirectory(), temporaryDirectory());
 

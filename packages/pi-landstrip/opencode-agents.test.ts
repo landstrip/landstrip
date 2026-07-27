@@ -109,13 +109,11 @@ describe('OpenCode agent import', () => {
     expect(result.agents.get('review')?.raw.description).toBe('Project');
   });
 
-  test('imports OpenCode agents into the catalog when settings enable them', () => {
+  test('imports OpenCode agents into the catalog by default', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     const globalDir = temporaryDirectory();
-    writeJson(join(agentDir, 'subagents.json'), {
-      opencode: { showGlobalAgents: true, showLocalAgents: true },
-    });
+    writeJson(join(agentDir, 'subagents.json'), {});
     write(
       join(globalDir, 'agents', 'review.md'),
       `---\ndescription: OpenCode review\nmode: subagent\ntools:\n  edit: false\n  read: true\n---\nReview the code.\n`,
@@ -195,6 +193,9 @@ describe('OpenCode agent import', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     const globalDir = temporaryDirectory();
+    writeJson(join(agentDir, 'subagents.json'), {
+      opencode: { showGlobalAgents: false, showLocalAgents: false },
+    });
     write(
       join(globalDir, 'agents', 'review.md'),
       `---\ndescription: OpenCode review\nmode: subagent\n---\nReview.\n`,

@@ -216,14 +216,15 @@ Sandbox policy remains in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi'
 }
 ```
 
-Optional OpenCode import flags live in `subagents.json` as top-level `opencode`:
+OpenCode Markdown agent import flags live in `subagents.json` as top-level
+`opencode` (both default to `true`):
 
 ```json
 {
   "maxSubagents": 0,
   "opencode": {
-    "showGlobalAgents": false,
-    "showLocalAgents": false
+    "showGlobalAgents": true,
+    "showLocalAgents": true
   },
   "subagents": {
     "agent": {}
@@ -231,18 +232,17 @@ Optional OpenCode import flags live in `subagents.json` as top-level `opencode`:
 }
 ```
 
-Both flags default to `false`. When enabled:
-
 - `showGlobalAgents` imports Markdown agents from the OpenCode global config
   directory (`$OPENCODE_CONFIG_DIR`, or `$XDG_CONFIG_HOME/opencode`, or
   `~/.config/opencode`) under `agent/` and `agents/`.
 - `showLocalAgents` imports Markdown agents from the trusted project's
   `.opencode/agent/` and `.opencode/agents/` directories.
 
-OpenCode local agents override OpenCode global agents. Pi agent definitions
-from `subagents.json` (built-in, global, and local) take precedence over OpenCode
-imports with the same name; conflicts are silent. Local OpenCode agents are
-skipped when the project is untrusted, regardless of the flag.
+Set a flag to `false` to disable that source. OpenCode local agents override
+OpenCode global agents. Pi agent definitions from `subagents.json` (built-in,
+global, and local) take precedence over OpenCode imports with the same name;
+conflicts are silent. Local OpenCode agents are skipped when the project is
+untrusted, regardless of the flag.
 
 `subagents.json` accepts top-level `maxSubagents`, `opencode`, and `subagents`;
 sandbox fields belong in `sandbox.json`.
@@ -321,12 +321,14 @@ roles. There is no separate subagent enable switch. The Settings tab in
 `/agents` edits this limit for global and trusted-project configuration.
 
 Agent modes, hidden/disabled agents, prompts, and ordered `allow`/`ask`/`deny`
-permissions apply to primary agents and subagents. Subagent workers also honor
-model selection, supported Pi thinking-level variants, and step limits. Primary
-agent activation currently changes the prompt and permissions only. Later
-matching permission rules win. Put provider-specific values under `options`;
-unknown agent fields are rejected. Agent permissions cannot weaken an enabled
-OS sandbox, grant filesystem access, or grant network access.
+permissions apply to primary agents and subagents. `hidden` only hides an agent
+from user-facing primary pickers; the model can still invoke a hidden subagent
+via `task`. Subagent workers also honor model selection, supported Pi
+thinking-level variants, and step limits. Primary agent activation currently
+changes the prompt and permissions only. Later matching permission rules win.
+Put provider-specific values under `options`; unknown agent fields are rejected.
+Agent permissions cannot weaken an enabled OS sandbox, grant filesystem access,
+or grant network access.
 
 ## Configuration migration
 

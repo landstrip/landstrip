@@ -36,8 +36,8 @@ export interface LandstripConfig extends LandstripConfigFile {
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_OPENCODE: OpenCodeConfig = {
-  showGlobalAgents: false,
-  showLocalAgents: false,
+  showGlobalAgents: true,
+  showLocalAgents: true,
 };
 
 const OPENCODE_KEYS = new Set(['showGlobalAgents', 'showLocalAgents']);
