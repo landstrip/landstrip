@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 import { getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent';
 
-import { formatError, isRecord } from './util.ts';
+import { expandFileReferences, formatError, isRecord } from './util.ts';
 
 export type ConfigObject = Record<string, unknown>;
 
@@ -69,6 +69,20 @@ function normalizeOpenCode(value: unknown, path: string): Partial<OpenCodeConfig
   return result;
 }
 
+function expandAgentPromptReferences(config: LandstripConfigFile, path: string): void {
+  if (!isRecord(config.subagents) || !isRecord(config.subagents.agent)) return;
+  const baseDir = dirname(path);
+  for (const [name, value] of Object.entries(config.subagents.agent)) {
+    if (!isRecord(value) || typeof value.prompt !== 'string') continue;
+    if (!value.prompt.includes('{file:')) continue;
+    try {
+      value.prompt = expandFileReferences(value.prompt, baseDir);
+    } catch (error) {
+      throw new Error(`${path}: agent ${name}: ${formatError(error)}`);
+    }
+  }
+}
+
 function readConfig(path: string, isGlobal = false): LandstripConfigFile {
   if (!existsSync(path)) return {};
   let value: unknown;
@@ -108,6 +122,7 @@ function readConfig(path: string, isGlobal = false): LandstripConfigFile {
   if ('opencode' in value) {
     config.opencode = normalizeOpenCode(value.opencode, `${path}: opencode`);
   }
+  expandAgentPromptReferences(config, path);
   return config;
 }
 

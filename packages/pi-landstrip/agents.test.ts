@@ -229,6 +229,45 @@ describe('landstrip agent configuration', () => {
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
     expect(catalog.diagnostics.join('\n')).toContain(path);
   });
+
+  test('expands {file:path} prompt references relative to subagents.json', () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    writeFileSync(join(agentDir, 'review-prompt.txt'), 'Review from file.\n');
+    write(join(agentDir, 'subagents.json'), {
+      subagents: {
+        agent: {
+          review: {
+            mode: 'subagent',
+            prompt: 'Prefix {file:./review-prompt.txt} suffix',
+          },
+        },
+      },
+    });
+
+    const catalog = loadAgentCatalog(cwd, agentDir);
+    expect(catalog.agents.get('review')?.prompt).toBe('Prefix Review from file. suffix');
+  });
+
+  test('reports a diagnostic for missing {file:path} prompt references', () => {
+    const agentDir = temporaryDirectory();
+    const path = join(agentDir, 'subagents.json');
+    write(path, {
+      subagents: {
+        agent: {
+          review: {
+            mode: 'subagent',
+            prompt: '{file:./missing-prompt.txt}',
+          },
+        },
+      },
+    });
+
+    const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
+    expect(catalog.agents.has('review')).toBe(false);
+    expect(catalog.diagnostics.join('\n')).toContain(path);
+    expect(catalog.diagnostics.join('\n')).toContain('bad file reference');
+  });
 });
 
 describe('permissions', () => {

@@ -321,7 +321,9 @@ roles. There is no separate subagent enable switch. The Settings tab in
 `/agents` edits this limit for global and trusted-project configuration.
 
 Agent modes, hidden/disabled agents, prompts, and ordered `allow`/`ask`/`deny`
-permissions apply to primary agents and subagents. `hidden` only hides an agent
+permissions apply to primary agents and subagents. Prompt strings may include
+OpenCode-style `{file:path}` tokens; relative paths resolve against the
+`subagents.json` file that defines them. `hidden` only hides an agent
 from user-facing primary pickers; the model can still invoke a hidden subagent
 via `task`. Subagent workers also honor model selection, supported Pi
 thinking-level variants, and step limits. Primary agent activation currently
