@@ -64,7 +64,6 @@ describe('landstrip agent configuration', () => {
       },
     });
     write(join(cwd, '.pi', 'subagents.json'), {
-      maxSubagents: 1,
       subagents: {
         agent: { review: { description: 'Project review' } },
         permission: { bash: { 'git status': 'allow' } },
@@ -72,7 +71,7 @@ describe('landstrip agent configuration', () => {
     });
 
     const catalog = loadAgentCatalog(cwd, agentDir);
-    expect(catalog.maxSubagents).toBe(1);
+    expect(catalog.maxSubagents).toBe(2);
     expect(catalog.agents.get('review')).toMatchObject({
       description: 'Project review',
       prompt: 'Review globally.',
@@ -114,7 +113,6 @@ describe('landstrip agent configuration', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     write(join(cwd, '.pi', 'subagents.json'), {
-      maxSubagents: 2,
       subagents: { agent: { project: { mode: 'subagent' } } },
     });
 
@@ -140,30 +138,29 @@ describe('landstrip agent configuration', () => {
     expect(catalog.diagnostics.join('\n')).toContain(`integer from 0 to ${MAX_SUBAGENTS}`);
   });
 
-  test('updates maxSubagents without replacing other project settings', async () => {
+  test('updates maxSubagents in global config without replacing other global settings', async () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    const path = join(cwd, '.pi', 'subagents.json');
+    const path = join(agentDir, 'subagents.json');
     write(path, { maxSubagents: 2, subagents: { permission: { bash: 'ask' } } });
 
-    await expect(setMaxSubagentsConfig(cwd, 6, true, agentDir)).resolves.toBe('project');
+    await expect(setMaxSubagentsConfig(cwd, 6, true, agentDir)).resolves.toBe('global');
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
       maxSubagents: 6,
       subagents: { permission: { bash: 'ask' } },
     });
   });
 
-  test('updates an explicitly selected scope', async () => {
+  test('rejects setting maxSubagents in project scope', async () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
 
     await setMaxSubagentsConfigForScope(cwd, 3, 'global', agentDir);
-    await setMaxSubagentsConfigForScope(cwd, 5, 'project', agentDir);
+    await expect(setMaxSubagentsConfigForScope(cwd, 5, 'project', agentDir)).rejects.toThrow(
+      'maxSubagents is only allowed in global subagents.json',
+    );
 
     expect(JSON.parse(readFileSync(join(agentDir, 'subagents.json'), 'utf8')).maxSubagents).toBe(3);
-    expect(JSON.parse(readFileSync(join(cwd, '.pi', 'subagents.json'), 'utf8')).maxSubagents).toBe(
-      5,
-    );
   });
 
   test('reports malformed agent permissions', () => {

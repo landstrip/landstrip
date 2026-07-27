@@ -24,32 +24,16 @@ describe('opencode config in subagents.json', () => {
     expect(config.opencode).toEqual({ showGlobalAgents: false, showLocalAgents: false });
   });
 
-  test('merges global and project opencode settings', () => {
+  test('rejects opencode settings in project subagents.json', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), {
-      opencode: { showGlobalAgents: true, showLocalAgents: false },
-    });
     write(join(cwd, '.pi', 'subagents.json'), {
       opencode: { showLocalAgents: true },
     });
 
-    const config = loadLandstripConfig(cwd, true, agentDir);
-    expect(config.opencode).toEqual({ showGlobalAgents: true, showLocalAgents: true });
-  });
-
-  test('ignores project opencode settings when the project is untrusted', () => {
-    const cwd = temporaryDirectory();
-    const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), {
-      opencode: { showGlobalAgents: true },
-    });
-    write(join(cwd, '.pi', 'subagents.json'), {
-      opencode: { showGlobalAgents: false, showLocalAgents: true },
-    });
-
-    const config = loadLandstripConfig(cwd, false, agentDir);
-    expect(config.opencode).toEqual({ showGlobalAgents: true, showLocalAgents: false });
+    expect(() => loadLandstripConfig(cwd, true, agentDir)).toThrow(
+      'opencode is only allowed in global subagents.json',
+    );
   });
 
   test('rejects invalid and unknown opencode settings', () => {

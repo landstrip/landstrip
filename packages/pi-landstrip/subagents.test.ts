@@ -325,7 +325,7 @@ test('registers task without spawning a worker process', async () => {
 
   const cwd = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
-  writeFileSync(join(cwd, '.pi', 'subagents.json'), JSON.stringify({ maxSubagents: 4 }));
+  writeFileSync(join(piAgentDir, 'subagents.json'), JSON.stringify({ maxSubagents: 4 }));
   const warnings: string[] = [];
   const ctx = {
     cwd,
@@ -415,10 +415,10 @@ test('runs a foreground task in an injected RPC worker', async () => {
   const cwd = temporaryDirectory();
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(join(piAgentDir, 'subagents.json'), JSON.stringify({ maxSubagents: 4 }));
   writeFileSync(
     join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
-      maxSubagents: 4,
       subagents: {
         agent: {
           review: {
@@ -769,10 +769,10 @@ test('cancels worker startup promptly and disposes a worker created afterward', 
   const cwd = temporaryDirectory();
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(join(piAgentDir, 'subagents.json'), JSON.stringify({ maxSubagents: 4 }));
   writeFileSync(
     join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
-      maxSubagents: 4,
       subagents: { agent: { review: { mode: 'subagent', prompt: 'Review.' } } },
     }),
   );
@@ -825,10 +825,10 @@ test('sends a continuation queued during worker startup once RPC is available', 
   const cwd = temporaryDirectory();
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(join(piAgentDir, 'subagents.json'), JSON.stringify({ maxSubagents: 4 }));
   writeFileSync(
     join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
-      maxSubagents: 4,
       subagents: { agent: { review: { mode: 'subagent', prompt: 'Review.' } } },
     }),
   );
@@ -914,10 +914,10 @@ test('records a running foreground task when continued in background', async () 
   const cwd = temporaryDirectory();
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(join(piAgentDir, 'subagents.json'), JSON.stringify({ maxSubagents: 4 }));
   writeFileSync(
     join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
-      maxSubagents: 4,
       subagents: { agent: { review: { mode: 'subagent', prompt: 'Review.' } } },
     }),
   );
@@ -997,10 +997,10 @@ test('delivers a completed task when it is continued in background', async () =>
   const cwd = temporaryDirectory();
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(join(piAgentDir, 'subagents.json'), JSON.stringify({ maxSubagents: 4 }));
   writeFileSync(
     join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
-      maxSubagents: 4,
       subagents: { agent: { review: { mode: 'subagent', prompt: 'Review.' } } },
     }),
   );
@@ -1094,10 +1094,10 @@ test('rejects an unknown continuation ID instead of creating a new task', async 
   const cwd = temporaryDirectory();
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(join(piAgentDir, 'subagents.json'), JSON.stringify({ maxSubagents: 4 }));
   writeFileSync(
     join(cwd, '.pi', 'subagents.json'),
     JSON.stringify({
-      maxSubagents: 4,
       subagents: { agent: { review: { mode: 'subagent', prompt: 'Review.' } } },
     }),
   );
@@ -1219,7 +1219,7 @@ test('hands a foreground scheduler permit to a nested task at capacity one', asy
   const cwd = temporaryDirectory();
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
-  writeFileSync(join(cwd, '.pi', 'subagents.json'), JSON.stringify({ maxSubagents: 1 }));
+  writeFileSync(join(piAgentDir, 'subagents.json'), JSON.stringify({ maxSubagents: 1 }));
 
   let taskTool: ToolDefinition | undefined;
   const parentManager = SessionManager.create(cwd, join(cwd, 'sessions'));

@@ -1,5 +1,4 @@
 {
-  "maxSubagents": 0,
   "subagents": {
     "agent": {
       "build": {
