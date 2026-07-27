@@ -55,6 +55,8 @@ describe('landstrip agent configuration', () => {
     expect(permissionDecision(catalog.permissions, 'bash')).toBe('allow');
     expect(permissionDecision(catalog.agents.get('plan')?.permissions ?? [], 'edit')).toBe('ask');
     expect(permissionDecision(catalog.agents.get('plan')?.permissions ?? [], 'task')).toBe('ask');
+    expect(catalog.agents.get('build')?.color).toBe('#034cff');
+    expect(catalog.agents.get('plan')?.color).toBe('#a753ae');
 
     const explore = catalog.agents.get('explore');
     const exploreRules = mergePermissionRules(catalog.permissions, explore?.permissions ?? []);
@@ -194,6 +196,25 @@ describe('landstrip agent configuration', () => {
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
     expect(catalog.agents.has('unsafe')).toBe(false);
     expect(catalog.diagnostics.join('\n')).toContain('unknown field permissions');
+  });
+
+  test('keeps agent color and rejects invalid colors', () => {
+    const agentDir = temporaryDirectory();
+    write(join(agentDir, 'subagents.json'), {
+      subagents: {
+        agent: {
+          build: { color: 'accent' },
+          plan: { color: '#FF00FF' },
+          bad: { color: 'not-a-color' },
+        },
+      },
+    });
+
+    const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
+    expect(catalog.agents.get('build')?.color).toBe('accent');
+    expect(catalog.agents.get('plan')?.color).toBe('#FF00FF');
+    expect(catalog.agents.has('bad')).toBe(false);
+    expect(catalog.diagnostics.join('\n')).toContain('color must be');
   });
 
   test('does not read subagent configuration from settings.json', () => {

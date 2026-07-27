@@ -44,7 +44,7 @@ import { boxBottom, boxRow, boxTop } from './box.ts';
 import { MAX_SUBAGENTS } from './config.ts';
 import type { LandstripIntegration, LandstripRpcWorkerLaunch } from './index.ts';
 import { type ExtensionUiRequest, type ExtensionUiResult, RpcProcess } from './rpc-process.ts';
-import { AsyncQueue, formatError, isRecord } from './util.ts';
+import { AsyncQueue, colorizeAgentText, formatError, isRecord } from './util.ts';
 
 const TASK_ENTRY = 'landstrip.task';
 const TASK_WIDGET = 'landstrip.subagents';
@@ -903,7 +903,7 @@ export class SubagentRuntime {
                 agent.hidden ? ' [hidden]' : ''
               }`;
               lines.push(
-                `${cursor} ${theme.fg('accent', name)} ${theme.fg('dim', agent.source.padEnd(8))} ${theme.fg('text', description)}`,
+                `${cursor} ${colorizeAgentText(agent.color, name, (c, t) => theme.fg(c as Parameters<Theme['fg']>[0], t))} ${theme.fg('dim', agent.source.padEnd(8))} ${theme.fg('text', description)}`,
               );
             }
             if (agents.length === 0) lines.push('  No subagent types are configured.');
@@ -1977,7 +1977,7 @@ export class SubagentRuntime {
     this.pi.registerTool(this.createTaskTool(undefined, this.primaryRules, ctx));
     if (persist) this.pi.appendEntry(PRIMARY_AGENT_ENTRY, { name: agent.name });
     if (ctx.hasUI) {
-      ctx.ui.setStatus('landstrip-agent', `@${agent.name}`);
+      ctx.ui.setStatus('landstrip-agent', colorizeAgentText(agent.color, `@${agent.name}`));
       if (persist) ctx.ui.notify(`Primary agent: ${agent.name}`, 'info');
     }
   }

@@ -80,7 +80,7 @@ import {
   MAX_SUBAGENTS,
   setMaxSubagentsConfigForScope,
 } from './config.ts';
-import { AsyncQueue, expandHomePath, formatError } from './util.ts';
+import { AsyncQueue, colorizeAgentText, expandHomePath, formatError } from './util.ts';
 
 interface SandboxFilesystemConfig {
   denyRead: string[];
@@ -2865,7 +2865,12 @@ export function createLandstripIntegration(
                     const selected = index === selectedAgent;
                     const cursor = selected ? accent('›') : ' ';
                     const active = agent.name === activeAgent ? theme.fg('success', '●') : dim('○');
-                    const name = selected ? accent(agent.name) : text(agent.name);
+                    const name = colorizeAgentText(
+                      agent.color,
+                      agent.name,
+                      (c, t) => theme.fg(c as Parameters<Theme['fg']>[0], t),
+                      selected ? 'accent' : 'text',
+                    );
                     const model = dim(`  ${agent.model ?? 'current model'}`);
                     const description = agent.description ? dim(`  ${agent.description}`) : '';
                     lines.push(row(`${cursor} ${active} ${name}${model}${description}`));
@@ -2880,7 +2885,12 @@ export function createLandstripIntegration(
                     const index = start + offset;
                     const selected = index === selectedSubagent;
                     const cursor = selected ? accent('›') : ' ';
-                    const name = selected ? accent(`@${agent.name}`) : text(`@${agent.name}`);
+                    const name = colorizeAgentText(
+                      agent.color,
+                      `@${agent.name}`,
+                      (c, t) => theme.fg(c as Parameters<Theme['fg']>[0], t),
+                      selected ? 'accent' : 'text',
+                    );
                     const flags = [agent.model ?? 'current model', agent.mode];
                     if (agent.hidden) flags.push('hidden');
                     lines.push(row(`${cursor} ${name} ${dim(flags.join(' · '))}`));

@@ -9,7 +9,7 @@ import { getAgentDir } from '@earendil-works/pi-coding-agent';
 
 import { loadLandstripConfig, type AgentSource, type ConfigObject } from './config.ts';
 import { loadOpenCodeAgents } from './opencode-agents.ts';
-import { expandHomePath, formatError, isRecord } from './util.ts';
+import { expandHomePath, formatError, isAgentColor, isRecord } from './util.ts';
 
 export type PermissionAction = 'allow' | 'ask' | 'deny';
 
@@ -30,6 +30,7 @@ export interface AgentDefinition {
   readonly model?: string;
   readonly variant?: string;
   readonly hidden: boolean;
+  readonly color?: string;
   readonly steps?: number;
   readonly permissions: PermissionRules;
   readonly providerOptions: Readonly<Record<string, unknown>>;
@@ -117,10 +118,15 @@ function normalizeAgent(
   raw: ConfigObject,
   source: AgentSource,
 ): AgentDefinition | undefined {
-  for (const field of ['description', 'prompt', 'model', 'variant'] as const) {
+  for (const field of ['description', 'prompt', 'model', 'variant', 'color'] as const) {
     if (raw[field] !== undefined && typeof raw[field] !== 'string') {
       throw new Error(`agent ${name} ${field} must be a string`);
     }
+  }
+  if (typeof raw.color === 'string' && !isAgentColor(raw.color)) {
+    throw new Error(
+      `agent ${name} color must be #RRGGBB or one of primary, secondary, accent, success, warning, error, info`,
+    );
   }
   for (const field of ['hidden', 'disable'] as const) {
     if (raw[field] !== undefined && typeof raw[field] !== 'boolean') {
@@ -162,6 +168,7 @@ function normalizeAgent(
     model: typeof raw.model === 'string' ? raw.model : undefined,
     variant: typeof raw.variant === 'string' ? raw.variant : undefined,
     hidden: raw.hidden === true,
+    color: typeof raw.color === 'string' ? raw.color : undefined,
     steps: typeof raw.steps === 'number' ? raw.steps : undefined,
     permissions: normalizePermissions(raw.permission),
     providerOptions,

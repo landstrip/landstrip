@@ -53,6 +53,52 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+const OPENCODE_THEME_COLORS = new Set([
+  'primary',
+  'secondary',
+  'accent',
+  'success',
+  'warning',
+  'error',
+  'info',
+]);
+
+/** Map OpenCode theme color names onto Pi ThemeColor keys. */
+const THEME_COLOR_ALIASES: Record<string, string> = {
+  primary: 'accent',
+  secondary: 'muted',
+  accent: 'accent',
+  success: 'success',
+  warning: 'warning',
+  error: 'error',
+  info: 'accent',
+};
+
+export function isAgentColor(value: string): boolean {
+  if (/^#[0-9a-fA-F]{6}$/.test(value)) return true;
+  return OPENCODE_THEME_COLORS.has(value);
+}
+
+function hexFg(hex: string, text: string): string {
+  const r = Number.parseInt(hex.slice(1, 3), 16);
+  const g = Number.parseInt(hex.slice(3, 5), 16);
+  const b = Number.parseInt(hex.slice(5, 7), 16);
+  return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`;
+}
+
+/** Color text with an agent color (hex or OpenCode theme name). */
+export function colorizeAgentText(
+  color: string | undefined,
+  text: string,
+  themeFg?: (name: string, value: string) => string,
+  fallback = 'accent',
+): string {
+  if (!color) return themeFg ? themeFg(fallback, text) : text;
+  if (color.startsWith('#')) return hexFg(color, text);
+  if (!themeFg) return text;
+  return themeFg(THEME_COLOR_ALIASES[color] ?? fallback, text);
+}
+
 export class AsyncQueue {
   private tail = Promise.resolve();
 

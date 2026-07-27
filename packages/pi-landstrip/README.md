@@ -111,8 +111,10 @@ global or trusted-project concurrency limit.
 
 The `/agents` selector provides OpenCode-compatible `build` and `plan` roles by
 default. Build has normal development access; plan asks before shell commands
-and file changes. The selection controls the root system prompt and permissions
-and is restored with the session.
+and file changes. Built-in colors match OpenCode's agent palette (`#034cff` for
+build, `#a753ae` for plan) and appear in the status line and agent selectors.
+The selection controls the root system prompt and permissions and is restored
+with the session.
 
 ## Subagents
 
@@ -320,17 +322,18 @@ The packaged default is 0, which removes the `task` tool while retaining primary
 roles. There is no separate subagent enable switch. The Settings tab in
 `/agents` edits this limit for global and trusted-project configuration.
 
-Agent modes, hidden/disabled agents, prompts, and ordered `allow`/`ask`/`deny`
-permissions apply to primary agents and subagents. Prompt strings may include
-OpenCode-style `{file:path}` tokens; relative paths resolve against the
-`subagents.json` file that defines them. `hidden` only hides an agent
-from user-facing primary pickers; the model can still invoke a hidden subagent
-via `task`. Subagent workers also honor model selection, supported Pi
-thinking-level variants, and step limits. Primary agent activation currently
-changes the prompt and permissions only. Later matching permission rules win.
-Put provider-specific values under `options`; unknown agent fields are rejected.
-Agent permissions cannot weaken an enabled OS sandbox, grant filesystem access,
-or grant network access.
+Agent modes, hidden/disabled agents, prompts, colors, and ordered
+`allow`/`ask`/`deny` permissions apply to primary agents and subagents. Prompt
+strings may include OpenCode-style `{file:path}` tokens; relative paths resolve
+against the `subagents.json` file that defines them. `color` accepts `#RRGGBB`
+or OpenCode theme names (`primary`, `secondary`, `accent`, `success`, `warning`,
+`error`, `info`). `hidden` only hides an agent from user-facing primary pickers;
+the model can still invoke a hidden subagent via `task`. Subagent workers also
+honor model selection, supported Pi thinking-level variants, and step limits.
+Primary agent activation currently changes the prompt and permissions only.
+Later matching permission rules win. Put provider-specific values under
+`options`; unknown agent fields are rejected. Agent permissions cannot weaken an
+enabled OS sandbox, grant filesystem access, or grant network access.
 
 ## Configuration migration
 
