@@ -158,6 +158,17 @@ network:
   allowNetwork: true
 ```
 
+### Executable policy
+
+Supplementary policy can be attached directly to a tool's executable inode:
+- **Unix**: `user.landstrip.policy` extended attribute (`xattr`).
+- **Windows**: `landstrip.policy` NTFS alternate data stream (`ADS`).
+
+When present, the attribute contents are parsed and merged to the policy. The
+executable is resolved via `PATH` lookup and canonicalized so policy attributes
+are always read from the real binary inode. If an attribute exists but is
+unreadable or malformed, tool execution is aborted.
+
 ## Filesystem policy
 
 Write access is denied by default. `allowWrite` paths grant write access and
