@@ -40,15 +40,15 @@ The `windows` command family is available only in Windows builds.
 
 Policy options are `-p, --policy <FILE>`, repeated in merge order, and
 `--policy-format <json|yaml>`. Use `-p -` to read standard input; its format
-must be explicit. `policy validate` checks the merged policy and current
-platform support. `policy resolve` prints the normalized merged policy. Add
-`--tool <PROGRAM>` to either policy command to include executable-attached
-policy.
+must be explicit. `policy validate` checks the merged policy and current platform
+support, returning `valid: true` or `valid: false` with a coded error. `policy
+resolve` prints the normalized merged policy. Add `--tool <PROGRAM>` to either
+policy command to include executable-attached policy.
 
 Policy inspection, `doctor`, and Windows management commands each write one JSON
-document to standard output. `doctor` and `windows status` exit with status 1 when
-they report an unhealthy sandbox. `run` returns the sandboxed program's exit
-status.
+document to standard output. An invalid policy, an unhealthy `doctor` report, or
+an unhealthy `windows status` exits with status 1. Operational failures emit a
+coded trap on standard error. `run` returns the sandboxed program's exit status.
 
 ### Agent extensions
 

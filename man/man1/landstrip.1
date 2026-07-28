@@ -50,6 +50,11 @@ separator before the program is required.
 .Cm policy validate
 checks policy parsing, merging, path resolution, executable-attached policy,
 and support on the current platform without launching a program.
+It writes a validation report with
+.Va valid
+set to true, or set to false with a coded
+.Va error ,
+and exits with status 1 for an invalid policy.
 .Cm policy resolve
 prints the normalized merged policy as JSON.
 .Cm doctor
@@ -316,6 +321,18 @@ recovered on a later lease or uninstall.
 and each
 .Cm windows
 management command write exactly one JSON document to standard output.
+A completed
+.Cm policy validate
+always uses its validation-report schema on standard output; invalid policy
+syntax, resolution, or platform support is reported with
+.Va valid
+set to false and an
+.Va error
+containing stable
+.Va code
+and
+.Va message
+fields.
 .Nm
 reports failures and completed denials as one JSON object per line on standard
 error. Pending Linux query events go only to
@@ -442,11 +459,13 @@ sandboxed command's standard output and standard error.
 returns the sandboxed command's exit status. Direct execution replaces
 .Nm
 with the command; supervised execution returns the child status after cleanup.
+.Cm policy validate
+exits with status 1 when its JSON report marks the policy invalid.
 .Cm doctor
 and
 .Cm windows status
-exit with status 1 when their JSON report is unhealthy. Policy loading, sandbox
-setup, and other Landstrip failures emit a coded trap and exit with status 1.
-Usage errors exit with status 2.
+exit with status 1 when their JSON report is unhealthy. Policy input/output
+failures, sandbox setup, and other Landstrip failures emit a coded trap and exit
+with status 1. Usage errors exit with status 2.
 .Sh AUTHORS
 .An Jarkko Sakkinen Aq Mt jarkko.sakkinen@iki.fi

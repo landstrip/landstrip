@@ -125,6 +125,37 @@ impl Error {
         self.into()
     }
 
+    /// The fallback message for a policy-validation rejection. `None` means the
+    /// error is operational and must remain a trap.
+    pub(crate) fn policy_validation_message(&self) -> Option<&'static str> {
+        match self {
+            Self::PolicyParseFailed { .. } => Some("policy document is not valid JSON or YAML"),
+            Self::PolicyUnrestrictedRead => {
+                Some("unrestricted reads are unsupported by the active Windows sandbox")
+            }
+            Self::PolicyTcpBindUnsupported => {
+                Some("local TCP binding is unsupported by the active Windows sandbox")
+            }
+            Self::PolicyUnixSocketUnsupported => {
+                Some("Unix socket policy is unsupported by the active Windows sandbox")
+            }
+            Self::PolicyUnixSocketPath => {
+                Some("an allowed Unix socket path exists but is not a socket")
+            }
+            Self::PolicyDenyWriteSymlinkAncestor => {
+                Some("a denied write symlink ancestor is reachable through an allowed write root")
+            }
+            Self::PolicyInvalidPort => Some("proxy ports must be between 1 and 65535"),
+            Self::PolicyEmptyPath => Some("policy paths must not be empty"),
+            Self::PolicyHomeUnavailable => {
+                Some("the home directory is unavailable for a tilde-prefixed policy path")
+            }
+            Self::PolicyTraversalDepth => Some("policy path traversal exceeded its maximum depth"),
+            Self::PlatformUnsupported => Some("the current platform is unsupported"),
+            _ => None,
+        }
+    }
+
     /// The errno the cause carries, or `None` when it carries none.
     #[cfg(unix)]
     pub(crate) fn errno(&self) -> Option<i32> {

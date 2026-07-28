@@ -23,8 +23,16 @@ pub(crate) enum SandboxImplementation {
 }
 
 #[derive(Debug, Serialize)]
+pub(crate) struct PolicyValidationError {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Serialize)]
 pub(crate) struct PolicyValidationReport {
     pub(crate) valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<PolicyValidationError>,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,10 +105,11 @@ impl CommandOutcome {
     pub(crate) fn exit_code(&self) -> i32 {
         match self {
             Self::Exit(code) => *code,
+            Self::PolicyValidated(report) => i32::from(!report.valid),
             Self::Doctor(report) => i32::from(!report.ok),
             #[cfg(target_os = "windows")]
             Self::Windows(report) => i32::from(!report.healthy),
-            Self::PolicyValidated(_) | Self::PolicyResolved(_) => 0,
+            Self::PolicyResolved(_) => 0,
         }
     }
 }
