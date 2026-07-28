@@ -127,6 +127,12 @@ covers Pi, its plugins and tools, model requests, and descendant processes. The
 root Pi process supervises RPC, permissions, nesting, persistence, and result
 delivery.
 
+The two permission layers act at different stages:
+
+- Agent permissions are checked before a tool call is dispatched.
+- Sandbox permissions are enforced at runtime by the OS while the subagent and its
+  descendants execute.
+
 Workers use normal Pi resource discovery and plugin loading, plus the
 `pi-landstrip` worker extension. Requested tools are composed inside the worker,
 so plugins can add or replace implementations. Each task starts a fresh Pi
