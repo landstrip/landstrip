@@ -59,14 +59,36 @@ describe('OpenCode settings', () => {
     );
   });
 
-  test('reports the subagents.json setting as a migration error', () => {
+  test('reports subagents.json as a migration error', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), {
-      opencode: { showGlobalAgents: false },
+    const path = join(agentDir, 'subagents.json');
+    write(path, { maxSubagents: 2 });
+
+    expect(() => loadLandstripConfig(temporaryDirectory(), true, agentDir)).toThrow(
+      `${path} is no longer supported; move its values to landstrip.maxSubagents, landstrip.agent, landstrip.permission, and landstrip.opencode in ${join(agentDir, 'settings.json')}`,
+    );
+  });
+
+  test('reports project subagents.json only for trusted projects', () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    const path = join(cwd, '.pi', 'subagents.json');
+    write(path, { subagents: { agent: {} } });
+
+    expect(() => loadLandstripConfig(cwd, true, agentDir)).toThrow(
+      `${path} is no longer supported`,
+    );
+    expect(() => loadLandstripConfig(cwd, false, agentDir)).not.toThrow();
+  });
+
+  test('rejects unknown landstrip settings', () => {
+    const agentDir = temporaryDirectory();
+    write(join(agentDir, 'settings.json'), {
+      landstrip: { unknown: true },
     });
 
     expect(() => loadLandstripConfig(temporaryDirectory(), true, agentDir)).toThrow(
-      `set landstrip.opencode in ${join(agentDir, 'settings.json')}`,
+      'landstrip has an unknown field unknown',
     );
   });
 });

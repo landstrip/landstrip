@@ -96,25 +96,26 @@ describe('landstrip agent configuration', () => {
     expect(permissionDecision(reviewerRules, 'bash', 'rm -rf build')).toBe('deny');
   });
 
-  test('merges global and project subagents.json sections', () => {
+  test('merges global and trusted-project landstrip settings', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), {
-      maxSubagents: 2,
-      subagents: {
+    write(join(agentDir, 'settings.json'), {
+      landstrip: {
+        maxSubagents: 2,
         agent: { review: { mode: 'subagent', prompt: 'Review globally.' } },
         permission: { bash: { 'git status': 'deny', '*': 'ask' } },
       },
     });
-    write(join(cwd, '.pi', 'subagents.json'), {
-      subagents: {
+    write(join(cwd, '.pi', 'settings.json'), {
+      landstrip: {
+        maxSubagents: 3,
         agent: { review: { description: 'Project review' } },
         permission: { bash: { 'git status': 'allow' } },
       },
     });
 
     const catalog = loadAgentCatalog(cwd, agentDir);
-    expect(catalog.maxSubagents).toBe(2);
+    expect(catalog.maxSubagents).toBe(3);
     expect(catalog.agents.get('review')).toMatchObject({
       description: 'Project review',
       prompt: 'Review globally.',
@@ -128,16 +129,16 @@ describe('landstrip agent configuration', () => {
   test('tracks the effective built-in, global, and local agent sources', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), {
-      subagents: {
+    write(join(agentDir, 'settings.json'), {
+      landstrip: {
         agent: {
           global: { mode: 'subagent' },
           general: { description: 'Customized globally' },
         },
       },
     });
-    write(join(cwd, '.pi', 'subagents.json'), {
-      subagents: {
+    write(join(cwd, '.pi', 'settings.json'), {
+      landstrip: {
         agent: {
           local: { mode: 'subagent' },
           global: { description: 'Customized locally' },
@@ -152,11 +153,15 @@ describe('landstrip agent configuration', () => {
     expect(catalog.agents.get('local')?.source).toBe('local');
   });
 
-  test('ignores project subagents.json when the project is untrusted', () => {
+  test('ignores project landstrip settings when the project is untrusted', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    write(join(cwd, '.pi', 'subagents.json'), {
-      subagents: { agent: { project: { mode: 'subagent' } } },
+    write(join(cwd, '.pi', 'settings.json'), {
+      landstrip: {
+        maxSubagents: 8,
+        agent: { project: { mode: 'subagent' } },
+        opencode: { showGlobalAgents: false },
+      },
     });
 
     const catalog = loadAgentCatalog(cwd, agentDir, false);
@@ -166,7 +171,7 @@ describe('landstrip agent configuration', () => {
 
   test('allows maxSubagents zero without removing primary agents', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), { maxSubagents: 0 });
+    write(join(agentDir, 'settings.json'), { landstrip: { maxSubagents: 0 } });
 
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
     expect(catalog.maxSubagents).toBe(0);
@@ -175,41 +180,48 @@ describe('landstrip agent configuration', () => {
 
   test('rejects maxSubagents above the supported limit', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), { maxSubagents: MAX_SUBAGENTS + 1 });
+    write(join(agentDir, 'settings.json'), {
+      landstrip: { maxSubagents: MAX_SUBAGENTS + 1 },
+    });
 
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
     expect(catalog.diagnostics.join('\n')).toContain(`integer from 0 to ${MAX_SUBAGENTS}`);
   });
 
-  test('updates maxSubagents in global config without replacing other global settings', async () => {
+  test('updates maxSubagents in global settings without replacing other settings', async () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    const path = join(agentDir, 'subagents.json');
-    write(path, { maxSubagents: 2, subagents: { permission: { bash: 'ask' } } });
+    const path = join(agentDir, 'settings.json');
+    write(path, {
+      theme: 'dark',
+      landstrip: { maxSubagents: 2, permission: { bash: 'ask' } },
+    });
 
     await expect(setMaxSubagentsConfig(cwd, 6, true, agentDir)).resolves.toBe('global');
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
-      maxSubagents: 6,
-      subagents: { permission: { bash: 'ask' } },
+      theme: 'dark',
+      landstrip: { maxSubagents: 6, permission: { bash: 'ask' } },
     });
   });
 
-  test('rejects setting maxSubagents in project scope', async () => {
+  test('updates maxSubagents in trusted-project settings', async () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
+    const globalPath = join(agentDir, 'settings.json');
+    const projectPath = join(cwd, '.pi', 'settings.json');
 
     await setMaxSubagentsConfigForScope(cwd, 3, 'global', agentDir);
-    await expect(setMaxSubagentsConfigForScope(cwd, 5, 'project', agentDir)).rejects.toThrow(
-      'maxSubagents is only allowed in global subagents.json',
-    );
+    await setMaxSubagentsConfigForScope(cwd, 5, 'project', agentDir);
 
-    expect(JSON.parse(readFileSync(join(agentDir, 'subagents.json'), 'utf8')).maxSubagents).toBe(3);
+    expect(JSON.parse(readFileSync(globalPath, 'utf8')).landstrip.maxSubagents).toBe(3);
+    expect(JSON.parse(readFileSync(projectPath, 'utf8')).landstrip.maxSubagents).toBe(5);
+    expect(loadAgentCatalog(cwd, agentDir).maxSubagents).toBe(5);
   });
 
   test('reports malformed agent permissions', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), {
-      subagents: { agent: { unsafe: { permission: { bash: { '*': false } } } } },
+    write(join(agentDir, 'settings.json'), {
+      landstrip: { agent: { unsafe: { permission: { bash: { '*': false } } } } },
     });
 
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
@@ -219,8 +231,8 @@ describe('landstrip agent configuration', () => {
 
   test('rejects unknown agent fields instead of treating typos as provider options', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), {
-      subagents: { agent: { unsafe: { permissions: { bash: 'deny' } } } },
+    write(join(agentDir, 'settings.json'), {
+      landstrip: { agent: { unsafe: { permissions: { bash: 'deny' } } } },
     });
 
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
@@ -230,8 +242,8 @@ describe('landstrip agent configuration', () => {
 
   test('keeps agent color and rejects invalid colors', () => {
     const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), {
-      subagents: {
+    write(join(agentDir, 'settings.json'), {
+      landstrip: {
         agent: {
           build: { color: 'accent' },
           plan: { color: '#FF00FF' },
@@ -247,7 +259,7 @@ describe('landstrip agent configuration', () => {
     expect(catalog.diagnostics.join('\n')).toContain('color must be');
   });
 
-  test('does not read subagent configuration from settings.json', () => {
+  test('ignores legacy top-level agent settings', () => {
     const agentDir = temporaryDirectory();
     const cwd = temporaryDirectory();
     write(join(agentDir, 'settings.json'), {
@@ -263,28 +275,21 @@ describe('landstrip agent configuration', () => {
     expect(catalog.warnings.join('\n')).toContain(join(cwd, '.pi', 'settings.json'));
   });
 
-  test('rejects sandbox fields in subagents.json', () => {
-    const agentDir = temporaryDirectory();
-    write(join(agentDir, 'subagents.json'), { sandbox: { enabled: false } });
-
-    const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
-    expect(catalog.diagnostics.join('\n')).toContain('unknown top-level field sandbox');
-  });
-
-  test('reports old OpenCode settings as an actionable migration diagnostic', () => {
+  test('reports subagents.json as an actionable migration diagnostic', () => {
     const agentDir = temporaryDirectory();
     const path = join(agentDir, 'subagents.json');
-    write(path, { opencode: { showGlobalAgents: false } });
+    write(path, { maxSubagents: 2 });
 
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
+    expect(catalog.diagnostics.join('\n')).toContain(`${path} is no longer supported`);
     expect(catalog.diagnostics.join('\n')).toContain(
-      `${path}: opencode has moved; set landstrip.opencode in ${join(agentDir, 'settings.json')}`,
+      `landstrip.agent, landstrip.permission, and landstrip.opencode in ${join(agentDir, 'settings.json')}`,
     );
   });
 
-  test('includes the source path in malformed JSON diagnostics', () => {
+  test('includes the source path in malformed settings JSON diagnostics', () => {
     const agentDir = temporaryDirectory();
-    const path = join(agentDir, 'subagents.json');
+    const path = join(agentDir, 'settings.json');
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, '{');
 
@@ -292,12 +297,12 @@ describe('landstrip agent configuration', () => {
     expect(catalog.diagnostics.join('\n')).toContain(path);
   });
 
-  test('expands {file:path} prompt references relative to subagents.json', () => {
+  test('expands {file:path} prompt references relative to settings.json', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     writeFileSync(join(agentDir, 'review-prompt.txt'), 'Review from file.\n');
-    write(join(agentDir, 'subagents.json'), {
-      subagents: {
+    write(join(agentDir, 'settings.json'), {
+      landstrip: {
         agent: {
           review: {
             mode: 'subagent',
@@ -313,9 +318,9 @@ describe('landstrip agent configuration', () => {
 
   test('reports a diagnostic for missing {file:path} prompt references', () => {
     const agentDir = temporaryDirectory();
-    const path = join(agentDir, 'subagents.json');
+    const path = join(agentDir, 'settings.json');
     write(path, {
-      subagents: {
+      landstrip: {
         agent: {
           review: {
             mode: 'subagent',

@@ -106,7 +106,7 @@ function legacyConfigWarnings(piAgentDir: string): string[] {
     );
     if (fields.length === 0) return [];
     return [
-      `${path}: legacy ${fields.join(', ')} configuration is ignored; move it to subagents.json`,
+      `${path}: legacy ${fields.join(', ')} configuration is ignored; move it under landstrip`,
     ];
   } catch {
     return [];
@@ -186,14 +186,16 @@ export function loadAgentCatalog(
   ];
   const diagnostics: string[] = [];
   let maxSubagents = 0;
-  let subagents: ConfigObject = {};
+  let configuredAgents: ConfigObject = {};
+  let configuredPermission: unknown;
   let agentSources = new Map<string, AgentSource>();
   let showGlobalAgents = false;
   let showLocalAgents = false;
   try {
     const config = loadLandstripConfig(cwd, includeProject, piAgentDir);
     maxSubagents = config.maxSubagents;
-    subagents = config.subagents;
+    configuredAgents = config.agent;
+    configuredPermission = config.permission;
     agentSources = new Map(config.agentSources);
     showGlobalAgents = config.opencode.showGlobalAgents;
     showLocalAgents = config.opencode.showLocalAgents;
@@ -220,33 +222,24 @@ export function loadAgentCatalog(
     }
   }
 
-  if (subagents.agent !== undefined && !isRecord(subagents.agent)) {
-    diagnostics.push('subagents.agent must be an object');
-  } else if (isRecord(subagents.agent)) {
-    for (const name of Object.keys(subagents.agent).sort()) {
-      const value = subagents.agent[name];
-      if (!isRecord(value)) {
-        diagnostics.push(`agent ${name} must be an object`);
-        continue;
-      }
-      try {
-        const agent = normalizeAgent(name, value, agentSources.get(name) ?? 'built-in');
-        if (agent) normalized.set(name, agent);
-        else normalized.delete(name);
-      } catch (error) {
-        diagnostics.push(formatError(error));
-      }
+  for (const name of Object.keys(configuredAgents).sort()) {
+    const value = configuredAgents[name];
+    if (!isRecord(value)) {
+      diagnostics.push(`agent ${name} must be an object`);
+      continue;
+    }
+    try {
+      const agent = normalizeAgent(name, value, agentSources.get(name) ?? 'built-in');
+      if (agent) normalized.set(name, agent);
+      else normalized.delete(name);
+    } catch (error) {
+      diagnostics.push(formatError(error));
     }
   }
 
   let permissions: PermissionRules = [];
-  for (const key of Object.keys(subagents)) {
-    if (key !== 'agent' && key !== 'permission') {
-      diagnostics.push(`subagents has an unknown field ${key}`);
-    }
-  }
   try {
-    permissions = normalizePermissions(subagents.permission);
+    permissions = normalizePermissions(configuredPermission);
   } catch (error) {
     diagnostics.push(formatError(error));
   }

@@ -12,10 +12,10 @@ execution, OpenCode-compatible primary agents, and sandbox-aware subagents. It
 uses an Anthropic-compatible policy and delegates OS-level enforcement to
 [`landstrip`](https://github.com/landstrip/landstrip).
 
-The extension includes a shared [sandbox policy](./sandbox.json) and separate
-[agent configuration](./subagents.json). Global and trusted-project files can
-override both. OpenCode integration flags live under `landstrip.opencode` in Pi
-`settings.json`.
+The extension includes a shared [sandbox policy](./sandbox.json). Agent definitions,
+worker limits, shared permissions, and OpenCode integration flags live under
+`landstrip` in Pi `settings.json`. Trusted-project settings override global settings
+and built-in agent defaults.
 
 Process-backed subagents require Pi >= 0.82.0, and Node.js >= 22.19.0.
 
@@ -207,19 +207,17 @@ first.
 
 ## Configuration
 
-Subagent configuration is read from `~/.pi/agent/subagents.json` and, for trusted
-projects, `.pi/subagents.json`. Project values override global values; both are
-merged over the packaged [defaults](./subagents.json). The packaged subagent types
-are `code-reviewer`, `explore`, `general`, and the OpenCode-compatible `scout`
-reconnaissance agent.
+Landstrip configuration is read from `landstrip` in `~/.pi/agent/settings.json` and,
+for trusted projects, `.pi/settings.json`. Project values override global values;
+both are merged over internal defaults. The built-in subagents are `code-reviewer`,
+`explore`, `general`, and the OpenCode-compatible `scout` reconnaissance agent.
 
 The read-only `code-reviewer` is available without additional configuration: delegate
 with `task` using `subagent_type: "code-reviewer"`. It can read and search files and
 run a fixed set of non-mutating Git inspection commands; all other tools are denied.
 
 Sandbox policy remains in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. OpenCode
-integration flags live under `landstrip.opencode` in global or trusted-project Pi
-`settings.json`; both default to `true`:
+integration flags live under `landstrip.opencode` and both default to `true`:
 
 ```json
 {
@@ -241,16 +239,16 @@ integration flags live under `landstrip.opencode` in global or trusted-project P
   `opencode.jsonc`, `.opencode/opencode.json` and `.opencode/opencode.jsonc`, and
   Markdown agents under `.opencode/agent/` and `.opencode/agents/`.
 
-Project settings override global settings. Set a flag to `false` to disable that
-source. OpenCode project agents override global OpenCode agents. Pi definitions from
-`subagents.json` (built-in, global, and project) take precedence over OpenCode imports
-with the same name; conflicts are silent. Project Pi settings and project OpenCode
-agents are skipped when the project is untrusted; global OpenCode agents still load
-when `showGlobalAgents` is enabled.
+Project settings override global settings, including each OpenCode flag. Set a flag
+to `false` to disable that source. OpenCode project agents override global OpenCode
+agents. Definitions from `landstrip.agent` (built-in, global, and project) take
+precedence over OpenCode imports with the same name; conflicts are silent. Project
+Pi settings and project OpenCode agents are skipped when the project is untrusted;
+global OpenCode agents still load when `showGlobalAgents` is enabled.
 
 OpenCode JSONC comments and trailing commas are supported. `{file:path}` prompt tokens
-resolve relative to the OpenCode config file. `subagents.json` accepts only top-level
-`maxSubagents` and `subagents`; sandbox fields belong in `sandbox.json`.
+resolve relative to the OpenCode config file or Pi `settings.json` that defines them.
+Sandbox fields belong in `sandbox.json`.
 
 The Windows sandbox fields are:
 
@@ -293,12 +291,12 @@ accounts, WFP rules, runner, and recovered per-run ACL grants with:
 npx @landstrip/landstrip windows uninstall
 ```
 
-A subagent configuration example follows:
+An agent configuration example follows:
 
 ```json
 {
-  "maxSubagents": 2,
-  "subagents": {
+  "landstrip": {
+    "maxSubagents": 2,
     "agent": {
       "review": {
         "description": "Review code without modifying it",
@@ -320,25 +318,27 @@ A subagent configuration example follows:
 }
 ```
 
-`maxSubagents` is an integer from 0 through 16 controlling concurrent workers.
-The packaged default is 1, making `task` and `code-reviewer` available immediately.
+`landstrip.maxSubagents` is an integer from 0 through 16 controlling concurrent
+workers. The default is 1, making `task` and `code-reviewer` available immediately.
 Set it to 0 to remove the `task` tool while retaining primary roles. There is no
 separate subagent enable switch. The Settings tab in `/agents` edits this limit for
 global and trusted-project configuration.
 
-Agent modes, hidden/disabled agents, prompts, colors, and ordered
-`allow`/`ask`/`deny` permissions apply to primary agents and subagents. Prompt
-strings may include OpenCode-style `{file:path}` tokens; relative paths resolve
-against the `subagents.json` file that defines them. `color` accepts `#RRGGBB`
-or OpenCode theme names (`primary`, `secondary`, `accent`, `success`, `warning`,
-`error`, `info`). `hidden` only hides an agent from user-facing primary pickers;
-the model can still invoke a hidden subagent via `task`.
+`landstrip.permission` defines the shared baseline inherited by every agent. Each
+`landstrip.agent.<name>.permission` map overrides that baseline. Agent modes,
+hidden/disabled agents, prompts, colors, and ordered `allow`/`ask`/`deny` permissions
+apply to primary agents and subagents. Prompt strings may include OpenCode-style
+`{file:path}` tokens; relative paths resolve against the `settings.json` file that
+defines them. `color` accepts `#RRGGBB` or OpenCode theme names (`primary`,
+`secondary`, `accent`, `success`, `warning`, `error`, `info`). `hidden` only hides an
+agent from user-facing primary pickers; the model can still invoke a hidden subagent
+via `task`.
 
 Primary agents honor configured models and supported Pi thinking-level variants;
 omitting either preserves the current session setting. A model may use the full
 `provider/model` name or a bare model ID when that ID is unique. Selection fails
-without changing the active primary agent when the model is missing, ambiguous,
-or unavailable for authentication. Subagent workers also honor model selection,
+without changing the active primary agent when the model is missing, ambiguous, or
+unavailable for authentication. Subagent workers also honor model selection,
 supported Pi thinking-level variants, and step limits. Later matching permission
 rules win. Put provider-specific values under `options`; unknown agent fields are
 rejected. Agent permissions cannot weaken an enabled OS sandbox, grant filesystem
@@ -346,21 +346,21 @@ access, or grant network access.
 
 ## Configuration migration
 
-There is no compatibility loader for previous Pi agent configuration fields. Legacy
-keys in `settings.json` produce a migration warning. Move configuration as follows,
-then remove the old fields:
+`subagents.json` is no longer supported. Move its values into the corresponding
+global or project Pi `settings.json`, then delete the old file:
 
-- Move `agent` and `permission` from Pi `settings.json` under `subagents.agent` and
-  `subagents.permission` in `subagents.json`.
+- Move top-level `maxSubagents` to `landstrip.maxSubagents`.
+- Move `subagents.agent` to `landstrip.agent`.
+- Move `subagents.permission` to `landstrip.permission`.
+- Move top-level `opencode` to `landstrip.opencode`.
 - Convert legacy `tools` booleans to explicit `permission` rules.
-- Put the worker limit in top-level `maxSubagents` in `subagents.json`; zero disables
-  delegation.
-- Move top-level `opencode` from `subagents.json` to `landstrip.opencode` in the
-  corresponding global or project Pi `settings.json`.
-- Use `~/.pi/agent/subagents.json` for global Pi agent configuration and
-  `.pi/subagents.json` for trusted project Pi agent configuration.
+- Move legacy top-level Pi `agent`, `permission`, `subagents`, and `maxSubagents`
+  settings under `landstrip`.
 - Leave sandbox policy in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`; those
   files are unchanged.
+
+An existing `~/.pi/agent/subagents.json` or trusted-project `.pi/subagents.json`
+produces an actionable migration diagnostic instead of being loaded.
 
 ## Plugin API
 

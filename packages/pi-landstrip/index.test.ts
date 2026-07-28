@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -43,6 +43,8 @@ describe('main Pi tool composition', () => {
 });
 
 it('registers the sandbox dashboard and separate agents command', async () => {
+  const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-overlay-agent-'));
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
   const commandNames: string[] = [];
   const commandHandlers = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
   let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
@@ -174,6 +176,8 @@ it('registers the sandbox dashboard and separate agents command', async () => {
   component?.handleInput('6');
   component?.handleInput('7');
   expect(component?.render(78).join('\n')).toContain('[ 16 ] Global');
+  vi.unstubAllEnvs();
+  rmSync(agentDir, { recursive: true, force: true });
 });
 
 describe('proxy destination addresses', () => {

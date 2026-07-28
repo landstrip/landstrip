@@ -73,6 +73,5 @@ describe('package metadata', () => {
     expect(extensionPackage.pi?.extensions).toEqual(['./dist/index.ts']);
     expect(existsSync(new URL('./dist/index.ts', import.meta.url))).toBe(true);
     expect(existsSync(new URL('./dist/sandbox.json', import.meta.url))).toBe(true);
-    expect(existsSync(new URL('./dist/subagents.json', import.meta.url))).toBe(true);
   });
 });

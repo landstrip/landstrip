@@ -150,7 +150,6 @@ describe('OpenCode agent import', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     const globalDir = temporaryDirectory();
-    writeJson(join(agentDir, 'subagents.json'), {});
     write(
       join(globalDir, 'agents', 'review.md'),
       `---\ndescription: OpenCode review\nmode: subagent\ntools:\n  edit: false\n  read: true\n---\nReview the code.\n`,
@@ -187,8 +186,8 @@ describe('OpenCode agent import', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     const globalDir = temporaryDirectory();
-    writeJson(join(agentDir, 'subagents.json'), {
-      subagents: {
+    writeJson(join(agentDir, 'settings.json'), {
+      landstrip: {
         agent: {
           review: { description: 'Pi review', mode: 'subagent', prompt: 'From Pi.' },
         },

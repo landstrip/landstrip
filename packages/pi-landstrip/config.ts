@@ -3,10 +3,10 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent';
 
+import { BUILT_IN_LANDSTRIP_CONFIG } from './built-in-agents.ts';
 import { expandFileReferences, formatError, isRecord } from './util.ts';
 
 export type ConfigObject = Record<string, unknown>;
@@ -15,8 +15,6 @@ export const MAX_SUBAGENTS = 16;
 
 export type AgentSource = 'built-in' | 'global' | 'local';
 
-type ConfigScope = 'built-in' | 'global' | 'project';
-
 export interface OpenCodeConfig {
   showGlobalAgents: boolean;
   showLocalAgents: boolean;
@@ -24,23 +22,24 @@ export interface OpenCodeConfig {
 
 export interface LandstripConfigFile {
   maxSubagents?: number;
-  subagents?: ConfigObject;
+  agent?: ConfigObject;
+  permission?: unknown;
+  opencode?: Partial<OpenCodeConfig>;
 }
 
 export interface LandstripConfig extends LandstripConfigFile {
   maxSubagents: number;
+  agent: ConfigObject;
   opencode: OpenCodeConfig;
-  subagents: ConfigObject;
   agentSources: ReadonlyMap<string, AgentSource>;
 }
-
-const packageDir = dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_OPENCODE: OpenCodeConfig = {
   showGlobalAgents: true,
   showLocalAgents: true,
 };
 
+const LANDSTRIP_KEYS = new Set(['maxSubagents', 'agent', 'permission', 'opencode']);
 const OPENCODE_KEYS = new Set(['showGlobalAgents', 'showLocalAgents']);
 
 function readBooleanField(
@@ -58,9 +57,7 @@ function normalizeOpenCode(value: unknown, path: string): Partial<OpenCodeConfig
   if (value === undefined) return {};
   if (!isRecord(value)) throw new Error(`${path} must be a JSON object`);
   for (const key of Object.keys(value)) {
-    if (!OPENCODE_KEYS.has(key)) {
-      throw new Error(`${path}: unknown field ${key}`);
-    }
+    if (!OPENCODE_KEYS.has(key)) throw new Error(`${path}: unknown field ${key}`);
   }
   const result: Partial<OpenCodeConfig> = {};
   const showGlobalAgents = readBooleanField(value, 'showGlobalAgents', path);
@@ -70,8 +67,7 @@ function normalizeOpenCode(value: unknown, path: string): Partial<OpenCodeConfig
   return result;
 }
 
-function readOpenCodeSettings(path: string): Partial<OpenCodeConfig> {
-  if (!existsSync(path)) return {};
+function readJsonObject(path: string): ConfigObject {
   let value: unknown;
   try {
     value = JSON.parse(readFileSync(path, 'utf8'));
@@ -79,17 +75,16 @@ function readOpenCodeSettings(path: string): Partial<OpenCodeConfig> {
     throw new Error(`${path}: ${formatError(error)}`);
   }
   if (!isRecord(value)) throw new Error(`${path} must contain a JSON object`);
-  if (value.landstrip === undefined) return {};
-  if (!isRecord(value.landstrip)) throw new Error(`${path}: landstrip must be a JSON object`);
-  return normalizeOpenCode(value.landstrip.opencode, `${path}: landstrip.opencode`);
+  return value;
 }
 
 function expandAgentPromptReferences(config: LandstripConfigFile, path: string): void {
-  if (!isRecord(config.subagents) || !isRecord(config.subagents.agent)) return;
+  if (!isRecord(config.agent)) return;
   const baseDir = dirname(path);
-  for (const [name, value] of Object.entries(config.subagents.agent)) {
-    if (!isRecord(value) || typeof value.prompt !== 'string') continue;
-    if (!value.prompt.includes('{file:')) continue;
+  for (const [name, value] of Object.entries(config.agent)) {
+    if (!isRecord(value) || typeof value.prompt !== 'string' || !value.prompt.includes('{file:')) {
+      continue;
+    }
     try {
       value.prompt = expandFileReferences(value.prompt, baseDir);
     } catch (error) {
@@ -98,43 +93,30 @@ function expandAgentPromptReferences(config: LandstripConfigFile, path: string):
   }
 }
 
-function readConfig(path: string, scope: ConfigScope = 'project'): LandstripConfigFile {
+function readLandstripSettings(path: string): LandstripConfigFile {
   if (!existsSync(path)) return {};
-  let value: unknown;
-  try {
-    value = JSON.parse(readFileSync(path, 'utf8'));
-  } catch (error) {
-    const message = formatError(error);
-    throw new Error(`${path}: ${message}`);
+  const settings = readJsonObject(path);
+  if (settings.landstrip === undefined) return {};
+  if (!isRecord(settings.landstrip)) throw new Error(`${path}: landstrip must be a JSON object`);
+  for (const key of Object.keys(settings.landstrip)) {
+    if (!LANDSTRIP_KEYS.has(key)) throw new Error(`${path}: landstrip has an unknown field ${key}`);
   }
-  if (!isRecord(value)) throw new Error(`${path} must contain a JSON object`);
-  if ('opencode' in value) {
-    const settingsPath = join(dirname(path), 'settings.json');
-    throw new Error(
-      `${path}: opencode has moved; set landstrip.opencode in ${settingsPath} and remove it from subagents.json`,
-    );
-  }
-  for (const key of Object.keys(value)) {
-    if (key !== 'maxSubagents' && key !== 'subagents') {
-      throw new Error(`${path}: unknown top-level field ${key}`);
-    }
-  }
-  if (scope === 'project' && 'maxSubagents' in value) {
-    throw new Error(`${path}: maxSubagents is only allowed in global subagents.json`);
-  }
+
   const config: LandstripConfigFile = {};
-  if ('maxSubagents' in value) {
-    if (typeof value.maxSubagents !== 'number') {
-      throw new Error(`${path}: maxSubagents must be a number`);
+  if ('maxSubagents' in settings.landstrip) {
+    if (typeof settings.landstrip.maxSubagents !== 'number') {
+      throw new Error(`${path}: landstrip.maxSubagents must be a number`);
     }
-    config.maxSubagents = value.maxSubagents;
+    config.maxSubagents = settings.landstrip.maxSubagents;
   }
-  if ('subagents' in value) {
-    if (!isRecord(value.subagents)) {
-      throw new Error(`${path}: subagents must be an object`);
+  if ('agent' in settings.landstrip) {
+    if (!isRecord(settings.landstrip.agent)) {
+      throw new Error(`${path}: landstrip.agent must be an object`);
     }
-    config.subagents = value.subagents;
+    config.agent = settings.landstrip.agent;
   }
+  if ('permission' in settings.landstrip) config.permission = settings.landstrip.permission;
+  config.opencode = normalizeOpenCode(settings.landstrip.opencode, `${path}: landstrip.opencode`);
   expandAgentPromptReferences(config, path);
   return config;
 }
@@ -159,8 +141,8 @@ function recordAgentSources(
   config: LandstripConfigFile,
   source: AgentSource,
 ): void {
-  if (!isRecord(config.subagents) || !isRecord(config.subagents.agent)) return;
-  for (const name of Object.keys(config.subagents.agent)) sources.set(name, source);
+  if (!isRecord(config.agent)) return;
+  for (const name of Object.keys(config.agent)) sources.set(name, source);
 }
 
 export function getPiConfigPaths(
@@ -172,6 +154,14 @@ export function getPiConfigPaths(
     globalPath: join(agentDir, fileName),
     projectPath: join(cwd, '.pi', fileName),
   };
+}
+
+function assertNoSubagentsConfig(path: string): void {
+  if (!existsSync(path)) return;
+  const settingsPath = join(dirname(path), 'settings.json');
+  throw new Error(
+    `${path} is no longer supported; move its values to landstrip.maxSubagents, landstrip.agent, landstrip.permission, and landstrip.opencode in ${settingsPath}`,
+  );
 }
 
 export async function setMaxSubagentsConfig(
@@ -190,18 +180,23 @@ export async function setMaxSubagentsConfigForScope(
   scope: 'global' | 'project',
   agentDir = getAgentDir(),
 ): Promise<void> {
-  if (scope !== 'global') {
-    throw new Error('maxSubagents is only allowed in global subagents.json');
-  }
   if (!Number.isInteger(maxSubagents) || maxSubagents < 0 || maxSubagents > MAX_SUBAGENTS) {
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
   }
-  const { globalPath } = getPiConfigPaths(cwd, 'subagents.json', agentDir);
-  await withFileMutationQueue(globalPath, async () => {
-    const config = readConfig(globalPath, 'global');
-    config.maxSubagents = maxSubagents;
-    mkdirSync(dirname(globalPath), { recursive: true });
-    writeFileSync(globalPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  const paths = getPiConfigPaths(cwd, 'settings.json', agentDir);
+  const path = scope === 'global' ? paths.globalPath : paths.projectPath;
+  const legacyPaths = getPiConfigPaths(cwd, 'subagents.json', agentDir);
+  assertNoSubagentsConfig(scope === 'global' ? legacyPaths.globalPath : legacyPaths.projectPath);
+  await withFileMutationQueue(path, async () => {
+    const settings = existsSync(path) ? readJsonObject(path) : {};
+    if (settings.landstrip !== undefined && !isRecord(settings.landstrip)) {
+      throw new Error(`${path}: landstrip must be a JSON object`);
+    }
+    const landstrip = isRecord(settings.landstrip) ? { ...settings.landstrip } : {};
+    landstrip.maxSubagents = maxSubagents;
+    settings.landstrip = landstrip;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
   });
 }
 
@@ -210,32 +205,28 @@ export function loadLandstripConfig(
   includeProject = true,
   agentDir = getAgentDir(),
 ): LandstripConfig {
-  const subagentPaths = getPiConfigPaths(cwd, 'subagents.json', agentDir);
   const settingsPaths = getPiConfigPaths(cwd, 'settings.json', agentDir);
-  const builtInConfig = readConfig(join(packageDir, 'subagents.json'), 'built-in');
-  const globalConfig = readConfig(subagentPaths.globalPath, 'global');
+  const legacyPaths = getPiConfigPaths(cwd, 'subagents.json', agentDir);
+  assertNoSubagentsConfig(legacyPaths.globalPath);
+  if (includeProject) assertNoSubagentsConfig(legacyPaths.projectPath);
+
+  const builtInConfig = BUILT_IN_LANDSTRIP_CONFIG as LandstripConfigFile;
+  const globalConfig = readLandstripSettings(settingsPaths.globalPath);
   const projectConfig = includeProject
-    ? readConfig(subagentPaths.projectPath, 'project')
-    : undefined;
-  const globalOpenCode = readOpenCodeSettings(settingsPaths.globalPath);
-  const projectOpenCode = includeProject
-    ? readOpenCodeSettings(settingsPaths.projectPath)
+    ? readLandstripSettings(settingsPaths.projectPath)
     : undefined;
   const agentSources = new Map<string, AgentSource>();
   recordAgentSources(agentSources, builtInConfig, 'built-in');
   recordAgentSources(agentSources, globalConfig, 'global');
   if (projectConfig) recordAgentSources(agentSources, projectConfig, 'local');
+
   let config = mergeValue(builtInConfig, globalConfig) as LandstripConfigFile;
   if (projectConfig) config = mergeValue(config, projectConfig) as LandstripConfigFile;
   const maxSubagents = config.maxSubagents ?? 0;
   if (!Number.isInteger(maxSubagents) || maxSubagents < 0 || maxSubagents > MAX_SUBAGENTS) {
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
   }
-  if (!isRecord(config.subagents)) throw new Error('subagents must be an object');
-  const opencode: OpenCodeConfig = {
-    ...DEFAULT_OPENCODE,
-    ...globalOpenCode,
-    ...projectOpenCode,
-  };
-  return { ...config, maxSubagents, opencode, agentSources } as LandstripConfig;
+  if (!isRecord(config.agent)) throw new Error('landstrip.agent must be an object');
+  const opencode: OpenCodeConfig = { ...DEFAULT_OPENCODE, ...config.opencode };
+  return { ...config, maxSubagents, agent: config.agent, opencode, agentSources };
 }
