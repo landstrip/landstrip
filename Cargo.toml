@@ -19,7 +19,7 @@ harness = false
 
 [dependencies]
 anyhow = "1.0"
-argh = "0.1.19"
+clap = { version = "4.5", features = ["derive"] }
 dirs = "6.0.0"
 env_logger = "0.11.10"
 libc = "0.2"

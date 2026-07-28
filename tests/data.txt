@@ -76,6 +76,7 @@ name=empty path is rejected | os=linux,macos | policy={"network":{"allowNetwork"
 name=httpProxyPort zero is rejected | os=linux,macos | policy={"network":{"httpProxyPort":0},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'printf ok' | status=!0
 name=socksProxyPort zero is rejected | os=linux,macos | policy={"network":{"socksProxyPort":0},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'printf ok' | status=!0
 name=malformed JSON policy is rejected | os=linux,macos | policy={bad | cmd=%SHELL% -c 'printf ok' | status=!0
+name=removed windows.backend reports migration | os=linux,macos | policy={"windows":{"backend":"appContainer"}} | cmd=%SHELL% -c 'printf ok' | status=!0 | out=windows.backend was removed
 
 # --- denyWrite subtrees ---
 

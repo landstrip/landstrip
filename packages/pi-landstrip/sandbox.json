@@ -22,7 +22,6 @@
     ]
   },
   "windows": {
-    "backend": "appContainer",
     "appContainerMode": "standard",
     "allowLoopback": false
   }

@@ -16,7 +16,9 @@ import { createLandstripIntegration } from './index.ts';
 import { temporaryDirectory } from './test-util.ts';
 
 const execFileAsync = promisify(execFile);
-const windowsIt = it.runIf(process.platform === 'win32');
+const appContainerWindowsIt = it.runIf(
+  process.platform === 'win32' && process.env.LANDSTRIP_TEST_RESTRICTED_USER !== '1',
+);
 
 const restrictedWindowsIt = it.runIf(
   process.platform === 'win32' && process.env.LANDSTRIP_TEST_RESTRICTED_USER === '1',
@@ -86,14 +88,13 @@ async function runPolicy(
   policy: object,
   command: string,
   args: string[],
-  landstripArgs: string[] = [],
 ): Promise<ProcessResult> {
   const policyPath = join(directory, 'policy.json');
   writeFileSync(policyPath, JSON.stringify(policy));
   try {
     const result = await execFileAsync(
       binaryPath(),
-      [...landstripArgs, '-p', policyPath, command, ...args],
+      ['run', '-p', policyPath, '--', command, ...args],
       {
         cwd: directory,
         timeout: 20_000,
@@ -112,7 +113,7 @@ async function runPolicy(
   }
 }
 
-windowsIt(
+appContainerWindowsIt(
   'runs Node.js in a deep standard AppContainer workspace',
   async () => {
     const root = temporaryDirectory('pi-landstrip-windows-');
@@ -189,24 +190,15 @@ restrictedWindowsIt(
       filesystem: filesystemPolicy(workspace),
     };
 
-    const allowed = await runPolicy(
-      workspace,
-      policy,
-      shell,
-      [...args, 'cat input.txt && printf written > output.txt && cat output.txt'],
-      ['--windows-backend', 'restricted-user'],
-    );
+    const allowed = await runPolicy(workspace, policy, shell, [
+      ...args,
+      'cat input.txt && printf written > output.txt && cat output.txt',
+    ]);
     expect(allowed.code, allowed.stderr).toBe(0);
     expect(allowed.stdout).toContain('allowed');
     expect(allowed.stdout).toContain('written');
 
-    const denied = await runPolicy(
-      workspace,
-      policy,
-      shell,
-      [...args, 'cat ../secret.txt'],
-      ['--windows-backend', 'restricted-user'],
-    );
+    const denied = await runPolicy(workspace, policy, shell, [...args, 'cat ../secret.txt']);
     expect(denied.code).not.toBe(0);
     expect(denied.stdout).not.toContain('secret');
     expect(denied.stderr).toMatch(/Access is denied|Permission denied/i);
@@ -214,7 +206,7 @@ restrictedWindowsIt(
   30_000,
 );
 
-windowsIt('does not silently downgrade LPAC when Git Bash cannot start', async () => {
+appContainerWindowsIt('does not silently downgrade LPAC when Git Bash cannot start', async () => {
   const directory = temporaryDirectory('landstrip-windows-lpac-');
   const { shell, args } = getShellConfig(gitBash());
   const result = await runPolicy(
@@ -231,31 +223,34 @@ windowsIt('does not silently downgrade LPAC when Git Bash cannot start', async (
   expect(result.stdout).not.toContain('unexpected-lpac-success');
 });
 
-windowsIt('keeps loopback blocked unless its explicit exemption is enabled', async () => {
-  const directory = temporaryDirectory('landstrip-windows-loopback-');
-  const server = createServer((_request, response) => response.end('loopback-ok'));
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
-  const address = server.address();
-  if (!address || typeof address === 'string') throw new Error('test server has no TCP address');
-  const script = `fetch('http://127.0.0.1:${address.port}', { signal: AbortSignal.timeout(3000) }).then(async response => process.stdout.write(await response.text()))`;
-  const policy = (allowLoopback: boolean) => ({
-    network: { allowNetwork: false },
-    filesystem: filesystemPolicy(directory, [process.execPath]),
-    windows: { appContainerMode: 'standard', allowLoopback },
-  });
+appContainerWindowsIt(
+  'keeps loopback blocked unless its explicit exemption is enabled',
+  async () => {
+    const directory = temporaryDirectory('landstrip-windows-loopback-');
+    const server = createServer((_request, response) => response.end('loopback-ok'));
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('test server has no TCP address');
+    const script = `fetch('http://127.0.0.1:${address.port}', { signal: AbortSignal.timeout(3000) }).then(async response => process.stdout.write(await response.text()))`;
+    const policy = (allowLoopback: boolean) => ({
+      network: { allowNetwork: false },
+      filesystem: filesystemPolicy(directory, [process.execPath]),
+      windows: { appContainerMode: 'standard', allowLoopback },
+    });
 
-  try {
-    const blocked = await runPolicy(directory, policy(false), process.execPath, ['-e', script]);
-    expect(blocked.code).not.toBe(0);
-    expect(blocked.stdout).not.toContain('loopback-ok');
+    try {
+      const blocked = await runPolicy(directory, policy(false), process.execPath, ['-e', script]);
+      expect(blocked.code).not.toBe(0);
+      expect(blocked.stdout).not.toContain('loopback-ok');
 
-    const allowed = await runPolicy(directory, policy(true), process.execPath, ['-e', script]);
-    expect(allowed.code, allowed.stderr).toBe(0);
-    expect(allowed.stdout).toBe('loopback-ok');
-  } finally {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-  }
-});
+      const allowed = await runPolicy(directory, policy(true), process.execPath, ['-e', script]);
+      expect(allowed.code, allowed.stderr).toBe(0);
+      expect(allowed.stdout).toBe('loopback-ok');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  },
+);

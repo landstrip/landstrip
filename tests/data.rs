@@ -138,7 +138,7 @@ enum Channel {
     TrapFd,
 }
 
-/// Serialization of a policy file and the value passed to `--format`.
+/// Serialization of a policy file and the value passed to `--policy-format`.
 #[derive(Clone, Copy, Default, PartialEq)]
 enum PolicyFormat {
     #[default]
@@ -370,17 +370,27 @@ impl Case {
         }
 
         let mut command = Command::new(&ctx.bin);
-        if self.format == PolicyFormat::Yaml {
-            command.args(["--format", "yaml"]);
+        command.arg("run");
+        if self.format == PolicyFormat::Yaml || self.stdin_policy {
+            command
+                .arg("--policy-format")
+                .arg(if self.format == PolicyFormat::Yaml {
+                    "yaml"
+                } else {
+                    "json"
+                });
         }
         if self.trap_fd {
             command.args(["--trap-fd", "3"]);
         }
-        if !self.stdin_policy {
+        if self.stdin_policy {
+            command.args(["-p", "-"]);
+        } else {
             for policy in &policies {
                 command.arg("-p").arg(policy);
             }
         }
+        command.arg("--");
         if let Some(cmd) = &self.cmd {
             for token in tokenize(cmd) {
                 command.arg(resolver.subst(&token));
@@ -562,12 +572,14 @@ fn non_loopback_ipv4() -> Option<Ipv4Addr> {
 
 fn landstrip_net(ctx: &Context, format: PolicyFormat, policies: &[PathBuf]) -> Command {
     let mut command = Command::new(&ctx.bin);
+    command.arg("run");
     if format == PolicyFormat::Yaml {
-        command.args(["--format", "yaml"]);
+        command.args(["--policy-format", "yaml"]);
     }
     for policy in policies {
         command.arg("-p").arg(policy);
     }
+    command.arg("--");
     command.stdin(Stdio::null());
     command
 }

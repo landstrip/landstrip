@@ -838,7 +838,7 @@ function buildWrappedCommand(
   command: string,
   trapPort: number | null,
 ): string {
-  const baseArgs = ['-p', policyPath, ...shellArgs(shell, command)];
+  const baseArgs = ['run', '-p', policyPath, '--', ...shellArgs(shell, command)];
   const plain = [landstripBinaryPath(), ...baseArgs].map(shellQuote).join(' ');
   if (trapPort === null) return plain;
 
@@ -851,7 +851,18 @@ function buildWrappedCommand(
   // and fall back to an explicit bash invocation that always speaks /dev/tcp.
   // If both fail (no bash, dead port, set -e in the outer shell) landstrip runs
   // without --trap-fd so the toast-notify path still works.
-  const trapped = [landstripBinaryPath(), '--trap-fd', '3', ...baseArgs].map(shellQuote).join(' ');
+  const trapped = [
+    landstripBinaryPath(),
+    'run',
+    '--trap-fd',
+    '3',
+    '-p',
+    policyPath,
+    '--',
+    ...shellArgs(shell, command),
+  ]
+    .map(shellQuote)
+    .join(' ');
   const bashTrap = `bash -c ${shellQuote(`exec 3<>/dev/tcp/127.0.0.1/${trapPort} 2>/dev/null && exec "$@"`)} bash ${trapped}`;
   return `{ exec 3<>/dev/tcp/127.0.0.1/${trapPort} ; } 2>/dev/null && ${trapped} || ${bashTrap} 2>/dev/null || ${plain}`;
 }

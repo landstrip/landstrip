@@ -18,6 +18,7 @@ use std::process::Command;
 use std::ptr;
 
 const SBPL_PROFILE_FLAGS: u64 = 0;
+const SANDBOX_FILTER_NONE: libc::c_int = 0;
 const FIRST_INHERITED_FD: RawFd = 3;
 const FALLBACK_FD_LIMIT: RawFd = 1_048_576;
 
@@ -36,6 +37,16 @@ pub(crate) fn execute(
         source: error.into(),
     }
     .into())
+}
+
+pub(crate) fn doctor() -> Result<()> {
+    let operation = CString::new("file-read-data").map_err(setup_failed)?;
+    let result =
+        unsafe { ffi::sandbox_check(libc::getpid(), operation.as_ptr(), SANDBOX_FILTER_NONE) };
+    if result < 0 {
+        return Err(setup_failed(io::Error::last_os_error()).into());
+    }
+    Ok(())
 }
 
 /// A Seatbelt profile landstrip could not render or install.
@@ -446,5 +457,11 @@ mod ffi {
             errorbuf: *mut *mut c_char,
         ) -> c_int;
         pub(super) fn sandbox_free_error(errorbuf: *mut c_char);
+        pub(super) fn sandbox_check(
+            pid: libc::pid_t,
+            operation: *const c_char,
+            filter_type: c_int,
+            ...
+        ) -> c_int;
     }
 }

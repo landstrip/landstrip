@@ -12,15 +12,14 @@
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
 //! while lowering the policy.
 
-use crate::config::{
-    AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows, WindowsBackend,
-};
+use crate::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows};
 use crate::engine::error::Error;
 #[cfg(not(target_os = "macos"))]
 use crate::engine::paths::normalize_path;
 use crate::engine::paths::{normalize_path_lexically, normalize_roots};
 use anyhow::Result;
 use rayon::prelude::*;
+use serde::Serialize;
 use std::env;
 use std::fs;
 use std::io;
@@ -28,7 +27,8 @@ use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
     pub(crate) write_denied_roots: Vec<PathBuf>,
@@ -39,8 +39,6 @@ pub(crate) struct AccessPolicy {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) read_symlinks: Vec<PathBuf>,
     pub(crate) network_access: NetworkAccess,
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub(crate) windows_backend: WindowsBackend,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) app_container_mode: AppContainerMode,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -156,13 +154,15 @@ impl AccessPolicy {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase", tag = "mode", content = "roots")]
 pub(crate) enum ReadAccess {
     Unrestricted,
     AllowRoots(Vec<PathBuf>),
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct NetworkAccess {
     pub(crate) restrict_connect_tcp: bool,
     pub(crate) connect_tcp_ports: Vec<u16>,
@@ -191,7 +191,8 @@ impl NetworkAccess {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase", tag = "mode", content = "paths")]
 pub(crate) enum UnixSocketAccess {
     Unrestricted,
     AllowPaths(Vec<PathBuf>),
@@ -275,7 +276,6 @@ pub(crate) fn resolve_policy(
         read_denied_roots,
         read_symlinks,
         network_access: lower_network_policy(network, &policy_base, home)?,
-        windows_backend: windows.backend,
         app_container_mode: windows.app_container_mode,
         allow_windows_loopback: windows.allow_loopback,
     };

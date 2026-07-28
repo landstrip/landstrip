@@ -16,11 +16,32 @@ npm install --save-dev @landstrip/landstrip
 ```
 
 ```sh
-npx landstrip -p policy.json cargo test
+npx landstrip run -p policy.json -- cargo test
 ```
 
 The npm package installs a small Node.js wrapper and a platform-specific native
 binary package.
+
+## Command line
+
+Landstrip uses explicit commands:
+
+```text
+landstrip run [OPTIONS] -- <PROGRAM> [ARGS...]
+landstrip policy validate [OPTIONS]
+landstrip policy resolve [OPTIONS]
+landstrip doctor
+landstrip windows install [OPTIONS]
+landstrip windows status
+landstrip windows uninstall
+```
+
+Policy options are `-p, --policy <FILE>`, repeated in merge order, and
+`--policy-format <json|yaml>`. Use `-p -` to read standard input; its format
+must be explicit. `policy validate` checks the merged policy and current
+platform support. `policy resolve` prints the normalized merged policy. Add
+`--tool <PROGRAM>` to either policy command to include executable-attached
+policy.
 
 ### Agent extensions
 
@@ -65,82 +86,93 @@ and reports broker decisions.
 
 ### Windows
 
-Landstrip has two Windows backends. AppContainer is the default and needs no
-installation. The restricted-user backend is an explicit, preinstalled alternative
-for programs such as Git Bash/MSYS that cannot initialize inside AppContainer.
-Select the backend with the trusted command-line option `--windows-backend`; a
-project policy cannot select it.
+Landstrip has two internal Windows implementations. AppContainer needs no
+installation and is used by default. `landstrip windows install` provisions
+and activates restricted-user execution for programs such as Git Bash/MSYS
+that cannot initialize inside AppContainer. `landstrip windows uninstall`
+returns to AppContainer. There is no implementation selector in the command
+line or policy. An unhealthy restricted-user installation causes failure
+rather than silent fallback, and `landstrip windows status` reports the active
+implementation and health. Policies containing the removed `windows.backend`
+field are rejected; use the Windows commands to select the implementation.
 
-Both backends use explicit read allowlists. Ancestors receive traversal-only,
-non-inheriting access; unrelated siblings are not exposed.
+Both implementations use explicit read allowlists. Ancestors receive
+traversal-only, non-inheriting access; unrelated siblings are not exposed.
 
 #### AppContainer
 
-Landstrip creates a per-run profile, grants its SID access to the lowered read and
-write roots, and removes those grants after the sandboxed process tree exits.
+Landstrip creates a per-run profile, grants its SID access to the lowered read
+and write roots, and removes those grants after the sandboxed process tree
+exits.
 
-`windows.appContainerMode` selects `"lpac"` (the default) or `"standard"`. LPAC
-provides the stricter boundary. Standard AppContainer can also access resources
-already granted to `ALL APPLICATION PACKAGES`, so selecting it is an explicit
-security downgrade. Landstrip never retries an LPAC launch in standard mode.
+`windows.appContainerMode` selects `"lpac"` (the default) or `"standard"`.
+LPAC provides the stricter boundary. Standard AppContainer can also access
+resources already granted to `ALL APPLICATION PACKAGES`, so selecting it is an
+explicit security downgrade. Landstrip never retries an LPAC launch in
+standard mode.
 
-Landstrip assigns the sandboxed process to a Job Object with `KILL_ON_JOB_CLOSE`, so
-child processes are kept in the sandbox process tree and terminated when the
-launcher exits. When a restrictive host Job Object prevents safe breakaway,
-Landstrip fails with `HOST_JOB_INCOMPATIBLE`; it never launches without its own job.
+Landstrip assigns the sandboxed process to a Job Object with
+`KILL_ON_JOB_CLOSE`, so child processes are kept in the sandbox process tree
+and terminated when the launcher exits. When a restrictive host Job Object
+prevents safe breakaway, Landstrip fails with `HOST_JOB_INCOMPATIBLE`; it never
+launches without its own job.
 
-`allowNetwork` grants the internet and private-network AppContainer capabilities,
-while the default container holds none. `windows.allowLoopback` is a separate,
-explicit opt-in that temporarily exempts only the per-run AppContainer SID. The
-exemption permits every local loopback service, not a single proxy port. Existing
-system exemptions are preserved and the per-run exemption is removed at exit.
+`allowNetwork` grants the internet and private-network AppContainer
+capabilities, while the default container holds none. `windows.allowLoopback`
+is a separate, explicit opt-in that temporarily exempts only the per-run
+AppContainer SID. The exemption permits every local loopback service, not a
+single proxy port. Existing system exemptions are preserved and the per-run
+exemption is removed at exit.
 
-AppContainer capabilities are coarse. Fine-grained direct TCP policies by host or
-port require elevated Windows Filtering Platform rules keyed by the AppContainer
-SID, which is unsuitable for an unprivileged agent sandbox runtime.
+AppContainer capabilities are coarse. Fine-grained direct TCP policies by host
+or port require elevated Windows Filtering Platform rules keyed by the
+AppContainer SID, which is unsuitable for an unprivileged agent sandbox
+runtime.
 
 #### Restricted user
 
-Install the restricted-user backend once from the intended host account. Setup
+Install restricted-user execution once from the intended host account. Install
 requests elevation through UAC, provisions dedicated local accounts, installs
-account-scoped persistent WFP rules, and copies a protected broker executable:
+account-scoped persistent WFP rules, and copies a protected runner executable:
 
 ```powershell
-landstrip windows setup
+landstrip windows install
 landstrip windows status
-landstrip --windows-backend restricted-user -p policy.json cargo test
+landstrip run -p policy.json -- cargo test
 landstrip windows uninstall
 ```
 
-The default pool has eight restricted-network accounts and two unrestricted-network
-accounts. Use `landstrip windows setup --help` to configure pool sizes and the
-loopback proxy port range. Setup replaces an existing installation; uninstall
-revokes recorded ACL grants, removes WFP policy and accounts, and deletes the
-installed runner.
+The default pool has eight restricted-network accounts and two
+unrestricted-network accounts. Use `landstrip windows install --help` to
+configure pool sizes and the loopback proxy port range. Install replaces an
+existing installation; uninstall revokes recorded ACL grants, removes WFP
+policy and accounts, and deletes the installed runner.
 
 Each run exclusively leases an account, journals its filesystem grants before
-applying them, launches the command through a restricted token and Job Object, then
-revokes the grants. A later lease or uninstall recovers stale journaled grants after
-a crash. Account credentials are random, stored with Windows DPAPI, and never placed
-in policy files.
+applying them, launches the command through a restricted token and Job Object,
+then revokes the grants. A later lease or uninstall recovers stale journaled
+grants after a crash. Account credentials are random, stored with Windows
+DPAPI, and never placed in policy files.
 
-Restricted-network accounts are blocked by WFP except for loopback connections to
-the proxy port range chosen during setup. Proxy ports in a policy must fall in that
-range. `network.allowLocalBinding` and `windows.allowLoopback` are unsupported by
-this backend. `network.allowNetwork: true` instead leases an unrestricted-network
-account and therefore requires at least one such account in the installed pool.
+Restricted-network accounts are blocked by WFP except for loopback connections
+to the proxy port range chosen during installation. Proxy ports in a policy
+must fall in that range. `network.allowLocalBinding` and
+`windows.allowLoopback` are unsupported by this implementation.
+`network.allowNetwork: true` instead leases an account and therefore requires
+at least one such account in the installed pool.
 
-The restricted token enforces the per-run account-SID grants while retaining the
-standard `ALL APPLICATION PACKAGES` read/execute baseline for Windows and Program
-Files. As with standard AppContainer, resources exposed to that SID remain visible.
+The restricted token enforces the per-run account-SID grants while retaining
+the standard `ALL APPLICATION PACKAGES` read/execute baseline for Windows and
+Program Files. As with standard AppContainer, resources exposed to that SID
+remain visible.
 
 ## Policy format
 
-JSON is the default policy format. Use `--format yaml` for YAML policy files or
-YAML read from standard input.
+JSON is the default policy format for files. Use `--policy-format yaml` for YAML
+or specify the format explicitly whenever policy is read from standard input.
 
 ```sh
-landstrip --format yaml -p policy.yaml cargo test
+landstrip run --policy-format yaml -p policy.yaml -- cargo test
 ```
 
 YAML path fields can use normal lists or one statement per line:
@@ -190,8 +222,7 @@ by platform:
 - **macOS**: Globs are snapshot-expanded when the Seatbelt profile is compiled.
   Files created after `sandbox_init` are not protected by glob denies; use
   concrete paths for them. A warning is logged when glob deny patterns are used.
-- **Windows**: Glob `denyWrite` entries are not enforced by the AppContainer
-  backend.
+- **Windows**: Glob `denyWrite` entries are not enforced by AppContainer.
 
 ## Network policy
 
@@ -215,10 +246,10 @@ For a filesystem-only sandbox with unrestricted direct network access, set:
 
 `allowNetwork` disables Landstrip network enforcement while leaving filesystem
 policy enforcement in place. On Windows, AppContainer receives its network
-capabilities while the restricted-user backend leases an unrestricted-network
+capabilities while restricted-user isolation leases an unrestricted-network
 account. With `allowNetwork: false`, AppContainer denies network unless
-`windows.allowLoopback` enables the all-loopback exemption described above; the
-restricted-user backend permits only the installed loopback proxy port range.
+`windows.allowLoopback` enables the all-loopback exemption described above;
+restricted-user isolation permits only the installed loopback proxy port range.
 
 A Windows runtime that requires standard AppContainer and loopback can opt in with
 the following policy:
@@ -244,7 +275,7 @@ default. On Linux, pending query traps go only to `--trap-fd FD`, which must nam
 an already-open descriptor.
 
 ```sh
-landstrip --trap-fd 3 -p policy.json cargo test 3>landstrip-traps.txt
+landstrip run --trap-fd 3 -p policy.json -- cargo test 3>landstrip-traps.txt
 ```
 
 The trap kinds are:
@@ -272,14 +303,15 @@ The trap kinds are:
   does not name.
 
 A code names the stage that failed, not the operating system that reported it:
-the same `LAUNCH_FAILED` or `SANDBOX_SETUP_FAILED` is raised by every backend
-that has that stage. The platform detail rides along in the record instead.
+the same `LAUNCH_FAILED` or `SANDBOX_SETUP_FAILED` is raised by every
+implementation that has that stage. The platform detail rides along in the
+record instead.
 
 `mechanism` records the kernel layer an event is attributed to: `landlock`,
-`seccomp`, `seatbelt`, `appcontainer`, or `windowsuser`. Per-denial traps are always
-`seccomp`, the only layer with a per-denial callback; Landlock enforces in-kernel
-without one. `SANDBOX_SETUP_FAILED` carries the mechanism that could not be
-installed.
+`seccomp`, `seatbelt`, `appcontainer`, or `windowsuser`. Per-denial traps are
+always `seccomp`, the only layer with a per-denial callback; Landlock enforces
+in-kernel without one. `SANDBOX_SETUP_FAILED` carries the mechanism that could
+not be installed.
 
 `reason` is a platform-independent classification of a filesystem decision,
 derived from the policy and the requested path:

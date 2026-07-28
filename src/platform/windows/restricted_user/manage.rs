@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! Elevated installation lifecycle for the restricted-user backend.
+//! Elevated installation lifecycle for restricted-user isolation.
 
 use super::account;
 use super::lease;
@@ -41,18 +41,14 @@ const MANAGEMENT_MUTEX: &str = "Global\\LandstripRestrictedUserManagement";
 
 pub(crate) fn manage(command: &WindowsCommand) -> Result<()> {
     match command {
-        WindowsCommand::Setup {
+        WindowsCommand::Install {
             restricted_accounts,
             unrestricted_accounts,
             proxy_port_low,
             proxy_port_high,
-            elevated,
         } => {
             if !is_elevated()? {
-                if *elevated {
-                    bail!("restricted-user setup requires elevation");
-                }
-                return elevate_setup(
+                return elevate_install(
                     *restricted_accounts,
                     *unrestricted_accounts,
                     *proxy_port_low,
@@ -68,17 +64,13 @@ pub(crate) fn manage(command: &WindowsCommand) -> Result<()> {
             )
         }
         WindowsCommand::Status => status(),
-        WindowsCommand::Uninstall { elevated } => {
+        WindowsCommand::Uninstall => {
             if !is_elevated()? {
-                if *elevated {
-                    bail!("restricted-user uninstall requires elevation");
-                }
                 return elevate_uninstall();
             }
             let _management_lock = ManagementLock::acquire()?;
             uninstall()
         }
-        WindowsCommand::Worker { .. } => bail!("worker command cannot be managed"),
     }
 }
 
@@ -156,7 +148,7 @@ fn setup(
     }
 
     println!(
-        "restricted-user backend installed: {restricted_accounts} restricted account(s), {unrestricted_accounts} unrestricted account(s), proxy ports {proxy_port_low}-{proxy_port_high}"
+        "restricted-user isolation installed and active: {restricted_accounts} restricted account(s), {unrestricted_accounts} unrestricted account(s), proxy ports {proxy_port_low}-{proxy_port_high}"
     );
     Ok(())
 }
@@ -192,7 +184,7 @@ fn provision_accounts(
 
 fn uninstall() -> Result<()> {
     let Some(mut installation) = state::load_optional()? else {
-        println!("restricted-user backend is not installed");
+        println!("restricted-user isolation is not installed; AppContainer remains active");
         return Ok(());
     };
 
@@ -208,26 +200,27 @@ fn uninstall() -> Result<()> {
     }
     remove_runner(&installation.runner_path)?;
     state::remove()?;
-    println!("restricted-user backend uninstalled");
+    println!("restricted-user isolation uninstalled; AppContainer is active");
     Ok(())
 }
 
 fn status() -> Result<()> {
     let Some(installation) = state::load_optional()? else {
-        println!("{}", json!({ "installed": false }));
+        println!(
+            "{}",
+            json!({ "active": "appContainer", "installed": false, "healthy": true })
+        );
         return Ok(());
     };
 
-    let accounts_healthy = installation.accounts.iter().all(|provisioned| {
-        account::lookup_sid(&provisioned.name)
-            .is_ok_and(|sid| sid.eq_ignore_ascii_case(&provisioned.sid))
-    });
-    let runner_healthy = installation.runner_path.is_file();
+    let (accounts_healthy, runner_healthy) = installation_health(&installation);
+    let healthy = installation.complete && accounts_healthy && runner_healthy;
     println!(
         "{}",
         json!({
+            "active": "restrictedUser",
             "installed": true,
-            "healthy": installation.complete && accounts_healthy && runner_healthy,
+            "healthy": healthy,
             "version": installation.version,
             "complete": installation.complete,
             "restrictedAccounts": installation.accounts.iter().filter(|account| account.network_mode == NetworkMode::Restricted).count(),
@@ -239,10 +232,29 @@ fn status() -> Result<()> {
             "accountsHealthy": accounts_healthy,
         })
     );
-    if !installation.complete || !accounts_healthy || !runner_healthy {
+    if !healthy {
         bail!("restricted-user installation is unhealthy");
     }
     Ok(())
+}
+
+pub(in crate::platform::windows) fn active_implementation() -> Result<&'static str> {
+    let Some(installation) = state::load_optional()? else {
+        return Ok("appContainer");
+    };
+    let (accounts_healthy, runner_healthy) = installation_health(&installation);
+    if !installation.complete || !accounts_healthy || !runner_healthy {
+        bail!("restricted-user installation is unhealthy");
+    }
+    Ok("restrictedUser")
+}
+
+fn installation_health(installation: &Installation) -> (bool, bool) {
+    let accounts_healthy = installation.accounts.iter().all(|provisioned| {
+        account::lookup_sid(&provisioned.name)
+            .is_ok_and(|sid| sid.eq_ignore_ascii_case(&provisioned.sid))
+    });
+    (accounts_healthy, installation.runner_path.is_file())
 }
 
 fn install_runner() -> Result<PathBuf> {
@@ -286,19 +298,19 @@ fn remove_runner(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn elevate_setup(
+fn elevate_install(
     restricted_accounts: u16,
     unrestricted_accounts: u16,
     proxy_port_low: u16,
     proxy_port_high: u16,
 ) -> Result<()> {
     elevate(&format!(
-        "windows setup --restricted-accounts {restricted_accounts} --unrestricted-accounts {unrestricted_accounts} --proxy-port-low {proxy_port_low} --proxy-port-high {proxy_port_high} --elevated"
+        "windows install --restricted-accounts {restricted_accounts} --unrestricted-accounts {unrestricted_accounts} --proxy-port-range {proxy_port_low}-{proxy_port_high}"
     ))
 }
 
 fn elevate_uninstall() -> Result<()> {
-    elevate("windows uninstall --elevated")
+    elevate("windows uninstall")
 }
 
 fn elevate(parameters: &str) -> Result<()> {

@@ -48,14 +48,14 @@ Alternatively, place the extension under `~/.pi/agent/extensions/` (global) or
 On unsupported platforms the extension loads but leaves sandboxing disabled.
 
 On Windows, Pi's Git Bash/MSYS shell cannot run under LPAC. The packaged policy
-therefore selects standard AppContainer explicitly. This is weaker than LPAC because
-resources granted to `ALL APPLICATION PACKAGES` remain visible; `/sandbox` and the
-status line report the active backend and mode. There is no silent
-LPAC-to-standard fallback.
+therefore selects standard AppContainer explicitly. This is weaker than LPAC
+because resources granted to `ALL APPLICATION PACKAGES` remain visible;
+`/sandbox` and the status line report the active implementation and mode. There
+is no silent LPAC-to-standard fallback.
 
-An optional restricted-user backend supports Git Bash without AppContainer. It
-requires one-time elevated host setup and persistent local accounts and WFP rules;
-see [Windows restricted-user setup](#windows-restricted-user-setup).
+Optional restricted-user installation supports Git Bash without AppContainer.
+It requires one-time elevation and persistent local accounts and WFP rules; see
+[Windows restricted-user installation](#windows-restricted-user-installation).
 
 ## Disabling
 
@@ -72,10 +72,9 @@ processes, but without the outer Landstrip OS sandbox. The extension warns once
 per session. Agent tool permissions still apply, but they are not an OS isolation
 boundary.
 
-Trusted project config overrides global config except for the Windows backend,
-which can be selected only in the trusted global file. `/sandbox` updates a trusted
-project sandbox file when present, otherwise the global file. Pi versions without a
-project-trust API use only global configuration.
+Trusted project config overrides global config. `/sandbox` updates a trusted
+project sandbox file when present, otherwise the global file. Pi versions
+without a project-trust API use only global configuration.
 
 ## Behavior
 
@@ -261,37 +260,37 @@ The Windows sandbox fields are:
 ```json
 {
   "windows": {
-    "backend": "appContainer",
     "appContainerMode": "standard",
     "allowLoopback": false
   }
 }
 ```
 
-`backend` is `"appContainer"` or `"restrictedUser"`. It is a trusted host setting:
-only `~/.pi/agent/sandbox.json` can change it, and project configuration cannot
-override it. `appContainerMode` is `"lpac"` or `"standard"`; core Landstrip defaults
-to LPAC, while the Pi package defaults to standard mode for Git Bash compatibility.
-`allowLoopback` is independently opt-in and applies only to AppContainer.
+`appContainerMode` is `"lpac"` or `"standard"`; core Landstrip defaults to LPAC,
+while the Pi package defaults to standard mode for Git Bash compatibility.
+`allowLoopback` is independently opt-in and applies only while AppContainer is
+active. Windows implementation selection is automatic and cannot be changed by
+project configuration.
 
-### Windows restricted-user setup
+### Windows restricted-user installation
 
-Provision the backend once before selecting it in global configuration:
+Provision restricted-user execution once to activate it:
 
 ```powershell
-npx @landstrip/landstrip windows setup
+npx @landstrip/landstrip windows install
 npx @landstrip/landstrip windows status
 ```
 
-Setup requests UAC elevation and defaults to eight restricted-network accounts, two
-unrestricted-network accounts, and proxy ports 60080-60111. Run
-`npx @landstrip/landstrip windows setup --help` for pool and port options. Then set
-`"backend": "restrictedUser"` in `~/.pi/agent/sandbox.json` and restart Pi.
+Install requests UAC elevation and defaults to eight restricted-network
+accounts, two unrestricted-network accounts, and proxy ports 60080-60111. Run
+`npx @landstrip/landstrip windows install --help` for pool and port options, then
+restart Pi. Uninstalling returns Landstrip to AppContainer automatically.
 
-The extension checks installation health and reads the configured proxy range before
-launching a restricted worker. Restricted-user mode does not support
-`windows.allowLoopback` or `network.allowLocalBinding`. Remove the persistent
-accounts, WFP rules, runner, and recovered per-run ACL grants with:
+The extension checks the active implementation and installation health before a
+sandboxed launch. An unhealthy installation fails rather than falling back to
+AppContainer. Restricted-user mode does not support `windows.allowLoopback` or
+`network.allowLocalBinding`. Remove the persistent accounts, WFP rules, runner,
+and recovered per-run ACL grants with:
 
 ```powershell
 npx @landstrip/landstrip windows uninstall

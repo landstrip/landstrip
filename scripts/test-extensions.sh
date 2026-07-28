@@ -81,7 +81,7 @@ if ((local_root)); then
   trap cleanup_local_root EXIT
 
   if [[ "$platform_package" == npm/win32-* && "${CI:-}" == true ]]; then
-    "target/debug/$binary" windows setup \
+    "target/debug/$binary" windows install \
       --restricted-accounts 2 --unrestricted-accounts 0
     restricted_user_setup=1
     export LANDSTRIP_TEST_RESTRICTED_USER=1

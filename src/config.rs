@@ -4,7 +4,7 @@
 use crate::cli::PolicyFormat;
 use crate::engine::error::Error;
 use anyhow::{Context, Result};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::error::Error as StdError;
 use std::ffi::OsStr;
@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct Settings {
     pub(crate) filesystem: SandboxFilesystem,
@@ -20,7 +20,7 @@ pub(crate) struct Settings {
     pub(crate) windows: SandboxWindows,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct SandboxFilesystem {
     #[serde(deserialize_with = "deserialize_paths")]
@@ -33,7 +33,7 @@ pub(crate) struct SandboxFilesystem {
     pub(crate) deny_read: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct SandboxNetwork {
     pub(crate) allow_network: bool,
@@ -45,7 +45,7 @@ pub(crate) struct SandboxNetwork {
     pub(crate) socks_proxy_port: Option<u16>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum AppContainerMode {
     #[default]
@@ -53,51 +53,48 @@ pub(crate) enum AppContainerMode {
     Standard,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum WindowsBackend {
-    #[default]
-    AppContainer,
-    RestrictedUser,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct SandboxWindows {
-    pub(crate) backend: WindowsBackend,
     pub(crate) app_container_mode: AppContainerMode,
     pub(crate) allow_loopback: bool,
+    #[serde(
+        rename = "backend",
+        deserialize_with = "reject_windows_backend",
+        skip_serializing
+    )]
+    _removed_backend: (),
 }
 
 pub(crate) fn load_settings(
     policy_paths: &[PathBuf],
     format: PolicyFormat,
-    tool: &OsStr,
+    tool: Option<&OsStr>,
 ) -> Result<Settings> {
     let mut merged = Value::Object(Map::new());
 
-    if policy_paths.is_empty() {
-        let mut document = String::new();
-        io::stdin()
-            .read_to_string(&mut document)
-            .map_err(|source| Error::PolicyIoFailed { source })
-            .context("policy stdin")?;
-        let value = parse_policy_document(&document, format).context("policy stdin")?;
-        merge_json(&mut merged, value);
-    } else {
-        for path in policy_paths {
+    for path in policy_paths {
+        let (document, source_name) = if path.as_path() == Path::new("-") {
+            let mut document = String::new();
+            io::stdin()
+                .read_to_string(&mut document)
+                .map_err(|source| Error::PolicyIoFailed { source })
+                .context("policy stdin")?;
+            (document, "policy stdin".to_owned())
+        } else {
             log::debug!("config: {}", path.display());
-
             let document = fs::read_to_string(path)
                 .map_err(|source| Error::PolicyIoFailed { source })
                 .with_context(|| format!("policy file {}", path.display()))?;
-            let value = parse_policy_document(&document, format)
-                .with_context(|| format!("policy file {}", path.display()))?;
-            merge_json(&mut merged, value);
-        }
+            (document, format!("policy file {}", path.display()))
+        };
+        let value = parse_policy_document(&document, format).with_context(|| source_name)?;
+        merge_json(&mut merged, value);
     }
 
-    if let Some(value) = read_executable_policy(tool, format)? {
+    if let Some(tool) = tool
+        && let Some(value) = read_executable_policy(tool, format)?
+    {
         merge_json(&mut merged, value);
     }
 
@@ -339,6 +336,18 @@ fn parse_failed(source: impl StdError + Send + Sync + 'static) -> Error {
     Error::PolicyParseFailed {
         source: Box::new(source),
     }
+}
+
+fn reject_windows_backend<'de, D>(deserializer: D) -> std::result::Result<(), D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+
+    Err(serde::de::Error::custom(
+        "windows.backend was removed; use `landstrip windows install` or \
+         `landstrip windows uninstall` to select the Windows implementation",
+    ))
 }
 
 fn deserialize_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! Windows restricted-user sandbox backend.
+//! Windows restricted-user sandbox implementation.
 
 mod access;
 mod account;
@@ -19,7 +19,11 @@ use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 
-pub(super) use manage::manage;
+pub(super) use manage::{active_implementation, manage};
+
+pub(super) fn is_installed() -> Result<bool> {
+    Ok(state::load_optional()?.is_some())
+}
 pub(super) fn execute(
     policy: &AccessPolicy,
     tool: &OsStr,
@@ -71,19 +75,30 @@ pub(super) fn run_worker(request: &std::path::Path) -> Result<()> {
     worker::run(request)
 }
 
+pub(super) fn validate(policy: &AccessPolicy) -> Result<()> {
+    let installation = state::load().map_err(setup_failed)?;
+    if !installation.complete {
+        return Err(setup_failed("restricted-user installation is incomplete").into());
+    }
+    if !policy.network_access.is_unrestricted() {
+        validate_restricted_network(policy, &installation)?;
+    }
+    Ok(())
+}
+
 fn validate_restricted_network(
     policy: &AccessPolicy,
     installation: &state::Installation,
 ) -> Result<()> {
     if policy.allow_windows_loopback {
         return Err(setup_failed(
-            "windows.allowLoopback is not supported by the restricted-user backend",
+            "windows.allowLoopback is not supported by restricted-user isolation",
         )
         .into());
     }
     if policy.network_access.local_tcp_bind || !policy.network_access.restrict_bind_tcp {
         return Err(setup_failed(
-            "allowLocalBinding is not supported by the restricted-user backend",
+            "allowLocalBinding is not supported by restricted-user isolation",
         )
         .into());
     }

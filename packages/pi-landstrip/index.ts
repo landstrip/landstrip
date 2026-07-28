@@ -99,7 +99,6 @@ interface SandboxNetworkConfig {
 }
 
 interface SandboxWindowsConfig {
-  backend: 'appContainer' | 'restrictedUser';
   appContainerMode: 'lpac' | 'standard';
   allowLoopback: boolean;
 }
@@ -253,11 +252,7 @@ function loadSandboxConfig(cwd: string, includeProject: boolean): SandboxConfig 
   if (includeProject && existsSync(projectConfigPath)) {
     try {
       const projectConfig = JSON.parse(readFileSync(projectConfigPath, 'utf-8'));
-      const merged = deepMerge(globalConfig, projectConfig);
-      // Backend selection is a trusted host setting. A repository must not be
-      // able to switch the Windows isolation mechanism.
-      merged.windows.backend = globalConfig.windows.backend;
-      return merged;
+      return deepMerge(globalConfig, projectConfig);
     } catch (error) {
       console.error(`Warning: Could not parse ${projectConfigPath}: ${error}`);
     }
@@ -293,24 +288,53 @@ function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxCo
       denyWrite: mergeArray(base.filesystem.denyWrite, filesystem?.denyWrite),
     },
     windows: {
-      backend: windows?.backend ?? base.windows.backend,
       appContainerMode: windows?.appContainerMode ?? base.windows.appContainerMode,
       allowLoopback: windows?.allowLoopback ?? base.windows.allowLoopback,
     },
   };
 }
 
-function windowsBackendArgs(config: SandboxConfig): string[] {
-  if (process.platform !== 'win32') return [];
-  const backend = config.windows.backend === 'restrictedUser' ? 'restricted-user' : 'app-container';
-  return ['--windows-backend', backend];
+type WindowsImplementation = 'appContainer' | 'restrictedUser';
+
+interface WindowsStatus {
+  active: WindowsImplementation;
+  installed: boolean;
+  healthy: boolean;
+  proxyPortLow?: number;
+  proxyPortHigh?: number;
+}
+
+function windowsStatus(): WindowsStatus {
+  const result = spawnSync(binaryPath(), ['windows', 'status'], {
+    encoding: 'utf-8',
+    windowsHide: true,
+  });
+  if (result.error) throw result.error;
+
+  let status: WindowsStatus;
+  try {
+    status = JSON.parse(result.stdout) as WindowsStatus;
+  } catch {
+    throw new Error(result.stderr.trim() || 'Windows sandbox status check failed');
+  }
+  if (result.status !== 0 || status.healthy !== true) {
+    throw new Error(
+      result.stderr.trim() ||
+        'The Windows restricted-user installation is unhealthy. Run "landstrip windows status".',
+    );
+  }
+  return status;
+}
+
+function activeWindowsImplementation(): WindowsImplementation {
+  return windowsStatus().active;
 }
 
 function shouldStartProxy(config: SandboxConfig): boolean {
   if (config.network.allowNetwork) return false;
   return (
     process.platform !== 'win32' ||
-    config.windows.backend === 'restrictedUser' ||
+    activeWindowsImplementation() === 'restrictedUser' ||
     config.windows.allowLoopback
   );
 }
@@ -320,34 +344,20 @@ interface ProxyPortRange {
   high: number;
 }
 
-function restrictedUserProxyPortRange(config: SandboxConfig): ProxyPortRange | undefined {
-  if (process.platform !== 'win32' || config.windows.backend !== 'restrictedUser') return undefined;
+function restrictedUserProxyPortRange(): ProxyPortRange | undefined {
+  if (process.platform !== 'win32') return undefined;
 
-  const result = spawnSync(binaryPath(), ['windows', 'status'], {
-    encoding: 'utf-8',
-    windowsHide: true,
-  });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(result.stderr.trim() || 'Restricted-user backend status check failed');
-  }
-
-  const status = JSON.parse(result.stdout) as {
-    installed?: boolean;
-    healthy?: boolean;
-    proxyPortLow?: number;
-    proxyPortHigh?: number;
-  };
+  const status = windowsStatus();
+  if (status.active === 'appContainer') return undefined;
   if (
     status.installed !== true ||
-    status.healthy !== true ||
     !Number.isInteger(status.proxyPortLow) ||
     !Number.isInteger(status.proxyPortHigh) ||
     status.proxyPortLow! < 1 ||
     status.proxyPortHigh! < status.proxyPortLow!
   ) {
     throw new Error(
-      'The Windows restricted-user backend is not installed or healthy. Run "landstrip windows setup".',
+      'The Windows restricted-user installation is unhealthy. Run "landstrip windows status".',
     );
   }
   return { low: status.proxyPortLow!, high: status.proxyPortHigh! };
@@ -1897,7 +1907,7 @@ export function createLandstripIntegration(
           processAllowances,
           options.signal,
           proxyAuthorization,
-          restrictedUserProxyPortRange(config),
+          restrictedUserProxyPortRange(),
         )
       : null;
     let policy: ReturnType<typeof writePolicyFile> | undefined;
@@ -1940,16 +1950,17 @@ export function createLandstripIntegration(
       if (spawned) throw new Error('Prepared process can only be spawned once');
       spawned = true;
       const landstripArgs = [
-        ...windowsBackendArgs(config),
+        'run',
         '-p',
         workerPolicy.path,
+        '--',
         options.command,
         ...options.args,
       ];
       const stdio: StdioOptions = workerChildEnd
         ? ['pipe', 'pipe', 'pipe', workerChildEnd]
         : ['pipe', 'pipe', 'pipe'];
-      if (workerChildEnd) landstripArgs.unshift('--trap-fd', '3');
+      if (workerChildEnd) landstripArgs.splice(1, 0, '--trap-fd', '3');
       const child = spawn(binaryPath(), landstripArgs, {
         ...spawnOptions,
         cwd: options.cwd,
@@ -2016,7 +2027,7 @@ export function createLandstripIntegration(
               allowances,
               signal,
               proxyAuthorization,
-              restrictedUserProxyPortRange(config),
+              restrictedUserProxyPortRange(),
             )
           : null;
 
@@ -2046,15 +2057,8 @@ export function createLandstripIntegration(
           processAllowances = withWindowsProcessReadAccess(allowances, shell, cwd, [envFile.path]);
           policy = writePolicyFile(cwd, proxy?.port ?? null, processAllowances);
           const wrappedCommand = `source '${envFile.path}' && ${command}`;
-          landstripArgs = [
-            ...windowsBackendArgs(config),
-            '-p',
-            policy.path,
-            shell,
-            ...args,
-            wrappedCommand,
-          ];
-          if (process.platform !== 'win32') landstripArgs.unshift('--trap-fd', '3');
+          landstripArgs = ['run', '-p', policy.path, '--', shell, ...args, wrappedCommand];
+          if (process.platform !== 'win32') landstripArgs.splice(1, 0, '--trap-fd', '3');
         } catch (error) {
           await teardownResources();
           throw error;
@@ -2449,7 +2453,15 @@ export function createLandstripIntegration(
   }
 
   function warnIfWindowsSecurityDowngraded(ctx: ExtensionContext, config: SandboxConfig): void {
-    if (process.platform !== 'win32' || config.windows.backend !== 'appContainer') return;
+    if (process.platform !== 'win32') return;
+    let implementation: WindowsImplementation;
+    try {
+      implementation = activeWindowsImplementation();
+    } catch (error) {
+      notify(ctx, formatError(error), 'error');
+      return;
+    }
+    if (implementation !== 'appContainer') return;
     if (config.windows.appContainerMode === 'standard') {
       notify(
         ctx,
@@ -2472,16 +2484,14 @@ export function createLandstripIntegration(
     const dot = theme.fg('success', '●');
     const label = theme.fg('text', 'Sandbox');
 
+    const windowsImplementation =
+      process.platform === 'win32' ? activeWindowsImplementation() : undefined;
     let networkLabel: string;
     let networkColor: 'warning' | 'accent';
     if (config.network.allowNetwork) {
       networkLabel = 'unrestricted';
       networkColor = 'warning';
-    } else if (
-      process.platform === 'win32' &&
-      config.windows.backend === 'appContainer' &&
-      !config.windows.allowLoopback
-    ) {
+    } else if (windowsImplementation === 'appContainer' && !config.windows.allowLoopback) {
       networkLabel = 'blocked';
       networkColor = 'accent';
     } else if (allowsAllDomains(config.network.allowedDomains)) {
@@ -2496,14 +2506,14 @@ export function createLandstripIntegration(
     const net = theme.fg(networkColor, networkLabel);
     const write = theme.fg('accent', `${config.filesystem.allowWrite.length} write paths`);
     const fields = [`${dot} ${label}`, net, write];
-    if (process.platform === 'win32') {
-      const backend = config.windows.backend;
-      const standard = backend === 'appContainer' && config.windows.appContainerMode === 'standard';
-      const label =
-        backend === 'restrictedUser'
+    if (windowsImplementation !== undefined) {
+      const standard =
+        windowsImplementation === 'appContainer' && config.windows.appContainerMode === 'standard';
+      const implementationLabel =
+        windowsImplementation === 'restrictedUser'
           ? 'restricted user'
           : `${config.windows.appContainerMode} AppContainer`;
-      fields.splice(1, 0, theme.fg(standard ? 'warning' : 'accent', label));
+      fields.splice(1, 0, theme.fg(standard ? 'warning' : 'accent', implementationLabel));
     }
 
     setTuiStatus(ctx, 'sandbox', fields.join(`  ${sep}  `));
@@ -2664,6 +2674,8 @@ export function createLandstripIntegration(
         if (!ctx.hasUI) return;
         const config = loadConfig(ctx.cwd);
         const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
+        const windowsImplementation =
+          process.platform === 'win32' ? activeWindowsImplementation() : undefined;
         const shouldToggle = await ctx.ui.custom<boolean>(
           (_tui, theme, _kb, done) => {
             const { dim, muted, accent, text } = themeColors(theme);
@@ -2713,9 +2725,7 @@ export function createLandstripIntegration(
 
                 const networkMode = config.network.allowNetwork
                   ? 'unrestricted'
-                  : process.platform === 'win32' &&
-                      config.windows.backend === 'appContainer' &&
-                      !config.windows.allowLoopback
+                  : windowsImplementation === 'appContainer' && !config.windows.allowLoopback
                     ? 'blocked'
                     : 'proxied';
                 section('Network', networkMode);
@@ -2738,14 +2748,17 @@ export function createLandstripIntegration(
                 item('allow write', listValue(config.filesystem.allowWrite));
                 item('deny write', listValue(config.filesystem.denyWrite));
 
-                if (process.platform === 'win32') {
+                if (windowsImplementation !== undefined) {
                   section('Windows');
-                  const backend = config.windows.backend;
                   item(
-                    'backend',
-                    text(backend === 'restrictedUser' ? 'restricted user' : 'AppContainer'),
+                    'implementation',
+                    text(
+                      windowsImplementation === 'restrictedUser'
+                        ? 'restricted user'
+                        : 'AppContainer',
+                    ),
                   );
-                  if (backend === 'appContainer') {
+                  if (windowsImplementation === 'appContainer') {
                     const mode = config.windows.appContainerMode;
                     item(
                       'container',

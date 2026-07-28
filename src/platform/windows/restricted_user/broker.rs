@@ -33,7 +33,7 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
     }
     let executable = wide_os(runner_path.as_os_str());
     let command_line = format!(
-        "{} windows worker {}",
+        "{} {}",
         quote(runner_path.as_os_str())?,
         quote(request_path.as_os_str())?
     );

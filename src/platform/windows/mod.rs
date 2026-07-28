@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! Windows sandbox backends.
+//! Windows sandbox implementations.
 
 use crate::cli::WindowsCommand;
 
 mod appcontainer;
 mod restricted_user;
 
-use crate::config::WindowsBackend;
 use crate::engine::policy::AccessPolicy;
 use crate::engine::trap_fd::TrapFd;
 use anyhow::Result;
@@ -20,15 +19,30 @@ pub(crate) fn execute(
     args: &[OsString],
     trap_fd: &TrapFd,
 ) -> Result<()> {
-    match policy.windows_backend {
-        WindowsBackend::AppContainer => appcontainer::execute(policy, tool, args, trap_fd),
-        WindowsBackend::RestrictedUser => restricted_user::execute(policy, tool, args, trap_fd),
+    if restricted_user::is_installed()? {
+        restricted_user::execute(policy, tool, args, trap_fd)
+    } else {
+        appcontainer::execute(policy, tool, args, trap_fd)
     }
 }
 
-pub(crate) fn manage(command: &WindowsCommand) -> Result<()> {
-    match command {
-        WindowsCommand::Worker { request } => restricted_user::run_worker(request),
-        command => restricted_user::manage(command),
+pub(crate) fn validate(policy: &AccessPolicy) -> Result<()> {
+    policy.validate()?;
+    if restricted_user::is_installed()? {
+        restricted_user::active_implementation()?;
+        restricted_user::validate(policy)?;
     }
+    Ok(())
+}
+
+pub(crate) fn manage(command: &WindowsCommand) -> Result<()> {
+    restricted_user::manage(command)
+}
+
+pub(crate) fn run_worker(request: &std::path::Path) -> Result<()> {
+    restricted_user::run_worker(request)
+}
+
+pub(crate) fn doctor() -> Result<&'static str> {
+    restricted_user::active_implementation()
 }

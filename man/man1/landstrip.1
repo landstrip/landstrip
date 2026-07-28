@@ -7,19 +7,54 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl -debug
-.Op Fl -format Ar format
+.Cm run
 .Op Fl -trap-fd Ar fd
 .Op Fl p Ar policy | Fl -policy Ar policy
-.Ar command
+.Op Fl -policy-format Ar format
+.Fl -
+.Ar program
 .Op Ar argument ...
+.Nm
+.Op Fl -debug
+.Cm policy Cm validate | Cm resolve
+.Op Fl p Ar policy | Fl -policy Ar policy
+.Op Fl -policy-format Ar format
+.Op Fl -tool Ar program
+.Nm
+.Op Fl -debug
+.Cm doctor
+.Nm
+.Op Fl -debug
+.Cm windows Cm install
+.Op Fl -restricted-accounts Ar count
+.Op Fl -unrestricted-accounts Ar count
+.Op Fl -proxy-port-range Ar low-high
+.Nm
+.Op Fl -debug
+.Cm windows Cm status | Cm uninstall
 .Nm
 .Fl V
 .Sh DESCRIPTION
 .Nm
+uses explicit commands to run a program, inspect policy, verify platform
+readiness, and manage Windows restricted-user installation.
+.Pp
+.Cm run
 loads a policy, translates it into the platform sandbox model, applies the
 sandbox, and executes
-.Ar command .
-If no policy file is specified, the policy is read from standard input.
+.Ar program .
+The
+.Fl -
+separator before the program is required.
+.Pp
+.Cm policy validate
+checks policy parsing, merging, path resolution, executable-attached policy,
+and support on the current platform without launching a program.
+.Cm policy resolve
+prints the normalized merged policy as JSON.
+.Cm doctor
+checks that the current operating-system sandbox is operational without
+launching a program.
 .Pp
 The accepted policy is the subset of Anthropic Sandbox Runtime settings used by
 .Nm .
@@ -28,29 +63,63 @@ Unknown fields are ignored.
 .Bl -tag -width Ds
 .It Fl -debug
 Enable debug logging.
-.It Fl -format Ar format
-Select the policy format. The accepted values are
-.Va json
-and
-.Va yaml .
-The default is
-.Va json .
-.It Fl -trap-fd Ar fd
-Write Landstrip trap events as JSON to the already-open file descriptor
-.Ar fd .
-The descriptor must be 3 or greater. On Linux, the seccomp broker emits
-filesystem denials with the same fields as other trap events. This option is
-best-effort on backends without per-access denial callbacks.
 .It Fl p Ar policy , Fl -policy Ar policy
 Read a policy file. This option may be repeated. Later policy arguments
 are merged over earlier policy arguments. Object values are merged recursively,
 arrays are concatenated without duplicates, and scalar values replace earlier
-values. Commas are literal filename characters.
+values. Commas are literal filename characters. Use
+.Sq -
+as the file to read standard input; it may appear only once and requires
+.Fl -policy-format .
+.It Fl -policy-format Ar format
+Select the policy format. The accepted values are
+.Va json
+and
+.Va yaml .
+The default for files is
+.Va json .
+.It Fl -tool Ar program
+For
+.Cm policy validate
+or
+.Cm policy resolve ,
+include policy attached to the resolved program executable.
+.It Fl -trap-fd Ar fd
+For
+.Cm run ,
+write Landstrip trap events as JSON to the already-open file descriptor
+.Ar fd .
+The descriptor must be 3 or greater. On Linux, the seccomp broker emits
+filesystem denials with the same fields as other trap events. This option is
+best-effort on implementations without per-access denial callbacks.
 .It Fl V , Fl -version
 Print version information and exit.
 .It Fl h , Fl -help
 Print usage information and exit.
 .El
+.Sh WINDOWS COMMANDS
+.Cm windows install
+requests elevation, provisions restricted-user isolation, and activates it.
+The default installation creates eight restricted-network accounts, two
+unrestricted-network accounts, and permits proxy ports 60080 through 60111.
+.Fl -restricted-accounts
+and
+.Fl -unrestricted-accounts
+set the pool sizes.
+.Fl -proxy-port-range
+sets the inclusive loopback proxy range in
+.Ar low-high
+form.
+.Pp
+.Cm windows status
+prints JSON describing the active implementation and its health.
+.Cm windows uninstall
+removes restricted-user isolation and returns to AppContainer. AppContainer is
+used automatically when no restricted-user installation exists. An unhealthy
+restricted-user installation is an error and never causes silent fallback.
+Policies containing the removed
+.Va windows.backend
+field are rejected; use these commands to select the implementation.
 .Sh POLICY
 The relevant policy shape is:
 .Bd -literal -offset indent
@@ -73,7 +142,7 @@ The relevant policy shape is:
 .Ed
 .Pp
 When
-.Fl -format Ar yaml
+.Fl -policy-format Ar yaml
 is used, path fields can also be written as one statement per non-empty line:
 .Bd -literal -offset indent
 filesystem:
@@ -230,15 +299,14 @@ uses Seatbelt path rules.
 .Pp
 On Windows,
 .Nm
-uses a Less-Privileged AppContainer. The backend creates or reuses a
-deterministic profile and grants its SID access to the lowered read and write
-roots through Windows ACL entries. Because LPAC has no broad filesystem read
-capability, Windows policies must use explicit read allowlists; unrestricted
-reads are rejected. The profile and ACL grants are released when
-.Nm
-exits. The grants may remain if
-.Nm
-is killed outright.
+uses AppContainer when restricted-user isolation is not installed. AppContainer
+creates a per-run profile and grants its SID access to the lowered read and
+write roots through Windows ACL entries. Restricted-user installation instead
+leases a provisioned local account, applies per-run ACL grants, and uses
+account-scoped Windows Filtering Platform rules. Both implementations require
+explicit read allowlists; unrestricted reads are rejected. Per-run grants are
+revoked after the process tree exits and stale restricted-user grants are
+recovered on a later lease or uninstall.
 .Sh OUTPUT
 .Nm
 reports failures and completed denials as one JSON object per line on standard

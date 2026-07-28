@@ -11,7 +11,8 @@ mod seccomp;
 use crate::engine::error::Error;
 use crate::engine::policy::AccessPolicy;
 use crate::engine::trap_fd::TrapFd;
-use anyhow::Result;
+use ::landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
+use anyhow::{Context, Result, bail};
 use fd::close_inherited_fds;
 use filter::NetworkFilter;
 use landlock::enforce_access_policy;
@@ -20,6 +21,24 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{self, Command};
 
+pub(crate) fn doctor() -> Result<()> {
+    Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::Execute)
+        .context("Landlock execute access is unavailable")?
+        .create()
+        .context("create a Landlock ruleset")?;
+
+    let actions = std::fs::read_to_string("/proc/sys/kernel/seccomp/actions_avail")
+        .context("read seccomp capabilities")?;
+    if !actions
+        .split_ascii_whitespace()
+        .any(|action| action == "user_notif")
+    {
+        bail!("seccomp user notification is unavailable");
+    }
+    Ok(())
+}
 pub(crate) fn execute(
     policy: &AccessPolicy,
     tool: &OsStr,
