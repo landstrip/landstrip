@@ -27,7 +27,7 @@ pub(crate) fn execute(
     tool: &OsStr,
     args: &[OsString],
     trap_fd: &TrapFd,
-) -> Result<()> {
+) -> Result<i32> {
     let profile = render_profile(policy).map_err(setup_failed)?;
     apply_profile(&profile)?;
     close_inherited_fds(trap_fd.fd()).map_err(setup_failed)?;

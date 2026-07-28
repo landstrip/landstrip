@@ -7,7 +7,6 @@ use serde::Serialize;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process;
 use std::str::FromStr;
 
 const PROGRAM_NAME: &str = "landstrip";
@@ -18,6 +17,12 @@ const RESTRICTED_USER_RUNNER: &str = "landstrip-restricted-user-runner.exe";
 pub(crate) struct Invocation {
     pub(crate) debug: bool,
     pub(crate) command: Command,
+}
+
+#[derive(Debug)]
+pub(crate) enum ParseOutcome {
+    Invocation(Invocation),
+    Display(String),
 }
 
 #[derive(Debug)]
@@ -207,20 +212,20 @@ impl FromStr for ProxyPortRange {
     }
 }
 
-pub(crate) fn parse_cli() -> Result<Invocation, Error> {
+pub(crate) fn parse_cli() -> Result<ParseOutcome, Error> {
     let mut args = env::args_os();
     let program = args.next().unwrap_or_else(|| OsString::from(PROGRAM_NAME));
     let args = args.collect::<Vec<_>>();
 
     #[cfg(target_os = "windows")]
     if is_restricted_user_runner()? {
-        return parse_worker(&args);
+        return parse_worker(&args).map(ParseOutcome::Invocation);
     }
 
     parse_from(program, args)
 }
 
-fn parse_from(program: OsString, args: Vec<OsString>) -> Result<Invocation, Error> {
+fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Error> {
     let mut command_line = Vec::with_capacity(args.len() + 1);
     command_line.push(program);
     command_line.extend(args);
@@ -233,8 +238,7 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<Invocation, Erro
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
             ) =>
         {
-            print!("{error}");
-            process::exit(0);
+            return Ok(ParseOutcome::Display(error.to_string()));
         }
         Err(error) => {
             return Err(Error::Usage {
@@ -250,10 +254,10 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<Invocation, Erro
         CliCommand::Windows(args) => Command::Windows(windows_command(args)),
     };
 
-    Ok(Invocation {
+    Ok(ParseOutcome::Invocation(Invocation {
         debug: cli.debug,
         command,
-    })
+    }))
 }
 
 fn run_command(args: RunArgs) -> Result<RunCommand, Error> {
@@ -398,10 +402,13 @@ mod tests {
     use std::ffi::OsStr;
 
     fn parse(args: &[&str]) -> Result<Invocation, Error> {
-        parse_from(
+        match parse_from(
             OsString::from(PROGRAM_NAME),
             args.iter().map(OsString::from).collect(),
-        )
+        )? {
+            ParseOutcome::Invocation(invocation) => Ok(invocation),
+            ParseOutcome::Display(message) => Err(Error::Usage { message }),
+        }
     }
 
     #[test]

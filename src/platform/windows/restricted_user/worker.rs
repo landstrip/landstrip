@@ -83,7 +83,7 @@ pub(super) fn write_request(
     result
 }
 
-pub(super) fn run(path: &Path) -> Result<()> {
+pub(super) fn run(path: &Path) -> Result<i32> {
     let bytes = fs::read(path).context("read restricted-user worker request")?;
     let request: Request =
         serde_json::from_slice(&bytes).context("parse restricted-user worker request")?;
@@ -100,7 +100,7 @@ pub(super) fn run(path: &Path) -> Result<()> {
         .collect::<Vec<_>>();
     let cwd = OsString::from_wide(&request.cwd);
     let exit_code = launch(&tool, &args, &cwd, &request.environment)?;
-    std::process::exit(i32::from_ne_bytes(exit_code.to_ne_bytes()));
+    Ok(i32::from_ne_bytes(exit_code.to_ne_bytes()))
 }
 
 fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> Result<u32> {

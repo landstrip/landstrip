@@ -10,21 +10,33 @@
 mod cli;
 mod config;
 mod engine;
+mod outcome;
 mod platform;
 
-use crate::cli::{Command, Invocation, PolicyCommand, PolicyRequest, RunCommand, parse_cli};
+use crate::cli::{
+    Command, Invocation, ParseOutcome, PolicyCommand, PolicyRequest, RunCommand, parse_cli,
+};
 use crate::config::load_settings;
 use crate::engine::error::Error;
 use crate::engine::policy::{AccessPolicy, resolve_policy};
 use crate::engine::trap::Trap;
 use crate::engine::trap_fd::TrapFd;
+use crate::outcome::{CommandOutcome, PolicyValidationReport};
 use anyhow::Result;
+use serde::Serialize;
 use std::error::Error as StdError;
+use std::io::{self, Write};
 use std::process;
 
 fn main() {
     let invocation = match parse_cli() {
-        Ok(invocation) => invocation,
+        Ok(ParseOutcome::Invocation(invocation)) => invocation,
+        Ok(ParseOutcome::Display(text)) => {
+            if let Err(error) = render_display(&text) {
+                exit_with_error(&error, &TrapFd::from_fd(None));
+            }
+            return;
+        }
         Err(error) => exit_with_error(&error.into(), &TrapFd::from_fd(None)),
     };
     init_logging(invocation.debug);
@@ -33,8 +45,16 @@ fn main() {
         Command::Run(command) => TrapFd::from_fd(command.trap_fd),
         _ => TrapFd::from_fd(None),
     };
-    if let Err(error) = dispatch(&invocation) {
+    let outcome = match dispatch(&invocation) {
+        Ok(outcome) => outcome,
+        Err(error) => exit_with_error(&error, &trap_fd),
+    };
+    if let Err(error) = render_outcome(&outcome) {
         exit_with_error(&error, &trap_fd);
+    }
+    let exit_code = outcome.exit_code();
+    if exit_code != 0 {
+        process::exit(exit_code);
     }
 }
 
@@ -45,36 +65,38 @@ fn init_logging(debug: bool) {
         .init();
 }
 
-fn dispatch(invocation: &Invocation) -> Result<()> {
+fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
     match &invocation.command {
         Command::Run(command) => run(command),
         Command::Policy(command) => inspect_policy(command),
-        Command::Doctor => platform::doctor(),
-        Command::Windows(command) => platform::manage_windows(command),
-        Command::Worker { request } => platform::run_worker(request),
+        Command::Doctor => platform::doctor().map(CommandOutcome::Doctor),
+        Command::Windows(command) => platform::manage_windows(command).map(CommandOutcome::Windows),
+        Command::Worker { request } => platform::run_worker(request).map(CommandOutcome::Exit),
     }
 }
 
-fn run(command: &RunCommand) -> Result<()> {
+fn run(command: &RunCommand) -> Result<CommandOutcome> {
     let policy = load_policy(&command.policy, Some(command.tool.as_os_str()))?;
     platform::validate(&policy)?;
     let trap_fd = TrapFd::from_fd(command.trap_fd);
     platform::execute(&policy, &command.tool, &command.tool_args, &trap_fd)
+        .map(CommandOutcome::Exit)
 }
 
-fn inspect_policy(command: &PolicyCommand) -> Result<()> {
+fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
     match command {
         PolicyCommand::Validate(request) => {
             let policy = load_requested_policy(request)?;
             platform::validate(&policy)?;
-            println!("policy valid");
+            Ok(CommandOutcome::PolicyValidated(PolicyValidationReport {
+                valid: true,
+            }))
         }
         PolicyCommand::Resolve(request) => {
             let policy = load_requested_policy(request)?;
-            println!("{}", serde_json::to_string_pretty(&policy)?);
+            Ok(CommandOutcome::PolicyResolved(policy))
         }
     }
-    Ok(())
 }
 
 fn load_requested_policy(request: &PolicyRequest) -> Result<AccessPolicy> {
@@ -97,21 +119,133 @@ fn load_policy(
     )
 }
 
+fn render_display(text: &str) -> Result<()> {
+    let stdout = io::stdout();
+    stdout.lock().write_all(text.as_bytes())?;
+    Ok(())
+}
+fn render_outcome(outcome: &CommandOutcome) -> Result<()> {
+    let stdout = io::stdout();
+    render_outcome_to(&mut stdout.lock(), outcome)
+}
+
+fn render_outcome_to(output: &mut impl Write, outcome: &CommandOutcome) -> Result<()> {
+    match outcome {
+        CommandOutcome::Exit(_) => Ok(()),
+        CommandOutcome::PolicyValidated(report) => write_json(output, report),
+        CommandOutcome::PolicyResolved(policy) => write_json(output, policy),
+        CommandOutcome::Doctor(report) => write_json(output, report),
+        CommandOutcome::Windows(report) => write_json(output, report),
+    }
+}
+
+fn write_json(output: &mut impl Write, value: &impl Serialize) -> Result<()> {
+    serde_json::to_writer(&mut *output, value)?;
+    writeln!(output)?;
+    Ok(())
+}
+
 fn exit_with_error(error: &anyhow::Error, trap_fd: &TrapFd) -> ! {
     let engine_error = error
         .chain()
         .find_map(<dyn StdError + 'static>::downcast_ref::<Error>);
     let trap = engine_error.map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from_error);
 
-    if let Some(Error::Usage { message }) = engine_error {
-        eprintln!("{message}");
-        trap_fd.write(&trap);
-        trap.emit();
-        process::exit(2);
-    }
-
     trap_fd.write(&trap);
     trap.emit();
-    log::error!("{error:#}");
-    process::exit(1)
+    let exit_code = if matches!(engine_error, Some(Error::Usage { .. })) {
+        2
+    } else {
+        1
+    };
+    process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use crate::outcome::{DoctorReport, SandboxImplementation};
+
+    #[test]
+    fn policy_validation_output_is_stable() -> Result<()> {
+        let outcome = CommandOutcome::PolicyValidated(PolicyValidationReport { valid: true });
+        let mut output = Vec::new();
+
+        render_outcome_to(&mut output, &outcome)?;
+
+        assert_eq!(String::from_utf8(output)?, "{\"valid\":true}\n");
+        assert_eq!(outcome.exit_code(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn child_exit_status_is_preserved() -> Result<()> {
+        let outcome = CommandOutcome::Exit(23);
+        let mut output = Vec::new();
+
+        render_outcome_to(&mut output, &outcome)?;
+
+        assert!(output.is_empty());
+        assert_eq!(outcome.exit_code(), 23);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_doctor_output_is_stable() -> Result<()> {
+        let outcome = CommandOutcome::Doctor(DoctorReport {
+            ok: true,
+            platform: "linux",
+            implementation: SandboxImplementation::LandlockSeccomp,
+            error: None,
+        });
+        let mut output = Vec::new();
+
+        render_outcome_to(&mut output, &outcome)?;
+
+        assert_eq!(
+            String::from_utf8(output)?,
+            "{\"ok\":true,\"platform\":\"linux\",\"implementation\":\"landlock+seccomp\"}\n"
+        );
+        assert_eq!(outcome.exit_code(), 0);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_doctor_output_is_stable() -> Result<()> {
+        let outcome = CommandOutcome::Doctor(DoctorReport {
+            ok: false,
+            platform: "macos",
+            implementation: SandboxImplementation::Seatbelt,
+            error: Some("Seatbelt unavailable".to_owned()),
+        });
+        let mut output = Vec::new();
+
+        render_outcome_to(&mut output, &outcome)?;
+
+        assert_eq!(
+            String::from_utf8(output)?,
+            "{\"ok\":false,\"platform\":\"macos\",\"implementation\":\"seatbelt\",\"error\":\"Seatbelt unavailable\"}\n"
+        );
+        assert_eq!(outcome.exit_code(), 1);
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_status_output_is_stable() -> Result<()> {
+        let outcome = CommandOutcome::Windows(crate::outcome::WindowsStatusReport::app_container());
+        let mut output = Vec::new();
+
+        render_outcome_to(&mut output, &outcome)?;
+
+        assert_eq!(
+            String::from_utf8(output)?,
+            "{\"active\":\"appContainer\",\"installed\":false,\"healthy\":true}\n"
+        );
+        assert_eq!(outcome.exit_code(), 0);
+        Ok(())
+    }
 }

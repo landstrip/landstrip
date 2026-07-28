@@ -308,6 +308,12 @@ explicit read allowlists; unrestricted reads are rejected. Per-run grants are
 revoked after the process tree exits and stale restricted-user grants are
 recovered on a later lease or uninstall.
 .Sh OUTPUT
+.Cm policy validate ,
+.Cm policy resolve ,
+.Cm doctor ,
+and each
+.Cm windows
+management command write exactly one JSON document to standard output.
 .Nm
 reports failures and completed denials as one JSON object per line on standard
 error. Pending Linux query events go only to
@@ -393,10 +399,11 @@ accompanies
 .Va SANDBOX_SETUP_FAILED .
 .El
 .Pp
-Failure traps include a human-readable log line; machines should read the JSON.
-Logs and sandboxed command output are not part of the trap event. Successful
-commands produce no trap: standard error belongs to Landstrip and standard
-output to the sandboxed command.
+Failure traps are emitted as coded JSON. Logs and sandboxed command output are
+not part of the trap event. Successful commands produce no trap: standard error
+belongs to
+.Nm
+and standard output to the sandboxed command.
 .Pp
 When
 .Fl -trap-fd Ar fd
@@ -429,15 +436,15 @@ A Linux broker launch failure also reaches
 while the descriptor remains open. This trap stream is separate from the
 sandboxed command's standard output and standard error.
 .Sh EXIT STATUS
-On success,
+.Cm run
+returns the sandboxed command's exit status. Direct execution replaces
 .Nm
-is usually replaced by
-.Ar command
-and returns that command's exit status. When seccomp user notification is needed,
-.Nm
-supervises the sandboxed child and exits with the child's status. If policy
-loading or sandbox setup fails,
-.Nm
-reports a coded trap and exits non-zero. Usage errors exit with status 2.
+with the command; supervised execution returns the child status after cleanup.
+.Cm doctor
+and
+.Cm windows status
+exit with status 1 when their JSON report is unhealthy. Policy loading, sandbox
+setup, and other Landstrip failures emit a coded trap and exit with status 1.
+Usage errors exit with status 2.
 .Sh AUTHORS
 .An Jarkko Sakkinen Aq Mt jarkko.sakkinen@iki.fi

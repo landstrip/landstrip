@@ -43,6 +43,11 @@ platform support. `policy resolve` prints the normalized merged policy. Add
 `--tool <PROGRAM>` to either policy command to include executable-attached
 policy.
 
+Policy inspection, `doctor`, and Windows management commands each write one JSON
+document to standard output. `doctor` and `windows status` exit with status 1 when
+they report an unhealthy sandbox. `run` returns the sandboxed program's exit
+status.
+
 ### Agent extensions
 
 The bundled extensions integrate Landstrip with Pi and OpenCode. The Pi
@@ -365,9 +370,9 @@ derived from the policy and the requested path:
 
 Denial traps are informational; the configured policy always applies. Landstrip
 is otherwise quiet on success: standard error belongs to Landstrip and standard
-output to the sandboxed tool. Failure traps include a human-readable log line;
-machines should read the JSON. Usage errors exit with status 2, other Landstrip
-failures with 1, and the tool's own status is otherwise passed through.
+output to the sandboxed tool. Failures are emitted as coded JSON traps. Usage
+errors exit with status 2, other Landstrip failures with 1, and the tool's own
+status is otherwise passed through.
 
 Writing to `--trap-fd` is best-effort: it needs an already-open descriptor (3 or
 greater; 0-2 are reserved), and if the write fails the trap is dropped while the

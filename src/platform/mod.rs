@@ -15,6 +15,10 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::outcome::SandboxImplementation;
+use crate::outcome::{DoctorReport, WindowsStatusReport};
+
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) use fallback::execute;
 #[cfg(target_os = "linux")]
@@ -50,55 +54,74 @@ pub(crate) fn validate(_policy: &crate::engine::policy::AccessPolicy) -> anyhow:
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn manage_windows(command: &crate::cli::WindowsCommand) -> anyhow::Result<()> {
+pub(crate) fn manage_windows(
+    command: &crate::cli::WindowsCommand,
+) -> anyhow::Result<WindowsStatusReport> {
     windows::manage(command)
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn run_worker(request: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn run_worker(request: &std::path::Path) -> anyhow::Result<i32> {
     windows::run_worker(request)
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn run_worker(_request: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn run_worker(_request: &std::path::Path) -> anyhow::Result<i32> {
     Err(crate::engine::error::Error::PlatformUnsupported.into())
 }
 
-pub(crate) fn doctor() -> anyhow::Result<()> {
-    #[cfg(target_os = "linux")]
-    let implementation = {
-        linux::doctor()?;
-        "landlock+seccomp"
-    };
-    #[cfg(target_os = "macos")]
-    let implementation = {
-        macos::doctor()?;
-        "seatbelt"
-    };
-    #[cfg(target_os = "windows")]
-    let implementation = windows::doctor()?;
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    return Err(crate::engine::error::Error::PlatformUnsupported.into());
-
-    println!(
-        "{}",
-        serde_json::to_string(&DoctorReport {
-            ok: true,
-            platform: std::env::consts::OS,
-            implementation,
-        })?
-    );
-    Ok(())
+#[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps, reason = "uniform platform doctor API")]
+pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
+    Ok(doctor_report(
+        SandboxImplementation::LandlockSeccomp,
+        linux::doctor(),
+    ))
 }
 
-#[derive(serde::Serialize)]
-struct DoctorReport {
-    ok: bool,
-    platform: &'static str,
-    implementation: &'static str,
+#[cfg(target_os = "macos")]
+#[allow(clippy::unnecessary_wraps, reason = "uniform platform doctor API")]
+pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
+    Ok(doctor_report(
+        SandboxImplementation::Seatbelt,
+        macos::doctor(),
+    ))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
+    let status = windows::status()?;
+    let error = (!status.healthy).then(|| "restricted-user installation is unhealthy".to_owned());
+    Ok(DoctorReport {
+        ok: status.healthy,
+        platform: std::env::consts::OS,
+        implementation: status.active,
+        error,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
+    Err(crate::engine::error::Error::PlatformUnsupported.into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn doctor_report(
+    implementation: SandboxImplementation,
+    result: anyhow::Result<()>,
+) -> DoctorReport {
+    let error = result.err().map(|error| format!("{error:#}"));
+    DoctorReport {
+        ok: error.is_none(),
+        platform: std::env::consts::OS,
+        implementation,
+        error,
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn manage_windows(_command: &crate::cli::WindowsCommand) -> anyhow::Result<()> {
+pub(crate) fn manage_windows(
+    _command: &crate::cli::WindowsCommand,
+) -> anyhow::Result<WindowsStatusReport> {
     Err(crate::engine::error::Error::PlatformUnsupported.into())
 }

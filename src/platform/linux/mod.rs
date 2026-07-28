@@ -19,7 +19,7 @@ use landlock::enforce_access_policy;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{self, Command};
+use std::process::Command;
 
 pub(crate) fn doctor() -> Result<()> {
     Ruleset::default()
@@ -44,7 +44,7 @@ pub(crate) fn execute(
     tool: &OsStr,
     args: &[OsString],
     trap_fd: &TrapFd,
-) -> Result<()> {
+) -> Result<i32> {
     let network = &policy.network_access;
     let unrestricted_network = network.is_unrestricted();
     if filter::needs_unix_socket_broker(&network.unix_socket_access) {
@@ -67,7 +67,7 @@ pub(crate) fn execute(
             trap_fd,
         )?;
         trap_fd.close();
-        process::exit(status);
+        return Ok(status);
     }
 
     enforce_access_policy(policy)?;

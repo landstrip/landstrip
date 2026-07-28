@@ -8,8 +8,8 @@ use super::lease;
 use super::state::{self, INSTALLATION_VERSION, Installation, NetworkMode};
 use super::wfp;
 use crate::cli::WindowsCommand;
+use crate::outcome::{SandboxImplementation, WindowsStatusReport};
 use anyhow::{Context, Result, bail};
-use serde_json::json;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -39,7 +39,7 @@ const INSTALL_DIRECTORY: &str = "Landstrip";
 const RUNNER_FILE: &str = "landstrip-restricted-user-runner.exe";
 const MANAGEMENT_MUTEX: &str = "Global\\LandstripRestrictedUserManagement";
 
-pub(crate) fn manage(command: &WindowsCommand) -> Result<()> {
+pub(crate) fn manage(command: &WindowsCommand) -> Result<WindowsStatusReport> {
     match command {
         WindowsCommand::Install {
             restricted_accounts,
@@ -48,12 +48,13 @@ pub(crate) fn manage(command: &WindowsCommand) -> Result<()> {
             proxy_port_high,
         } => {
             if !is_elevated()? {
-                return elevate_install(
+                elevate_install(
                     *restricted_accounts,
                     *unrestricted_accounts,
                     *proxy_port_low,
                     *proxy_port_high,
-                );
+                )?;
+                return status();
             }
             let _management_lock = ManagementLock::acquire()?;
             setup(
@@ -66,7 +67,8 @@ pub(crate) fn manage(command: &WindowsCommand) -> Result<()> {
         WindowsCommand::Status => status(),
         WindowsCommand::Uninstall => {
             if !is_elevated()? {
-                return elevate_uninstall();
+                elevate_uninstall()?;
+                return status();
             }
             let _management_lock = ManagementLock::acquire()?;
             uninstall()
@@ -79,7 +81,7 @@ fn setup(
     unrestricted_accounts: u16,
     proxy_port_low: u16,
     proxy_port_high: u16,
-) -> Result<()> {
+) -> Result<WindowsStatusReport> {
     if state::load_optional()?.is_some() {
         uninstall().context("remove previous restricted-user installation")?;
     }
@@ -140,17 +142,14 @@ fn setup(
     if let Err(error) = setup_result {
         let cleanup = uninstall();
         return match cleanup {
-            Ok(()) => Err(error),
+            Ok(_) => Err(error),
             Err(cleanup_error) => {
                 Err(error.context(format!("automatic cleanup also failed: {cleanup_error:#}")))
             }
         };
     }
 
-    println!(
-        "restricted-user isolation installed and active: {restricted_accounts} restricted account(s), {unrestricted_accounts} unrestricted account(s), proxy ports {proxy_port_low}-{proxy_port_high}"
-    );
-    Ok(())
+    status()
 }
 
 fn provision_accounts(
@@ -182,10 +181,9 @@ fn provision_accounts(
     Ok(())
 }
 
-fn uninstall() -> Result<()> {
+fn uninstall() -> Result<WindowsStatusReport> {
     let Some(mut installation) = state::load_optional()? else {
-        println!("restricted-user isolation is not installed; AppContainer remains active");
-        return Ok(());
+        return Ok(WindowsStatusReport::app_container());
     };
 
     installation.complete = false;
@@ -200,42 +198,42 @@ fn uninstall() -> Result<()> {
     }
     remove_runner(&installation.runner_path)?;
     state::remove()?;
-    println!("restricted-user isolation uninstalled; AppContainer is active");
-    Ok(())
+    Ok(WindowsStatusReport::app_container())
 }
 
-fn status() -> Result<()> {
+pub(in crate::platform::windows) fn status() -> Result<WindowsStatusReport> {
     let Some(installation) = state::load_optional()? else {
-        println!(
-            "{}",
-            json!({ "active": "appContainer", "installed": false, "healthy": true })
-        );
-        return Ok(());
+        return Ok(WindowsStatusReport::app_container());
     };
 
     let (accounts_healthy, runner_healthy) = installation_health(&installation);
     let healthy = installation.complete && accounts_healthy && runner_healthy;
-    println!(
-        "{}",
-        json!({
-            "active": "restrictedUser",
-            "installed": true,
-            "healthy": healthy,
-            "version": installation.version,
-            "complete": installation.complete,
-            "restrictedAccounts": installation.accounts.iter().filter(|account| account.network_mode == NetworkMode::Restricted).count(),
-            "unrestrictedAccounts": installation.accounts.iter().filter(|account| account.network_mode == NetworkMode::Unrestricted).count(),
-            "proxyPortLow": installation.proxy_port_low,
-            "proxyPortHigh": installation.proxy_port_high,
-            "runner": installation.runner_path,
-            "runnerHealthy": runner_healthy,
-            "accountsHealthy": accounts_healthy,
-        })
-    );
-    if !healthy {
-        bail!("restricted-user installation is unhealthy");
-    }
-    Ok(())
+    Ok(WindowsStatusReport {
+        active: SandboxImplementation::RestrictedUser,
+        installed: true,
+        healthy,
+        version: Some(installation.version),
+        complete: Some(installation.complete),
+        restricted_accounts: Some(
+            installation
+                .accounts
+                .iter()
+                .filter(|account| account.network_mode == NetworkMode::Restricted)
+                .count(),
+        ),
+        unrestricted_accounts: Some(
+            installation
+                .accounts
+                .iter()
+                .filter(|account| account.network_mode == NetworkMode::Unrestricted)
+                .count(),
+        ),
+        proxy_port_low: Some(installation.proxy_port_low),
+        proxy_port_high: Some(installation.proxy_port_high),
+        runner: Some(installation.runner_path),
+        runner_healthy: Some(runner_healthy),
+        accounts_healthy: Some(accounts_healthy),
+    })
 }
 
 pub(in crate::platform::windows) fn active_implementation() -> Result<&'static str> {

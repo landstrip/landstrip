@@ -121,7 +121,7 @@ pub(crate) fn execute(
     tool: &OsStr,
     args: &[OsString],
     _trap_fd: &TrapFd,
-) -> Result<()> {
+) -> Result<i32> {
     let moniker = appcontainer_moniker(tool, policy, policy.allow_windows_loopback);
     let profile = AppContainerProfile::new(&moniker, !policy.allow_windows_loopback)?;
     let loopback = if policy.allow_windows_loopback {
@@ -146,16 +146,14 @@ pub(crate) fn execute(
         policy.app_container_mode,
     );
 
-    // The tool has exited, so the container's access to the policy roots is
-    // released here. std::process::exit runs no destructors, and this is the
-    // path every successful run takes: leaving it to `Drop` leaves the
-    // container's ACEs on the user's files and its profile on the machine.
-    // Grants go first — revoking an ACE needs the SID the profile owns.
+    // The tool has exited, so release the container's access to policy roots
+    // before returning its status. Grants go first because revoking an ACE needs
+    // the SID owned by the profile.
     drop(grants);
     drop(loopback);
     drop(profile);
 
-    std::process::exit(i32::from_ne_bytes(exit_code?.to_ne_bytes()));
+    Ok(i32::from_ne_bytes(exit_code?.to_ne_bytes()))
 }
 
 fn appcontainer_moniker(tool: &OsStr, policy: &AccessPolicy, loopback: bool) -> String {

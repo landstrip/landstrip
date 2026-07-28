@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 
-pub(super) use manage::{active_implementation, manage};
+pub(super) use manage::{active_implementation, manage, status};
 
 pub(super) fn is_installed() -> Result<bool> {
     Ok(state::load_optional()?.is_some())
@@ -29,7 +29,7 @@ pub(super) fn execute(
     tool: &OsStr,
     args: &[OsString],
     _trap_fd: &TrapFd,
-) -> Result<()> {
+) -> Result<i32> {
     let installation = state::load().map_err(setup_failed)?;
     if !installation.complete {
         return Err(setup_failed("restricted-user installation is incomplete").into());
@@ -68,10 +68,10 @@ pub(super) fn execute(
     let _ = fs::remove_file(&request_path);
     let exit_code = launch_result?;
     revoke_result?;
-    std::process::exit(i32::from_ne_bytes(exit_code.to_ne_bytes()));
+    Ok(i32::from_ne_bytes(exit_code.to_ne_bytes()))
 }
 
-pub(super) fn run_worker(request: &std::path::Path) -> Result<()> {
+pub(super) fn run_worker(request: &std::path::Path) -> Result<i32> {
     worker::run(request)
 }
 
