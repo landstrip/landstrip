@@ -217,15 +217,29 @@ test('selects a primary agent and applies its prompt', async () => {
         ctx: ExtensionContext,
       ) => Promise<{ block?: boolean; reason?: string } | void>)
     | undefined;
+  let cycleShortcut:
+    | {
+        key: string;
+        handler: (ctx: ExtensionContext) => Promise<void> | void;
+      }
+    | undefined;
   const entries: Array<{ type: string; data: unknown }> = [];
   const statuses: string[] = [];
   const selections: string[] = [];
   const selectedModels: string[] = [];
   const thinkingLevels: string[] = [];
+  const notifications: string[] = [];
+  let idle = true;
   const planModel = { provider: 'anthropic', id: 'claude-plan' };
   const pi = {
     registerTool() {},
     registerCommand() {},
+    registerShortcut(
+      key: string,
+      options: { handler: (ctx: ExtensionContext) => Promise<void> | void },
+    ) {
+      cycleShortcut = { key, handler: options.handler };
+    },
     on(event: string, handler: unknown) {
       if (event === 'session_start') sessionStart = handler as typeof sessionStart;
       if (event === 'before_agent_start') {
@@ -254,7 +268,9 @@ test('selects a primary agent and applies its prompt', async () => {
     model: { provider: 'anthropic', id: 'claude-build' },
     modelRegistry: { getAll: () => [planModel] },
     ui: {
-      notify() {},
+      notify(message: string) {
+        notifications.push(message);
+      },
       async select(title: string) {
         selections.push(title);
         return 'Allow once';
@@ -265,6 +281,7 @@ test('selects a primary agent and applies its prompt', async () => {
       setWidget() {},
       theme: { fg: (_color: string, value: string) => value },
     },
+    isIdle: () => idle,
     sessionManager: {
       getBranch: () => [],
       getSessionId: () => 'parent',
@@ -319,6 +336,21 @@ test('selects a primary agent and applies its prompt', async () => {
   await expect(
     toolCall?.({ toolName: 'edit', input: { path: 'tmp/../secrets/token' } }, ctx),
   ).resolves.toMatchObject({ block: true, reason: expect.stringContaining('secrets/token') });
+
+  expect(cycleShortcut?.key).toBe('ctrl+shift+a');
+  await cycleShortcut?.handler(ctx);
+  expect(runtime.getPrimaryAgent()?.name).toBe('build');
+  expect(entries.at(-1)).toEqual({ type: 'landstrip.primary-agent', data: { name: 'build' } });
+  await cycleShortcut?.handler(ctx);
+  expect(runtime.getPrimaryAgent()?.name).toBe('plan');
+  expect(entries.at(-1)).toEqual({ type: 'landstrip.primary-agent', data: { name: 'plan' } });
+
+  const entryCount = entries.length;
+  idle = false;
+  await cycleShortcut?.handler(ctx);
+  expect(runtime.getPrimaryAgent()?.name).toBe('plan');
+  expect(entries).toHaveLength(entryCount);
+  expect(notifications.at(-1)).toBe('Cannot switch primary agents while an agent run is active');
 });
 
 test('restores a primary agent model and thinking variant', async () => {
@@ -332,6 +364,7 @@ test('restores a primary agent model and thinking variant', async () => {
   const pi = {
     registerTool() {},
     registerCommand() {},
+    registerShortcut() {},
     on(event: string, handler: unknown) {
       if (event === 'session_start') sessionStart = handler as typeof sessionStart;
     },
@@ -397,12 +430,19 @@ test('retains the current primary agent when model activation fails', async () =
   let sessionStart:
     | ((event: { type: 'session_start' }, ctx: ExtensionContext) => Promise<void> | void)
     | undefined;
+  let cyclePrimaryAgent: ((ctx: ExtensionContext) => Promise<void> | void) | undefined;
   const entries: Array<{ type: string; data: unknown }> = [];
   const notifications: string[] = [];
   const lockedModel = { provider: 'anthropic', id: 'locked-model' };
   const pi = {
     registerTool() {},
     registerCommand() {},
+    registerShortcut(
+      _key: string,
+      options: { handler: (ctx: ExtensionContext) => Promise<void> | void },
+    ) {
+      cyclePrimaryAgent = options.handler;
+    },
     on(event: string, handler: unknown) {
       if (event === 'session_start') sessionStart = handler as typeof sessionStart;
     },
@@ -448,11 +488,14 @@ test('retains the current primary agent when model activation fails', async () =
       setWidget() {},
     },
     sessionManager: { getBranch: () => [], getSessionId: () => 'parent' },
+    isIdle: () => true,
   } as unknown as ExtensionContext;
 
   await sessionStart?.({ type: 'session_start' }, ctx);
+  await cyclePrimaryAgent?.(ctx);
+  expect(runtime.getPrimaryAgent()?.name).toBe('build');
+  expect(entries).toEqual([]);
   expect(await runtime.selectPrimaryAgent('plan', ctx)).toBe(false);
-  expect(await runtime.selectPrimaryAgent('locked', ctx)).toBe(false);
 
   expect(runtime.getPrimaryAgent()?.name).toBe('build');
   expect(entries).toEqual([]);
@@ -473,6 +516,7 @@ test('registers task without spawning a worker process', async () => {
       taskTool = tool;
     },
     registerCommand() {},
+    registerShortcut() {},
     on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void>) {
       if (event === 'session_start') sessionStart = handler;
     },
@@ -530,6 +574,7 @@ test('lists hidden agents in the task tool description', () => {
       taskTool = tool;
     },
     registerCommand() {},
+    registerShortcut() {},
     on() {},
     getActiveTools: () => ['task'],
     setActiveTools() {},
@@ -579,6 +624,7 @@ test('removes the task tool when maxSubagents is zero', async () => {
   const pi = {
     registerTool() {},
     registerCommand() {},
+    registerShortcut() {},
     on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void>) {
       if (event === 'session_start') sessionStart = handler;
     },
@@ -656,6 +702,7 @@ test('runs a foreground task in an injected RPC worker', async () => {
       taskTool = tool;
     },
     registerCommand() {},
+    registerShortcut() {},
     on() {},
     appendEntry(customType: string, data: unknown) {
       parentManager.appendCustomEntry(customType, data);
@@ -904,6 +951,7 @@ test('inspects and navigates persisted child sessions without switching sessions
     ) {
       if (name === 'subagents') command = definition.handler;
     },
+    registerShortcut() {},
     on(event: string, handler: unknown) {
       if (event === 'session_start') sessionStart = handler as typeof sessionStart;
     },
@@ -998,6 +1046,7 @@ test('cancels worker startup promptly and disposes a worker created afterward', 
       taskTool = tool;
     },
     registerCommand() {},
+    registerShortcut() {},
     on() {},
     appendEntry() {},
   } as unknown as ExtensionAPI;
@@ -1054,6 +1103,7 @@ test('sends a continuation queued during worker startup once RPC is available', 
       taskTool = tool;
     },
     registerCommand() {},
+    registerShortcut() {},
     on() {},
     appendEntry() {},
     sendMessage() {},
@@ -1145,6 +1195,7 @@ test('records a running foreground task when continued in background', async () 
       taskTool = tool;
     },
     registerCommand() {},
+    registerShortcut() {},
     on() {},
     appendEntry(_customType: string, data: Record<string, unknown>) {
       entries.push(data);
@@ -1227,6 +1278,7 @@ test('delivers a completed task when it is continued in background', async () =>
       taskTool = tool;
     },
     registerCommand() {},
+    registerShortcut() {},
     on() {},
     appendEntry() {},
     sendMessage,
@@ -1323,6 +1375,7 @@ test('rejects an unknown continuation ID instead of creating a new task', async 
       taskTool = tool;
     },
     registerCommand() {},
+    registerShortcut() {},
     on() {},
     appendEntry() {},
   } as unknown as ExtensionAPI;
@@ -1443,6 +1496,7 @@ test('hands a foreground scheduler permit to a nested task at capacity one', asy
       taskTool = tool;
     },
     registerCommand() {},
+    registerShortcut() {},
     on() {},
     appendEntry() {},
     sendMessage() {},

@@ -32,6 +32,7 @@ describe('main Pi tool composition', () => {
       },
       registerFlag() {},
       registerCommand() {},
+      registerShortcut() {},
       on() {},
     } as unknown as ExtensionAPI;
     landstripExtension(pi);

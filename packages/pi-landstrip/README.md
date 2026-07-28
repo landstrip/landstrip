@@ -115,7 +115,8 @@ and file changes. Built-in colors match OpenCode's default theme roles
 (`success`/green for build, `warning`/orange for plan) and appear in the status
 line and agent selectors.
 The selection controls the root system prompt and permissions and is restored
-with the session.
+with the session. Press `Ctrl+Shift+A` while Pi is idle to cycle through enabled
+primary agents; switching is blocked while an agent run is active.
 
 ## Subagents
 

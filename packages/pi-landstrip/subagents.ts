@@ -747,6 +747,7 @@ export class SubagentRuntime {
   private primaryRules: PermissionRules | undefined;
   private primaryConfigurationError = false;
   private maxSubagents = 0;
+  private primaryAgentSwitching = false;
   private shuttingDown = false;
   private activeSessionId: string | undefined;
 
@@ -762,6 +763,10 @@ export class SubagentRuntime {
     this.pi.registerCommand('subagents', {
       description: 'Inspect and navigate subagent sessions',
       handler: async (args, ctx) => this.openTaskInspector(args, ctx),
+    });
+    this.pi.registerShortcut('ctrl+shift+a', {
+      description: 'Cycle to the next primary agent',
+      handler: async (ctx) => this.cyclePrimaryAgent(ctx),
     });
     this.pi.on('session_start', async (_event, ctx) => {
       this.activeSessionId = undefined;
@@ -1053,6 +1058,41 @@ export class SubagentRuntime {
       return false;
     }
     return this.activatePrimaryAgent(agent, catalog, ctx, true);
+  }
+
+  private async cyclePrimaryAgent(ctx: ExtensionContext): Promise<void> {
+    if (!ctx.isIdle()) {
+      ctx.ui.notify('Cannot switch primary agents while an agent run is active', 'warning');
+      return;
+    }
+    if (this.primaryAgentSwitching) {
+      ctx.ui.notify('Primary agent selection is already in progress', 'warning');
+      return;
+    }
+
+    const catalog = this.getAgentCatalog(ctx);
+    for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
+    for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
+    if (catalog.diagnostics.length > 0) return;
+
+    const agents = availablePrimaryAgents(catalog);
+    if (agents.length === 0) {
+      ctx.ui.notify('No primary agents are available', 'warning');
+      return;
+    }
+    if (agents.length === 1 && agents[0]?.name === this.primaryAgent?.name) {
+      ctx.ui.notify(`Only one primary agent is available: ${agents[0].name}`, 'info');
+      return;
+    }
+
+    const currentIndex = agents.findIndex((agent) => agent.name === this.primaryAgent?.name);
+    const nextAgent = agents[(currentIndex + 1) % agents.length]!;
+    this.primaryAgentSwitching = true;
+    try {
+      await this.activatePrimaryAgent(nextAgent, catalog, ctx, true);
+    } finally {
+      this.primaryAgentSwitching = false;
+    }
   }
 
   private createTaskTool(
