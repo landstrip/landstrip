@@ -67,20 +67,13 @@ import {
 } from './api.ts';
 import type { RpcSpawn } from './rpc-process.ts';
 import {
-  type SubagentRuntime,
   registerSubagents,
   registerSubagentWorker,
   workerConfigFromEnvironment,
 } from './subagents.ts';
-import { availablePrimaryAgents, availableSubagents } from './agents.ts';
 import { boxBottom, boxRow, boxTop } from './box.ts';
-import {
-  getPiConfigPaths,
-  loadLandstripConfig,
-  MAX_SUBAGENTS,
-  setMaxSubagentsConfigForScope,
-} from './config.ts';
-import { AsyncQueue, colorizeAgentText, expandHomePath, formatError } from './util.ts';
+import { getPiConfigPaths } from './config.ts';
+import { AsyncQueue, expandHomePath, formatError } from './util.ts';
 
 interface SandboxFilesystemConfig {
   denyRead: string[];
@@ -1134,7 +1127,7 @@ export interface LandstripIntegration extends PiLandstripRuntimeV1 {
   /** Prepare a full Pi RPC process constrained by the effective sandbox policy. */
   prepareRpcWorker(options: LandstripRpcWorkerOptions): Promise<LandstripRpcWorkerLaunch>;
   /** Register the integration's tools, events, flags, and commands with Pi. */
-  register(pi: ExtensionAPI, runtime?: SubagentRuntime): void;
+  register(pi: ExtensionAPI): void;
   /** Publish an integration lifecycle event from an embedded runtime. */
   emit(event: LandstripEvent): void;
 }
@@ -1168,8 +1161,8 @@ export default function (pi: ExtensionAPI) {
     return;
   }
   const integration = createLandstripIntegration();
-  const runtime = registerSubagents(pi, integration);
-  integration.register(pi, runtime);
+  registerSubagents(pi, integration);
+  integration.register(pi);
 }
 
 /** Create a landstrip integration for registration or custom embedding. */
@@ -2614,7 +2607,7 @@ export function createLandstripIntegration(
     };
   }
 
-  function register(pi: ExtensionAPI, runtime?: SubagentRuntime): void {
+  function register(pi: ExtensionAPI): void {
     const maybePi = pi as ExtensionAPI & {
       getFlag?: (name: string) => unknown;
       registerCommand?: ExtensionAPI['registerCommand'];
@@ -2822,284 +2815,6 @@ export function createLandstripIntegration(
         } catch (error) {
           notify(ctx, `Could not update config: ${error}`, 'error');
         }
-      },
-    });
-
-    maybePi.registerCommand?.('agents', {
-      description: 'Select the primary agent and configure subagents',
-      handler: async (_args, ctx) => {
-        if (!ctx.hasUI) return;
-        await ctx.ui.custom(
-          (tui, theme, _kb, done) => {
-            let tab: 'agents' | 'subagents' | 'settings' = 'agents';
-            const initialAgents = runtime
-              ? availablePrimaryAgents(runtime.getAgentCatalog(ctx))
-              : [];
-            let selectedAgent = Math.max(
-              0,
-              initialAgents.findIndex((agent) => agent.name === runtime?.getPrimaryAgent()?.name),
-            );
-            let selectedSubagent = 0;
-            let selectedSetting = 0;
-            let values = [
-              loadLandstripConfig(ctx.cwd, false).maxSubagents,
-              loadLandstripConfig(ctx.cwd, projectConfigTrusted).maxSubagents,
-            ];
-            let editing = false;
-            const supportedVariants = new Set([
-              'off',
-              'minimal',
-              'low',
-              'medium',
-              'high',
-              'xhigh',
-              'max',
-            ]);
-            const { dim, muted, accent, text } = themeColors(theme);
-
-            return {
-              render(width: number): string[] {
-                const row = (content = '') => boxRow(theme, width, content);
-                const lines = [boxTop(theme, width, 'Agents')];
-                lines.push(
-                  row(
-                    ` ${tab === 'agents' ? accent('Agents') : muted('Agents')} ${dim('│')} ${tab === 'subagents' ? accent('Subagents') : muted('Subagents')} ${dim('│')} ${tab === 'settings' ? accent('Settings') : muted('Settings')}`,
-                  ),
-                  row(''),
-                );
-
-                if (tab === 'agents') {
-                  const catalog = runtime?.getAgentCatalog(ctx);
-                  const agents = catalog ? availablePrimaryAgents(catalog) : [];
-                  const activeAgent = runtime?.getPrimaryAgent()?.name;
-                  selectedAgent = Math.min(selectedAgent, Math.max(0, agents.length - 1));
-                  if (agents.length === 0) lines.push(row(muted('No primary agents configured')));
-                  for (const [index, agent] of agents.entries()) {
-                    const selected = index === selectedAgent;
-                    const cursor = selected ? accent('›') : ' ';
-                    const active = agent.name === activeAgent ? theme.fg('success', '●') : dim('○');
-                    const name = colorizeAgentText(
-                      agent.color,
-                      agent.name,
-                      (c, t) => theme.fg(c as Parameters<Theme['fg']>[0], t),
-                      selected ? 'accent' : 'text',
-                    );
-                    const model = dim(`  ${agent.model ?? 'current model'}`);
-                    const description = agent.description ? dim(`  ${agent.description}`) : '';
-                    lines.push(row(`${cursor} ${active} ${name}${model}${description}`));
-                  }
-                } else if (tab === 'subagents') {
-                  const catalog = runtime?.getAgentCatalog(ctx);
-                  const agents = catalog ? availableSubagents(catalog) : [];
-                  selectedSubagent = Math.min(selectedSubagent, Math.max(0, agents.length - 1));
-                  if (agents.length === 0) lines.push(row(muted('No subagents configured')));
-                  const start = Math.max(0, Math.min(selectedSubagent - 3, agents.length - 7));
-                  for (const [offset, agent] of agents.slice(start, start + 7).entries()) {
-                    const index = start + offset;
-                    const selected = index === selectedSubagent;
-                    const cursor = selected ? accent('›') : ' ';
-                    const name = colorizeAgentText(
-                      agent.color,
-                      `@${agent.name}`,
-                      (c, t) => theme.fg(c as Parameters<Theme['fg']>[0], t),
-                      selected ? 'accent' : 'text',
-                    );
-                    const flags = [agent.model ?? 'current model', agent.mode];
-                    if (agent.hidden) flags.push('hidden');
-                    lines.push(row(`${cursor} ${name} ${dim(flags.join(' · '))}`));
-                  }
-
-                  const agent = agents[selectedSubagent];
-                  if (agent) {
-                    lines.push(row(''));
-                    const details = [
-                      `model ${agent.model ?? 'current model'}`,
-                      agent.variant ? `variant ${agent.variant}` : undefined,
-                      agent.steps ? `${agent.steps} steps` : undefined,
-                    ].filter(Boolean);
-                    lines.push(row(`  ${text(details.join(' · '))}`));
-                    const permissions = [...(catalog?.permissions ?? []), ...agent.permissions];
-                    lines.push(row(`  ${dim('Permissions')}`));
-                    if (permissions.length === 0) lines.push(row(`    ${muted('default: ask')}`));
-                    for (const rule of permissions.slice(0, 4)) {
-                      lines.push(
-                        row(
-                          `    ${text(`${rule.permission}:${rule.pattern}`)} ${dim('→')} ${theme.fg(
-                            rule.action === 'deny'
-                              ? 'error'
-                              : rule.action === 'allow'
-                                ? 'success'
-                                : 'warning',
-                            rule.action,
-                          )}`,
-                        ),
-                      );
-                    }
-                    if (permissions.length > 4) {
-                      lines.push(row(`    ${muted(`… ${permissions.length - 4} more`)}`));
-                    }
-                    const unsupported = Object.keys(agent.providerOptions);
-                    if (agent.variant && !supportedVariants.has(agent.variant)) {
-                      unsupported.push(`variant=${agent.variant}`);
-                    }
-                    const unsupportedText =
-                      unsupported.length > 0 ? unsupported.join(', ') : 'none';
-                    lines.push(
-                      row(`  ${dim('Unsupported RPC options:')} ${text(unsupportedText)}`),
-                    );
-                  }
-                  if ((catalog?.diagnostics.length ?? 0) > 0) {
-                    lines.push(row(`  ${theme.fg('error', 'Catalog diagnostics')}`));
-                    for (const diagnostic of catalog?.diagnostics.slice(0, 3) ?? []) {
-                      lines.push(row(`    ${theme.fg('error', diagnostic)}`));
-                    }
-                  }
-                  for (const warning of catalog?.warnings.slice(0, 2) ?? []) {
-                    lines.push(row(`  ${theme.fg('warning', warning)}`));
-                  }
-                } else {
-                  const scopes = ['Global', 'Project'] as const;
-                  for (const [index, scope] of scopes.entries()) {
-                    const selected = index === selectedSetting;
-                    const unavailable = scope === 'Project' && !projectConfigTrusted;
-                    const cursor = selected ? accent('›') : ' ';
-                    const value = selected
-                      ? accent(`[ ${values[index]} ]`)
-                      : text(`[ ${values[index]} ]`);
-                    const label = unavailable
-                      ? muted(`${scope} (project not trusted)`)
-                      : text(scope);
-                    lines.push(row(`${cursor} ${value} ${label}`));
-                  }
-                  if (values[selectedSetting] === 0) {
-                    lines.push(row(`    ${dim('Task delegation is disabled for this scope')}`));
-                  }
-                }
-
-                lines.push(
-                  row(''),
-                  row(
-                    tab === 'agents'
-                      ? `${dim('↑↓')} ${muted('select')}  ${dim('enter')} ${muted('activate')}  ${dim('tab')} ${muted('subagents')}  ${dim('esc')} ${muted('close')}`
-                      : tab === 'subagents'
-                        ? `${dim('↑↓')} ${muted('inspect')}  ${dim('tab')} ${muted('settings')}  ${dim('esc')} ${muted('close')}`
-                        : `${dim('↑↓')} ${muted('scope')}  ${dim('0-9/+/-')} ${muted('change')}  ${dim('enter')} ${muted('save')}  ${dim('tab')} ${muted('agents')}  ${dim('esc')} ${muted('close')}`,
-                  ),
-                  boxBottom(theme, width),
-                );
-                return lines;
-              },
-
-              handleInput(data: string): void {
-                if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) {
-                  done(undefined);
-                  return;
-                }
-                if (
-                  matchesKey(data, 'tab') ||
-                  matchesKey(data, 'left') ||
-                  matchesKey(data, 'right')
-                ) {
-                  const tabs = ['agents', 'subagents', 'settings'] as const;
-                  const current = tabs.indexOf(tab);
-                  const offset = matchesKey(data, 'left') ? -1 : 1;
-                  tab = tabs[(current + offset + tabs.length) % tabs.length] ?? 'agents';
-                  editing = false;
-                  tui.requestRender();
-                  return;
-                }
-                if (tab === 'agents') {
-                  const catalog = runtime?.getAgentCatalog(ctx);
-                  const agents = catalog ? availablePrimaryAgents(catalog) : [];
-                  if (matchesKey(data, 'up')) selectedAgent = Math.max(0, selectedAgent - 1);
-                  else if (matchesKey(data, 'down')) {
-                    selectedAgent = Math.min(Math.max(0, agents.length - 1), selectedAgent + 1);
-                  } else if (matchesKey(data, 'return')) {
-                    const agent = agents[selectedAgent];
-                    if (agent && runtime) {
-                      void runtime
-                        .selectPrimaryAgent(agent.name, ctx)
-                        .then(() => tui.requestRender())
-                        .catch((error: unknown) =>
-                          notify(ctx, `Could not select primary agent: ${error}`, 'error'),
-                        );
-                    }
-                  } else return;
-                  tui.requestRender();
-                  return;
-                }
-                if (tab === 'subagents') {
-                  const catalog = runtime?.getAgentCatalog(ctx);
-                  const agents = catalog ? availableSubagents(catalog) : [];
-                  if (matchesKey(data, 'up')) {
-                    selectedSubagent = Math.max(0, selectedSubagent - 1);
-                  } else if (matchesKey(data, 'down')) {
-                    selectedSubagent = Math.min(
-                      Math.max(0, agents.length - 1),
-                      selectedSubagent + 1,
-                    );
-                  } else return;
-                  tui.requestRender();
-                  return;
-                }
-
-                if (matchesKey(data, 'up')) {
-                  selectedSetting = Math.max(0, selectedSetting - 1);
-                  editing = false;
-                } else if (matchesKey(data, 'down')) {
-                  selectedSetting = Math.min(1, selectedSetting + 1);
-                  editing = false;
-                } else if (/^[0-9]$/.test(data)) {
-                  const value = Number(editing ? `${values[selectedSetting]}${data}` : data);
-                  if (value <= MAX_SUBAGENTS) {
-                    values[selectedSetting] = value;
-                    editing = true;
-                  }
-                } else if (data === '+' || data === '-') {
-                  values[selectedSetting] = Math.min(
-                    MAX_SUBAGENTS,
-                    Math.max(0, values[selectedSetting] + (data === '+' ? 1 : -1)),
-                  );
-                  editing = false;
-                } else if (matchesKey(data, 'return')) {
-                  const scope = selectedSetting === 0 ? 'global' : 'project';
-                  if (scope === 'project' && !projectConfigTrusted) {
-                    notify(ctx, 'Project settings require a trusted project', 'warning');
-                    return;
-                  }
-                  const maxSubagents = values[selectedSetting];
-                  void setMaxSubagentsConfigForScope(ctx.cwd, maxSubagents, scope)
-                    .then(() => {
-                      const effective = loadLandstripConfig(
-                        ctx.cwd,
-                        projectConfigTrusted,
-                      ).maxSubagents;
-                      runtime?.setMaxSubagents(effective);
-                      values = [loadLandstripConfig(ctx.cwd, false).maxSubagents, effective];
-                      editing = false;
-                      notify(
-                        ctx,
-                        `Maximum concurrent subagents set to ${maxSubagents} in ${scope} config`,
-                        'info',
-                      );
-                      tui.requestRender();
-                    })
-                    .catch((error: unknown) => {
-                      notify(ctx, `Could not update config: ${error}`, 'error');
-                    });
-                  return;
-                } else return;
-                tui.requestRender();
-              },
-
-              invalidate(): void {},
-            };
-          },
-          {
-            overlay: true,
-            overlayOptions: { anchor: 'center', width: 72, margin: 2 },
-          },
-        );
       },
     });
   }

@@ -33,15 +33,15 @@ import { encodeLandstripContext, type LandstripContextV1, LANDSTRIP_CONTEXT_ENV 
 import {
   type AgentCatalog,
   type AgentDefinition,
-  availablePrimaryAgents,
-  availableSubagents,
+  agentSupportsMode,
+  availableAgents,
   loadAgentCatalog,
   mergePermissionRules,
   permissionDecision,
   type PermissionRules,
 } from './agents.ts';
 import { boxBottom, boxRow, boxTop } from './box.ts';
-import { MAX_SUBAGENTS } from './config.ts';
+import { loadLandstripConfig, MAX_SUBAGENTS, setMaxSubagentsConfigForScope } from './config.ts';
 import type { LandstripIntegration, LandstripRpcWorkerLaunch } from './index.ts';
 import { type ExtensionUiRequest, type ExtensionUiResult, RpcProcess } from './rpc-process.ts';
 import { AsyncQueue, colorizeAgentText, formatError, isRecord } from './util.ts';
@@ -760,9 +760,9 @@ export class SubagentRuntime {
 
   register(): void {
     this.pi.registerTool(this.createTaskTool());
-    this.pi.registerCommand('subagents', {
-      description: 'Inspect and navigate subagent sessions',
-      handler: async (args, ctx) => this.openTaskInspector(args, ctx),
+    this.pi.registerCommand('agents', {
+      description: 'Select agents, inspect task sessions, and configure task concurrency',
+      handler: async (args, ctx) => this.openAgents(args, ctx),
     });
     this.pi.registerShortcut('ctrl+shift+a', {
       description: 'Cycle to the next primary agent',
@@ -850,27 +850,37 @@ export class SubagentRuntime {
     if (nextTools.join('\0') !== activeTools.join('\0')) this.pi.setActiveTools(nextTools);
   }
 
-  private async openTaskInspector(args: string, ctx: ExtensionContext): Promise<void> {
+  private async openAgents(args: string, ctx: ExtensionContext): Promise<void> {
     if (ctx.mode !== 'tui') {
-      ctx.ui.notify('Subagent inspection is available in TUI mode', 'warning');
+      ctx.ui.notify('Agent management is available in TUI mode', 'warning');
       return;
     }
 
     const catalog = this.getAgentCatalog(ctx);
     for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
-    const agents = availableSubagents(catalog).sort((a, b) => a.name.localeCompare(b.name));
+    const agents = availableAgents(catalog);
     const tasks = [...this.tasks.values()];
     const requested = args.trim();
-    let tab: 'agents' | 'sessions' = requested ? 'sessions' : 'agents';
-    let selectedAgent = 0;
+    const projectTrusted = isProjectTrusted(ctx);
+    let tab: 'agents' | 'sessions' | 'settings' = requested ? 'sessions' : 'agents';
+    let selectedAgent = Math.max(
+      0,
+      agents.findIndex((agent) => agent.name === this.primaryAgent?.name),
+    );
     let selectedTask = requested
       ? tasks.findIndex((task) => task.id === requested || task.id.startsWith(requested))
       : 0;
     if (selectedTask < 0) {
-      ctx.ui.notify(`Unknown subagent task: ${requested}`, 'error');
+      ctx.ui.notify(`Unknown task session: ${requested}`, 'error');
       return;
     }
+    let selectedSetting = 0;
+    let values = [
+      loadLandstripConfig(ctx.cwd, false).maxSubagents,
+      loadLandstripConfig(ctx.cwd, projectTrusted).maxSubagents,
+    ];
+    let editing = false;
     let detail = requested.length > 0;
     let scroll = 0;
 
@@ -879,7 +889,7 @@ export class SubagentRuntime {
         render: (width: number) => {
           const contentWidth = Math.max(1, width - 4);
           const box = (lines: string[]) => [
-            boxTop(theme, width, 'Subagents'),
+            boxTop(theme, width, 'Agents'),
             ...lines.map((line) => boxRow(theme, width, line)),
             boxBottom(theme, width),
           ];
@@ -888,40 +898,113 @@ export class SubagentRuntime {
           const tabs = `${tabLabel('Agents', tab === 'agents')}  ${tabLabel(
             `Sessions ${tasks.length}`,
             tab === 'sessions',
-          )}`;
+          )}  ${tabLabel('Settings', tab === 'settings')}`;
 
           if (tab === 'agents') {
-            const start = Math.max(0, Math.min(selectedAgent - 5, agents.length - 11));
-            const shown = agents.slice(start, start + 11);
-            const nameWidth = Math.min(
-              24,
-              Math.max(5, ...agents.map((agent) => agent.name.length + 1)),
-            );
-            const lines = [
-              tabs,
-              '',
-              `  ${'AGENT'.padEnd(nameWidth)} ${'SOURCE'.padEnd(8)} DESCRIPTION`,
-            ];
+            const start = Math.max(0, Math.min(selectedAgent - 3, agents.length - 7));
+            const shown = agents.slice(start, start + 7);
+            const lines = [tabs, ''];
             for (const [offset, agent] of shown.entries()) {
               const index = start + offset;
-              const cursor = index === selectedAgent ? theme.fg('accent', '›') : ' ';
-              const name = `@${agent.name}`.padEnd(nameWidth);
-              const description = `${agent.description ?? 'No description'}${
-                agent.hidden ? ' [hidden]' : ''
-              }`;
+              const selected = index === selectedAgent;
+              const cursor = selected ? theme.fg('accent', '›') : ' ';
+              const active =
+                agent.name === this.primaryAgent?.name
+                  ? theme.fg('success', '●')
+                  : theme.fg('dim', '○');
+              const name = colorizeAgentText(agent.color, `@${agent.name}`, (color, text) =>
+                theme.fg(color as Parameters<Theme['fg']>[0], text),
+              );
+              const metadata = theme.fg(
+                'dim',
+                `${agent.mode} · ${agent.source} · ${agent.model ?? 'current model'}`,
+              );
+              lines.push(`${cursor} ${active} ${name} ${metadata}`);
+            }
+            if (agents.length === 0) lines.push(theme.fg('muted', '  No agents configured.'));
+
+            const agent = agents[selectedAgent];
+            if (agent) {
+              lines.push('', theme.fg('text', agent.description ?? 'No description'));
+              const details = [
+                agent.variant ? `variant ${agent.variant}` : undefined,
+                agent.steps ? `${agent.steps} steps` : undefined,
+              ].filter(Boolean);
+              if (details.length > 0) lines.push(theme.fg('dim', details.join(' · ')));
+              const permissions = [...catalog.permissions, ...agent.permissions];
+              lines.push(theme.fg('dim', 'Permissions'));
+              if (permissions.length === 0) lines.push(`  ${theme.fg('muted', 'default: ask')}`);
+              for (const rule of permissions.slice(0, 4)) {
+                const color =
+                  rule.action === 'deny'
+                    ? 'error'
+                    : rule.action === 'allow'
+                      ? 'success'
+                      : 'warning';
+                lines.push(
+                  `  ${theme.fg('text', `${rule.permission}:${rule.pattern}`)} ${theme.fg('dim', '→')} ${theme.fg(color, rule.action)}`,
+                );
+              }
+              if (permissions.length > 4) {
+                lines.push(`  ${theme.fg('muted', `… ${permissions.length - 4} more`)}`);
+              }
+              const unsupported = Object.keys(agent.providerOptions);
+              if (agent.variant && !PI_THINKING_LEVELS.has(agent.variant)) {
+                unsupported.push(`variant=${agent.variant}`);
+              }
               lines.push(
-                `${cursor} ${colorizeAgentText(agent.color, name, (c, t) => theme.fg(c as Parameters<Theme['fg']>[0], t))} ${theme.fg('dim', agent.source.padEnd(8))} ${theme.fg('text', description)}`,
+                `${theme.fg('dim', 'Unsupported RPC options:')} ${theme.fg('text', unsupported.join(', ') || 'none')}`,
               );
             }
-            if (agents.length === 0) lines.push('  No subagent types are configured.');
-            lines.push('', theme.fg('dim', '↑↓ select  tab/→ sessions  esc close'));
+            if (catalog.diagnostics.length > 0) {
+              lines.push(theme.fg('error', 'Catalog diagnostics'));
+              for (const diagnostic of catalog.diagnostics.slice(0, 3)) {
+                lines.push(`  ${theme.fg('error', diagnostic)}`);
+              }
+            }
+            for (const warning of catalog.warnings.slice(0, 2)) {
+              lines.push(theme.fg('warning', warning));
+            }
+            const canActivate = agent !== undefined && agentSupportsMode(agent, 'primary');
+            lines.push(
+              '',
+              theme.fg(
+                'dim',
+                `↑↓ select${canActivate ? '  enter activate' : ''}  tab/→ sessions  esc close`,
+              ),
+            );
+            return box(lines);
+          }
+
+          if (tab === 'settings') {
+            const scopes = ['Global', 'Project'] as const;
+            const lines = [tabs, ''];
+            for (const [index, scope] of scopes.entries()) {
+              const selected = index === selectedSetting;
+              const unavailable = scope === 'Project' && !projectTrusted;
+              const cursor = selected ? theme.fg('accent', '›') : ' ';
+              const value = selected
+                ? theme.fg('accent', `[ ${values[index]} ]`)
+                : theme.fg('text', `[ ${values[index]} ]`);
+              const label = unavailable
+                ? theme.fg('muted', `${scope} (project not trusted)`)
+                : theme.fg('text', scope);
+              lines.push(`${cursor} ${value} ${label}`);
+            }
+            if (values[selectedSetting] === 0) {
+              lines.push(`    ${theme.fg('dim', 'Task delegation is disabled for this scope')}`);
+            }
+            lines.push(
+              '',
+              theme.fg('dim', '↑↓ scope  0-9/+/- change  enter save  tab agents  esc close'),
+            );
             return box(lines);
           }
 
           if (!detail) {
             const lines = [tabs, ''];
             if (tasks.length === 0) {
-              lines.push('No subagent sessions in this session.');
+              lines.push('No task sessions in this session.');
             } else {
               const start = Math.max(0, Math.min(selectedTask - 5, tasks.length - 11));
               const shown = tasks.slice(start, start + 11);
@@ -934,12 +1017,12 @@ export class SubagentRuntime {
                 );
               }
             }
-            lines.push('', theme.fg('dim', '↑↓ select  enter inspect  tab/← agents  esc close'));
+            lines.push('', theme.fg('dim', '↑↓ select  enter inspect  tab settings  esc close'));
             return box(lines);
           }
 
           const task = tasks[selectedTask];
-          if (!task) return box([tabs, '', 'No subagent sessions in this session.']);
+          if (!task) return box([tabs, '', 'No task sessions in this session.']);
           const siblings = tasks.filter(
             (candidate) => candidate.parentTaskId === task.parentTaskId,
           );
@@ -972,14 +1055,19 @@ export class SubagentRuntime {
             );
           }
           lines.push(
-            theme.fg('dim', 'Parent p/backspace  Prev ←  Next →  ↑↓ scroll  tab agents  esc back'),
+            theme.fg(
+              'dim',
+              'Parent p/backspace  Prev ←  Next →  ↑↓ scroll  tab settings  esc back',
+            ),
           );
           return box(lines.map((line) => truncateToWidth(line, contentWidth)));
         },
         handleInput: (data: string) => {
           if (matchesKey(data, 'tab')) {
-            tab = tab === 'agents' ? 'sessions' : 'agents';
+            const tabs = ['agents', 'sessions', 'settings'] as const;
+            tab = tabs[(tabs.indexOf(tab) + 1) % tabs.length] ?? 'agents';
             detail = false;
+            editing = false;
             scroll = 0;
             tui.requestRender();
             return;
@@ -992,6 +1080,65 @@ export class SubagentRuntime {
               selectedAgent = Math.min(agents.length - 1, selectedAgent + 1);
             } else if (matchesKey(data, 'right')) {
               tab = 'sessions';
+            } else if (matchesKey(data, 'return')) {
+              const agent = agents[selectedAgent];
+              if (!agent || !agentSupportsMode(agent, 'primary')) return;
+              void this.selectPrimaryAgent(agent.name, ctx)
+                .then(() => tui.requestRender())
+                .catch((error: unknown) =>
+                  ctx.ui.notify(`Could not select primary agent: ${formatError(error)}`, 'error'),
+                );
+            } else return;
+            tui.requestRender();
+            return;
+          }
+
+          if (tab === 'settings') {
+            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) {
+              done();
+              return;
+            }
+            if (matchesKey(data, 'up')) {
+              selectedSetting = Math.max(0, selectedSetting - 1);
+              editing = false;
+            } else if (matchesKey(data, 'down')) {
+              selectedSetting = Math.min(1, selectedSetting + 1);
+              editing = false;
+            } else if (/^[0-9]$/.test(data)) {
+              const value = Number(editing ? `${values[selectedSetting]}${data}` : data);
+              if (value <= MAX_SUBAGENTS) {
+                values[selectedSetting] = value;
+                editing = true;
+              }
+            } else if (data === '+' || data === '-') {
+              values[selectedSetting] = Math.min(
+                MAX_SUBAGENTS,
+                Math.max(0, values[selectedSetting] + (data === '+' ? 1 : -1)),
+              );
+              editing = false;
+            } else if (matchesKey(data, 'return')) {
+              const scope = selectedSetting === 0 ? 'global' : 'project';
+              if (scope === 'project' && !projectTrusted) {
+                ctx.ui.notify('Project settings require a trusted project', 'warning');
+                return;
+              }
+              const maxSubagents = values[selectedSetting];
+              void setMaxSubagentsConfigForScope(ctx.cwd, maxSubagents, scope)
+                .then(() => {
+                  const effective = loadLandstripConfig(ctx.cwd, projectTrusted).maxSubagents;
+                  this.setMaxSubagents(effective);
+                  values = [loadLandstripConfig(ctx.cwd, false).maxSubagents, effective];
+                  editing = false;
+                  ctx.ui.notify(
+                    `Maximum concurrent tasks set to ${maxSubagents} in ${scope} config`,
+                    'info',
+                  );
+                  tui.requestRender();
+                })
+                .catch((error: unknown) =>
+                  ctx.ui.notify(`Could not update config: ${formatError(error)}`, 'error'),
+                );
+              return;
             } else return;
             tui.requestRender();
             return;
@@ -1000,6 +1147,7 @@ export class SubagentRuntime {
           if (!detail) {
             if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
             else if (matchesKey(data, 'left')) tab = 'agents';
+            else if (matchesKey(data, 'right')) tab = 'settings';
             else if (matchesKey(data, 'up')) selectedTask = Math.max(0, selectedTask - 1);
             else if (matchesKey(data, 'down') && tasks.length > 0) {
               selectedTask = Math.min(tasks.length - 1, selectedTask + 1);
@@ -1038,7 +1186,7 @@ export class SubagentRuntime {
             const sibling = siblings[siblingIndex + offset];
             if (sibling) selectedTask = tasks.indexOf(sibling);
             scroll = 0;
-          } else if (data !== 'r') return;
+          } else return;
           tui.requestRender();
         },
         invalidate() {},
@@ -1052,7 +1200,9 @@ export class SubagentRuntime {
     for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
     if (catalog.diagnostics.length > 0) return false;
-    const agent = availablePrimaryAgents(catalog).find((candidate) => candidate.name === name);
+    const agent = availableAgents(catalog).find(
+      (candidate) => candidate.name === name && agentSupportsMode(candidate, 'primary'),
+    );
     if (!agent) {
       ctx.ui.notify(`Unknown primary agent: ${name}`, 'error');
       return false;
@@ -1075,7 +1225,7 @@ export class SubagentRuntime {
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
     if (catalog.diagnostics.length > 0) return;
 
-    const agents = availablePrimaryAgents(catalog);
+    const agents = availableAgents(catalog).filter((agent) => agentSupportsMode(agent, 'primary'));
     if (agents.length === 0) {
       ctx.ui.notify('No primary agents are available', 'warning');
       return;
@@ -1106,8 +1256,9 @@ export class SubagentRuntime {
       getAgentDir(),
       boundCtx ? isProjectTrusted(boundCtx) : false,
     );
-    const agents = availableSubagents(catalog).filter(
+    const agents = [...catalog.agents.values()].filter(
       (agent) =>
+        agentSupportsMode(agent, 'subagent') &&
         permissionDecision(callerRules ?? catalog.permissions, 'task', agent.name) !== 'deny',
     );
     const descriptions = agents
@@ -1191,7 +1342,7 @@ export class SubagentRuntime {
             text += `\n${theme.fg('muted', `… ${keyHint('app.tools.expand', 'to expand')}`)}`;
           }
         }
-        text += `\n${theme.fg('dim', `↳ /subagents ${details.taskId.slice(0, 8)} to inspect`)}`;
+        text += `\n${theme.fg('dim', `↳ /agents ${details.taskId.slice(0, 8)} to inspect`)}`;
         return new Text(text, 0, 0);
       },
     };
@@ -1995,7 +2146,7 @@ export class SubagentRuntime {
       const value = entry.data as { name?: unknown } | undefined;
       if (typeof value?.name === 'string') name = value.name;
     }
-    const agents = availablePrimaryAgents(catalog);
+    const agents = availableAgents(catalog).filter((agent) => agentSupportsMode(agent, 'primary'));
     const agent = agents.find((candidate) => candidate.name === name) ?? agents[0];
     if (agent && !(await this.activatePrimaryAgent(agent, catalog, ctx, false))) {
       this.invalidatePrimaryAgent(catalog, ctx);
@@ -2132,10 +2283,4 @@ export function registerSubagents(
   const runtime = new SubagentRuntime(pi, integration);
   runtime.register();
   return runtime;
-}
-
-export function describeSubagents(catalog: AgentCatalog): string {
-  return availableSubagents(catalog)
-    .map((agent) => `${agent.name}: ${agent.description ?? 'No description'}`)
-    .join('\n');
 }

@@ -103,17 +103,18 @@ task's dedicated session directory. These paths are required to construct a
 normal Pi worker and are not persisted into `sandbox.json`. The worker receives
 write access only to its own session and temporary directories.
 
-Use `/sandbox` to inspect the active policy and toggle sandboxing. Use `/agents`
-to select the primary role, inspect worker configuration and status, and set the
-global or trusted-project concurrency limit.
+Use `/sandbox` to inspect the active policy and toggle sandboxing. `/agents` is the
+single interface for selecting the primary role, inspecting every configured agent
+and task session, and setting the global or trusted-project concurrency limit.
 
 ## Primary agents
 
-The `/agents` selector provides OpenCode-compatible `build` and `plan` roles by
-default. Build has normal development access; plan asks before shell commands
-and file changes. Built-in colors match OpenCode's default theme roles
-(`success`/green for build, `warning`/orange for plan) and appear in the status
-line and agent selectors.
+The `/agents` dialog provides one catalog for every configured agent. Each entry
+shows whether its mode is `primary`, `subagent`, or `all`; primary-capable entries
+can be activated from the list. OpenCode-compatible `build` and `plan` roles are
+provided by default. Build has normal development access; plan asks before shell
+commands and file changes. Their built-in colors appear in the status line and
+agent catalog.
 The selection controls the root system prompt and permissions and is restored
 with the session. Press `Ctrl+Shift+A` while Pi is idle to cycle through enabled
 primary agents; switching is blocked while an agent run is active.
@@ -154,11 +155,10 @@ The tool accepts the OpenCode task fields:
 Foreground tasks return the child result directly. Background tasks return a
 queued result and deliver completion automatically. Task rows show lifecycle
 state, current activity, tool-call count, elapsed time, and expandable output.
-Use `/subagents` to open an inspector with **Agents** and **Sessions** tabs. The
-Agents tab lists every available subagent type and its `built-in`, `global`, or
-`local` source. The Sessions tab inspects child transcripts; task rows can open a
-specific one with `/subagents <id>`. Completed and failed task metadata remains
-available after reload, and persisted sessions can be continued with `task_id`.
+The **Sessions** tab in `/agents` inspects child transcripts and supports parent and
+sibling navigation. Open a specific task directly with `/agents <id>`. Completed and
+failed task metadata remains available after reload, and persisted sessions can be
+continued with `task_id`.
 
 Session switching or shutdown stops live workers. After an unclean restart,
 unfinished work is marked interrupted; completed but undelivered background
@@ -335,9 +335,9 @@ hidden/disabled agents, prompts, colors, and ordered `allow`/`ask`/`deny` permis
 apply to primary agents and subagents. Prompt strings may include OpenCode-style
 `{file:path}` tokens; relative paths resolve against the `settings.json` file that
 defines them. `color` accepts `#RRGGBB` or OpenCode theme names (`primary`,
-`secondary`, `accent`, `success`, `warning`, `error`, `info`). `hidden` only hides an
-agent from user-facing primary pickers; the model can still invoke a hidden subagent
-via `task`.
+`secondary`, `accent`, `success`, `warning`, `error`, `info`). `hidden` removes an
+agent from the user-facing catalog; the model can still invoke a hidden agent whose
+mode supports subagent work via `task`.
 
 Primary agents honor configured models and supported Pi thinking-level variants;
 omitting either preserves the current session setting. A model may use the full

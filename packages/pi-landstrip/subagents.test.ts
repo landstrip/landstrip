@@ -898,6 +898,12 @@ test('runs a foreground task in an injected RPC worker', async () => {
 
 test('inspects and navigates persisted child sessions without switching sessions', async () => {
   const cwd = temporaryDirectory();
+  const agentDir = temporaryDirectory();
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  writeFileSync(
+    join(agentDir, 'settings.json'),
+    JSON.stringify({ landstrip: { maxSubagents: 1 } }),
+  );
   const parentManager = SessionManager.create(cwd, join(cwd, 'parent-sessions'));
   const childManager = SessionManager.create(cwd, join(cwd, 'child-sessions'));
   childManager.appendMessage({
@@ -950,6 +956,7 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<void>) | undefined;
   let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  const commandNames: string[] = [];
   let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
   let finishCustom: (() => void) | undefined;
   const pi = {
@@ -958,7 +965,8 @@ test('inspects and navigates persisted child sessions without switching sessions
       name: string,
       definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
     ) {
-      if (name === 'subagents') command = definition.handler;
+      commandNames.push(name);
+      if (name === 'agents') command = definition.handler;
     },
     registerShortcut() {},
     on(event: string, handler: unknown) {
@@ -973,6 +981,19 @@ test('inspects and navigates persisted child sessions without switching sessions
     maxSubagents: 1,
     agents: new Map([
       [
+        'build',
+        {
+          name: 'build',
+          source: 'built-in',
+          description: 'Build code',
+          prompt: 'Build.',
+          mode: 'primary' as const,
+          hidden: false,
+          permissions: [],
+          providerOptions: {},
+        },
+      ],
+      [
         'review',
         {
           name: 'review',
@@ -980,6 +1001,19 @@ test('inspects and navigates persisted child sessions without switching sessions
           description: 'Review code',
           prompt: 'Review.',
           mode: 'subagent' as const,
+          hidden: false,
+          permissions: [],
+          providerOptions: {},
+        },
+      ],
+      [
+        'general',
+        {
+          name: 'general',
+          source: 'built-in',
+          description: 'General work',
+          prompt: 'Work.',
+          mode: 'all' as const,
           hidden: false,
           permissions: [],
           providerOptions: {},
@@ -1001,6 +1035,7 @@ test('inspects and navigates persisted child sessions without switching sessions
     sessionManager: parentManager,
     ui: {
       notify() {},
+      setStatus() {},
       setWidget() {},
       custom(
         factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => typeof component,
@@ -1014,11 +1049,13 @@ test('inspects and navigates persisted child sessions without switching sessions
   } as unknown as ExtensionContext;
 
   await sessionStart?.({}, ctx);
+  expect(commandNames).toEqual(['agents']);
   const running = command?.('', ctx);
   const agents = component?.render(96).join('\n');
-  expect(agents).toContain('Agents');
-  expect(agents).toContain('@review');
-  expect(agents).toContain('local');
+  expect(agents).toContain('[Agents]  Sessions 2  Settings');
+  expect(agents).toContain('@build primary · built-in');
+  expect(agents).toContain('@review subagent · local');
+  expect(agents).toContain('@general all · built-in');
   component?.handleInput('\t');
   expect(component?.render(96).join('\n')).toContain('Sessions 2');
   expect(component?.render(96).join('\n')).toContain('task-123');
@@ -1033,8 +1070,17 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(component?.render(96).join('\n')).toContain('Inspect child');
   component?.handleInput('\x1b');
   expect(component?.render(96).join('\n')).toContain('Sessions 2');
+  component?.handleInput('\t');
+  expect(component?.render(96).join('\n')).toContain('[Settings]');
+  expect(component?.render(96).join('\n')).toContain('[ 1 ] Global');
   finishCustom?.();
   await running;
+
+  const direct = command?.('task-123', ctx);
+  expect(component?.render(96).join('\n')).toContain('Inspect this child session.');
+  finishCustom?.();
+  await direct;
+  vi.unstubAllEnvs();
 });
 
 test('cancels worker startup promptly and disposes a worker created afterward', async () => {

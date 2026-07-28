@@ -21,7 +21,6 @@ import landstripExtension, {
   shouldPromptForWrite,
   writeEnvFile,
 } from './index.ts';
-import type { SubagentRuntime } from './subagents.ts';
 
 describe('main Pi tool composition', () => {
   it('leaves filesystem tool names available to Pi plugins', () => {
@@ -42,7 +41,7 @@ describe('main Pi tool composition', () => {
   });
 });
 
-it('registers the sandbox dashboard and separate agents command', async () => {
+it('registers the sandbox dashboard independently from agent supervision', async () => {
   const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-overlay-agent-'));
   vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
   const commandNames: string[] = [];
@@ -60,65 +59,7 @@ it('registers the sandbox dashboard and separate agents command', async () => {
     },
     on() {},
   } as unknown as ExtensionAPI;
-  let selected: string | undefined;
-  const agents = new Map([
-    [
-      'build',
-      {
-        name: 'build',
-        mode: 'primary' as const,
-        prompt: 'Build.',
-        hidden: false,
-        permissions: [],
-        providerOptions: {},
-      },
-    ],
-    [
-      'plan',
-      {
-        name: 'plan',
-        mode: 'primary' as const,
-        prompt: 'Plan.',
-        hidden: false,
-        permissions: [],
-        providerOptions: {},
-      },
-    ],
-    [
-      'review',
-      {
-        name: 'review',
-        description: 'Review code',
-        mode: 'subagent' as const,
-        prompt: 'Review.',
-        model: 'anthropic/claude-test',
-        variant: 'turbo',
-        hidden: false,
-        permissions: [{ permission: 'read', pattern: '*', action: 'allow' as const }],
-        providerOptions: { temperature: 0.2 },
-      },
-    ],
-  ]);
-  let maxSubagents = 0;
-  const runtime = {
-    getAgentCatalog: () => ({
-      agents,
-      permissions: [{ permission: 'bash', pattern: '*', action: 'deny' as const }],
-      diagnostics: ['agent broken has an unknown field'],
-      warnings: ['legacy configuration is ignored'],
-      maxSubagents: 0,
-    }),
-    getPrimaryAgent: () => agents.get(selected ?? 'build'),
-    getMaxSubagents: () => maxSubagents,
-    setMaxSubagents(value: number) {
-      maxSubagents = value;
-    },
-    async selectPrimaryAgent(name: string) {
-      selected = name;
-      return true;
-    },
-  } as unknown as SubagentRuntime;
-  createLandstripIntegration({ registerBashTool: false }).register(pi, runtime);
+  createLandstripIntegration({ registerBashTool: false }).register(pi);
   let customResult: unknown;
   const ctx = {
     cwd: join(tmpdir(), 'pi-landstrip-overlay-test'),
@@ -151,31 +92,9 @@ it('registers the sandbox dashboard and separate agents command', async () => {
   component?.handleInput('\x1b');
   expect(customResult).toBe(false);
 
-  await commandHandlers.get('agents')?.('', ctx);
-  expect(commandNames).toEqual(['sandbox', 'agents']);
+  expect(commandNames).toEqual(['sandbox']);
   expect(commandNames).not.toContain('landstrip');
-  const agentsView = component?.render(78).join('\n') ?? '';
-  expect(agentsView).toContain('Agents │ Subagents │ Settings');
-  expect(agentsView).toContain('build');
-  component?.handleInput('\x1b[B');
-  component?.handleInput('\r');
-  await vi.waitFor(() => expect(selected).toBe('plan'));
-  component?.handleInput('\t');
-  const subagentsView = component?.render(78).join('\n') ?? '';
-  expect(subagentsView).toContain('@review');
-  expect(subagentsView).toContain('anthropic/claude-test');
-  expect(subagentsView).toContain('bash:*');
-  expect(subagentsView).toContain('read:*');
-  expect(subagentsView).toContain('temperature, variant=turbo');
-  expect(subagentsView).toContain('agent broken has an unknown field');
-  expect(subagentsView).toContain('legacy configuration is ignored');
-  component?.handleInput('\t');
-  expect(component?.render(78).join('\n')).toContain('Global');
-  expect(component?.render(78).join('\n')).toContain('Project (project not trusted)');
-  component?.handleInput('1');
-  component?.handleInput('6');
-  component?.handleInput('7');
-  expect(component?.render(78).join('\n')).toContain('[ 16 ] Global');
+  expect(commandNames).not.toContain('subagents');
   vi.unstubAllEnvs();
   rmSync(agentDir, { recursive: true, force: true });
 });

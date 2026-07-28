@@ -7,8 +7,8 @@ import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 
 import {
-  availablePrimaryAgents,
-  availableSubagents,
+  agentSupportsMode,
+  availableAgents,
   loadAgentCatalog,
   mergePermissionRules,
   permissionDecision,
@@ -38,17 +38,25 @@ describe('landstrip agent configuration', () => {
     if (previousOpenCodeConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR;
     else process.env.OPENCODE_CONFIG_DIR = previousOpenCodeConfigDir;
   });
-  test('provides default primary agents and subagents', () => {
+  test('provides one default agent catalog with mode capabilities', () => {
     const catalog = loadAgentCatalog(temporaryDirectory(), temporaryDirectory());
 
     expect(catalog.maxSubagents).toBe(1);
-    expect(availablePrimaryAgents(catalog).map((agent) => agent.name)).toEqual(['build', 'plan']);
-    expect(availableSubagents(catalog).map((agent) => agent.name)).toEqual([
+    const agents = availableAgents(catalog);
+    expect(agents.map((agent) => agent.name)).toEqual([
+      'build',
       'code-reviewer',
       'explore',
       'general',
+      'plan',
       'scout',
     ]);
+    expect(
+      agents.filter((agent) => agentSupportsMode(agent, 'primary')).map((agent) => agent.name),
+    ).toEqual(['build', 'plan']);
+    expect(
+      agents.filter((agent) => agentSupportsMode(agent, 'subagent')).map((agent) => agent.name),
+    ).toEqual(['code-reviewer', 'explore', 'general', 'scout']);
     expect(catalog.agents.get('scout')).toMatchObject({
       source: 'built-in',
       mode: 'subagent',
@@ -175,7 +183,11 @@ describe('landstrip agent configuration', () => {
 
     const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
     expect(catalog.maxSubagents).toBe(0);
-    expect(availablePrimaryAgents(catalog).map((agent) => agent.name)).toEqual(['build', 'plan']);
+    expect(
+      availableAgents(catalog)
+        .filter((agent) => agentSupportsMode(agent, 'primary'))
+        .map((agent) => agent.name),
+    ).toEqual(['build', 'plan']);
   });
 
   test('rejects maxSubagents above the supported limit', () => {

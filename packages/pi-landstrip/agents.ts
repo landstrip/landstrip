@@ -270,10 +270,10 @@ export function mergePermissionRules(...values: PermissionRules[]): PermissionRu
   return values.flatMap((value) => value);
 }
 
-export function availableSubagents(catalog: AgentCatalog): AgentDefinition[] {
-  return [...catalog.agents.values()].filter((agent) => agent.mode !== 'primary');
+export function availableAgents(catalog: AgentCatalog): AgentDefinition[] {
+  return [...catalog.agents.values()].filter((agent) => !agent.hidden);
 }
 
-export function availablePrimaryAgents(catalog: AgentCatalog): AgentDefinition[] {
-  return [...catalog.agents.values()].filter((agent) => agent.mode !== 'subagent' && !agent.hidden);
+export function agentSupportsMode(agent: AgentDefinition, mode: 'primary' | 'subagent'): boolean {
+  return agent.mode === mode || agent.mode === 'all';
 }
