@@ -55,8 +55,8 @@ describe('landstrip agent configuration', () => {
     expect(permissionDecision(catalog.permissions, 'bash')).toBe('allow');
     expect(permissionDecision(catalog.agents.get('plan')?.permissions ?? [], 'edit')).toBe('ask');
     expect(permissionDecision(catalog.agents.get('plan')?.permissions ?? [], 'task')).toBe('ask');
-    expect(catalog.agents.get('build')?.color).toBe('secondary');
-    expect(catalog.agents.get('plan')?.color).toBe('accent');
+    expect(catalog.agents.get('build')?.color).toBe('success');
+    expect(catalog.agents.get('plan')?.color).toBe('warning');
 
     const explore = catalog.agents.get('explore');
     const exploreRules = mergePermissionRules(catalog.permissions, explore?.permissions ?? []);

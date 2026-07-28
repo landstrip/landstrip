@@ -4,13 +4,13 @@
       "build": {
         "description": "Default primary agent with full development access",
         "mode": "primary",
-        "color": "secondary",
+        "color": "success",
         "prompt": "Work in build mode. Implement, test, and complete the requested changes."
       },
       "plan": {
         "description": "Planning agent that asks before commands or file changes",
         "mode": "primary",
-        "color": "accent",
+        "color": "warning",
         "prompt": "Work in plan mode. Analyze the problem and produce a clear plan before making changes.",
         "permission": { "edit": "ask", "bash": "ask", "task": "ask" }
       },

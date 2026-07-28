@@ -274,10 +274,10 @@ test('selects a primary agent and applies its prompt', async () => {
   runtime.register();
 
   await sessionStart?.({ type: 'session_start' }, ctx);
-  expect(statuses.at(-1)).toBe('\x1b[35m@build\x1b[39m');
+  expect(statuses.at(-1)).toBe('\x1b[32m@build\x1b[39m');
   expect(runtime.selectPrimaryAgent('plan', ctx)).toBe(true);
   expect(entries.at(-1)).toEqual({ type: 'landstrip.primary-agent', data: { name: 'plan' } });
-  expect(statuses.at(-1)).toBe('\x1b[36m@plan\x1b[39m');
+  expect(statuses.at(-1)).toBe('\x1b[33m@plan\x1b[39m');
 
   const result = await beforeAgentStart?.({ systemPrompt: 'Base prompt' }, ctx);
   expect(result?.systemPrompt).toContain('Base prompt\n\nWork in plan mode.');
