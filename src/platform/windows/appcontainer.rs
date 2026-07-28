@@ -6,7 +6,6 @@
 use crate::config::AppContainerMode;
 use crate::engine::error::{Cause, Error as LandstripError, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
-use crate::engine::trap_fd::TrapFd;
 use anyhow::Result;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString, c_void};
@@ -116,12 +115,7 @@ fn hresult_cause(hr: i32) -> Cause {
     }
 }
 
-pub(crate) fn execute(
-    policy: &AccessPolicy,
-    tool: &OsStr,
-    args: &[OsString],
-    _trap_fd: &TrapFd,
-) -> Result<i32> {
+pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<i32> {
     let moniker = appcontainer_moniker(tool, policy, policy.allow_windows_loopback);
     let profile = AppContainerProfile::new(&moniker, !policy.allow_windows_loopback)?;
     let loopback = if policy.allow_windows_loopback {

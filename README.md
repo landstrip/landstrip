@@ -36,6 +36,8 @@ landstrip windows status
 landstrip windows uninstall
 ```
 
+The `windows` command family is available only in Windows builds.
+
 Policy options are `-p, --policy <FILE>`, repeated in merge order, and
 `--policy-format <json|yaml>`. Use `-p -` to read standard input; its format
 must be explicit. `policy validate` checks the merged policy and current
@@ -276,8 +278,8 @@ Every Landstrip event, whether a sandbox denial or a failure that prevents the
 tool from running, is reported as one JSON object per line, with a fixed `kind`
 discriminant and stable `code`. Consumers route on `kind` for the record shape
 and `code` for the event. Failures and completed denials go to standard error by
-default. On Linux, pending query traps go only to `--trap-fd FD`, which must name
-an already-open descriptor.
+default. The `--trap-fd FD` option is available only in Unix builds and names an
+already-open descriptor. On Linux, pending query traps go only to that descriptor.
 
 ```sh
 landstrip run --trap-fd 3 -p policy.json -- cargo test 3>landstrip-traps.txt
@@ -374,10 +376,10 @@ output to the sandboxed tool. Failures are emitted as coded JSON traps. Usage
 errors exit with status 2, other Landstrip failures with 1, and the tool's own
 status is otherwise passed through.
 
-Writing to `--trap-fd` is best-effort: it needs an already-open descriptor (3 or
-greater; 0-2 are reserved), and if the write fails the trap is dropped while the
-policy stays in effect. On Linux, a broker launch failure also reaches
-`--trap-fd` while the descriptor remains open.
+On Unix, writing to `--trap-fd` is best-effort: it needs an already-open
+descriptor (3 or greater; 0-2 are reserved), and if the write fails the trap is
+dropped while the policy stays in effect. On Linux, a broker launch failure also
+reaches `--trap-fd` while the descriptor remains open.
 
 ## Development
 

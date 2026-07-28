@@ -14,7 +14,6 @@ mod worker;
 
 use crate::engine::error::{Error, Mechanism};
 use crate::engine::policy::AccessPolicy;
-use crate::engine::trap_fd::TrapFd;
 use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -24,12 +23,7 @@ pub(super) use manage::{active_implementation, manage, status};
 pub(super) fn is_installed() -> Result<bool> {
     Ok(state::load_optional()?.is_some())
 }
-pub(super) fn execute(
-    policy: &AccessPolicy,
-    tool: &OsStr,
-    args: &[OsString],
-    _trap_fd: &TrapFd,
-) -> Result<i32> {
+pub(super) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<i32> {
     let installation = state::load().map_err(setup_failed)?;
     if !installation.complete {
         return Err(setup_failed("restricted-user installation is incomplete").into());

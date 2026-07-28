@@ -9,21 +9,15 @@ mod appcontainer;
 mod restricted_user;
 
 use crate::engine::policy::AccessPolicy;
-use crate::engine::trap_fd::TrapFd;
 use crate::outcome::WindowsStatusReport;
 use anyhow::Result;
 use std::ffi::{OsStr, OsString};
 
-pub(crate) fn execute(
-    policy: &AccessPolicy,
-    tool: &OsStr,
-    args: &[OsString],
-    trap_fd: &TrapFd,
-) -> Result<i32> {
+pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<i32> {
     if restricted_user::is_installed()? {
-        restricted_user::execute(policy, tool, args, trap_fd)
+        restricted_user::execute(policy, tool, args)
     } else {
-        appcontainer::execute(policy, tool, args, trap_fd)
+        appcontainer::execute(policy, tool, args)
     }
 }
 

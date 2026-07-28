@@ -8,4 +8,5 @@ pub(crate) mod error;
 pub(crate) mod paths;
 pub(crate) mod policy;
 pub(crate) mod trap;
+#[cfg(unix)]
 pub(crate) mod trap_fd;

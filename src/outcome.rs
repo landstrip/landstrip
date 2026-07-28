@@ -3,6 +3,7 @@
 
 use crate::engine::policy::AccessPolicy;
 use serde::Serialize;
+#[cfg(target_os = "windows")]
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -35,6 +36,7 @@ pub(crate) struct DoctorReport {
     pub(crate) error: Option<String>,
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WindowsStatusReport {
@@ -87,6 +89,7 @@ pub(crate) enum CommandOutcome {
     PolicyValidated(PolicyValidationReport),
     PolicyResolved(AccessPolicy),
     Doctor(DoctorReport),
+    #[cfg(target_os = "windows")]
     Windows(WindowsStatusReport),
 }
 
@@ -95,6 +98,7 @@ impl CommandOutcome {
         match self {
             Self::Exit(code) => *code,
             Self::Doctor(report) => i32::from(!report.ok),
+            #[cfg(target_os = "windows")]
             Self::Windows(report) => i32::from(!report.healthy),
             Self::PolicyValidated(_) | Self::PolicyResolved(_) => 0,
         }

@@ -20,6 +20,7 @@ use crate::config::load_settings;
 use crate::engine::error::Error;
 use crate::engine::policy::{AccessPolicy, resolve_policy};
 use crate::engine::trap::Trap;
+#[cfg(unix)]
 use crate::engine::trap_fd::TrapFd;
 use crate::outcome::{CommandOutcome, PolicyValidationReport};
 use anyhow::Result;
@@ -33,24 +34,33 @@ fn main() {
         Ok(ParseOutcome::Invocation(invocation)) => invocation,
         Ok(ParseOutcome::Display(text)) => {
             if let Err(error) = render_display(&text) {
-                exit_with_error(&error, &TrapFd::from_fd(None));
+                exit_with_error(&error);
             }
             return;
         }
-        Err(error) => exit_with_error(&error.into(), &TrapFd::from_fd(None)),
+        Err(error) => exit_with_error(&error.into()),
     };
     init_logging(invocation.debug);
 
+    #[cfg(unix)]
     let trap_fd = match &invocation.command {
         Command::Run(command) => TrapFd::from_fd(command.trap_fd),
         _ => TrapFd::from_fd(None),
     };
     let outcome = match dispatch(&invocation) {
         Ok(outcome) => outcome,
-        Err(error) => exit_with_error(&error, &trap_fd),
+        Err(error) => {
+            #[cfg(unix)]
+            exit_with_trap_fd(&error, &trap_fd);
+            #[cfg(not(unix))]
+            exit_with_error(&error);
+        }
     };
     if let Err(error) = render_outcome(&outcome) {
-        exit_with_error(&error, &trap_fd);
+        #[cfg(unix)]
+        exit_with_trap_fd(&error, &trap_fd);
+        #[cfg(not(unix))]
+        exit_with_error(&error);
     }
     let exit_code = outcome.exit_code();
     if exit_code != 0 {
@@ -70,7 +80,9 @@ fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
         Command::Run(command) => run(command),
         Command::Policy(command) => inspect_policy(command),
         Command::Doctor => platform::doctor().map(CommandOutcome::Doctor),
+        #[cfg(target_os = "windows")]
         Command::Windows(command) => platform::manage_windows(command).map(CommandOutcome::Windows),
+        #[cfg(target_os = "windows")]
         Command::Worker { request } => platform::run_worker(request).map(CommandOutcome::Exit),
     }
 }
@@ -78,9 +90,18 @@ fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
 fn run(command: &RunCommand) -> Result<CommandOutcome> {
     let policy = load_policy(&command.policy, Some(command.tool.as_os_str()))?;
     platform::validate(&policy)?;
+    execute_run(&policy, command).map(CommandOutcome::Exit)
+}
+
+#[cfg(unix)]
+fn execute_run(policy: &AccessPolicy, command: &RunCommand) -> Result<i32> {
     let trap_fd = TrapFd::from_fd(command.trap_fd);
-    platform::execute(&policy, &command.tool, &command.tool_args, &trap_fd)
-        .map(CommandOutcome::Exit)
+    platform::execute(policy, &command.tool, &command.tool_args, &trap_fd)
+}
+
+#[cfg(not(unix))]
+fn execute_run(policy: &AccessPolicy, command: &RunCommand) -> Result<i32> {
+    platform::execute(policy, &command.tool, &command.tool_args)
 }
 
 fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
@@ -135,6 +156,7 @@ fn render_outcome_to(output: &mut impl Write, outcome: &CommandOutcome) -> Resul
         CommandOutcome::PolicyValidated(report) => write_json(output, report),
         CommandOutcome::PolicyResolved(policy) => write_json(output, policy),
         CommandOutcome::Doctor(report) => write_json(output, report),
+        #[cfg(target_os = "windows")]
         CommandOutcome::Windows(report) => write_json(output, report),
     }
 }
@@ -145,20 +167,31 @@ fn write_json(output: &mut impl Write, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn exit_with_error(error: &anyhow::Error, trap_fd: &TrapFd) -> ! {
+fn exit_with_error(error: &anyhow::Error) -> ! {
+    let (trap, exit_code) = error_trap(error);
+    trap.emit();
+    process::exit(exit_code)
+}
+
+#[cfg(unix)]
+fn exit_with_trap_fd(error: &anyhow::Error, trap_fd: &TrapFd) -> ! {
+    let (trap, exit_code) = error_trap(error);
+    trap_fd.write(&trap);
+    trap.emit();
+    process::exit(exit_code)
+}
+
+fn error_trap(error: &anyhow::Error) -> (Trap, i32) {
     let engine_error = error
         .chain()
         .find_map(<dyn StdError + 'static>::downcast_ref::<Error>);
     let trap = engine_error.map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from_error);
-
-    trap_fd.write(&trap);
-    trap.emit();
     let exit_code = if matches!(engine_error, Some(Error::Usage { .. })) {
         2
     } else {
         1
     };
-    process::exit(exit_code)
+    (trap, exit_code)
 }
 
 #[cfg(test)]

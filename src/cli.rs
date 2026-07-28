@@ -7,6 +7,7 @@ use serde::Serialize;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
 use std::str::FromStr;
 
 const PROGRAM_NAME: &str = "landstrip";
@@ -30,8 +31,9 @@ pub(crate) enum Command {
     Run(RunCommand),
     Policy(PolicyCommand),
     Doctor,
+    #[cfg(target_os = "windows")]
     Windows(WindowsCommand),
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg(target_os = "windows")]
     Worker {
         request: PathBuf,
     },
@@ -40,6 +42,7 @@ pub(crate) enum Command {
 #[derive(Debug)]
 pub(crate) struct RunCommand {
     pub(crate) policy: PolicyInput,
+    #[cfg(unix)]
     pub(crate) trap_fd: Option<i32>,
     pub(crate) tool: OsString,
     pub(crate) tool_args: Vec<OsString>,
@@ -57,8 +60,8 @@ pub(crate) struct PolicyRequest {
     pub(crate) tool: Option<OsString>,
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Debug)]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) enum WindowsCommand {
     Install {
         restricted_accounts: u16,
@@ -103,6 +106,7 @@ enum CliCommand {
     Policy(PolicyArgs),
     /// Verify that the current OS sandbox is operational.
     Doctor,
+    #[cfg(target_os = "windows")]
     /// Manage Windows restricted-user provisioning.
     Windows(WindowsArgs),
 }
@@ -112,6 +116,7 @@ struct RunArgs {
     #[command(flatten)]
     policy: PolicyInputArgs,
 
+    #[cfg(unix)]
     /// Write traps to an already-open file descriptor.
     #[arg(long, value_name = "FD", value_parser = parse_trap_fd)]
     trap_fd: Option<i32>,
@@ -156,12 +161,14 @@ struct PolicyRequestArgs {
     tool: Option<OsString>,
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Debug, Args)]
 struct WindowsArgs {
     #[command(subcommand)]
     command: WindowsAction,
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Debug, Subcommand)]
 enum WindowsAction {
     /// Install and activate restricted-user isolation.
@@ -172,6 +179,7 @@ enum WindowsAction {
     Uninstall,
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Debug, Args)]
 struct WindowsInstallArgs {
     /// Restricted-network account pool size.
@@ -187,12 +195,14 @@ struct WindowsInstallArgs {
     proxy_port_range: ProxyPortRange,
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Clone, Copy, Debug)]
 struct ProxyPortRange {
     low: u16,
     high: u16,
 }
 
+#[cfg(target_os = "windows")]
 impl FromStr for ProxyPortRange {
     type Err = String;
 
@@ -251,6 +261,7 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
         CliCommand::Run(args) => Command::Run(run_command(args)?),
         CliCommand::Policy(args) => Command::Policy(policy_command(args)),
         CliCommand::Doctor => Command::Doctor,
+        #[cfg(target_os = "windows")]
         CliCommand::Windows(args) => Command::Windows(windows_command(args)),
     };
 
@@ -269,6 +280,7 @@ fn run_command(args: RunArgs) -> Result<RunCommand, Error> {
     };
     Ok(RunCommand {
         policy: policy_input(args.policy),
+        #[cfg(unix)]
         trap_fd: args.trap_fd,
         tool,
         tool_args: program.collect(),
@@ -296,6 +308,7 @@ fn policy_input(args: PolicyInputArgs) -> PolicyInput {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn windows_command(args: WindowsArgs) -> WindowsCommand {
     match args.command {
         WindowsAction::Install(args) => WindowsCommand::Install {
@@ -339,6 +352,7 @@ fn parse_policy_path(path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(path))
 }
 
+#[cfg(unix)]
 fn parse_trap_fd(value: &str) -> Result<i32, String> {
     let fd = value
         .parse::<i32>()
@@ -349,14 +363,17 @@ fn parse_trap_fd(value: &str) -> Result<i32, String> {
     Ok(fd)
 }
 
+#[cfg(target_os = "windows")]
 fn parse_restricted_accounts(value: &str) -> Result<u16, String> {
     parse_count(value, 1, "restricted accounts")
 }
 
+#[cfg(target_os = "windows")]
 fn parse_unrestricted_accounts(value: &str) -> Result<u16, String> {
     parse_count(value, 0, "unrestricted accounts")
 }
 
+#[cfg(target_os = "windows")]
 fn parse_count(value: &str, minimum: u16, name: &str) -> Result<u16, String> {
     let count = value
         .parse::<u16>()
@@ -367,6 +384,7 @@ fn parse_count(value: &str, minimum: u16, name: &str) -> Result<u16, String> {
     Ok(count)
 }
 
+#[cfg(target_os = "windows")]
 fn parse_port(value: &str) -> Result<u16, String> {
     let port = value
         .parse::<u16>()
@@ -411,6 +429,18 @@ mod tests {
         }
     }
 
+    fn display(args: &[&str]) -> Result<String, Error> {
+        match parse_from(
+            OsString::from(PROGRAM_NAME),
+            args.iter().map(OsString::from).collect(),
+        )? {
+            ParseOutcome::Display(message) => Ok(message),
+            ParseOutcome::Invocation(_) => Err(Error::Usage {
+                message: "expected display output".to_owned(),
+            }),
+        }
+    }
+
     #[test]
     fn run_requires_separator() {
         assert!(parse(&["run", "echo"]).is_err());
@@ -427,6 +457,39 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_run_accepts_trap_fd() -> anyhow::Result<()> {
+        let invocation = parse(&["run", "--trap-fd", "3", "--", "echo"])?;
+        let Command::Run(run) = invocation.command else {
+            anyhow::bail!("expected run command");
+        };
+        assert_eq!(run.trap_fd, Some(3));
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_run_rejects_trap_fd() {
+        assert!(parse(&["run", "--trap-fd", "3", "--", "echo"]).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_help_is_target_native() -> anyhow::Result<()> {
+        assert!(display(&["--help"])?.contains("windows"));
+        assert!(!display(&["run", "--help"])?.contains("--trap-fd"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_help_is_target_native() -> anyhow::Result<()> {
+        assert!(!display(&["--help"])?.contains("windows"));
+        assert!(display(&["run", "--help"])?.contains("--trap-fd"));
+        Ok(())
+    }
+
     #[test]
     fn old_implicit_run_is_rejected() {
         assert!(parse(&["-p", "policy.json", "echo"]).is_err());
@@ -435,6 +498,23 @@ mod tests {
     #[test]
     fn old_windows_setup_is_rejected() {
         assert!(parse(&["windows", "setup"]).is_err());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn windows_commands_are_unavailable() {
+        assert!(parse(&["windows", "status"]).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_commands_are_available() -> anyhow::Result<()> {
+        let invocation = parse(&["windows", "status"])?;
+        assert!(matches!(
+            invocation.command,
+            Command::Windows(WindowsCommand::Status)
+        ));
+        Ok(())
     }
 
     #[test]

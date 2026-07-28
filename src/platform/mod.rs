@@ -15,9 +15,11 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+use crate::outcome::DoctorReport;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::outcome::SandboxImplementation;
-use crate::outcome::{DoctorReport, WindowsStatusReport};
+#[cfg(target_os = "windows")]
+use crate::outcome::WindowsStatusReport;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) use fallback::execute;
@@ -63,11 +65,6 @@ pub(crate) fn manage_windows(
 #[cfg(target_os = "windows")]
 pub(crate) fn run_worker(request: &std::path::Path) -> anyhow::Result<i32> {
     windows::run_worker(request)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn run_worker(_request: &std::path::Path) -> anyhow::Result<i32> {
-    Err(crate::engine::error::Error::PlatformUnsupported.into())
 }
 
 #[cfg(target_os = "linux")]
@@ -117,11 +114,4 @@ fn doctor_report(
         implementation,
         error,
     }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn manage_windows(
-    _command: &crate::cli::WindowsCommand,
-) -> anyhow::Result<WindowsStatusReport> {
-    Err(crate::engine::error::Error::PlatformUnsupported.into())
 }

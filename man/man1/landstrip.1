@@ -86,18 +86,20 @@ or
 include policy attached to the resolved program executable.
 .It Fl -trap-fd Ar fd
 For
-.Cm run ,
-write Landstrip trap events as JSON to the already-open file descriptor
+.Cm run
+on Unix builds, write Landstrip trap events as JSON to the already-open file
+descriptor
 .Ar fd .
 The descriptor must be 3 or greater. On Linux, the seccomp broker emits
-filesystem denials with the same fields as other trap events. This option is
-best-effort on implementations without per-access denial callbacks.
+filesystem denials with the same fields as other trap events.
 .It Fl V , Fl -version
 Print version information and exit.
 .It Fl h , Fl -help
 Print usage information and exit.
 .El
 .Sh WINDOWS COMMANDS
+This command family is available only in Windows builds.
+.Pp
 .Cm windows install
 requests elevation, provisions restricted-user isolation, and activates it.
 The default installation creates eight restricted-network accounts, two

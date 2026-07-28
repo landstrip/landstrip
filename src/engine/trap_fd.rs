@@ -7,9 +7,6 @@ use crate::engine::trap::Trap;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TrapFd {
-    // Denial traps are a `--trap-fd` concept only the Linux broker produces;
-    // Windows accepts the flag but has no descriptor to write to.
-    #[cfg_attr(not(unix), allow(dead_code))]
     fd: Option<i32>,
 }
 
@@ -37,17 +34,14 @@ impl TrapFd {
         }
     }
 
-    #[cfg(unix)]
     pub(crate) fn fd(&self) -> Option<i32> {
         self.fd
     }
 
-    #[cfg(unix)]
     pub(crate) fn write(&self, trap: &Trap) {
         self.write_json(&trap.json_line());
     }
 
-    #[cfg(unix)]
     pub(crate) fn write_json(&self, json: &str) {
         let mut line = json.to_owned();
         line.push('\n');
@@ -61,13 +55,6 @@ impl TrapFd {
 
             write_nonblocking_trap_fd(fd, line.as_bytes());
         }
-    }
-
-    /// Windows has no inherited landstrip descriptor: traps reach the launcher
-    /// on stderr only.
-    #[cfg(not(unix))]
-    pub(crate) fn write(&self, _trap: &Trap) {
-        let _ = self;
     }
 }
 
@@ -85,7 +72,6 @@ fn write_socket_trap_fd(fd: i32, line: &[u8]) {
     log_short_write(fd, line.len(), written);
 }
 
-#[cfg(unix)]
 fn write_nonblocking_trap_fd(fd: i32, line: &[u8]) {
     if line.len() > libc::PIPE_BUF {
         log::debug!("trap: dropping fd={fd} record larger than PIPE_BUF");
@@ -121,7 +107,6 @@ fn write_nonblocking_trap_fd(fd: i32, line: &[u8]) {
     }
 }
 
-#[cfg(unix)]
 fn write_without_sigpipe(fd: i32, line: &[u8]) -> isize {
     // SAFETY: the signal set pointers point to initialized local storage.
     unsafe {
@@ -159,7 +144,6 @@ fn write_without_sigpipe(fd: i32, line: &[u8]) -> isize {
     }
 }
 
-#[cfg(unix)]
 fn log_short_write(fd: i32, expected: usize, written: isize) {
     if written == isize::try_from(expected).unwrap_or(-1) {
         return;
@@ -172,7 +156,6 @@ fn log_short_write(fd: i32, expected: usize, written: isize) {
     );
 }
 
-#[cfg(unix)]
 fn log_fd_error(operation: &str, fd: i32) {
     let error = std::io::Error::last_os_error();
     log::debug!(

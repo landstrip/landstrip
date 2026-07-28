@@ -8,15 +8,22 @@
 
 use crate::engine::error::Error;
 use crate::engine::policy::AccessPolicy;
+#[cfg(unix)]
 use crate::engine::trap_fd::TrapFd;
 use anyhow::Result;
 use std::ffi::{OsStr, OsString};
 
+#[cfg(unix)]
 pub(crate) fn execute(
     _policy: &AccessPolicy,
     _tool: &OsStr,
     _args: &[OsString],
     _trap_fd: &TrapFd,
 ) -> Result<i32> {
+    Err(Error::PlatformUnsupported.into())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn execute(_policy: &AccessPolicy, _tool: &OsStr, _args: &[OsString]) -> Result<i32> {
     Err(Error::PlatformUnsupported.into())
 }
