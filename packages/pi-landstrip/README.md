@@ -7,15 +7,13 @@ Subagents  3 active
 └─ ● running  @general  Design bounded summaries
 ```
 
-`pi-landstrip` is a [Pi](https://pi.dev/) extension that provides sandboxed Bash
-execution, OpenCode-compatible primary agents, and sandbox-aware subagents. It
-uses an Anthropic-compatible policy and delegates OS-level enforcement to
+`pi-landstrip` adds sandboxed Bash, primary agents, and sandboxed subagents to
+[Pi](https://pi.dev/). OS isolation is provided by
 [`landstrip`](https://github.com/landstrip/landstrip).
 
-The extension includes a shared [sandbox policy](./sandbox.json). Agent definitions,
-worker limits, shared permissions, and OpenCode integration flags live under
-`landstrip` in Pi `settings.json`. Trusted-project settings override global settings
-and built-in agent defaults.
+The package includes a default [sandbox policy](./sandbox.json). Configure agents,
+subagent limits, permissions, and OpenCode imports under `landstrip` in Pi
+`settings.json`. Trusted project settings override global settings.
 
 Process-backed subagents require Pi >= 0.82.0, and Node.js >= 22.19.0.
 
@@ -47,14 +45,11 @@ Alternatively, place the extension under `~/.pi/agent/extensions/` (global) or
 
 On unsupported platforms the extension loads but leaves sandboxing disabled.
 
-On Windows, Pi's Git Bash/MSYS shell cannot run under LPAC. The packaged policy
-therefore selects standard AppContainer explicitly. This is weaker than LPAC
-because resources granted to `ALL APPLICATION PACKAGES` remain visible;
-`/sandbox` and the status line report the active implementation and mode. There
-is no silent LPAC-to-standard fallback.
+Pi's Git Bash/MSYS shell cannot start in LPAC, so the default Windows policy uses
+standard AppContainer. `/sandbox` and the status line show the active Windows
+isolation. LPAC launch failures return an error.
 
-Optional restricted-user installation supports Git Bash without AppContainer.
-It requires one-time elevation and persistent local accounts and WFP rules; see
+Restricted-user isolation supports Git Bash with restricted local accounts. See
 [Windows restricted-user installation](#windows-restricted-user-installation).
 
 ## Disabling
@@ -78,11 +73,10 @@ without a project-trust API use only global configuration.
 
 ## Behavior
 
-When a sandboxed command requests access not already covered by policy, the extension
-sends a host notification and opens a dialog. The user can allow once, allow for the
-session, persist for the project or globally, or reject. The dialog shows the exact
-path or domain being requested. Project approvals are written to `.pi/sandbox.json`;
-global approvals are written to `~/.pi/agent/sandbox.json`.
+When a command requests additional access, the extension opens an approval dialog.
+The user can allow once, allow for the session, save the approval globally or for the
+project, or reject it. Project approvals go to `.pi/sandbox.json`; global approvals
+go to `~/.pi/agent/sandbox.json`.
 
 The main agent remains a normal Pi process. `pi-landstrip` replaces Bash execution,
 including AI `bash` calls and manually typed shell commands (`!` and `!!`), with a
@@ -101,64 +95,39 @@ task's dedicated session directory. These paths are required to construct a
 normal Pi worker and are not persisted into `sandbox.json`. The worker receives
 write access only to its own session and temporary directories.
 
-Use `/sandbox` to inspect the active policy and toggle sandboxing. `/agents` is the
-single interface for selecting the primary role, inspecting every configured agent
-and task session, and setting the global or trusted-project concurrency limit.
+Use `/sandbox` to inspect or disable the sandbox. Use `/agents` to select a primary
+agent, inspect primary agents, subagents, and tasks, and set subagent limits.
 
 ## Permission model
 
-Agent permissions and sandbox permissions are separate policy layers. They have
-different targets and make decisions at different stages:
+Agent and sandbox permissions apply at different stages:
 
-| Layer              | Target                                           | Decision point       | Governs                                                             |
-| ------------------ | ------------------------------------------------ | -------------------- | ------------------------------------------------------------------- |
-| Agent permission   | A primary agent or subagent                      | Before tool dispatch | Whether that agent may invoke a tool with the declared arguments    |
-| Sandbox permission | A sandboxed command and its descendant processes | During execution     | The filesystem and network operations the command actually attempts |
-
-The execution path is:
+| Layer              | Checked before or during | Controls                                   |
+| ------------------ | ------------------------ | ------------------------------------------ |
+| Agent permission   | Before tool dispatch     | Which tools an agent may call              |
+| Sandbox permission | During process execution | Filesystem and network access for commands |
 
 ```text
-agent → agent permission check → tool command → sandbox → OS resource
+agent → agent permission → tool → sandbox → OS resource
 ```
 
-The two kinds of query are triggered independently. An agent `ask` decision comes
-from the selected primary or subagent definition and holds the tool call before it is
-dispatched. A sandbox query comes from the command reaching the OS boundary. Where
-the platform supports dynamic queries, such as Linux seccomp traps, this can happen
-after the process has started; the broker holds the operation while the user decides.
-
-Neither policy can replace the other:
-
-- An agent `allow` permits tool dispatch but cannot widen the sandbox.
-- A sandbox approval permits a concrete OS operation but does not authorize an agent
-  to invoke a tool denied by its agent policy.
-- Agent policy describes tool requests known before dispatch. Sandbox policy constrains
-  executable behavior, including unexpected or malicious native code.
-- Agent and sandbox approvals are tracked separately and do not imply one another.
-
-For example, an agent may be allowed to invoke Bash, while the launched executable is
-still blocked or queried when it attempts `openat("/home/user/.ssh/config")` or
-`connect("127.0.0.1:5432")`.
+Each layer prompts independently. An agent approval allows tool dispatch; sandbox
+restrictions still apply to the resulting process.
 
 ## Primary agents
 
-The `/agents` dialog provides one catalog for every configured agent. Each entry
-shows whether its mode is `primary`, `subagent`, or `all`; primary-capable entries
-can be activated from the list. OpenCode-compatible `build` and `plan` roles are
-provided by default. Build has normal development access; plan asks before shell
-commands and file changes. Their built-in colors appear in the status line and
-agent catalog.
-The selection controls the root system prompt and permissions and is restored
-with the session. Press `Ctrl+Shift+A` while Pi is idle to cycle through enabled
-primary agents; switching is blocked while an agent run is active.
+`/agents` lists all configured agents and their modes. Press Enter to activate a
+visible primary agent. The built-in primary agents are `build` and `plan`. Build has
+normal development access; plan asks before shell commands and file edits.
+
+The selected prompt and permissions are stored in the session. Press `Ctrl+Shift+A`
+while Pi is idle to cycle through visible primary agents.
 
 ## Subagents
 
-Landstrip provides an OpenCode-compatible `task` tool. Each active task runs as a
-full `pi --mode rpc` process inside an outer Landstrip sandbox. The sandbox
-covers Pi, its plugins and tools, model requests, and descendant processes. The
-root Pi process supervises RPC, permissions, nesting, persistence, and result
-delivery.
+The `task` tool runs each subagent in a separate `pi --mode rpc` process inside a
+Landstrip sandbox. The root Pi process manages RPC, permissions, nesting, sessions,
+and results.
 
 Workers use normal Pi resource discovery and plugin loading, plus the
 `pi-landstrip` worker extension. Requested tools are composed inside the worker,
@@ -166,7 +135,7 @@ so plugins can add or replace implementations. Each task starts a fresh Pi
 process and plugin instances; continuing a `task_id` restores its persisted Pi
 session in a new process.
 
-The tool accepts the OpenCode task fields:
+The tool accepts these fields:
 
 ```json
 {
@@ -179,28 +148,18 @@ The tool accepts the OpenCode task fields:
 }
 ```
 
-Foreground tasks return the child result directly. Background tasks return a
-queued result and deliver completion automatically. Task rows show lifecycle
-state, current activity, tool-call count, elapsed time, and expandable output.
-The **Sessions** tab in `/agents` inspects child transcripts and supports parent and
-sibling navigation. Open a specific task directly with `/agents <id>`. Completed and
-failed task metadata remains available after reload, and persisted sessions can be
-continued with `task_id`.
+Foreground tasks return their result directly. Background tasks return immediately
+and report completion later. The **Tasks** tab in `/agents` shows task status and
+output. Open a task with `/agents <id>`. Continue a saved session with `task_id`.
 
 Session switching or shutdown stops live workers. After an unclean restart,
 unfinished work is marked interrupted; completed but undelivered background
 results are delivered when the root session resumes.
 
-Agent permissions wrap each worker's composed tools: `deny` blocks dispatch, `ask`
-prompts in the root UI, and `allow` runs the tool. Other workers may continue while
-an agent-permission prompt is open. Forwarded dialogs identify the agent, task
-summary, and task ID. An "Allow for this session" decision applies to the root
-session and its descendants.
-
-Subagents fail closed when sandboxing is expected but unavailable, unsupported,
-or missing. An explicit `--no-sandbox` flag or `enabled: false` configuration is
-treated as an intentional opt-out and uses the warned unsandboxed process path.
-Unsupported Pi versions still fail task startup.
+Workers check agent permissions before tool dispatch: `deny` blocks, `ask` prompts in
+the root UI, and `allow` runs the tool. Required sandbox startup failures stop the
+task. With `--no-sandbox` or `enabled: false`, workers run without OS isolation and
+Pi shows a warning.
 
 ### Platform behavior
 
@@ -236,30 +195,21 @@ first.
 
 ## Configuration
 
-The two permission layers deliberately use different configuration files:
-
-- Agent policy belongs under `landstrip` in Pi `settings.json`. It controls which
-  primary agents and subagents exist and which tools they may dispatch.
-- Sandbox policy belongs in `sandbox.json`. It controls the filesystem and network
-  operations attempted by sandboxed commands and worker processes.
-
-Rules cannot be copied between these files: the schemas, targets, and enforcement
-stages are different, so an agent rule is neither valid nor equivalent as a sandbox
-rule, or vice versa.
+Agent permissions are configured under `landstrip` in Pi `settings.json`. Sandbox
+permissions are configured in `sandbox.json`. The files use different schemas and
+control different stages.
 
 ### Agent policy (`settings.json`)
 
-Agent configuration is read from `landstrip` in `~/.pi/agent/settings.json` and, for
-trusted projects, `.pi/settings.json`. Project values override global values; both
-are merged over internal defaults. The built-in subagents are `code-reviewer`,
-`explore`, `general`, and the OpenCode-compatible `scout` reconnaissance agent.
+Agent settings are read from `~/.pi/agent/settings.json` and, for trusted projects,
+`.pi/settings.json`. Built-in subagents are `explore`, `general`, and `scout`.
 
-The read-only `code-reviewer` is available without additional configuration: delegate
-with `task` using `subagent_type: "code-reviewer"`. It can read and search files and
-run a fixed set of non-mutating Git inspection commands; all other tools are denied.
+Pi Markdown agents are loaded from `~/.pi/agent/agents/*.md` and, for trusted
+projects, `.pi/agents/*.md`. Nested directories are supported. Project Markdown
+agents override global Markdown agents. Settings under `landstrip.agent` override
+Markdown and OpenCode agents with the same name.
 
-An agent configuration example follows. This belongs in Pi `settings.json`, not
-`sandbox.json`:
+Add agent configuration under `landstrip` in Pi `settings.json`:
 
 ```json
 {
@@ -286,30 +236,21 @@ An agent configuration example follows. This belongs in Pi `settings.json`, not
 }
 ```
 
-`landstrip.maxSubagents` is an integer from 0 through 16 controlling concurrent
-workers. The default is 1, making `task` and `code-reviewer` available immediately.
-Set it to 0 to remove the `task` tool while retaining primary roles. There is no
-separate subagent enable switch. The Settings tab in `/agents` edits this limit for
-global and trusted-project configuration.
+`landstrip.maxSubagents` sets the maximum number of concurrent subagents from 0 to 16. The default is 1; zero disables `task`. The `/agents` **Settings** tab provides
+**Maximum subagents (global)** and **Maximum subagents (local)**.
 
-`landstrip.permission` defines the shared baseline inherited by every agent. Each
-`landstrip.agent.<name>.permission` map overrides that baseline. Agent modes,
-hidden/disabled agents, prompts, colors, and ordered `allow`/`ask`/`deny` permissions
-apply to primary agents and subagents. Prompt strings may include OpenCode-style
-`{file:path}` tokens; relative paths resolve against the `settings.json` file that
-defines them. `color` accepts `#RRGGBB` or OpenCode theme names (`primary`,
-`secondary`, `accent`, `success`, `warning`, `error`, `info`). `hidden` removes an
-agent from the user-facing catalog; the model can still invoke a hidden agent whose
-mode supports subagent work via `task`.
+`landstrip.permission` applies to every agent. Each
+`landstrip.agent.<name>.permission` map adds agent-specific rules; later matching
+rules win. Agent definitions support `mode`, `prompt`, `model`, `variant`, `steps`,
+`color`, `disable`, and `allow`/`ask`/`deny` permissions. `{file:path}` prompt
+references are resolved from the defining `settings.json`. Provider-specific fields
+belong under `options`.
 
-Primary agents honor configured models and supported Pi thinking-level variants;
-omitting either preserves the current session setting. A model may use the full
-`provider/model` name or a bare model ID when that ID is unique. Selection fails
-without changing the active primary agent when the model is missing, ambiguous, or
-unavailable for authentication. Subagent workers also honor model selection,
-supported Pi thinking-level variants, and step limits. Later matching permission
-rules win. Put provider-specific values under `options`; unknown agent fields are
-rejected.
+`hidden` removes an agent from `/agents`. A hidden, subagent-capable agent remains
+available to `task`. Agent `mode` controls activation: only `primary` and `all` agents
+can be selected as primary, while only `subagent` and `all` agents can be passed to
+`task`. Missing, ambiguous, or unauthenticated primary-agent models produce an error
+and leave the current agent active.
 
 OpenCode integration flags also live in Pi `settings.json` under
 `landstrip.opencode`; both default to `true`:
@@ -334,25 +275,18 @@ OpenCode integration flags also live in Pi `settings.json` under
   `opencode.jsonc`, `.opencode/opencode.json` and `.opencode/opencode.jsonc`, and
   Markdown agents under `.opencode/agent/` and `.opencode/agents/`.
 
-Project settings override global settings, including each OpenCode flag. Set a flag
-to `false` to disable that source. OpenCode project agents override global OpenCode
-agents. Definitions from `landstrip.agent` (built-in, global, and project) take
-precedence over OpenCode imports with the same name; conflicts are silent. Project
-Pi settings and project OpenCode agents are skipped when the project is untrusted;
-global OpenCode agents still load when `showGlobalAgents` is enabled.
-
-OpenCode JSONC comments and trailing commas are supported. `{file:path}` prompt tokens
-resolve relative to the OpenCode config file or Pi `settings.json` that defines them.
+Set either flag to `false` to disable that OpenCode source. Project OpenCode agents
+override global OpenCode agents. Pi Markdown agents and `landstrip.agent` settings
+take precedence over OpenCode imports. Project sources require a trusted project.
+OpenCode config files support JSONC comments, trailing commas, and `{file:path}`
+prompt references.
 
 ### Sandbox policy (`sandbox.json`)
 
-Sandbox policy is read from `~/.pi/agent/sandbox.json` and, for trusted projects,
-`.pi/sandbox.json`. It grants runtime filesystem and network access to sandboxed
-commands; it does not grant an agent permission to dispatch a tool. Likewise, an
-agent `allow` cannot grant filesystem or network access through the sandbox.
+Sandbox settings are read from `~/.pi/agent/sandbox.json` and, for trusted projects,
+`.pi/sandbox.json`. They control runtime filesystem and network access.
 
-For example, Windows sandbox fields belong in `sandbox.json`, not Pi
-`settings.json`:
+Configure Windows sandbox fields in `sandbox.json`:
 
 ```json
 {
@@ -363,11 +297,9 @@ For example, Windows sandbox fields belong in `sandbox.json`, not Pi
 }
 ```
 
-`appContainerMode` is `"lpac"` or `"standard"`; core Landstrip defaults to LPAC,
-while the Pi package defaults to standard mode for Git Bash compatibility.
-`allowLoopback` is independently opt-in and applies only while AppContainer is
-active. Windows implementation selection is automatic and cannot be changed by
-project configuration.
+`appContainerMode` accepts `"lpac"` or `"standard"`. The Pi package defaults to
+standard mode for Git Bash. `allowLoopback` applies only to AppContainer. Landstrip
+selects Windows isolation automatically.
 
 #### Windows restricted-user installation
 
@@ -378,38 +310,18 @@ npx @landstrip/landstrip windows install
 npx @landstrip/landstrip windows status
 ```
 
-Install requests UAC elevation and defaults to eight restricted-network
-accounts, two unrestricted-network accounts, and proxy ports 60080-60111. Run
-`npx @landstrip/landstrip windows install --help` for pool and port options, then
-restart Pi. Uninstalling returns Landstrip to AppContainer automatically.
+Installation requests elevation and creates eight restricted-network accounts, two
+unrestricted-network accounts, and proxy ports 60080–60111 by default. Use
+`windows install --help` to change these values. Restart Pi after installation.
 
-The extension checks the active implementation and installation health before a
-sandboxed launch. An unhealthy installation fails rather than falling back to
-AppContainer. Restricted-user mode does not support `windows.allowLoopback` or
-`network.allowLocalBinding`. Remove the persistent accounts, WFP rules, runner,
-and recovered per-run ACL grants with:
+Before each launch, the extension checks the installation. A failed health check
+stops the task. Restricted-user isolation does not support `windows.allowLoopback`
+or `network.allowLocalBinding`. Remove the accounts, WFP rules, runner, and ACL
+grants with:
 
 ```powershell
 npx @landstrip/landstrip windows uninstall
 ```
-
-## Configuration migration
-
-`subagents.json` is no longer supported. Move its values into the corresponding
-global or project Pi `settings.json`, then delete the old file:
-
-- Move top-level `maxSubagents` to `landstrip.maxSubagents`.
-- Move `subagents.agent` to `landstrip.agent`.
-- Move `subagents.permission` to `landstrip.permission`.
-- Move top-level `opencode` to `landstrip.opencode`.
-- Convert legacy `tools` booleans to explicit `permission` rules.
-- Move legacy top-level Pi `agent`, `permission`, `subagents`, and `maxSubagents`
-  settings under `landstrip`.
-- Leave sandbox policy in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`; those
-  files are unchanged.
-
-An existing `~/.pi/agent/subagents.json` or trusted-project `.pi/subagents.json`
-produces an actionable migration diagnostic instead of being loaded.
 
 ## Plugin API
 

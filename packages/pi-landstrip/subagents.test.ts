@@ -131,7 +131,7 @@ test('propagates registered extensions and public context to workers', async () 
   expect(context).not.toHaveProperty('rules');
 });
 
-test('renders OpenCode-compatible task result envelopes', () => {
+test('renders task result envelopes', () => {
   expect(renderTaskResult('task-1', 'completed', 'Result text')).toBe(
     '<task id="task-1" state="completed">\n<task_result>\nResult text\n</task_result>\n</task>',
   );
@@ -613,7 +613,6 @@ test('lists hidden agents in the task tool description', () => {
       ],
     ]),
     permissions: [],
-    warnings: [],
     diagnostics: [],
   })).register();
 
@@ -1021,7 +1020,6 @@ test('inspects and navigates persisted child sessions without switching sessions
       ],
     ]),
     permissions: [],
-    warnings: [],
     diagnostics: [],
   })).register();
   const theme = {
@@ -1032,6 +1030,7 @@ test('inspects and navigates persisted child sessions without switching sessions
     cwd,
     hasUI: true,
     mode: 'tui',
+    isProjectTrusted: () => true,
     sessionManager: parentManager,
     ui: {
       notify() {},
@@ -1051,15 +1050,23 @@ test('inspects and navigates persisted child sessions without switching sessions
   await sessionStart?.({}, ctx);
   expect(commandNames).toEqual(['agents']);
   const running = command?.('', ctx);
-  const agents = component?.render(96).join('\n');
-  expect(agents).toContain('[Agents]  Sessions 2  Settings');
-  expect(agents).toContain('@build primary · built-in');
-  expect(agents).toContain('@review subagent · local');
-  expect(agents).toContain('@general all · built-in');
+  const primary = component?.render(96).join('\n');
+  expect(primary).toContain('[Primary]  Subagent  Tasks  Settings');
+  expect(primary).toContain('@build primary · built-in');
+  expect(primary).toContain('@general all · built-in');
+  expect(primary).not.toContain('@review subagent · local');
   component?.handleInput('\t');
-  expect(component?.render(96).join('\n')).toContain('Sessions 2');
-  expect(component?.render(96).join('\n')).toContain('task-123');
-  expect(component?.render(96).join('\n')).toContain('Failed child');
+  const subagents = component?.render(96).join('\n');
+  expect(subagents).toContain('Primary  [Subagent]  Tasks  Settings');
+  expect(subagents).toContain('@review subagent · local');
+  expect(subagents).toContain('@general all · built-in');
+  expect(subagents).not.toContain('@build primary · built-in');
+  component?.handleInput('\t');
+  const tasks = component?.render(96).join('\n');
+  expect(tasks).toContain('[Tasks]');
+  expect(tasks).not.toContain('Tasks 2');
+  expect(tasks).toContain('task-123');
+  expect(tasks).toContain('Failed child');
   component?.handleInput('\r');
   const detail = component?.render(96).join('\n');
   expect(detail).toContain('Inspect this child session.');
@@ -1069,10 +1076,49 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('\x1b[D');
   expect(component?.render(96).join('\n')).toContain('Inspect child');
   component?.handleInput('\x1b');
-  expect(component?.render(96).join('\n')).toContain('Sessions 2');
+  expect(component?.render(96).join('\n')).toContain('[Tasks]');
   component?.handleInput('\t');
-  expect(component?.render(96).join('\n')).toContain('[Settings]');
-  expect(component?.render(96).join('\n')).toContain('[ 1 ] Global');
+  const settings = component?.render(96).join('\n');
+  expect(settings).toContain('[Settings]');
+  expect(settings).toContain('[ 1 ] Maximum subagents (global)');
+  expect(settings).toContain('[ inherited: 1 ] Maximum subagents (local)');
+
+  component?.handleInput('\x1b[B');
+  component?.handleInput('\r');
+  expect(existsSync(join(cwd, '.pi', 'settings.json'))).toBe(false);
+  component?.handleInput('\x1b[A');
+
+  component?.handleInput('+');
+  expect(component?.render(96).join('\n')).toContain('[ 2 ] Maximum subagents (global)');
+  component?.handleInput('\r');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf8'));
+    expect(settings.landstrip.maxSubagents).toBe(2);
+  });
+  await vi.waitFor(() => {
+    expect(component?.render(96).join('\n')).not.toContain('Saving…');
+  });
+
+  component?.handleInput('\x1b[B');
+  component?.handleInput('3');
+  expect(component?.render(96).join('\n')).toContain('[ 3 ] Maximum subagents (local)');
+  component?.handleInput('\r');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+    expect(settings.landstrip.maxSubagents).toBe(3);
+  });
+  await vi.waitFor(() => {
+    expect(component?.render(96).join('\n')).not.toContain('Saving…');
+  });
+
+  component?.handleInput('i');
+  expect(component?.render(96).join('\n')).toContain('[ inherited: 2 ] Maximum subagents (local)');
+  component?.handleInput('\r');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+    expect(settings.landstrip).toBeUndefined();
+    expect(component?.render(96).join('\n')).not.toContain('Saving…');
+  });
   finishCustom?.();
   await running;
 

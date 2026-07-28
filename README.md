@@ -52,11 +52,10 @@ coded trap on standard error. `run` returns the sandboxed program's exit status.
 
 ### Agent extensions
 
-The bundled extensions integrate Landstrip with Pi and OpenCode. The Pi
-extension sandboxes Bash execution, provides OpenCode-compatible primary-agent
-selection, and runs subagents as full Pi RPC processes. Subagents normally run
-inside an outer Landstrip sandbox; explicitly disabling sandboxing emits a
-warning and uses a process-only fallback:
+The bundled extensions integrate Landstrip with Pi and OpenCode. The Pi extension
+sandboxes Bash, supports primary agents, and runs subagents as separate Pi RPC
+processes. Subagents normally run inside a Landstrip sandbox. Disabling sandboxing
+shows a warning and uses process isolation only:
 
 ```sh
 pi install npm:pi-landstrip

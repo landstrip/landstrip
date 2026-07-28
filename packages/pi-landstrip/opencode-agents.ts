@@ -3,7 +3,7 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, extname, join, relative, sep } from 'node:path';
+import { dirname, extname, join, relative, sep } from 'node:path';
 
 import { parse as parseYaml } from 'yaml';
 import { parse as parseJsonc, printParseErrorCode, type ParseError } from 'jsonc-parser';
@@ -66,9 +66,8 @@ function agentNameFromPath(dir: string, filePath: string): string {
       return extension.length > 0 ? candidate.slice(0, -extension.length) : candidate;
     }
   }
-  const base = basename(filePath);
-  const extension = extname(base);
-  return extension.length > 0 ? base.slice(0, -extension.length) : base;
+  const extension = extname(relativePath);
+  return extension.length > 0 ? relativePath.slice(0, -extension.length) : relativePath;
 }
 
 function parseFrontmatter(content: string): { data: ConfigObject; body: string } {
@@ -210,6 +209,30 @@ function loadConfigAgentsFromDir(
   }
 }
 
+function loadAgentsFromRoot(
+  root: string,
+  nameRoot: string,
+  source: AgentSource,
+  agents: Map<string, OpenCodeAgentRaw>,
+  diagnostics: string[],
+): void {
+  for (const filePath of listMarkdownFiles(root)) {
+    try {
+      const content = readFileSync(filePath, 'utf8');
+      const { data, body } = parseFrontmatter(content);
+      const name = agentNameFromPath(nameRoot, filePath);
+      if (!name) {
+        diagnostics.push(`${filePath}: agent name is empty`);
+        continue;
+      }
+      const raw = normalizeOpenCodeAgentRaw(data, body.trim());
+      agents.set(name, { name, source, path: filePath, raw });
+    } catch (error) {
+      diagnostics.push(`${filePath}: ${formatError(error)}`);
+    }
+  }
+}
+
 function loadAgentsFromDir(
   dir: string,
   source: AgentSource,
@@ -217,23 +240,19 @@ function loadAgentsFromDir(
   diagnostics: string[],
 ): void {
   for (const subdir of ['agent', 'agents']) {
-    const root = join(dir, subdir);
-    for (const filePath of listMarkdownFiles(root)) {
-      try {
-        const content = readFileSync(filePath, 'utf8');
-        const { data, body } = parseFrontmatter(content);
-        const name = agentNameFromPath(dir, filePath);
-        if (!name) {
-          diagnostics.push(`${filePath}: agent name is empty`);
-          continue;
-        }
-        const raw = normalizeOpenCodeAgentRaw(data, body.trim());
-        agents.set(name, { name, source, path: filePath, raw });
-      } catch (error) {
-        diagnostics.push(`${filePath}: ${formatError(error)}`);
-      }
-    }
+    loadAgentsFromRoot(join(dir, subdir), dir, source, agents, diagnostics);
   }
+}
+
+export function loadPiMarkdownAgents(options: {
+  directories: readonly { path: string; source: AgentSource }[];
+}): OpenCodeAgentLoadResult {
+  const agents = new Map<string, OpenCodeAgentRaw>();
+  const diagnostics: string[] = [];
+  for (const directory of options.directories) {
+    loadAgentsFromRoot(directory.path, directory.path, directory.source, agents, diagnostics);
+  }
+  return { agents, diagnostics };
 }
 
 export function loadOpenCodeAgents(options: {

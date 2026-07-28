@@ -11,48 +11,21 @@ export const BUILT_IN_LANDSTRIP_CONFIG = {
       prompt: 'Work in build mode. Implement, test, and complete the requested changes.',
     },
     plan: {
-      description: 'Planning agent that asks before commands or file changes',
+      description: 'Planning agent that asks before shell commands and file edits',
       mode: 'primary',
       color: 'warning',
       prompt:
         'Work in plan mode. Analyze the problem and produce a clear plan before making changes.',
       permission: { edit: 'ask', bash: 'ask', task: 'ask' },
     },
-    'code-reviewer': {
-      description: 'Read-only reviewer for concrete code defects',
-      mode: 'subagent',
-      color: 'info',
-      prompt:
-        'Review the requested code without modifying files. Inspect correctness, security, regressions, tests, performance, and maintainability. Report only concrete findings ordered by severity with exact file and line references, explain the impact, and recommend a concise fix. State clearly when there are no findings. Git inspection permits only these exact commands: `git --no-optional-locks -c core.fsmonitor=false status --short`, `git --no-pager diff --no-ext-diff --no-textconv`, `git --no-pager diff --cached --no-ext-diff --no-textconv`, `git --no-pager log -20 --oneline`, and `git --no-pager show --stat --no-ext-diff --no-textconv`.',
-      permission: {
-        '*': 'deny',
-        read: {
-          '*': 'allow',
-          '**/*.env': 'ask',
-          '**/*.env.*': 'ask',
-          '**/*.env.example': 'allow',
-        },
-        glob: 'allow',
-        grep: 'allow',
-        list: 'allow',
-        bash: {
-          '*': 'deny',
-          'git --no-optional-locks -c core.fsmonitor=false status --short': 'allow',
-          'git --no-pager diff --no-ext-diff --no-textconv': 'allow',
-          'git --no-pager diff --cached --no-ext-diff --no-textconv': 'allow',
-          'git --no-pager log -20 --oneline': 'allow',
-          'git --no-pager show --stat --no-ext-diff --no-textconv': 'allow',
-        },
-      },
-    },
     general: {
-      description: 'General-purpose agent for researching and executing complex tasks',
+      description: 'General-purpose agent for complex tasks',
       mode: 'subagent',
       prompt: 'Complete the delegated task autonomously. Return one concise result to the parent.',
       permission: { todowrite: 'deny' },
     },
     scout: {
-      description: 'Fast codebase reconnaissance with concise handoff findings',
+      description: 'Fast codebase reconnaissance',
       mode: 'subagent',
       prompt:
         'Scout the codebase without modifying it. Return concise findings with exact file references, key code, architecture, and a recommended starting point.',
@@ -70,7 +43,7 @@ export const BUILT_IN_LANDSTRIP_CONFIG = {
       },
     },
     explore: {
-      description: 'Fast agent specialized for exploring codebases',
+      description: 'Fast codebase exploration',
       mode: 'subagent',
       prompt:
         'Explore the codebase without modifying it. Report findings with file references. Use bash and network fetch tools when needed for git, PR metadata, or remote docs; do not edit files.',

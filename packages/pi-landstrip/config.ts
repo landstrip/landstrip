@@ -34,6 +34,11 @@ export interface LandstripConfig extends LandstripConfigFile {
   agentSources: ReadonlyMap<string, AgentSource>;
 }
 
+export interface MaxSubagentsSettings {
+  readonly global: number;
+  readonly project?: number;
+}
+
 const DEFAULT_OPENCODE: OpenCodeConfig = {
   showGlobalAgents: true,
   showLocalAgents: true,
@@ -156,14 +161,6 @@ export function getPiConfigPaths(
   };
 }
 
-function assertNoSubagentsConfig(path: string): void {
-  if (!existsSync(path)) return;
-  const settingsPath = join(dirname(path), 'settings.json');
-  throw new Error(
-    `${path} is no longer supported; move its values to landstrip.maxSubagents, landstrip.agent, landstrip.permission, and landstrip.opencode in ${settingsPath}`,
-  );
-}
-
 export async function setMaxSubagentsConfig(
   cwd: string,
   maxSubagents: number,
@@ -172,6 +169,29 @@ export async function setMaxSubagentsConfig(
 ): Promise<'global'> {
   await setMaxSubagentsConfigForScope(cwd, maxSubagents, 'global', agentDir);
   return 'global';
+}
+
+async function writeMaxSubagentsConfigForScope(
+  cwd: string,
+  maxSubagents: number | undefined,
+  scope: 'global' | 'project',
+  agentDir: string,
+): Promise<void> {
+  const paths = getPiConfigPaths(cwd, 'settings.json', agentDir);
+  const path = scope === 'global' ? paths.globalPath : paths.projectPath;
+  await withFileMutationQueue(path, async () => {
+    const settings = existsSync(path) ? readJsonObject(path) : {};
+    if (settings.landstrip !== undefined && !isRecord(settings.landstrip)) {
+      throw new Error(`${path}: landstrip must be a JSON object`);
+    }
+    const landstrip = isRecord(settings.landstrip) ? { ...settings.landstrip } : {};
+    if (maxSubagents === undefined) delete landstrip.maxSubagents;
+    else landstrip.maxSubagents = maxSubagents;
+    if (Object.keys(landstrip).length === 0) delete settings.landstrip;
+    else settings.landstrip = landstrip;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+  });
 }
 
 export async function setMaxSubagentsConfigForScope(
@@ -183,21 +203,15 @@ export async function setMaxSubagentsConfigForScope(
   if (!Number.isInteger(maxSubagents) || maxSubagents < 0 || maxSubagents > MAX_SUBAGENTS) {
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
   }
-  const paths = getPiConfigPaths(cwd, 'settings.json', agentDir);
-  const path = scope === 'global' ? paths.globalPath : paths.projectPath;
-  const legacyPaths = getPiConfigPaths(cwd, 'subagents.json', agentDir);
-  assertNoSubagentsConfig(scope === 'global' ? legacyPaths.globalPath : legacyPaths.projectPath);
-  await withFileMutationQueue(path, async () => {
-    const settings = existsSync(path) ? readJsonObject(path) : {};
-    if (settings.landstrip !== undefined && !isRecord(settings.landstrip)) {
-      throw new Error(`${path}: landstrip must be a JSON object`);
-    }
-    const landstrip = isRecord(settings.landstrip) ? { ...settings.landstrip } : {};
-    landstrip.maxSubagents = maxSubagents;
-    settings.landstrip = landstrip;
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
-  });
+  await writeMaxSubagentsConfigForScope(cwd, maxSubagents, scope, agentDir);
+}
+
+export async function clearMaxSubagentsConfigForScope(
+  cwd: string,
+  scope: 'global' | 'project',
+  agentDir = getAgentDir(),
+): Promise<void> {
+  await writeMaxSubagentsConfigForScope(cwd, undefined, scope, agentDir);
 }
 
 export function loadLandstripConfig(
@@ -206,9 +220,6 @@ export function loadLandstripConfig(
   agentDir = getAgentDir(),
 ): LandstripConfig {
   const settingsPaths = getPiConfigPaths(cwd, 'settings.json', agentDir);
-  const legacyPaths = getPiConfigPaths(cwd, 'subagents.json', agentDir);
-  assertNoSubagentsConfig(legacyPaths.globalPath);
-  if (includeProject) assertNoSubagentsConfig(legacyPaths.projectPath);
 
   const builtInConfig = BUILT_IN_LANDSTRIP_CONFIG as LandstripConfigFile;
   const globalConfig = readLandstripSettings(settingsPaths.globalPath);
@@ -229,4 +240,23 @@ export function loadLandstripConfig(
   if (!isRecord(config.agent)) throw new Error('landstrip.agent must be an object');
   const opencode: OpenCodeConfig = { ...DEFAULT_OPENCODE, ...config.opencode };
   return { ...config, maxSubagents, agent: config.agent, opencode, agentSources };
+}
+
+export function loadMaxSubagentsSettings(
+  cwd: string,
+  includeProject = true,
+  agentDir = getAgentDir(),
+): MaxSubagentsSettings {
+  const global = loadLandstripConfig(cwd, false, agentDir).maxSubagents;
+  if (!includeProject) return { global };
+
+  const paths = getPiConfigPaths(cwd, 'settings.json', agentDir);
+  const project = readLandstripSettings(paths.projectPath).maxSubagents;
+  if (
+    project !== undefined &&
+    (!Number.isInteger(project) || project < 0 || project > MAX_SUBAGENTS)
+  ) {
+    throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
+  }
+  return { global, project };
 }

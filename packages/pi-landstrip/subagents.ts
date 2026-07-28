@@ -41,7 +41,12 @@ import {
   type PermissionRules,
 } from './agents.ts';
 import { boxBottom, boxRow, boxTop } from './box.ts';
-import { loadLandstripConfig, MAX_SUBAGENTS, setMaxSubagentsConfigForScope } from './config.ts';
+import {
+  clearMaxSubagentsConfigForScope,
+  loadMaxSubagentsSettings,
+  MAX_SUBAGENTS,
+  setMaxSubagentsConfigForScope,
+} from './config.ts';
 import type { LandstripIntegration, LandstripRpcWorkerLaunch } from './index.ts';
 import { type ExtensionUiRequest, type ExtensionUiResult, RpcProcess } from './rpc-process.ts';
 import { AsyncQueue, colorizeAgentText, formatError, isRecord } from './util.ts';
@@ -857,17 +862,19 @@ export class SubagentRuntime {
     }
 
     const catalog = this.getAgentCatalog(ctx);
-    for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
-    const agents = availableAgents(catalog);
+    const visibleAgents = availableAgents(catalog);
+    const primaryAgents = visibleAgents.filter((agent) => agentSupportsMode(agent, 'primary'));
+    const subagents = visibleAgents.filter((agent) => agentSupportsMode(agent, 'subagent'));
     const tasks = [...this.tasks.values()];
     const requested = args.trim();
     const projectTrusted = isProjectTrusted(ctx);
-    let tab: 'agents' | 'sessions' | 'settings' = requested ? 'sessions' : 'agents';
-    let selectedAgent = Math.max(
+    let tab: 'primary' | 'subagent' | 'tasks' | 'settings' = requested ? 'tasks' : 'primary';
+    let selectedPrimaryAgent = Math.max(
       0,
-      agents.findIndex((agent) => agent.name === this.primaryAgent?.name),
+      primaryAgents.findIndex((agent) => agent.name === this.primaryAgent?.name),
     );
+    let selectedSubagent = 0;
     let selectedTask = requested
       ? tasks.findIndex((task) => task.id === requested || task.id.startsWith(requested))
       : 0;
@@ -876,10 +883,20 @@ export class SubagentRuntime {
       return;
     }
     let selectedSetting = 0;
-    let values = [
-      loadLandstripConfig(ctx.cwd, false).maxSubagents,
-      loadLandstripConfig(ctx.cwd, projectTrusted).maxSubagents,
-    ];
+    let maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
+    const selectedMaxSubagents = () =>
+      selectedSetting === 0
+        ? maxSubagentsSettings.global
+        : (maxSubagentsSettings.project ?? maxSubagentsSettings.global);
+    const updateSelectedMaxSubagents = (value: number) => {
+      maxSubagentsSettings =
+        selectedSetting === 0
+          ? { ...maxSubagentsSettings, global: value }
+          : { ...maxSubagentsSettings, project: value };
+      dirtySettings.add(selectedSetting);
+    };
+    const dirtySettings = new Set<number>();
+    let saving = false;
     let editing = false;
     let detail = requested.length > 0;
     let scroll = 0;
@@ -895,12 +912,14 @@ export class SubagentRuntime {
           ];
           const tabLabel = (label: string, active: boolean) =>
             active ? theme.fg('accent', theme.bold(`[${label}]`)) : theme.fg('muted', label);
-          const tabs = `${tabLabel('Agents', tab === 'agents')}  ${tabLabel(
-            `Sessions ${tasks.length}`,
-            tab === 'sessions',
-          )}  ${tabLabel('Settings', tab === 'settings')}`;
+          const tabs = `${tabLabel('Primary', tab === 'primary')}  ${tabLabel(
+            'Subagent',
+            tab === 'subagent',
+          )}  ${tabLabel('Tasks', tab === 'tasks')}  ${tabLabel('Settings', tab === 'settings')}`;
 
-          if (tab === 'agents') {
+          if (tab === 'primary' || tab === 'subagent') {
+            const agents = tab === 'primary' ? primaryAgents : subagents;
+            const selectedAgent = tab === 'primary' ? selectedPrimaryAgent : selectedSubagent;
             const start = Math.max(0, Math.min(selectedAgent - 3, agents.length - 7));
             const shown = agents.slice(start, start + 7);
             const lines = [tabs, ''];
@@ -909,7 +928,7 @@ export class SubagentRuntime {
               const selected = index === selectedAgent;
               const cursor = selected ? theme.fg('accent', '›') : ' ';
               const active =
-                agent.name === this.primaryAgent?.name
+                tab === 'primary' && agent.name === this.primaryAgent?.name
                   ? theme.fg('success', '●')
                   : theme.fg('dim', '○');
               const name = colorizeAgentText(agent.color, `@${agent.name}`, (color, text) =>
@@ -921,7 +940,9 @@ export class SubagentRuntime {
               );
               lines.push(`${cursor} ${active} ${name} ${metadata}`);
             }
-            if (agents.length === 0) lines.push(theme.fg('muted', '  No agents configured.'));
+            if (agents.length === 0) {
+              lines.push(theme.fg('muted', `  No ${tab} agents configured.`));
+            }
 
             const agent = agents[selectedAgent];
             if (agent) {
@@ -962,41 +983,56 @@ export class SubagentRuntime {
                 lines.push(`  ${theme.fg('error', diagnostic)}`);
               }
             }
-            for (const warning of catalog.warnings.slice(0, 2)) {
-              lines.push(theme.fg('warning', warning));
-            }
-            const canActivate = agent !== undefined && agentSupportsMode(agent, 'primary');
+            const canActivate = tab === 'primary' && agent !== undefined;
             lines.push(
               '',
               theme.fg(
                 'dim',
-                `↑↓ select${canActivate ? '  enter activate' : ''}  tab/→ sessions  esc close`,
+                `↑↓ select${canActivate ? '  enter activate' : ''}  tab/→ next  esc close`,
               ),
             );
             return box(lines);
           }
 
           if (tab === 'settings') {
-            const scopes = ['Global', 'Project'] as const;
+            const rows = [
+              {
+                label: 'Maximum subagents (global)',
+                value: maxSubagentsSettings.global,
+                unavailable: false,
+                inherited: false,
+              },
+              {
+                label: 'Maximum subagents (local)',
+                value: maxSubagentsSettings.project ?? maxSubagentsSettings.global,
+                unavailable: !projectTrusted,
+                inherited: maxSubagentsSettings.project === undefined,
+              },
+            ];
             const lines = [tabs, ''];
-            for (const [index, scope] of scopes.entries()) {
+            for (const [index, row] of rows.entries()) {
               const selected = index === selectedSetting;
-              const unavailable = scope === 'Project' && !projectTrusted;
               const cursor = selected ? theme.fg('accent', '›') : ' ';
+              const text = row.inherited ? `[ inherited: ${row.value} ]` : `[ ${row.value} ]`;
               const value = selected
-                ? theme.fg('accent', `[ ${values[index]} ]`)
-                : theme.fg('text', `[ ${values[index]} ]`);
-              const label = unavailable
-                ? theme.fg('muted', `${scope} (project not trusted)`)
-                : theme.fg('text', scope);
+                ? theme.fg('accent', text)
+                : theme.fg(row.unavailable ? 'muted' : 'text', text);
+              const label = row.unavailable
+                ? theme.fg('muted', `${row.label} (project not trusted)`)
+                : theme.fg('text', row.label);
               lines.push(`${cursor} ${value} ${label}`);
             }
-            if (values[selectedSetting] === 0) {
-              lines.push(`    ${theme.fg('dim', 'Task delegation is disabled for this scope')}`);
+            if (selectedMaxSubagents() === 0) {
+              lines.push(`    ${theme.fg('dim', 'Subagents disabled')}`);
             }
             lines.push(
               '',
-              theme.fg('dim', '↑↓ scope  0-9/+/- change  enter save  tab agents  esc close'),
+              theme.fg(
+                'dim',
+                saving
+                  ? 'Saving…'
+                  : '↑↓ setting  0-9/+/- change  i use global  enter save  tab primary  esc close',
+              ),
             );
             return box(lines);
           }
@@ -1064,8 +1100,8 @@ export class SubagentRuntime {
         },
         handleInput: (data: string) => {
           if (matchesKey(data, 'tab')) {
-            const tabs = ['agents', 'sessions', 'settings'] as const;
-            tab = tabs[(tabs.indexOf(tab) + 1) % tabs.length] ?? 'agents';
+            const tabs = ['primary', 'subagent', 'tasks', 'settings'] as const;
+            tab = tabs[(tabs.indexOf(tab) + 1) % tabs.length] ?? 'primary';
             detail = false;
             editing = false;
             scroll = 0;
@@ -1073,16 +1109,24 @@ export class SubagentRuntime {
             return;
           }
 
-          if (tab === 'agents') {
+          if (tab === 'primary' || tab === 'subagent') {
+            const agents = tab === 'primary' ? primaryAgents : subagents;
+            const selectedAgent = tab === 'primary' ? selectedPrimaryAgent : selectedSubagent;
+            const setSelectedAgent = (index: number) => {
+              if (tab === 'primary') selectedPrimaryAgent = index;
+              else selectedSubagent = index;
+            };
             if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
-            else if (matchesKey(data, 'up')) selectedAgent = Math.max(0, selectedAgent - 1);
+            else if (matchesKey(data, 'up')) setSelectedAgent(Math.max(0, selectedAgent - 1));
             else if (matchesKey(data, 'down') && agents.length > 0) {
-              selectedAgent = Math.min(agents.length - 1, selectedAgent + 1);
+              setSelectedAgent(Math.min(agents.length - 1, selectedAgent + 1));
+            } else if (matchesKey(data, 'left') && tab === 'subagent') {
+              tab = 'primary';
             } else if (matchesKey(data, 'right')) {
-              tab = 'sessions';
-            } else if (matchesKey(data, 'return')) {
+              tab = tab === 'primary' ? 'subagent' : 'tasks';
+            } else if (matchesKey(data, 'return') && tab === 'primary') {
               const agent = agents[selectedAgent];
-              if (!agent || !agentSupportsMode(agent, 'primary')) return;
+              if (!agent) return;
               void this.selectPrimaryAgent(agent.name, ctx)
                 .then(() => tui.requestRender())
                 .catch((error: unknown) =>
@@ -1094,6 +1138,7 @@ export class SubagentRuntime {
           }
 
           if (tab === 'settings') {
+            if (saving) return;
             if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) {
               done();
               return;
@@ -1105,39 +1150,63 @@ export class SubagentRuntime {
               selectedSetting = Math.min(1, selectedSetting + 1);
               editing = false;
             } else if (/^[0-9]$/.test(data)) {
-              const value = Number(editing ? `${values[selectedSetting]}${data}` : data);
+              const value = Number(editing ? `${selectedMaxSubagents()}${data}` : data);
               if (value <= MAX_SUBAGENTS) {
-                values[selectedSetting] = value;
+                updateSelectedMaxSubagents(value);
                 editing = true;
               }
             } else if (data === '+' || data === '-') {
-              values[selectedSetting] = Math.min(
-                MAX_SUBAGENTS,
-                Math.max(0, values[selectedSetting] + (data === '+' ? 1 : -1)),
+              updateSelectedMaxSubagents(
+                Math.min(
+                  MAX_SUBAGENTS,
+                  Math.max(0, selectedMaxSubagents() + (data === '+' ? 1 : -1)),
+                ),
               );
               editing = false;
+            } else if (data === 'i' && selectedSetting === 1) {
+              maxSubagentsSettings = { ...maxSubagentsSettings, project: undefined };
+              dirtySettings.add(selectedSetting);
+              editing = false;
             } else if (matchesKey(data, 'return')) {
-              const scope = selectedSetting === 0 ? 'global' : 'project';
+              const setting = selectedSetting;
+              const scope = setting === 0 ? 'global' : 'project';
               if (scope === 'project' && !projectTrusted) {
-                ctx.ui.notify('Project settings require a trusted project', 'warning');
+                ctx.ui.notify('Local settings require a trusted project', 'warning');
                 return;
               }
-              const maxSubagents = values[selectedSetting];
-              void setMaxSubagentsConfigForScope(ctx.cwd, maxSubagents, scope)
+              if (!dirtySettings.has(setting)) return;
+
+              const pendingSettings = maxSubagentsSettings;
+              const inherited = scope === 'project' && pendingSettings.project === undefined;
+              const maxSubagents = selectedMaxSubagents();
+              saving = true;
+              const save = inherited
+                ? clearMaxSubagentsConfigForScope(ctx.cwd, scope)
+                : setMaxSubagentsConfigForScope(ctx.cwd, maxSubagents, scope);
+              void save
                 .then(() => {
-                  const effective = loadLandstripConfig(ctx.cwd, projectTrusted).maxSubagents;
-                  this.setMaxSubagents(effective);
-                  values = [loadLandstripConfig(ctx.cwd, false).maxSubagents, effective];
+                  dirtySettings.delete(setting);
+                  const loaded = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
+                  this.setMaxSubagents(loaded.project ?? loaded.global);
+                  maxSubagentsSettings = {
+                    global: dirtySettings.has(0) ? pendingSettings.global : loaded.global,
+                    project: dirtySettings.has(1) ? pendingSettings.project : loaded.project,
+                  };
                   editing = false;
                   ctx.ui.notify(
-                    `Maximum concurrent tasks set to ${maxSubagents} in ${scope} config`,
+                    inherited
+                      ? 'Maximum subagents (local) now uses the global value'
+                      : `Maximum subagents (${scope === 'project' ? 'local' : 'global'}) set to ${maxSubagents}`,
                     'info',
                   );
-                  tui.requestRender();
                 })
                 .catch((error: unknown) =>
-                  ctx.ui.notify(`Could not update config: ${formatError(error)}`, 'error'),
-                );
+                  ctx.ui.notify(`Could not save setting: ${formatError(error)}`, 'error'),
+                )
+                .finally(() => {
+                  saving = false;
+                  tui.requestRender();
+                });
               return;
             } else return;
             tui.requestRender();
@@ -1146,7 +1215,7 @@ export class SubagentRuntime {
 
           if (!detail) {
             if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
-            else if (matchesKey(data, 'left')) tab = 'agents';
+            else if (matchesKey(data, 'left')) tab = 'subagent';
             else if (matchesKey(data, 'right')) tab = 'settings';
             else if (matchesKey(data, 'up')) selectedTask = Math.max(0, selectedTask - 1);
             else if (matchesKey(data, 'down') && tasks.length > 0) {
@@ -1197,7 +1266,6 @@ export class SubagentRuntime {
 
   async selectPrimaryAgent(name: string, ctx: ExtensionContext): Promise<boolean> {
     const catalog = this.getAgentCatalog(ctx);
-    for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
     if (catalog.diagnostics.length > 0) return false;
     const agent = availableAgents(catalog).find(
@@ -1221,7 +1289,6 @@ export class SubagentRuntime {
     }
 
     const catalog = this.getAgentCatalog(ctx);
-    for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
     if (catalog.diagnostics.length > 0) return;
 
@@ -1358,7 +1425,6 @@ export class SubagentRuntime {
   ): Promise<{ task: TaskRecord; text: string; state: TaskState }> {
     if (!input.prompt.trim()) throw new Error('Task prompt cannot be empty');
     const catalog = this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
-    for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
     if (catalog.diagnostics.length > 0) {
       throw new Error(`Invalid agent configuration:\n${catalog.diagnostics.join('\n')}`);
@@ -2133,7 +2199,6 @@ export class SubagentRuntime {
     this.primaryRules = undefined;
     this.primaryConfigurationError = false;
     const catalog = this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
-    for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
     this.maxSubagents = catalog.maxSubagents;
     this.semaphore = new Semaphore(Math.max(1, this.maxSubagents));
     if (catalog.diagnostics.length > 0) {

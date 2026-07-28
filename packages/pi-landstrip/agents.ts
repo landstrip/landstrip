@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-
 import { minimatch } from 'minimatch';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 
 import { loadLandstripConfig, type AgentSource, type ConfigObject } from './config.ts';
-import { loadOpenCodeAgents } from './opencode-agents.ts';
+import { loadOpenCodeAgents, loadPiMarkdownAgents } from './opencode-agents.ts';
 import { expandHomePath, formatError, isAgentColor, isRecord } from './util.ts';
 
 export type PermissionAction = 'allow' | 'ask' | 'deny';
@@ -40,7 +38,6 @@ export interface AgentCatalog {
   readonly agents: ReadonlyMap<string, AgentDefinition>;
   readonly permissions: PermissionRules;
   readonly diagnostics: readonly string[];
-  readonly warnings: readonly string[];
   readonly maxSubagents: number;
 }
 
@@ -93,24 +90,6 @@ function normalizePermissions(value: unknown): PermissionRules {
   return Object.entries(value).flatMap(([permission, rules]) =>
     permissionEntries(permission, rules),
   );
-}
-
-function legacyConfigWarnings(piAgentDir: string): string[] {
-  const path = join(piAgentDir, 'settings.json');
-  if (!existsSync(path)) return [];
-  try {
-    const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
-    if (!isRecord(value)) return [];
-    const fields = ['agent', 'permission', 'subagents', 'maxSubagents'].filter(
-      (field) => value[field] !== undefined,
-    );
-    if (fields.length === 0) return [];
-    return [
-      `${path}: legacy ${fields.join(', ')} configuration is ignored; move it under landstrip`,
-    ];
-  } catch {
-    return [];
-  }
 }
 
 function normalizeAgent(
@@ -180,10 +159,6 @@ export function loadAgentCatalog(
   piAgentDir = getAgentDir(),
   includeProject = true,
 ): AgentCatalog {
-  const warnings = [
-    ...legacyConfigWarnings(piAgentDir),
-    ...(includeProject ? legacyConfigWarnings(join(cwd, '.pi')) : []),
-  ];
   const diagnostics: string[] = [];
   let maxSubagents = 0;
   let configuredAgents: ConfigObject = {};
@@ -222,6 +197,22 @@ export function loadAgentCatalog(
     }
   }
 
+  const piMarkdown = loadPiMarkdownAgents({
+    directories: [
+      { path: join(piAgentDir, 'agents'), source: 'global' },
+      ...(includeProject ? ([{ path: join(cwd, '.pi', 'agents'), source: 'local' }] as const) : []),
+    ],
+  });
+  diagnostics.push(...piMarkdown.diagnostics);
+  for (const imported of piMarkdown.agents.values()) {
+    try {
+      const agent = normalizeAgent(imported.name, imported.raw, imported.source);
+      if (agent) normalized.set(imported.name, agent);
+    } catch (error) {
+      diagnostics.push(`${imported.path}: ${formatError(error)}`);
+    }
+  }
+
   for (const name of Object.keys(configuredAgents).sort()) {
     const value = configuredAgents[name];
     if (!isRecord(value)) {
@@ -243,7 +234,7 @@ export function loadAgentCatalog(
   } catch (error) {
     diagnostics.push(formatError(error));
   }
-  return { agents: normalized, permissions, diagnostics, warnings, maxSubagents };
+  return { agents: normalized, permissions, diagnostics, maxSubagents };
 }
 
 export function permissionDecision(

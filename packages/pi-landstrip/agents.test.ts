@@ -14,7 +14,13 @@ import {
   permissionDecision,
   type PermissionRules,
 } from './agents.ts';
-import { MAX_SUBAGENTS, setMaxSubagentsConfig, setMaxSubagentsConfigForScope } from './config.ts';
+import {
+  clearMaxSubagentsConfigForScope,
+  loadMaxSubagentsSettings,
+  MAX_SUBAGENTS,
+  setMaxSubagentsConfig,
+  setMaxSubagentsConfigForScope,
+} from './config.ts';
 import { temporaryDirectory as makeTemporaryDirectory } from './test-util.ts';
 
 function temporaryDirectory(): string {
@@ -45,7 +51,6 @@ describe('landstrip agent configuration', () => {
     const agents = availableAgents(catalog);
     expect(agents.map((agent) => agent.name)).toEqual([
       'build',
-      'code-reviewer',
       'explore',
       'general',
       'plan',
@@ -56,7 +61,7 @@ describe('landstrip agent configuration', () => {
     ).toEqual(['build', 'plan']);
     expect(
       agents.filter((agent) => agentSupportsMode(agent, 'subagent')).map((agent) => agent.name),
-    ).toEqual(['code-reviewer', 'explore', 'general', 'scout']);
+    ).toEqual(['explore', 'general', 'scout']);
     expect(catalog.agents.get('scout')).toMatchObject({
       source: 'built-in',
       mode: 'subagent',
@@ -78,30 +83,35 @@ describe('landstrip agent configuration', () => {
     expect(permissionDecision(exploreRules, 'websearch')).toBe('allow');
     expect(permissionDecision(exploreRules, 'edit')).toBe('deny');
     expect(permissionDecision(exploreRules, 'task')).toBe('deny');
+  });
 
-    const reviewer = catalog.agents.get('code-reviewer');
-    const reviewerRules = mergePermissionRules(catalog.permissions, reviewer?.permissions ?? []);
-    expect(reviewer).toMatchObject({ source: 'built-in', mode: 'subagent', color: 'info' });
-    expect(permissionDecision(reviewerRules, 'read', 'src/index.ts')).toBe('allow');
-    expect(permissionDecision(reviewerRules, 'read', '.env')).toBe('ask');
-    expect(permissionDecision(reviewerRules, 'edit', 'src/index.ts')).toBe('deny');
-    expect(permissionDecision(reviewerRules, 'task', 'general')).toBe('deny');
-    expect(
-      permissionDecision(
-        reviewerRules,
-        'bash',
-        'git --no-pager diff --cached --no-ext-diff --no-textconv',
-      ),
-    ).toBe('allow');
-    expect(permissionDecision(reviewerRules, 'bash', 'git diff')).toBe('deny');
-    expect(
-      permissionDecision(
-        reviewerRules,
-        'bash',
-        'git --no-pager diff --no-ext-diff --no-textconv && rm -rf build',
-      ),
-    ).toBe('deny');
-    expect(permissionDecision(reviewerRules, 'bash', 'rm -rf build')).toBe('deny');
+  test('loads global and trusted-project Pi markdown agents', () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    const advisorPath = join(agentDir, 'agents', 'advisor.md');
+    const localPath = join(cwd, '.pi', 'agents', 'local-review.md');
+    mkdirSync(dirname(advisorPath), { recursive: true });
+    mkdirSync(dirname(localPath), { recursive: true });
+    writeFileSync(
+      advisorPath,
+      '---\ndescription: Stronger reviewer\nmode: subagent\nhidden: true\n---\nAdvise.\n',
+    );
+    writeFileSync(localPath, '---\ndescription: Local reviewer\nmode: subagent\n---\nReview.\n');
+
+    const catalog = loadAgentCatalog(cwd, agentDir);
+    expect(catalog.diagnostics).toEqual([]);
+    expect(catalog.agents.get('advisor')).toMatchObject({
+      source: 'global',
+      description: 'Stronger reviewer',
+      prompt: 'Advise.',
+      hidden: true,
+    });
+    expect(availableAgents(catalog).map((agent) => agent.name)).not.toContain('advisor');
+    expect(catalog.agents.get('local-review')?.source).toBe('local');
+
+    const untrustedCatalog = loadAgentCatalog(cwd, agentDir, false);
+    expect(untrustedCatalog.agents.has('advisor')).toBe(true);
+    expect(untrustedCatalog.agents.has('local-review')).toBe(false);
   });
 
   test('merges global and trusted-project landstrip settings', () => {
@@ -223,11 +233,23 @@ describe('landstrip agent configuration', () => {
     const projectPath = join(cwd, '.pi', 'settings.json');
 
     await setMaxSubagentsConfigForScope(cwd, 3, 'global', agentDir);
+    expect(loadMaxSubagentsSettings(cwd, true, agentDir)).toEqual({
+      global: 3,
+      project: undefined,
+    });
     await setMaxSubagentsConfigForScope(cwd, 5, 'project', agentDir);
+    expect(loadMaxSubagentsSettings(cwd, true, agentDir)).toEqual({ global: 3, project: 5 });
 
     expect(JSON.parse(readFileSync(globalPath, 'utf8')).landstrip.maxSubagents).toBe(3);
     expect(JSON.parse(readFileSync(projectPath, 'utf8')).landstrip.maxSubagents).toBe(5);
     expect(loadAgentCatalog(cwd, agentDir).maxSubagents).toBe(5);
+
+    await clearMaxSubagentsConfigForScope(cwd, 'project', agentDir);
+    expect(loadMaxSubagentsSettings(cwd, true, agentDir)).toEqual({
+      global: 3,
+      project: undefined,
+    });
+    expect(JSON.parse(readFileSync(projectPath, 'utf8')).landstrip).toBeUndefined();
   });
 
   test('reports malformed agent permissions', () => {
@@ -269,34 +291,6 @@ describe('landstrip agent configuration', () => {
     expect(catalog.agents.get('plan')?.color).toBe('#FF00FF');
     expect(catalog.agents.has('bad')).toBe(false);
     expect(catalog.diagnostics.join('\n')).toContain('color must be');
-  });
-
-  test('ignores legacy top-level agent settings', () => {
-    const agentDir = temporaryDirectory();
-    const cwd = temporaryDirectory();
-    write(join(agentDir, 'settings.json'), {
-      agent: { legacy: { mode: 'subagent', prompt: 'Do not load.' } },
-    });
-    write(join(cwd, '.pi', 'settings.json'), {
-      permission: { bash: 'deny' },
-    });
-
-    const catalog = loadAgentCatalog(cwd, agentDir);
-    expect(catalog.agents.has('legacy')).toBe(false);
-    expect(catalog.warnings.join('\n')).toContain('legacy agent configuration is ignored');
-    expect(catalog.warnings.join('\n')).toContain(join(cwd, '.pi', 'settings.json'));
-  });
-
-  test('reports subagents.json as an actionable migration diagnostic', () => {
-    const agentDir = temporaryDirectory();
-    const path = join(agentDir, 'subagents.json');
-    write(path, { maxSubagents: 2 });
-
-    const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
-    expect(catalog.diagnostics.join('\n')).toContain(`${path} is no longer supported`);
-    expect(catalog.diagnostics.join('\n')).toContain(
-      `landstrip.agent, landstrip.permission, and landstrip.opencode in ${join(agentDir, 'settings.json')}`,
-    );
   });
 
   test('includes the source path in malformed settings JSON diagnostics', () => {

@@ -217,7 +217,6 @@ describe('OpenCode agent import', () => {
       });
       expect(catalog.agents.get('explore')?.description).not.toBe('OpenCode explore override');
       expect(catalog.diagnostics).toEqual([]);
-      expect(catalog.warnings.filter((warning) => warning.includes('conflict'))).toEqual([]);
     } finally {
       if (previous === undefined) delete process.env.OPENCODE_CONFIG_DIR;
       else process.env.OPENCODE_CONFIG_DIR = previous;
@@ -243,7 +242,6 @@ describe('OpenCode agent import', () => {
     try {
       const catalog = loadAgentCatalog(cwd, agentDir);
       expect(catalog.agents.has('review')).toBe(false);
-      expect(catalog.warnings).toEqual([]);
     } finally {
       if (previous === undefined) delete process.env.OPENCODE_CONFIG_DIR;
       else process.env.OPENCODE_CONFIG_DIR = previous;
