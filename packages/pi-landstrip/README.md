@@ -78,13 +78,11 @@ without a project-trust API use only global configuration.
 
 ## Behavior
 
-When Pi requests a sandboxed permission, the extension sends a host notification
-and opens a dialog. The user can allow once, allow for the session, persist for
-the project or globally, or reject. The dialog shows the exact path or domain
-being approved.
-
-Project approvals are written to `.pi/sandbox.json`; global approvals are
-written to `~/.pi/agent/sandbox.json`.
+When a sandboxed command requests access not already covered by policy, the extension
+sends a host notification and opens a dialog. The user can allow once, allow for the
+session, persist for the project or globally, or reject. The dialog shows the exact
+path or domain being requested. Project approvals are written to `.pi/sandbox.json`;
+global approvals are written to `~/.pi/agent/sandbox.json`.
 
 The main agent remains a normal Pi process. `pi-landstrip` replaces Bash execution,
 including AI `bash` calls and manually typed shell commands (`!` and `!!`), with a
@@ -107,6 +105,41 @@ Use `/sandbox` to inspect the active policy and toggle sandboxing. `/agents` is 
 single interface for selecting the primary role, inspecting every configured agent
 and task session, and setting the global or trusted-project concurrency limit.
 
+## Permission model
+
+Agent permissions and sandbox permissions are separate policy layers. They have
+different targets and make decisions at different stages:
+
+| Layer              | Target                                           | Decision point       | Governs                                                             |
+| ------------------ | ------------------------------------------------ | -------------------- | ------------------------------------------------------------------- |
+| Agent permission   | A primary agent or subagent                      | Before tool dispatch | Whether that agent may invoke a tool with the declared arguments    |
+| Sandbox permission | A sandboxed command and its descendant processes | During execution     | The filesystem and network operations the command actually attempts |
+
+The execution path is:
+
+```text
+agent → agent permission check → tool command → sandbox → OS resource
+```
+
+The two kinds of query are triggered independently. An agent `ask` decision comes
+from the selected primary or subagent definition and holds the tool call before it is
+dispatched. A sandbox query comes from the command reaching the OS boundary. Where
+the platform supports dynamic queries, such as Linux seccomp traps, this can happen
+after the process has started; the broker holds the operation while the user decides.
+
+Neither policy can replace the other:
+
+- An agent `allow` permits tool dispatch but cannot widen the sandbox.
+- A sandbox approval permits a concrete OS operation but does not authorize an agent
+  to invoke a tool denied by its agent policy.
+- Agent policy describes tool requests known before dispatch. Sandbox policy constrains
+  executable behavior, including unexpected or malicious native code.
+- Agent and sandbox approvals are tracked separately and do not imply one another.
+
+For example, an agent may be allowed to invoke Bash, while the launched executable is
+still blocked or queried when it attempts `openat("/home/user/.ssh/config")` or
+`connect("127.0.0.1:5432")`.
+
 ## Primary agents
 
 The `/agents` dialog provides one catalog for every configured agent. Each entry
@@ -126,12 +159,6 @@ full `pi --mode rpc` process inside an outer Landstrip sandbox. The sandbox
 covers Pi, its plugins and tools, model requests, and descendant processes. The
 root Pi process supervises RPC, permissions, nesting, persistence, and result
 delivery.
-
-The two permission layers act at different stages:
-
-- Agent permissions are checked before a tool call is dispatched.
-- Sandbox permissions are enforced at runtime by the OS while the subagent and its
-  descendants execute.
 
 Workers use normal Pi resource discovery and plugin loading, plus the
 `pi-landstrip` worker extension. Requested tools are composed inside the worker,
@@ -164,14 +191,11 @@ Session switching or shutdown stops live workers. After an unclean restart,
 unfinished work is marked interrupted; completed but undelivered background
 results are delivered when the root session resumes.
 
-OpenCode-style permissions wrap each worker's composed tools: `deny` blocks,
-`ask` prompts in the root UI, and `allow` runs the tool. Other workers may
-continue while a prompt is open. Forwarded worker dialogs identify the agent,
-task summary, and task ID. An "Allow for this session" decision applies to the
-root session and its descendants.
-
-Tool permissions cannot widen the outer Landstrip policy. Sandbox approvals
-continue to use `.pi/sandbox.json` and `~/.pi/agent/sandbox.json`.
+Agent permissions wrap each worker's composed tools: `deny` blocks dispatch, `ask`
+prompts in the root UI, and `allow` runs the tool. Other workers may continue while
+an agent-permission prompt is open. Forwarded dialogs identify the agent, task
+summary, and task ID. An "Allow for this session" decision applies to the root
+session and its descendants.
 
 Subagents fail closed when sandboxing is expected but unavailable, unsupported,
 or missing. An explicit `--no-sandbox` flag or `enabled: false` configuration is
