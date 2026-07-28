@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import type { TuiPlugin, TuiSlotContext, TuiSlotPlugin } from '@opencode-ai/plugin/tui';
 import { type AddressInfo, createServer, type Socket as NetSocket } from 'node:net';
+
+import type { TuiPlugin, TuiSlotContext, TuiSlotPlugin } from '@opencode-ai/plugin/tui';
+import { useTerminalDimensions } from '@opentui/solid';
+import { jsx, jsxs } from '@opentui/solid/jsx-runtime';
+import { createSignal, onCleanup } from 'solid-js';
 
 import {
   controlResponseLine,
@@ -41,6 +45,33 @@ type QueryChoice = 'once' | 'session' | 'project' | 'global' | 'deny';
 // No project/global option: no landstrip policy field expresses "allow this
 // address:port" the way allowRead/allowWrite express a path.
 type NetworkQueryChoice = 'once' | 'session' | 'deny';
+
+interface PromptOption<Value extends string> {
+  label: string;
+  value: Value;
+}
+
+interface PermissionPromptProps<Value extends string> {
+  title: string;
+  icon: string;
+  detail: string;
+  options: readonly PromptOption<Value>[];
+  onSelect: (value: Value) => void;
+}
+
+const promptBorderChars = {
+  topLeft: '',
+  bottomLeft: '',
+  vertical: '┃',
+  topRight: '',
+  bottomRight: '',
+  horizontal: ' ',
+  bottomT: '',
+  topT: '',
+  cross: '',
+  leftT: '',
+  rightT: '',
+};
 
 // A landstrip filesystem query (read or write) held pending over the fd-3
 // socket. It shares the dialog stack with permission prompts so the two never
@@ -87,6 +118,134 @@ function permissionDetail(permission: PendingPermission): string {
 
 const tui: TuiPlugin = async (api, options, meta) => {
   const optionOverrides = normalizeOptions(options);
+
+  function renderPermissionPrompt<Value extends string>(props: PermissionPromptProps<Value>) {
+    const theme = api.theme.current;
+    const dimensions = useTerminalDimensions();
+    const [selected, setSelected] = createSignal(0);
+
+    function move(direction: number): void {
+      setSelected((index) => (index + direction + props.options.length) % props.options.length);
+    }
+
+    function submit(): void {
+      const option = props.options[selected()];
+      if (option) props.onSelect(option.value);
+    }
+
+    const unregister = api.keymap.registerLayer({
+      priority: 1000,
+      bindings: [
+        { key: 'left', cmd: () => move(-1) },
+        { key: 'h', cmd: () => move(-1) },
+        { key: 'right', cmd: () => move(1) },
+        { key: 'l', cmd: () => move(1) },
+        { key: 'return', cmd: submit },
+      ],
+    });
+    onCleanup(unregister);
+
+    const optionButtons = props.options.map((option, index) =>
+      jsx('box', {
+        paddingLeft: 1,
+        paddingRight: 1,
+        get backgroundColor() {
+          return selected() === index ? theme.warning : theme.backgroundMenu;
+        },
+        onMouseOver: () => setSelected(index),
+        onMouseUp: () => {
+          setSelected(index);
+          props.onSelect(option.value);
+        },
+        children: jsx('text', {
+          get fg() {
+            return selected() === index ? theme.selectedListItemText : theme.textMuted;
+          },
+          children: option.label,
+        }),
+      }),
+    );
+
+    return jsxs('box', {
+      border: ['left'],
+      borderColor: theme.warning,
+      customBorderChars: promptBorderChars,
+      backgroundColor: theme.backgroundPanel,
+      children: [
+        jsxs('box', {
+          gap: 1,
+          paddingLeft: 2,
+          paddingRight: 3,
+          paddingTop: 1,
+          paddingBottom: 1,
+          children: [
+            jsxs('box', {
+              flexDirection: 'row',
+              gap: 1,
+              children: [
+                jsx('text', { fg: theme.warning, children: '△' }),
+                jsx('text', { fg: theme.text, children: props.title }),
+              ],
+            }),
+            jsxs('box', {
+              flexDirection: 'row',
+              gap: 1,
+              paddingLeft: 2,
+              children: [
+                jsx('text', { fg: theme.textMuted, flexShrink: 0, children: props.icon }),
+                jsx('text', { fg: theme.text, wrapMode: 'word', children: props.detail }),
+              ],
+            }),
+          ],
+        }),
+        jsxs('box', {
+          get flexDirection() {
+            return dimensions().width < 100 ? 'column' : 'row';
+          },
+          flexShrink: 0,
+          gap: 1,
+          paddingTop: 1,
+          paddingLeft: 2,
+          paddingRight: 3,
+          paddingBottom: 1,
+          backgroundColor: theme.backgroundElement,
+          get justifyContent() {
+            return dimensions().width < 100 ? 'flex-start' : 'space-between';
+          },
+          get alignItems() {
+            return dimensions().width < 100 ? 'flex-start' : 'center';
+          },
+          children: [
+            jsx('box', {
+              flexDirection: 'row',
+              gap: 1,
+              children: optionButtons,
+            }),
+            jsxs('box', {
+              flexDirection: 'row',
+              gap: 2,
+              children: [
+                jsxs('text', {
+                  fg: theme.text,
+                  children: [
+                    '⇆ ',
+                    jsx('span', { style: { fg: theme.textMuted }, children: 'select' }),
+                  ],
+                }),
+                jsxs('text', {
+                  fg: theme.text,
+                  children: [
+                    'enter ',
+                    jsx('span', { style: { fg: theme.textMuted }, children: 'confirm' }),
+                  ],
+                }),
+              ],
+            }),
+          ],
+        }),
+      ],
+    });
+  }
 
   // Permission requests can arrive twice (the live event and a reconnect replay
   // of `api.state`), so `resolved` tracks ids we have already answered and
@@ -205,43 +364,19 @@ const tui: TuiPlugin = async (api, options, meta) => {
 
     api.ui.dialog.replace(
       () =>
-        api.ui.DialogSelect<PermissionChoice>({
-          title: 'Sandbox Permission',
-          placeholder: permissionDetail(permission),
+        renderPermissionPrompt<PermissionChoice>({
+          title: 'Permission required',
+          icon: '⚙',
+          detail: permissionDetail(permission),
           options: [
-            {
-              title: 'Allow once',
-              value: 'once',
-              category: 'This request',
-              description: 'Approve only this request',
-            },
-            {
-              title: 'Allow for session',
-              value: 'session',
-              category: 'This request',
-              description: 'Use OpenCode session approval for matching requests',
-            },
-            {
-              title: 'Allow for project',
-              value: 'project',
-              category: 'Persist to sandbox.json',
-              description: 'Persist to .opencode/sandbox.json and approve this session',
-            },
-            {
-              title: 'Allow globally',
-              value: 'global',
-              category: 'Persist to sandbox.json',
-              description: 'Persist to ~/.config/opencode/sandbox.json and approve this session',
-            },
-            {
-              title: 'Reject',
-              value: 'reject',
-              category: 'Deny',
-              description: 'Deny this request',
-            },
+            { label: 'Allow once', value: 'once' },
+            { label: 'Allow for session', value: 'session' },
+            { label: 'Allow for project', value: 'project' },
+            { label: 'Allow globally', value: 'global' },
+            { label: 'Reject', value: 'reject' },
           ],
-          onSelect: (option) => {
-            void replyPermission(permission, option.value);
+          onSelect: (choice) => {
+            void replyPermission(permission, choice);
           },
         }),
       () => {
@@ -254,6 +389,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
         queueMicrotask(pump);
       },
     );
+    api.ui.dialog.setSize('xlarge');
   }
 
   function respondQuery(socket: NetSocket, queryId: string, action: 'allow' | 'deny'): void {
@@ -307,13 +443,9 @@ const tui: TuiPlugin = async (api, options, meta) => {
   function showFsQuery(entry: FsQueryEntry): void {
     activeId = entry.id;
     const verb = entry.operation === 'read' ? 'Read' : 'Write';
-    const noun = entry.operation;
-    const listName = entry.operation === 'read' ? 'allowRead' : 'allowWrite';
-    const directory = api.state.path.directory || process.cwd();
-    const scope = sessionScopeFor(entry.path, directory);
 
     void api.attention.notify({
-      title: `Sandbox ${noun} blocked`,
+      title: `Sandbox ${entry.operation} blocked`,
       message: entry.path,
       sound: { name: 'permission' },
       notification: true,
@@ -326,50 +458,27 @@ const tui: TuiPlugin = async (api, options, meta) => {
 
     api.ui.dialog.replace(
       () =>
-        api.ui.DialogSelect<QueryChoice>({
-          title: `Sandbox ${verb} Blocked`,
-          placeholder: `${verb} blocked: ${entry.path}`,
+        renderPermissionPrompt<QueryChoice>({
+          title: 'Sandbox access blocked',
+          icon: '→',
+          detail: `${verb}: ${entry.path}`,
           options: [
-            {
-              title: 'Allow once',
-              value: 'once',
-              category: `This ${noun}`,
-              description: `Permit only this ${noun}`,
-            },
-            {
-              title: 'Allow for session',
-              value: 'session',
-              category: `This ${noun}`,
-              description: `Permit ${noun}s under ${scope} for this session`,
-            },
-            {
-              title: 'Allow for project',
-              value: 'project',
-              category: 'Persist to sandbox.json',
-              description: `Add ${scope} to .opencode/sandbox.json ${listName}`,
-            },
-            {
-              title: 'Allow globally',
-              value: 'global',
-              category: 'Persist to sandbox.json',
-              description: `Add ${scope} to ~/.config/opencode/sandbox.json ${listName}`,
-            },
-            {
-              title: 'Deny',
-              value: 'deny',
-              category: 'Deny',
-              description: `Block this ${noun}`,
-            },
+            { label: 'Allow once', value: 'once' },
+            { label: 'Allow for session', value: 'session' },
+            { label: 'Allow for project', value: 'project' },
+            { label: 'Allow globally', value: 'global' },
+            { label: 'Deny', value: 'deny' },
           ],
-          onSelect: (option) => {
+          onSelect: (choice) => {
             selectionMade = true;
-            resolveFsQuery(entry, option.value);
+            resolveFsQuery(entry, choice);
           },
         }),
       () => {
         if (!selectionMade) resolveFsQuery(entry, 'deny');
       },
     );
+    api.ui.dialog.setSize('xlarge');
   }
 
   function resolveNetworkQuery(entry: NetworkQueryEntry, choice: NetworkQueryChoice): void {
@@ -409,38 +518,25 @@ const tui: TuiPlugin = async (api, options, meta) => {
 
     api.ui.dialog.replace(
       () =>
-        api.ui.DialogSelect<NetworkQueryChoice>({
-          title: 'Sandbox Network Blocked',
-          placeholder: `${entry.operation} blocked: ${entry.target}`,
+        renderPermissionPrompt<NetworkQueryChoice>({
+          title: 'Sandbox access blocked',
+          icon: '%',
+          detail: `${entry.operation}: ${entry.target}`,
           options: [
-            {
-              title: 'Allow once',
-              value: 'once',
-              category: `This ${entry.operation}`,
-              description: `Permit only this ${entry.operation}`,
-            },
-            {
-              title: 'Allow for session',
-              value: 'session',
-              category: `This ${entry.operation}`,
-              description: `Permit ${entry.target} for this session`,
-            },
-            {
-              title: 'Deny',
-              value: 'deny',
-              category: 'Deny',
-              description: `Block this ${entry.operation}`,
-            },
+            { label: 'Allow once', value: 'once' },
+            { label: 'Allow for session', value: 'session' },
+            { label: 'Deny', value: 'deny' },
           ],
-          onSelect: (option) => {
+          onSelect: (choice) => {
             selectionMade = true;
-            resolveNetworkQuery(entry, option.value);
+            resolveNetworkQuery(entry, choice);
           },
         }),
       () => {
         if (!selectionMade) resolveNetworkQuery(entry, 'deny');
       },
     );
+    api.ui.dialog.setSize('xlarge');
   }
 
   const unsubscribeAsked = api.event.on('permission.asked', (event) => {
@@ -629,12 +725,8 @@ const tui: TuiPlugin = async (api, options, meta) => {
     },
   ]);
 
-  // Persistent status badge in the prompt area. It needs the host's Solid
-  // runtime, imported defensively so a host that resolves plugin imports
-  // differently still loads the plugin — the badge just stays absent there.
+  // Persistent status badge in the prompt area.
   try {
-    const { jsx } = await import('@opentui/solid/jsx-runtime');
-    const { createSignal } = await import('solid-js');
     const [sandboxRevision, setSandboxRevision] = createSignal(0);
     const statusBadge = (ctx: TuiSlotContext) => {
       sandboxRevision();

@@ -60,10 +60,13 @@ sets it, otherwise to the global config.
 
 ## Behavior
 
-When OpenCode requests a sandboxed permission, the plugin sends a host
-notification and opens a dialog. The user can allow once, allow for the session,
-persist for the project or globally, or reject. The dialog shows the exact path
-or domain being approved.
+When OpenCode asks whether the agent may invoke a sandboxed tool, the plugin
+shows an agent-permission prompt. If a running command instead reaches a
+filesystem or network boundary, the plugin shows a distinct **Sandbox access
+blocked** prompt with the exact path or network target. Both use OpenCode's
+permission-prompt styling, while retaining their separate choices and behavior.
+The user can allow once, allow for the session, persist an approval for the
+project or globally, or reject the request.
 
 Project approvals are written to `.opencode/sandbox.json`; global approvals go
 to `~/.config/opencode/sandbox.json`. A newly created global file starts with the
