@@ -236,91 +236,30 @@ first.
 
 ## Configuration
 
-Landstrip configuration is read from `landstrip` in `~/.pi/agent/settings.json` and,
-for trusted projects, `.pi/settings.json`. Project values override global values;
-both are merged over internal defaults. The built-in subagents are `code-reviewer`,
+The two permission layers deliberately use different configuration files:
+
+- Agent policy belongs under `landstrip` in Pi `settings.json`. It controls which
+  primary agents and subagents exist and which tools they may dispatch.
+- Sandbox policy belongs in `sandbox.json`. It controls the filesystem and network
+  operations attempted by sandboxed commands and worker processes.
+
+Rules cannot be copied between these files: the schemas, targets, and enforcement
+stages are different, so an agent rule is neither valid nor equivalent as a sandbox
+rule, or vice versa.
+
+### Agent policy (`settings.json`)
+
+Agent configuration is read from `landstrip` in `~/.pi/agent/settings.json` and, for
+trusted projects, `.pi/settings.json`. Project values override global values; both
+are merged over internal defaults. The built-in subagents are `code-reviewer`,
 `explore`, `general`, and the OpenCode-compatible `scout` reconnaissance agent.
 
 The read-only `code-reviewer` is available without additional configuration: delegate
 with `task` using `subagent_type: "code-reviewer"`. It can read and search files and
 run a fixed set of non-mutating Git inspection commands; all other tools are denied.
 
-Sandbox policy remains in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. OpenCode
-integration flags live under `landstrip.opencode` and both default to `true`:
-
-```json
-{
-  "packages": ["npm:pi-landstrip"],
-  "landstrip": {
-    "opencode": {
-      "showGlobalAgents": true,
-      "showLocalAgents": true
-    }
-  }
-}
-```
-
-- `showGlobalAgents` imports `agent` definitions from `opencode.json` and
-  `opencode.jsonc`, plus Markdown agents under `agent/` and `agents/`, in the
-  OpenCode global config directory (`$OPENCODE_CONFIG_DIR`,
-  `$XDG_CONFIG_HOME/opencode`, or `~/.config/opencode`).
-- `showLocalAgents` imports `agent` definitions from project `opencode.json` and
-  `opencode.jsonc`, `.opencode/opencode.json` and `.opencode/opencode.jsonc`, and
-  Markdown agents under `.opencode/agent/` and `.opencode/agents/`.
-
-Project settings override global settings, including each OpenCode flag. Set a flag
-to `false` to disable that source. OpenCode project agents override global OpenCode
-agents. Definitions from `landstrip.agent` (built-in, global, and project) take
-precedence over OpenCode imports with the same name; conflicts are silent. Project
-Pi settings and project OpenCode agents are skipped when the project is untrusted;
-global OpenCode agents still load when `showGlobalAgents` is enabled.
-
-OpenCode JSONC comments and trailing commas are supported. `{file:path}` prompt tokens
-resolve relative to the OpenCode config file or Pi `settings.json` that defines them.
-Sandbox fields belong in `sandbox.json`.
-
-The Windows sandbox fields are:
-
-```json
-{
-  "windows": {
-    "appContainerMode": "standard",
-    "allowLoopback": false
-  }
-}
-```
-
-`appContainerMode` is `"lpac"` or `"standard"`; core Landstrip defaults to LPAC,
-while the Pi package defaults to standard mode for Git Bash compatibility.
-`allowLoopback` is independently opt-in and applies only while AppContainer is
-active. Windows implementation selection is automatic and cannot be changed by
-project configuration.
-
-### Windows restricted-user installation
-
-Provision restricted-user execution once to activate it:
-
-```powershell
-npx @landstrip/landstrip windows install
-npx @landstrip/landstrip windows status
-```
-
-Install requests UAC elevation and defaults to eight restricted-network
-accounts, two unrestricted-network accounts, and proxy ports 60080-60111. Run
-`npx @landstrip/landstrip windows install --help` for pool and port options, then
-restart Pi. Uninstalling returns Landstrip to AppContainer automatically.
-
-The extension checks the active implementation and installation health before a
-sandboxed launch. An unhealthy installation fails rather than falling back to
-AppContainer. Restricted-user mode does not support `windows.allowLoopback` or
-`network.allowLocalBinding`. Remove the persistent accounts, WFP rules, runner,
-and recovered per-run ACL grants with:
-
-```powershell
-npx @landstrip/landstrip windows uninstall
-```
-
-An agent configuration example follows:
+An agent configuration example follows. This belongs in Pi `settings.json`, not
+`sandbox.json`:
 
 ```json
 {
@@ -370,8 +309,89 @@ without changing the active primary agent when the model is missing, ambiguous, 
 unavailable for authentication. Subagent workers also honor model selection,
 supported Pi thinking-level variants, and step limits. Later matching permission
 rules win. Put provider-specific values under `options`; unknown agent fields are
-rejected. Agent permissions cannot weaken an enabled OS sandbox, grant filesystem
-access, or grant network access.
+rejected.
+
+OpenCode integration flags also live in Pi `settings.json` under
+`landstrip.opencode`; both default to `true`:
+
+```json
+{
+  "packages": ["npm:pi-landstrip"],
+  "landstrip": {
+    "opencode": {
+      "showGlobalAgents": true,
+      "showLocalAgents": true
+    }
+  }
+}
+```
+
+- `showGlobalAgents` imports `agent` definitions from `opencode.json` and
+  `opencode.jsonc`, plus Markdown agents under `agent/` and `agents/`, in the
+  OpenCode global config directory (`$OPENCODE_CONFIG_DIR`,
+  `$XDG_CONFIG_HOME/opencode`, or `~/.config/opencode`).
+- `showLocalAgents` imports `agent` definitions from project `opencode.json` and
+  `opencode.jsonc`, `.opencode/opencode.json` and `.opencode/opencode.jsonc`, and
+  Markdown agents under `.opencode/agent/` and `.opencode/agents/`.
+
+Project settings override global settings, including each OpenCode flag. Set a flag
+to `false` to disable that source. OpenCode project agents override global OpenCode
+agents. Definitions from `landstrip.agent` (built-in, global, and project) take
+precedence over OpenCode imports with the same name; conflicts are silent. Project
+Pi settings and project OpenCode agents are skipped when the project is untrusted;
+global OpenCode agents still load when `showGlobalAgents` is enabled.
+
+OpenCode JSONC comments and trailing commas are supported. `{file:path}` prompt tokens
+resolve relative to the OpenCode config file or Pi `settings.json` that defines them.
+
+### Sandbox policy (`sandbox.json`)
+
+Sandbox policy is read from `~/.pi/agent/sandbox.json` and, for trusted projects,
+`.pi/sandbox.json`. It grants runtime filesystem and network access to sandboxed
+commands; it does not grant an agent permission to dispatch a tool. Likewise, an
+agent `allow` cannot grant filesystem or network access through the sandbox.
+
+For example, Windows sandbox fields belong in `sandbox.json`, not Pi
+`settings.json`:
+
+```json
+{
+  "windows": {
+    "appContainerMode": "standard",
+    "allowLoopback": false
+  }
+}
+```
+
+`appContainerMode` is `"lpac"` or `"standard"`; core Landstrip defaults to LPAC,
+while the Pi package defaults to standard mode for Git Bash compatibility.
+`allowLoopback` is independently opt-in and applies only while AppContainer is
+active. Windows implementation selection is automatic and cannot be changed by
+project configuration.
+
+#### Windows restricted-user installation
+
+Provision restricted-user execution once to activate it:
+
+```powershell
+npx @landstrip/landstrip windows install
+npx @landstrip/landstrip windows status
+```
+
+Install requests UAC elevation and defaults to eight restricted-network
+accounts, two unrestricted-network accounts, and proxy ports 60080-60111. Run
+`npx @landstrip/landstrip windows install --help` for pool and port options, then
+restart Pi. Uninstalling returns Landstrip to AppContainer automatically.
+
+The extension checks the active implementation and installation health before a
+sandboxed launch. An unhealthy installation fails rather than falling back to
+AppContainer. Restricted-user mode does not support `windows.allowLoopback` or
+`network.allowLocalBinding`. Remove the persistent accounts, WFP rules, runner,
+and recovered per-run ACL grants with:
+
+```powershell
+npx @landstrip/landstrip windows uninstall
+```
 
 ## Configuration migration
 
