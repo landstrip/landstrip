@@ -208,7 +208,12 @@ first.
 Subagent configuration is read from `~/.pi/agent/subagents.json` and, for trusted
 projects, `.pi/subagents.json`. Project values override global values; both are
 merged over the packaged [defaults](./subagents.json). The packaged subagent types
-are `explore`, `general`, and the OpenCode-compatible `scout` reconnaissance agent.
+are `code-reviewer`, `explore`, `general`, and the OpenCode-compatible `scout`
+reconnaissance agent.
+
+The read-only `code-reviewer` is available without additional configuration: delegate
+with `task` using `subagent_type: "code-reviewer"`. It can read and search files and
+run a fixed set of non-mutating Git inspection commands; all other tools are denied.
 
 Sandbox policy remains in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi's
 `settings.json` only needs the normal package entry for the extension:
@@ -224,7 +229,7 @@ OpenCode Markdown agent import flags live in `subagents.json` as top-level
 
 ```json
 {
-  "maxSubagents": 0,
+  "maxSubagents": 1,
   "opencode": {
     "showGlobalAgents": true,
     "showLocalAgents": true
@@ -319,9 +324,10 @@ A subagent configuration example follows:
 ```
 
 `maxSubagents` is an integer from 0 through 16 controlling concurrent workers.
-The packaged default is 0, which removes the `task` tool while retaining primary
-roles. There is no separate subagent enable switch. The Settings tab in
-`/agents` edits this limit for global and trusted-project configuration.
+The packaged default is 1, making `task` and `code-reviewer` available immediately.
+Set it to 0 to remove the `task` tool while retaining primary roles. There is no
+separate subagent enable switch. The Settings tab in `/agents` edits this limit for
+global and trusted-project configuration.
 
 Agent modes, hidden/disabled agents, prompts, colors, and ordered
 `allow`/`ask`/`deny` permissions apply to primary agents and subagents. Prompt

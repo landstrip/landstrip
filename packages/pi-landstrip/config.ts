@@ -15,6 +15,8 @@ export const MAX_SUBAGENTS = 16;
 
 export type AgentSource = 'built-in' | 'global' | 'local';
 
+type ConfigScope = 'built-in' | 'global' | 'project';
+
 export interface OpenCodeConfig {
   showGlobalAgents: boolean;
   showLocalAgents: boolean;
@@ -83,7 +85,7 @@ function expandAgentPromptReferences(config: LandstripConfigFile, path: string):
   }
 }
 
-function readConfig(path: string, isGlobal = false): LandstripConfigFile {
+function readConfig(path: string, scope: ConfigScope = 'project'): LandstripConfigFile {
   if (!existsSync(path)) return {};
   let value: unknown;
   try {
@@ -98,7 +100,7 @@ function readConfig(path: string, isGlobal = false): LandstripConfigFile {
       throw new Error(`${path}: unknown top-level field ${key}`);
     }
   }
-  if (!isGlobal) {
+  if (scope === 'project') {
     if ('maxSubagents' in value) {
       throw new Error(`${path}: maxSubagents is only allowed in global subagents.json`);
     }
@@ -185,7 +187,7 @@ export async function setMaxSubagentsConfigForScope(
   }
   const { globalPath } = getPiConfigPaths(cwd, 'subagents.json', agentDir);
   await withFileMutationQueue(globalPath, async () => {
-    const config = readConfig(globalPath, true);
+    const config = readConfig(globalPath, 'global');
     config.maxSubagents = maxSubagents;
     mkdirSync(dirname(globalPath), { recursive: true });
     writeFileSync(globalPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
@@ -198,9 +200,9 @@ export function loadLandstripConfig(
   agentDir = getAgentDir(),
 ): LandstripConfig {
   const { globalPath, projectPath } = getPiConfigPaths(cwd, 'subagents.json', agentDir);
-  const builtInConfig = readConfig(join(packageDir, 'subagents.json'), false);
-  const globalConfig = readConfig(globalPath, true);
-  const projectConfig = includeProject ? readConfig(projectPath, false) : undefined;
+  const builtInConfig = readConfig(join(packageDir, 'subagents.json'), 'built-in');
+  const globalConfig = readConfig(globalPath, 'global');
+  const projectConfig = includeProject ? readConfig(projectPath, 'project') : undefined;
   const agentSources = new Map<string, AgentSource>();
   recordAgentSources(agentSources, builtInConfig, 'built-in');
   recordAgentSources(agentSources, globalConfig, 'global');

@@ -1,4 +1,5 @@
 {
+  "maxSubagents": 1,
   "subagents": {
     "agent": {
       "build": {
@@ -13,6 +14,32 @@
         "color": "warning",
         "prompt": "Work in plan mode. Analyze the problem and produce a clear plan before making changes.",
         "permission": { "edit": "ask", "bash": "ask", "task": "ask" }
+      },
+      "code-reviewer": {
+        "description": "Read-only reviewer for concrete code defects",
+        "mode": "subagent",
+        "color": "info",
+        "prompt": "Review the requested code without modifying files. Inspect correctness, security, regressions, tests, performance, and maintainability. Report only concrete findings ordered by severity with exact file and line references, explain the impact, and recommend a concise fix. State clearly when there are no findings. Git inspection permits only these exact commands: `git --no-optional-locks -c core.fsmonitor=false status --short`, `git --no-pager diff --no-ext-diff --no-textconv`, `git --no-pager diff --cached --no-ext-diff --no-textconv`, `git --no-pager log -20 --oneline`, and `git --no-pager show --stat --no-ext-diff --no-textconv`.",
+        "permission": {
+          "*": "deny",
+          "read": {
+            "*": "allow",
+            "**/*.env": "ask",
+            "**/*.env.*": "ask",
+            "**/*.env.example": "allow"
+          },
+          "glob": "allow",
+          "grep": "allow",
+          "list": "allow",
+          "bash": {
+            "*": "deny",
+            "git --no-optional-locks -c core.fsmonitor=false status --short": "allow",
+            "git --no-pager diff --no-ext-diff --no-textconv": "allow",
+            "git --no-pager diff --cached --no-ext-diff --no-textconv": "allow",
+            "git --no-pager log -20 --oneline": "allow",
+            "git --no-pager show --stat --no-ext-diff --no-textconv": "allow"
+          }
+        }
       },
       "general": {
         "description": "General-purpose agent for researching and executing complex tasks",

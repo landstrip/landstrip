@@ -41,9 +41,10 @@ describe('landstrip agent configuration', () => {
   test('provides default primary agents and subagents', () => {
     const catalog = loadAgentCatalog(temporaryDirectory(), temporaryDirectory());
 
-    expect(catalog.maxSubagents).toBe(0);
+    expect(catalog.maxSubagents).toBe(1);
     expect(availablePrimaryAgents(catalog).map((agent) => agent.name)).toEqual(['build', 'plan']);
     expect(availableSubagents(catalog).map((agent) => agent.name)).toEqual([
+      'code-reviewer',
       'explore',
       'general',
       'scout',
@@ -69,6 +70,30 @@ describe('landstrip agent configuration', () => {
     expect(permissionDecision(exploreRules, 'websearch')).toBe('allow');
     expect(permissionDecision(exploreRules, 'edit')).toBe('deny');
     expect(permissionDecision(exploreRules, 'task')).toBe('deny');
+
+    const reviewer = catalog.agents.get('code-reviewer');
+    const reviewerRules = mergePermissionRules(catalog.permissions, reviewer?.permissions ?? []);
+    expect(reviewer).toMatchObject({ source: 'built-in', mode: 'subagent', color: 'info' });
+    expect(permissionDecision(reviewerRules, 'read', 'src/index.ts')).toBe('allow');
+    expect(permissionDecision(reviewerRules, 'read', '.env')).toBe('ask');
+    expect(permissionDecision(reviewerRules, 'edit', 'src/index.ts')).toBe('deny');
+    expect(permissionDecision(reviewerRules, 'task', 'general')).toBe('deny');
+    expect(
+      permissionDecision(
+        reviewerRules,
+        'bash',
+        'git --no-pager diff --cached --no-ext-diff --no-textconv',
+      ),
+    ).toBe('allow');
+    expect(permissionDecision(reviewerRules, 'bash', 'git diff')).toBe('deny');
+    expect(
+      permissionDecision(
+        reviewerRules,
+        'bash',
+        'git --no-pager diff --no-ext-diff --no-textconv && rm -rf build',
+      ),
+    ).toBe('deny');
+    expect(permissionDecision(reviewerRules, 'bash', 'rm -rf build')).toBe('deny');
   });
 
   test('merges global and project subagents.json sections', () => {
@@ -135,7 +160,7 @@ describe('landstrip agent configuration', () => {
     });
 
     const catalog = loadAgentCatalog(cwd, agentDir, false);
-    expect(catalog.maxSubagents).toBe(0);
+    expect(catalog.maxSubagents).toBe(1);
     expect(catalog.agents.has('project')).toBe(false);
   });
 
