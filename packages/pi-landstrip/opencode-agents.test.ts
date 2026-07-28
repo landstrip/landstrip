@@ -86,16 +86,53 @@ describe('OpenCode agent import', () => {
     });
   });
 
+  test('loads JSONC agents and expands prompt files relative to the config', () => {
+    const cwd = temporaryDirectory();
+    const globalDir = temporaryDirectory();
+    write(join(globalDir, 'prompts', 'review.txt'), 'Review from a prompt file.\n');
+    write(
+      join(globalDir, 'opencode.jsonc'),
+      `{
+        // OpenCode JSONC agent
+        "agent": {
+          "review": {
+            "description": "JSONC review",
+            "mode": "primary",
+            "prompt": "{file:prompts/review.txt}",
+          },
+        },
+      }\n`,
+    );
+
+    const result = loadOpenCodeAgents({
+      cwd,
+      includeGlobal: true,
+      includeProject: false,
+      globalConfigDir: globalDir,
+    });
+
+    expect(result.diagnostics).toEqual([]);
+    expect(result.agents.get('review')).toMatchObject({
+      source: 'global',
+      raw: {
+        description: 'JSONC review',
+        mode: 'primary',
+        prompt: 'Review from a prompt file.',
+      },
+    });
+  });
+
   test('project OpenCode agents override global OpenCode agents', () => {
     const cwd = temporaryDirectory();
     const globalDir = temporaryDirectory();
+    writeJson(join(globalDir, 'opencode.json'), {
+      agent: {
+        review: { description: 'Global', mode: 'subagent', prompt: 'Global.' },
+      },
+    });
     write(
-      join(globalDir, 'agent', 'review.md'),
-      `---\ndescription: Global\nmode: subagent\n---\nGlobal.\n`,
-    );
-    write(
-      join(cwd, '.opencode', 'agents', 'review.md'),
-      `---\ndescription: Project\nmode: subagent\n---\nProject.\n`,
+      join(cwd, 'opencode.jsonc'),
+      `{"agent":{"review":{"description":"Project","mode":"subagent","prompt":"Project."}}}`,
     );
 
     const result = loadOpenCodeAgents({
@@ -151,7 +188,6 @@ describe('OpenCode agent import', () => {
     const agentDir = temporaryDirectory();
     const globalDir = temporaryDirectory();
     writeJson(join(agentDir, 'subagents.json'), {
-      opencode: { showGlobalAgents: true, showLocalAgents: true },
       subagents: {
         agent: {
           review: { description: 'Pi review', mode: 'subagent', prompt: 'From Pi.' },
@@ -193,8 +229,10 @@ describe('OpenCode agent import', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     const globalDir = temporaryDirectory();
-    writeJson(join(agentDir, 'subagents.json'), {
-      opencode: { showGlobalAgents: false, showLocalAgents: false },
+    writeJson(join(agentDir, 'settings.json'), {
+      landstrip: {
+        opencode: { showGlobalAgents: false, showLocalAgents: false },
+      },
     });
     write(
       join(globalDir, 'agents', 'review.md'),
@@ -206,6 +244,7 @@ describe('OpenCode agent import', () => {
     try {
       const catalog = loadAgentCatalog(cwd, agentDir);
       expect(catalog.agents.has('review')).toBe(false);
+      expect(catalog.warnings).toEqual([]);
     } finally {
       if (previous === undefined) delete process.env.OPENCODE_CONFIG_DIR;
       else process.env.OPENCODE_CONFIG_DIR = previous;
@@ -215,8 +254,11 @@ describe('OpenCode agent import', () => {
   test('skips project OpenCode agents when the project is untrusted', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    writeJson(join(agentDir, 'subagents.json'), {
-      opencode: { showLocalAgents: true },
+    writeJson(join(agentDir, 'settings.json'), {
+      landstrip: { opencode: { showLocalAgents: false } },
+    });
+    writeJson(join(cwd, '.pi', 'settings.json'), {
+      landstrip: { opencode: { showLocalAgents: true } },
     });
     write(
       join(cwd, '.opencode', 'agent', 'local-only.md'),

@@ -101,7 +101,7 @@ function legacyConfigWarnings(piAgentDir: string): string[] {
   try {
     const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
     if (!isRecord(value)) return [];
-    const fields = ['agent', 'permission', 'subagents', 'maxSubagents', 'landstrip'].filter(
+    const fields = ['agent', 'permission', 'subagents', 'maxSubagents'].filter(
       (field) => value[field] !== undefined,
     );
     if (fields.length === 0) return [];

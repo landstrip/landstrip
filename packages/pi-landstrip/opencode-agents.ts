@@ -3,12 +3,13 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, extname, join, relative, sep } from 'node:path';
+import { basename, dirname, extname, join, relative, sep } from 'node:path';
 
 import { parse as parseYaml } from 'yaml';
+import { parse as parseJsonc, printParseErrorCode, type ParseError } from 'jsonc-parser';
 
 import type { AgentSource, ConfigObject } from './config.ts';
-import { formatError, isRecord } from './util.ts';
+import { expandFileReferences, formatError, isRecord } from './util.ts';
 
 export interface OpenCodeAgentRaw {
   readonly name: string;
@@ -154,6 +155,61 @@ export function normalizeOpenCodeAgentRaw(data: ConfigObject, prompt: string): C
   return raw;
 }
 
+function parseOpenCodeConfig(path: string): ConfigObject {
+  const errors: ParseError[] = [];
+  const value: unknown = parseJsonc(readFileSync(path, 'utf8'), errors, {
+    allowTrailingComma: true,
+  });
+  if (errors.length > 0) {
+    const error = errors[0];
+    throw new Error(`${printParseErrorCode(error.error)} at offset ${error.offset}`);
+  }
+  if (!isRecord(value)) throw new Error('config must contain a JSON object');
+  return value;
+}
+
+function loadAgentsFromConfigFile(
+  path: string,
+  source: AgentSource,
+  agents: Map<string, OpenCodeAgentRaw>,
+  diagnostics: string[],
+): void {
+  if (!existsSync(path)) return;
+  try {
+    const config = parseOpenCodeConfig(path);
+    if (config.agent === undefined) return;
+    if (!isRecord(config.agent)) throw new Error('agent must be a JSON object');
+    for (const [name, value] of Object.entries(config.agent)) {
+      try {
+        if (!name) throw new Error('agent name is empty');
+        if (!isRecord(value)) throw new Error(`agent ${name} must be a JSON object`);
+        if (value.prompt !== undefined && typeof value.prompt !== 'string') {
+          throw new Error(`agent ${name} prompt must be a string`);
+        }
+        const prompt =
+          typeof value.prompt === 'string' ? expandFileReferences(value.prompt, dirname(path)) : '';
+        const raw = normalizeOpenCodeAgentRaw(value, prompt);
+        agents.set(name, { name, source, path, raw });
+      } catch (error) {
+        diagnostics.push(`${path}: ${formatError(error)}`);
+      }
+    }
+  } catch (error) {
+    diagnostics.push(`${path}: ${formatError(error)}`);
+  }
+}
+
+function loadConfigAgentsFromDir(
+  dir: string,
+  source: AgentSource,
+  agents: Map<string, OpenCodeAgentRaw>,
+  diagnostics: string[],
+): void {
+  for (const file of ['opencode.json', 'opencode.jsonc']) {
+    loadAgentsFromConfigFile(join(dir, file), source, agents, diagnostics);
+  }
+}
+
 function loadAgentsFromDir(
   dir: string,
   source: AgentSource,
@@ -189,15 +245,15 @@ export function loadOpenCodeAgents(options: {
   const agents = new Map<string, OpenCodeAgentRaw>();
   const diagnostics: string[] = [];
   if (options.includeGlobal) {
-    loadAgentsFromDir(
-      options.globalConfigDir ?? openCodeGlobalConfigDir(),
-      'global',
-      agents,
-      diagnostics,
-    );
+    const globalDir = options.globalConfigDir ?? openCodeGlobalConfigDir();
+    loadConfigAgentsFromDir(globalDir, 'global', agents, diagnostics);
+    loadAgentsFromDir(globalDir, 'global', agents, diagnostics);
   }
   if (options.includeProject) {
-    loadAgentsFromDir(join(options.cwd, '.opencode'), 'local', agents, diagnostics);
+    loadConfigAgentsFromDir(options.cwd, 'local', agents, diagnostics);
+    const projectDir = join(options.cwd, '.opencode');
+    loadConfigAgentsFromDir(projectDir, 'local', agents, diagnostics);
+    loadAgentsFromDir(projectDir, 'local', agents, diagnostics);
   }
   return { agents, diagnostics };
 }

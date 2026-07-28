@@ -24,7 +24,6 @@ export interface OpenCodeConfig {
 
 export interface LandstripConfigFile {
   maxSubagents?: number;
-  opencode?: Partial<OpenCodeConfig>;
   subagents?: ConfigObject;
 }
 
@@ -71,6 +70,20 @@ function normalizeOpenCode(value: unknown, path: string): Partial<OpenCodeConfig
   return result;
 }
 
+function readOpenCodeSettings(path: string): Partial<OpenCodeConfig> {
+  if (!existsSync(path)) return {};
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (error) {
+    throw new Error(`${path}: ${formatError(error)}`);
+  }
+  if (!isRecord(value)) throw new Error(`${path} must contain a JSON object`);
+  if (value.landstrip === undefined) return {};
+  if (!isRecord(value.landstrip)) throw new Error(`${path}: landstrip must be a JSON object`);
+  return normalizeOpenCode(value.landstrip.opencode, `${path}: landstrip.opencode`);
+}
+
 function expandAgentPromptReferences(config: LandstripConfigFile, path: string): void {
   if (!isRecord(config.subagents) || !isRecord(config.subagents.agent)) return;
   const baseDir = dirname(path);
@@ -95,18 +108,19 @@ function readConfig(path: string, scope: ConfigScope = 'project'): LandstripConf
     throw new Error(`${path}: ${message}`);
   }
   if (!isRecord(value)) throw new Error(`${path} must contain a JSON object`);
+  if ('opencode' in value) {
+    const settingsPath = join(dirname(path), 'settings.json');
+    throw new Error(
+      `${path}: opencode has moved; set landstrip.opencode in ${settingsPath} and remove it from subagents.json`,
+    );
+  }
   for (const key of Object.keys(value)) {
-    if (key !== 'maxSubagents' && key !== 'subagents' && key !== 'opencode') {
+    if (key !== 'maxSubagents' && key !== 'subagents') {
       throw new Error(`${path}: unknown top-level field ${key}`);
     }
   }
-  if (scope === 'project') {
-    if ('maxSubagents' in value) {
-      throw new Error(`${path}: maxSubagents is only allowed in global subagents.json`);
-    }
-    if ('opencode' in value) {
-      throw new Error(`${path}: opencode is only allowed in global subagents.json`);
-    }
+  if (scope === 'project' && 'maxSubagents' in value) {
+    throw new Error(`${path}: maxSubagents is only allowed in global subagents.json`);
   }
   const config: LandstripConfigFile = {};
   if ('maxSubagents' in value) {
@@ -120,9 +134,6 @@ function readConfig(path: string, scope: ConfigScope = 'project'): LandstripConf
       throw new Error(`${path}: subagents must be an object`);
     }
     config.subagents = value.subagents;
-  }
-  if ('opencode' in value) {
-    config.opencode = normalizeOpenCode(value.opencode, `${path}: opencode`);
   }
   expandAgentPromptReferences(config, path);
   return config;
@@ -199,10 +210,17 @@ export function loadLandstripConfig(
   includeProject = true,
   agentDir = getAgentDir(),
 ): LandstripConfig {
-  const { globalPath, projectPath } = getPiConfigPaths(cwd, 'subagents.json', agentDir);
+  const subagentPaths = getPiConfigPaths(cwd, 'subagents.json', agentDir);
+  const settingsPaths = getPiConfigPaths(cwd, 'settings.json', agentDir);
   const builtInConfig = readConfig(join(packageDir, 'subagents.json'), 'built-in');
-  const globalConfig = readConfig(globalPath, 'global');
-  const projectConfig = includeProject ? readConfig(projectPath, 'project') : undefined;
+  const globalConfig = readConfig(subagentPaths.globalPath, 'global');
+  const projectConfig = includeProject
+    ? readConfig(subagentPaths.projectPath, 'project')
+    : undefined;
+  const globalOpenCode = readOpenCodeSettings(settingsPaths.globalPath);
+  const projectOpenCode = includeProject
+    ? readOpenCodeSettings(settingsPaths.projectPath)
+    : undefined;
   const agentSources = new Map<string, AgentSource>();
   recordAgentSources(agentSources, builtInConfig, 'built-in');
   recordAgentSources(agentSources, globalConfig, 'global');
@@ -216,7 +234,8 @@ export function loadLandstripConfig(
   if (!isRecord(config.subagents)) throw new Error('subagents must be an object');
   const opencode: OpenCodeConfig = {
     ...DEFAULT_OPENCODE,
-    ...config.opencode,
+    ...globalOpenCode,
+    ...projectOpenCode,
   };
   return { ...config, maxSubagents, opencode, agentSources } as LandstripConfig;
 }

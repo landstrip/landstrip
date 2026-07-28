@@ -14,7 +14,8 @@ uses an Anthropic-compatible policy and delegates OS-level enforcement to
 
 The extension includes a shared [sandbox policy](./sandbox.json) and separate
 [agent configuration](./subagents.json). Global and trusted-project files can
-override both.
+override both. OpenCode integration flags live under `landstrip.opencode` in Pi
+`settings.json`.
 
 Process-backed subagents require Pi >= 0.82.0, and Node.js >= 22.19.0.
 
@@ -216,45 +217,40 @@ The read-only `code-reviewer` is available without additional configuration: del
 with `task` using `subagent_type: "code-reviewer"`. It can read and search files and
 run a fixed set of non-mutating Git inspection commands; all other tools are denied.
 
-Sandbox policy remains in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. Pi's
-`settings.json` only needs the normal package entry for the extension:
+Sandbox policy remains in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`. OpenCode
+integration flags live under `landstrip.opencode` in global or trusted-project Pi
+`settings.json`; both default to `true`:
 
 ```json
 {
-  "packages": ["npm:pi-landstrip"]
-}
-```
-
-OpenCode Markdown agent import flags live in `subagents.json` as top-level
-`opencode` (both default to `true`):
-
-```json
-{
-  "maxSubagents": 1,
-  "opencode": {
-    "showGlobalAgents": true,
-    "showLocalAgents": true
-  },
-  "subagents": {
-    "agent": {}
+  "packages": ["npm:pi-landstrip"],
+  "landstrip": {
+    "opencode": {
+      "showGlobalAgents": true,
+      "showLocalAgents": true
+    }
   }
 }
 ```
 
-- `showGlobalAgents` imports Markdown agents from the OpenCode global config
-  directory (`$OPENCODE_CONFIG_DIR`, or `$XDG_CONFIG_HOME/opencode`, or
-  `~/.config/opencode`) under `agent/` and `agents/`.
-- `showLocalAgents` imports Markdown agents from the trusted project's
-  `.opencode/agent/` and `.opencode/agents/` directories.
+- `showGlobalAgents` imports `agent` definitions from `opencode.json` and
+  `opencode.jsonc`, plus Markdown agents under `agent/` and `agents/`, in the
+  OpenCode global config directory (`$OPENCODE_CONFIG_DIR`,
+  `$XDG_CONFIG_HOME/opencode`, or `~/.config/opencode`).
+- `showLocalAgents` imports `agent` definitions from project `opencode.json` and
+  `opencode.jsonc`, `.opencode/opencode.json` and `.opencode/opencode.jsonc`, and
+  Markdown agents under `.opencode/agent/` and `.opencode/agents/`.
 
-Set a flag to `false` to disable that source. OpenCode local agents override
-OpenCode global agents. Pi agent definitions from `subagents.json` (built-in,
-global, and local) take precedence over OpenCode imports with the same name;
-conflicts are silent. Local OpenCode agents are skipped when the project is
-untrusted, regardless of the flag.
+Project settings override global settings. Set a flag to `false` to disable that
+source. OpenCode project agents override global OpenCode agents. Pi definitions from
+`subagents.json` (built-in, global, and project) take precedence over OpenCode imports
+with the same name; conflicts are silent. Project Pi settings and project OpenCode
+agents are skipped when the project is untrusted; global OpenCode agents still load
+when `showGlobalAgents` is enabled.
 
-`subagents.json` accepts top-level `maxSubagents`, `opencode`, and `subagents`;
-sandbox fields belong in `sandbox.json`.
+OpenCode JSONC comments and trailing commas are supported. `{file:path}` prompt tokens
+resolve relative to the OpenCode config file. `subagents.json` accepts only top-level
+`maxSubagents` and `subagents`; sandbox fields belong in `sandbox.json`.
 
 The Windows sandbox fields are:
 
@@ -350,24 +346,21 @@ access, or grant network access.
 
 ## Configuration migration
 
-There is no compatibility loader for previous subagent configuration sources.
-Legacy keys in `settings.json` produce a migration warning. Move configuration as
-follows, then remove the old fields:
+There is no compatibility loader for previous Pi agent configuration fields. Legacy
+keys in `settings.json` produce a migration warning. Move configuration as follows,
+then remove the old fields:
 
-- Move `agent` and `permission` from Pi `settings.json` or OpenCode JSON under
-  `subagents.agent` and `subagents.permission`.
+- Move `agent` and `permission` from Pi `settings.json` under `subagents.agent` and
+  `subagents.permission` in `subagents.json`.
 - Convert legacy `tools` booleans to explicit `permission` rules.
-- Move Markdown agent prompts into each `subagents.agent.<name>.prompt` string.
-- Put the worker limit in top-level `maxSubagents`; zero disables delegation.
-- Move `landstrip.opencode` flags from Pi `settings.json` to top-level
-  `opencode` in `subagents.json`.
-- Use `~/.pi/agent/subagents.json` for global configuration and
-  `.pi/subagents.json` for trusted project configuration.
-- Leave sandbox policy in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`;
-  those files are unchanged.
-
-Do not put these fields in Pi's `settings.json`; `pi-landstrip` does not read
-them there.
+- Put the worker limit in top-level `maxSubagents` in `subagents.json`; zero disables
+  delegation.
+- Move top-level `opencode` from `subagents.json` to `landstrip.opencode` in the
+  corresponding global or project Pi `settings.json`.
+- Use `~/.pi/agent/subagents.json` for global Pi agent configuration and
+  `.pi/subagents.json` for trusted project Pi agent configuration.
+- Leave sandbox policy in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`; those
+  files are unchanged.
 
 ## Plugin API
 

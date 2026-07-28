@@ -271,6 +271,17 @@ describe('landstrip agent configuration', () => {
     expect(catalog.diagnostics.join('\n')).toContain('unknown top-level field sandbox');
   });
 
+  test('reports old OpenCode settings as an actionable migration diagnostic', () => {
+    const agentDir = temporaryDirectory();
+    const path = join(agentDir, 'subagents.json');
+    write(path, { opencode: { showGlobalAgents: false } });
+
+    const catalog = loadAgentCatalog(temporaryDirectory(), agentDir);
+    expect(catalog.diagnostics.join('\n')).toContain(
+      `${path}: opencode has moved; set landstrip.opencode in ${join(agentDir, 'settings.json')}`,
+    );
+  });
+
   test('includes the source path in malformed JSON diagnostics', () => {
     const agentDir = temporaryDirectory();
     const path = join(agentDir, 'subagents.json');

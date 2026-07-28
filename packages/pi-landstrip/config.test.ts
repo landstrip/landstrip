@@ -18,33 +18,55 @@ function write(path: string, value: unknown): void {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-describe('opencode config in subagents.json', () => {
+describe('OpenCode settings', () => {
   test('defaults both OpenCode agent imports to true', () => {
     const config = loadLandstripConfig(temporaryDirectory(), true, temporaryDirectory());
     expect(config.opencode).toEqual({ showGlobalAgents: true, showLocalAgents: true });
   });
 
-  test('rejects opencode settings in project subagents.json', () => {
+  test('merges global and trusted-project settings', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    write(join(cwd, '.pi', 'subagents.json'), {
-      opencode: { showLocalAgents: true },
+    write(join(agentDir, 'settings.json'), {
+      landstrip: {
+        opencode: { showGlobalAgents: false, showLocalAgents: false },
+      },
+    });
+    write(join(cwd, '.pi', 'settings.json'), {
+      landstrip: { opencode: { showLocalAgents: true } },
     });
 
-    expect(() => loadLandstripConfig(cwd, true, agentDir)).toThrow(
-      'opencode is only allowed in global subagents.json',
-    );
+    expect(loadLandstripConfig(cwd, true, agentDir).opencode).toEqual({
+      showGlobalAgents: false,
+      showLocalAgents: true,
+    });
+    expect(loadLandstripConfig(cwd, false, agentDir).opencode).toEqual({
+      showGlobalAgents: false,
+      showLocalAgents: false,
+    });
   });
 
-  test('rejects invalid and unknown opencode settings', () => {
+  test('rejects invalid and unknown OpenCode settings', () => {
     const agentDir = temporaryDirectory();
-    const path = join(agentDir, 'subagents.json');
-    write(path, {
-      opencode: { showGlobalAgents: 'yes', showLocalAgents: true, extra: 1 },
+    write(join(agentDir, 'settings.json'), {
+      landstrip: {
+        opencode: { showGlobalAgents: 'yes', showLocalAgents: true, extra: 1 },
+      },
     });
 
     expect(() => loadLandstripConfig(temporaryDirectory(), true, agentDir)).toThrow(
       /unknown field extra|must be a boolean/,
+    );
+  });
+
+  test('reports the subagents.json setting as a migration error', () => {
+    const agentDir = temporaryDirectory();
+    write(join(agentDir, 'subagents.json'), {
+      opencode: { showGlobalAgents: false },
+    });
+
+    expect(() => loadLandstripConfig(temporaryDirectory(), true, agentDir)).toThrow(
+      `set landstrip.opencode in ${join(agentDir, 'settings.json')}`,
     );
   });
 });
