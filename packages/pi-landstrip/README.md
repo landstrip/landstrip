@@ -329,12 +329,17 @@ strings may include OpenCode-style `{file:path}` tokens; relative paths resolve
 against the `subagents.json` file that defines them. `color` accepts `#RRGGBB`
 or OpenCode theme names (`primary`, `secondary`, `accent`, `success`, `warning`,
 `error`, `info`). `hidden` only hides an agent from user-facing primary pickers;
-the model can still invoke a hidden subagent via `task`. Subagent workers also
-honor model selection, supported Pi thinking-level variants, and step limits.
-Primary agent activation currently changes the prompt and permissions only.
-Later matching permission rules win. Put provider-specific values under
-`options`; unknown agent fields are rejected. Agent permissions cannot weaken an
-enabled OS sandbox, grant filesystem access, or grant network access.
+the model can still invoke a hidden subagent via `task`.
+
+Primary agents honor configured models and supported Pi thinking-level variants;
+omitting either preserves the current session setting. A model may use the full
+`provider/model` name or a bare model ID when that ID is unique. Selection fails
+without changing the active primary agent when the model is missing, ambiguous,
+or unavailable for authentication. Subagent workers also honor model selection,
+supported Pi thinking-level variants, and step limits. Later matching permission
+rules win. Put provider-specific values under `options`; unknown agent fields are
+rejected. Agent permissions cannot weaken an enabled OS sandbox, grant filesystem
+access, or grant network access.
 
 ## Configuration migration
 

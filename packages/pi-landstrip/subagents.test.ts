@@ -220,6 +220,9 @@ test('selects a primary agent and applies its prompt', async () => {
   const entries: Array<{ type: string; data: unknown }> = [];
   const statuses: string[] = [];
   const selections: string[] = [];
+  const selectedModels: string[] = [];
+  const thinkingLevels: string[] = [];
+  const planModel = { provider: 'anthropic', id: 'claude-plan' };
   const pi = {
     registerTool() {},
     registerCommand() {},
@@ -232,6 +235,13 @@ test('selects a primary agent and applies its prompt', async () => {
     },
     getActiveTools: () => ['read', 'bash'],
     setActiveTools() {},
+    async setModel(model: { provider: string; id: string }) {
+      selectedModels.push(`${model.provider}/${model.id}`);
+      return true;
+    },
+    setThinkingLevel(level: string) {
+      thinkingLevels.push(level);
+    },
     appendEntry(type: string, data: unknown) {
       entries.push({ type, data });
     },
@@ -241,6 +251,8 @@ test('selects a primary agent and applies its prompt', async () => {
     cwd,
     hasUI: true,
     mode: 'tui',
+    model: { provider: 'anthropic', id: 'claude-build' },
+    modelRegistry: { getAll: () => [planModel] },
     ui: {
       notify() {},
       async select(title: string) {
@@ -264,7 +276,13 @@ test('selects a primary agent and applies its prompt', async () => {
     join(piAgentDir, 'subagents.json'),
     JSON.stringify({
       subagents: {
-        agent: { plan: { permission: { edit: { '*': 'allow', 'secrets/**': 'deny' } } } },
+        agent: {
+          plan: {
+            model: 'anthropic/claude-plan',
+            variant: 'high',
+            permission: { edit: { '*': 'allow', 'secrets/**': 'deny' } },
+          },
+        },
       },
     }),
   );
@@ -275,9 +293,13 @@ test('selects a primary agent and applies its prompt', async () => {
 
   await sessionStart?.({ type: 'session_start' }, ctx);
   expect(statuses.at(-1)).toBe('\x1b[32m@build\x1b[39m');
-  expect(runtime.selectPrimaryAgent('plan', ctx)).toBe(true);
+  expect(selectedModels).toEqual([]);
+  expect(thinkingLevels).toEqual([]);
+  expect(await runtime.selectPrimaryAgent('plan', ctx)).toBe(true);
   expect(entries.at(-1)).toEqual({ type: 'landstrip.primary-agent', data: { name: 'plan' } });
   expect(statuses.at(-1)).toBe('\x1b[33m@plan\x1b[39m');
+  expect(selectedModels).toEqual(['anthropic/claude-plan']);
+  expect(thinkingLevels).toEqual(['high']);
 
   const result = await beforeAgentStart?.({ systemPrompt: 'Base prompt' }, ctx);
   expect(result?.systemPrompt).toContain('Base prompt\n\nWork in plan mode.');
@@ -297,6 +319,149 @@ test('selects a primary agent and applies its prompt', async () => {
   await expect(
     toolCall?.({ toolName: 'edit', input: { path: 'tmp/../secrets/token' } }, ctx),
   ).resolves.toMatchObject({ block: true, reason: expect.stringContaining('secrets/token') });
+});
+
+test('restores a primary agent model and thinking variant', async () => {
+  let sessionStart:
+    | ((event: { type: 'session_start' }, ctx: ExtensionContext) => Promise<void> | void)
+    | undefined;
+  const selectedModels: string[] = [];
+  const thinkingLevels: string[] = [];
+  const entries: Array<{ type: string; data: unknown }> = [];
+  const planModel = { provider: 'anthropic', id: 'claude-plan' };
+  const pi = {
+    registerTool() {},
+    registerCommand() {},
+    on(event: string, handler: unknown) {
+      if (event === 'session_start') sessionStart = handler as typeof sessionStart;
+    },
+    getActiveTools: () => ['read', 'bash'],
+    setActiveTools() {},
+    async setModel(model: { provider: string; id: string }) {
+      selectedModels.push(`${model.provider}/${model.id}`);
+      return true;
+    },
+    setThinkingLevel(level: string) {
+      thinkingLevels.push(level);
+    },
+    appendEntry(type: string, data: unknown) {
+      entries.push({ type, data });
+    },
+  } as unknown as ExtensionAPI;
+  const piAgentDir = temporaryDirectory();
+  writeFileSync(
+    join(piAgentDir, 'subagents.json'),
+    JSON.stringify({
+      subagents: {
+        agent: {
+          plan: { model: 'anthropic/claude-plan', variant: 'xhigh' },
+        },
+      },
+    }),
+  );
+  const runtime = new SubagentRuntime(
+    pi,
+    { createTools: () => [] } as unknown as LandstripIntegration,
+    undefined,
+    (projectCwd) => loadAgentCatalog(projectCwd, piAgentDir),
+  );
+  runtime.register();
+  const ctx = {
+    cwd: temporaryDirectory(),
+    hasUI: false,
+    mode: 'json',
+    model: { provider: 'anthropic', id: 'claude-build' },
+    modelRegistry: { getAll: () => [planModel] },
+    ui: { notify() {}, setWidget() {} },
+    sessionManager: {
+      getBranch: () => [
+        {
+          type: 'custom',
+          customType: 'landstrip.primary-agent',
+          data: { name: 'plan' },
+        },
+      ],
+      getSessionId: () => 'parent',
+    },
+  } as unknown as ExtensionContext;
+
+  await sessionStart?.({ type: 'session_start' }, ctx);
+
+  expect(runtime.getPrimaryAgent()?.name).toBe('plan');
+  expect(selectedModels).toEqual(['anthropic/claude-plan']);
+  expect(thinkingLevels).toEqual(['xhigh']);
+  expect(entries).toEqual([]);
+});
+
+test('retains the current primary agent when model activation fails', async () => {
+  let sessionStart:
+    | ((event: { type: 'session_start' }, ctx: ExtensionContext) => Promise<void> | void)
+    | undefined;
+  const entries: Array<{ type: string; data: unknown }> = [];
+  const notifications: string[] = [];
+  const lockedModel = { provider: 'anthropic', id: 'locked-model' };
+  const pi = {
+    registerTool() {},
+    registerCommand() {},
+    on(event: string, handler: unknown) {
+      if (event === 'session_start') sessionStart = handler as typeof sessionStart;
+    },
+    getActiveTools: () => ['read', 'bash'],
+    setActiveTools() {},
+    async setModel() {
+      return false;
+    },
+    setThinkingLevel() {},
+    appendEntry(type: string, data: unknown) {
+      entries.push({ type, data });
+    },
+  } as unknown as ExtensionAPI;
+  const piAgentDir = temporaryDirectory();
+  writeFileSync(
+    join(piAgentDir, 'subagents.json'),
+    JSON.stringify({
+      subagents: {
+        agent: {
+          plan: { model: 'anthropic/missing-model' },
+          locked: { mode: 'primary', model: 'anthropic/locked-model' },
+        },
+      },
+    }),
+  );
+  const runtime = new SubagentRuntime(
+    pi,
+    { createTools: () => [] } as unknown as LandstripIntegration,
+    undefined,
+    (projectCwd) => loadAgentCatalog(projectCwd, piAgentDir),
+  );
+  runtime.register();
+  const ctx = {
+    cwd: temporaryDirectory(),
+    hasUI: false,
+    mode: 'json',
+    model: { provider: 'anthropic', id: 'claude-build' },
+    modelRegistry: { getAll: () => [lockedModel] },
+    ui: {
+      notify(message: string) {
+        notifications.push(message);
+      },
+      setWidget() {},
+    },
+    sessionManager: { getBranch: () => [], getSessionId: () => 'parent' },
+  } as unknown as ExtensionContext;
+
+  await sessionStart?.({ type: 'session_start' }, ctx);
+  expect(await runtime.selectPrimaryAgent('plan', ctx)).toBe(false);
+  expect(await runtime.selectPrimaryAgent('locked', ctx)).toBe(false);
+
+  expect(runtime.getPrimaryAgent()?.name).toBe('build');
+  expect(entries).toEqual([]);
+  expect(notifications).toContain(
+    'Model not found for primary agent plan: anthropic/missing-model',
+  );
+  expect(notifications).toContain(
+    'No authentication configured for primary agent locked model: anthropic/locked-model',
+  );
 });
 
 test('registers task without spawning a worker process', async () => {

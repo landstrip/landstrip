@@ -110,7 +110,7 @@ it('registers the sandbox dashboard and separate agents command', async () => {
     setMaxSubagents(value: number) {
       maxSubagents = value;
     },
-    selectPrimaryAgent(name: string) {
+    async selectPrimaryAgent(name: string) {
       selected = name;
       return true;
     },
@@ -156,7 +156,7 @@ it('registers the sandbox dashboard and separate agents command', async () => {
   expect(agentsView).toContain('build');
   component?.handleInput('\x1b[B');
   component?.handleInput('\r');
-  expect(selected).toBe('plan');
+  await vi.waitFor(() => expect(selected).toBe('plan'));
   component?.handleInput('\t');
   const subagentsView = component?.render(78).join('\n') ?? '';
   expect(subagentsView).toContain('@review');

@@ -3003,7 +3003,14 @@ export function createLandstripIntegration(
                     selectedAgent = Math.min(Math.max(0, agents.length - 1), selectedAgent + 1);
                   } else if (matchesKey(data, 'return')) {
                     const agent = agents[selectedAgent];
-                    if (agent) runtime?.selectPrimaryAgent(agent.name, ctx);
+                    if (agent && runtime) {
+                      void runtime
+                        .selectPrimaryAgent(agent.name, ctx)
+                        .then(() => tui.requestRender())
+                        .catch((error: unknown) =>
+                          notify(ctx, `Could not select primary agent: ${error}`, 'error'),
+                        );
+                    }
                   } else return;
                   tui.requestRender();
                   return;

@@ -55,6 +55,8 @@ const MAX_DEPTH = 3;
 const packageDir = dirname(fileURLToPath(import.meta.url));
 const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
 const INSPECTOR_BODY_LINES = 16;
+const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+type PiThinkingLevel = Parameters<ExtensionAPI['setThinkingLevel']>[0];
 
 interface PiPackage {
   readonly cliEntry: string;
@@ -768,7 +770,7 @@ export class SubagentRuntime {
       this.activeSessionId = ctx.sessionManager.getSessionId();
       this.broker.reset();
       this.restore(ctx);
-      this.restorePrimaryAgent(ctx);
+      await this.restorePrimaryAgent(ctx);
       const activeTools = this.pi.getActiveTools();
       const withoutTask = activeTools.filter((tool) => tool !== 'task');
       const nextTools = this.maxSubagents > 0 ? [...withoutTask, 'task'] : withoutTask;
@@ -1040,7 +1042,7 @@ export class SubagentRuntime {
     );
   }
 
-  selectPrimaryAgent(name: string, ctx: ExtensionContext): boolean {
+  async selectPrimaryAgent(name: string, ctx: ExtensionContext): Promise<boolean> {
     const catalog = this.getAgentCatalog(ctx);
     for (const warning of catalog.warnings) ctx.ui.notify(warning, 'warning');
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
@@ -1050,8 +1052,7 @@ export class SubagentRuntime {
       ctx.ui.notify(`Unknown primary agent: ${name}`, 'error');
       return false;
     }
-    this.activatePrimaryAgent(agent, catalog, ctx, true);
-    return true;
+    return this.activatePrimaryAgent(agent, catalog, ctx, true);
   }
 
   private createTaskTool(
@@ -1504,12 +1505,11 @@ export class SubagentRuntime {
     this.validatePiInvocation();
     const model = agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
     if (!model) throw new Error(`No model available for subagent ${agent.name}`);
-    const thinkingLevels = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
     const thinking =
-      agent.variant && thinkingLevels.has(agent.variant)
+      agent.variant && PI_THINKING_LEVELS.has(agent.variant)
         ? agent.variant
         : this.pi.getThinkingLevel();
-    if (agent.variant && !thinkingLevels.has(agent.variant)) {
+    if (agent.variant && !PI_THINKING_LEVELS.has(agent.variant)) {
       ctx.ui.notify(
         `Agent ${agent.name} uses unsupported Pi model variant: ${agent.variant}`,
         'warning',
@@ -1937,7 +1937,7 @@ export class SubagentRuntime {
     this.updateTaskWidget(ctx);
   }
 
-  private restorePrimaryAgent(ctx: ExtensionContext): void {
+  private async restorePrimaryAgent(ctx: ExtensionContext): Promise<void> {
     this.primaryAgent = undefined;
     this.primaryRules = undefined;
     this.primaryConfigurationError = false;
@@ -1946,11 +1946,7 @@ export class SubagentRuntime {
     this.maxSubagents = catalog.maxSubagents;
     this.semaphore = new Semaphore(Math.max(1, this.maxSubagents));
     if (catalog.diagnostics.length > 0) {
-      this.primaryRules = [{ permission: '*', pattern: '*', action: 'deny' }];
-      this.primaryConfigurationError = true;
-      this.pi.registerTool(this.createTaskTool(undefined, this.primaryRules, ctx));
-      for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'error');
-      if (ctx.hasUI) ctx.ui.setStatus('landstrip-agent', '@invalid');
+      this.invalidatePrimaryAgent(catalog, ctx);
       return;
     }
     let name = 'build';
@@ -1961,15 +1957,76 @@ export class SubagentRuntime {
     }
     const agents = availablePrimaryAgents(catalog);
     const agent = agents.find((candidate) => candidate.name === name) ?? agents[0];
-    if (agent) this.activatePrimaryAgent(agent, catalog, ctx, false);
+    if (agent && !(await this.activatePrimaryAgent(agent, catalog, ctx, false))) {
+      this.invalidatePrimaryAgent(catalog, ctx);
+    }
   }
 
-  private activatePrimaryAgent(
+  private invalidatePrimaryAgent(catalog: AgentCatalog, ctx: ExtensionContext): void {
+    this.primaryAgent = undefined;
+    this.primaryRules = [{ permission: '*', pattern: '*', action: 'deny' }];
+    this.primaryConfigurationError = true;
+    this.pi.registerTool(this.createTaskTool(undefined, this.primaryRules, ctx));
+    for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'error');
+    if (ctx.hasUI) ctx.ui.setStatus('landstrip-agent', '@invalid');
+  }
+
+  private async applyPrimaryAgentRuntime(
+    agent: AgentDefinition,
+    ctx: ExtensionContext,
+  ): Promise<boolean> {
+    if (agent.variant && !PI_THINKING_LEVELS.has(agent.variant)) {
+      ctx.ui.notify(
+        `Agent ${agent.name} uses unsupported Pi model variant: ${agent.variant}`,
+        'error',
+      );
+      return false;
+    }
+
+    if (agent.model) {
+      const models = ctx.modelRegistry.getAll();
+      const qualified = models.filter((model) => `${model.provider}/${model.id}` === agent.model);
+      const matches =
+        qualified.length > 0 ? qualified : models.filter((model) => model.id === agent.model);
+      if (matches.length === 0) {
+        ctx.ui.notify(`Model not found for primary agent ${agent.name}: ${agent.model}`, 'error');
+        return false;
+      }
+      if (matches.length > 1) {
+        ctx.ui.notify(`Ambiguous model for primary agent ${agent.name}: ${agent.model}`, 'error');
+        return false;
+      }
+      const model = matches[0]!;
+      if (ctx.model?.provider !== model.provider || ctx.model.id !== model.id) {
+        try {
+          if (!(await this.pi.setModel(model))) {
+            ctx.ui.notify(
+              `No authentication configured for primary agent ${agent.name} model: ${agent.model}`,
+              'error',
+            );
+            return false;
+          }
+        } catch (error) {
+          ctx.ui.notify(
+            `Could not select model for primary agent ${agent.name}: ${formatError(error)}`,
+            'error',
+          );
+          return false;
+        }
+      }
+    }
+
+    if (agent.variant) this.pi.setThinkingLevel(agent.variant as PiThinkingLevel);
+    return true;
+  }
+
+  private async activatePrimaryAgent(
     agent: AgentDefinition,
     catalog: AgentCatalog,
     ctx: ExtensionContext,
     persist: boolean,
-  ): void {
+  ): Promise<boolean> {
+    if (!(await this.applyPrimaryAgentRuntime(agent, ctx))) return false;
     this.primaryAgent = agent;
     this.primaryRules = mergePermissionRules(catalog.permissions, agent.permissions);
     this.primaryConfigurationError = false;
@@ -1980,6 +2037,7 @@ export class SubagentRuntime {
       ctx.ui.setStatus('landstrip-agent', colorizeAgentText(agent.color, `@${agent.name}`));
       if (persist) ctx.ui.notify(`Primary agent: ${agent.name}`, 'info');
     }
+    return true;
   }
 
   private async dispose(): Promise<void> {
