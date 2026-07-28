@@ -1,11 +1,6 @@
 # pi-landstrip
 
-```
-Subagents  3 active
-├─ ● running  @explore  Design Pi entry parsing
-├─ ● running  @general  Design trigger serialization
-└─ ● running  @general  Design bounded summaries
-```
+<img alt="Screenshot of Pi running pi-landstrip" src="screenshot.png" width="800">
 
 `pi-landstrip` adds sandboxed Bash, primary agents, and sandboxed subagents to
 [Pi](https://pi.dev/). OS isolation is provided by
