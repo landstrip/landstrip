@@ -2,10 +2,18 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { type AddressInfo, createServer, type Socket as NetSocket } from 'node:net';
+import { homedir } from 'node:os';
+import path from 'node:path';
 
-import type { TuiPlugin, TuiSlotContext, TuiSlotPlugin } from '@opencode-ai/plugin/tui';
+import type {
+  TuiHostSlotMap,
+  TuiPlugin,
+  TuiSlotContext,
+  TuiSlotPlugin,
+} from '@opencode-ai/plugin/tui';
+import { RGBA } from '@opentui/core';
 import { useTerminalDimensions } from '@opentui/solid';
-import { jsx, jsxs } from '@opentui/solid/jsx-runtime';
+import { Fragment, jsx, jsxs } from '@opentui/solid/jsx-runtime';
 import { createSignal, onCleanup } from 'solid-js';
 
 import {
@@ -14,8 +22,6 @@ import {
   loadConfig,
   normalizeOptions,
   parseLandstripTraps,
-  permissionLabel,
-  permissionResource,
   removeDiscoveryFile,
   sessionAllows,
   sandboxSummary,
@@ -25,20 +31,6 @@ import {
   writeConfigFile,
   writeDiscoveryPort,
 } from './shared.js';
-
-// The shape shared by the `permission.asked` event payload and the entries
-// returned from `api.state.session.permission()`. Both carry `permission`
-// (the kind), `patterns`, and `tool.callID`; neither carries a `title`.
-interface PendingPermission {
-  id: string;
-  sessionID: string;
-  permission: string;
-  patterns: string[];
-  metadata: Record<string, unknown>;
-  tool?: { callID: string };
-}
-
-type PermissionChoice = 'once' | 'session' | 'project' | 'global' | 'reject';
 
 type QueryChoice = 'once' | 'session' | 'project' | 'global' | 'deny';
 
@@ -52,11 +44,11 @@ interface PromptOption<Value extends string> {
 }
 
 interface PermissionPromptProps<Value extends string> {
-  title: string;
   icon: string;
-  detail: string;
+  title: string;
   options: readonly PromptOption<Value>[];
   onSelect: (value: Value) => void;
+  onCancel: () => void;
 }
 
 const promptBorderChars = {
@@ -74,8 +66,8 @@ const promptBorderChars = {
 };
 
 // A landstrip filesystem query (read or write) held pending over the fd-3
-// socket. It shares the dialog stack with permission prompts so the two never
-// overlap, hence the common `id`/`kind` shape.
+// socket. Filesystem and network queries share one queue so only one toolchain
+// prompt is active at a time.
 interface FsQueryEntry {
   kind: 'fs-query';
   id: string;
@@ -98,28 +90,38 @@ interface NetworkQueryEntry {
   target: string;
 }
 
-interface PermissionEntry {
-  kind: 'permission';
-  id: string;
-  permission: PendingPermission;
+type QueueEntry = FsQueryEntry | NetworkQueryEntry;
+
+function formatPath(input: string, base: string): string {
+  const absolute = path.isAbsolute(input) ? input : path.resolve(base, input);
+  const relative = path.relative(base, absolute);
+
+  if (!relative) return '.';
+  if (relative !== '..' && !relative.startsWith(`..${path.sep}`)) return relative;
+
+  const home = homedir();
+  if (absolute === home) return '~';
+  if (absolute.startsWith(`${home}${path.sep}`)) return `~${absolute.slice(home.length)}`;
+  return absolute;
 }
 
-type QueueEntry = PermissionEntry | FsQueryEntry | NetworkQueryEntry;
+function selectedForeground(theme: TuiSlotContext['theme']['current']): RGBA {
+  const resolved = theme as typeof theme & { _hasSelectedListItemText?: boolean };
+  if (resolved._hasSelectedListItemText) return theme.selectedListItemText;
 
-function asRecord(permission: PendingPermission): Record<string, unknown> {
-  return permission as unknown as Record<string, unknown>;
-}
-
-function permissionDetail(permission: PendingPermission): string {
-  const label = permissionLabel(asRecord(permission));
-  const resource = permissionResource(asRecord(permission));
-  return resource && !label.includes(resource) ? `${label}: ${resource}` : label;
+  if (theme.background.a === 0) {
+    const { r, g, b } = theme.warning;
+    const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+    return luminance > 0.5 ? RGBA.fromInts(0, 0, 0) : RGBA.fromInts(255, 255, 255);
+  }
+  return theme.background;
 }
 
 const tui: TuiPlugin = async (api, options, meta) => {
   const optionOverrides = normalizeOptions(options);
 
-  function renderPermissionPrompt<Value extends string>(props: PermissionPromptProps<Value>) {
+  function LandstripPermissionPrompt(rawProps: Record<string, unknown>) {
+    const props = rawProps as unknown as PermissionPromptProps<string>;
     const theme = api.theme.current;
     const dimensions = useTerminalDimensions();
     const [selected, setSelected] = createSignal(0);
@@ -141,6 +143,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
         { key: 'right', cmd: () => move(1) },
         { key: 'l', cmd: () => move(1) },
         { key: 'return', cmd: submit },
+        { key: 'escape', cmd: props.onCancel },
       ],
     });
     onCleanup(unregister);
@@ -149,6 +152,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
       jsx('box', {
         paddingLeft: 1,
         paddingRight: 1,
+        flexShrink: 0,
         get backgroundColor() {
           return selected() === index ? theme.warning : theme.backgroundMenu;
         },
@@ -159,7 +163,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
         },
         children: jsx('text', {
           get fg() {
-            return selected() === index ? theme.selectedListItemText : theme.textMuted;
+            return selected() === index ? selectedForeground(theme) : theme.textMuted;
           },
           children: option.label,
         }),
@@ -167,6 +171,12 @@ const tui: TuiPlugin = async (api, options, meta) => {
     );
 
     return jsxs('box', {
+      top: 0,
+      maxHeight: 15,
+      bottom: 0,
+      left: 0,
+      right: 0,
+      position: 'relative',
       border: ['left'],
       borderColor: theme.warning,
       customBorderChars: promptBorderChars,
@@ -174,33 +184,44 @@ const tui: TuiPlugin = async (api, options, meta) => {
       children: [
         jsxs('box', {
           gap: 1,
-          paddingLeft: 2,
+          paddingLeft: 1,
           paddingRight: 3,
           paddingTop: 1,
           paddingBottom: 1,
+          flexGrow: 1,
           children: [
             jsxs('box', {
-              flexDirection: 'row',
-              gap: 1,
+              flexDirection: 'column',
+              gap: 0,
+              paddingLeft: 1,
+              flexShrink: 0,
               children: [
-                jsx('text', { fg: theme.warning, children: '△' }),
-                jsx('text', { fg: theme.text, children: props.title }),
-              ],
-            }),
-            jsxs('box', {
-              flexDirection: 'row',
-              gap: 1,
-              paddingLeft: 2,
-              children: [
-                jsx('text', { fg: theme.textMuted, flexShrink: 0, children: props.icon }),
-                jsx('text', { fg: theme.text, wrapMode: 'word', children: props.detail }),
+                jsxs('box', {
+                  flexDirection: 'row',
+                  gap: 1,
+                  flexShrink: 0,
+                  children: [
+                    jsx('text', { fg: theme.warning, children: '△' }),
+                    jsx('text', { fg: theme.text, children: 'Permission required' }),
+                  ],
+                }),
+                jsxs('box', {
+                  flexDirection: 'row',
+                  gap: 1,
+                  paddingLeft: 2,
+                  flexShrink: 0,
+                  children: [
+                    jsx('text', { fg: theme.textMuted, flexShrink: 0, children: props.icon }),
+                    jsx('text', { fg: theme.text, wrapMode: 'word', children: props.title }),
+                  ],
+                }),
               ],
             }),
           ],
         }),
         jsxs('box', {
           get flexDirection() {
-            return dimensions().width < 100 ? 'column' : 'row';
+            return dimensions().width < 80 ? 'column' : 'row';
           },
           flexShrink: 0,
           gap: 1,
@@ -210,20 +231,22 @@ const tui: TuiPlugin = async (api, options, meta) => {
           paddingBottom: 1,
           backgroundColor: theme.backgroundElement,
           get justifyContent() {
-            return dimensions().width < 100 ? 'flex-start' : 'space-between';
+            return dimensions().width < 80 ? 'flex-start' : 'space-between';
           },
           get alignItems() {
-            return dimensions().width < 100 ? 'flex-start' : 'center';
+            return dimensions().width < 80 ? 'flex-start' : 'center';
           },
           children: [
             jsx('box', {
               flexDirection: 'row',
               gap: 1,
+              flexShrink: 0,
               children: optionButtons,
             }),
             jsxs('box', {
               flexDirection: 'row',
               gap: 2,
+              flexShrink: 0,
               children: [
                 jsxs('text', {
                   fg: theme.text,
@@ -247,13 +270,9 @@ const tui: TuiPlugin = async (api, options, meta) => {
     });
   }
 
-  // Permission requests can arrive twice (the live event and a reconnect replay
-  // of `api.state`), so `resolved` tracks ids we have already answered and
-  // `activeId` guards against stacking a second sandbox dialog on the first.
-  // Write queries share the same queue so a held-write prompt never stacks on a
-  // permission prompt.
   const resolved = new Set<string>();
   const queue: QueueEntry[] = [];
+  const [activeEntry, setActiveEntry] = createSignal<QueueEntry>();
   let activeId: string | undefined;
   let refreshSandboxStatus: (() => void) | undefined;
 
@@ -277,8 +296,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     let next = queue.shift();
     while (next && resolved.has(next.id)) next = queue.shift();
     if (!next) return;
-    if (next.kind === 'permission') showPermission(next.permission);
-    else if (next.kind === 'fs-query') showFsQuery(next);
+    if (next.kind === 'fs-query') showFsQuery(next);
     else showNetworkQuery(next);
   }
 
@@ -290,106 +308,68 @@ const tui: TuiPlugin = async (api, options, meta) => {
     pump();
   }
 
-  function enqueue(permission: PendingPermission): void {
-    if (!permission.id) return;
-    enqueueEntry({ kind: 'permission', id: permission.id, permission });
-  }
-
-  // Safety net for missed/late events and reconnects: fold whatever the host
-  // still considers pending for this session back into the queue.
-  function reconcile(sessionID: string): void {
-    for (const pending of api.state.session.permission(sessionID)) {
-      enqueue(pending as PendingPermission);
-    }
-  }
-
   function finishActive(id: string): void {
     resolved.add(id);
     if (activeId === id) {
       activeId = undefined;
-      api.ui.dialog.clear();
+      setActiveEntry(undefined);
     }
-    // Defer: `clear()` above tears the dialog down by calling its `onClose`,
-    // and the host pops the stack asynchronously. Opening the next dialog
-    // synchronously here would race that teardown and get wiped.
     queueMicrotask(pump);
   }
 
-  async function replyPermission(
-    permission: PendingPermission,
-    choice: PermissionChoice,
-  ): Promise<void> {
-    const { id, sessionID } = permission;
-    if (!id || !sessionID) return;
-
-    const directory = api.state.path.directory || process.cwd();
-    const { globalPath, projectPath } = getConfigPaths(directory);
-
-    try {
-      if (choice === 'project' || choice === 'global') {
-        const update = updateForPermission(asRecord(permission));
-        if (update) writeConfigFile(choice === 'project' ? projectPath : globalPath, update);
-      }
-
-      await api.client.permission.reply({
-        requestID: id,
-        reply: choice === 'reject' ? 'reject' : choice === 'once' ? 'once' : 'always',
-      });
-
-      api.ui.toast({
-        title: 'Sandbox',
-        message: choice === 'reject' ? 'Permission rejected' : `Permission allowed for ${choice}`,
-        variant: choice === 'reject' ? 'warning' : 'success',
-      });
-    } catch {
-      api.ui.toast({
-        title: 'Sandbox',
-        message: 'Permission was already handled or could not be updated',
-        variant: 'warning',
-      });
-    } finally {
-      finishActive(id);
-    }
-  }
-
-  function showPermission(permission: PendingPermission): void {
-    activeId = permission.id;
-
-    void api.attention.notify({
-      title: 'Sandbox permission',
-      message: permissionDetail(permission),
-      sound: { name: 'permission' },
-      notification: true,
-    });
-
-    api.ui.dialog.replace(
-      () =>
-        renderPermissionPrompt<PermissionChoice>({
-          title: 'Permission required',
-          icon: '⚙',
-          detail: permissionDetail(permission),
-          options: [
-            { label: 'Allow once', value: 'once' },
-            { label: 'Allow for session', value: 'session' },
-            { label: 'Allow for project', value: 'project' },
-            { label: 'Allow globally', value: 'global' },
-            { label: 'Reject', value: 'reject' },
-          ],
-          onSelect: (choice) => {
-            void replyPermission(permission, choice);
-          },
-        }),
-      () => {
-        // Dialog dismissed (esc) without a choice: drop our hold so the next
-        // pending permission can surface, but leave it unresolved upstream.
-        // The host pops the dialog itself; calling `clear()` here would re-enter
-        // this `onClose` (clear() invokes every entry's onClose) and loop until
-        // the stack overflows. Defer `pump()` so the pop settles first.
-        if (activeId === permission.id) activeId = undefined;
-        queueMicrotask(pump);
+  function renderSessionPrompt(props: TuiHostSlotMap['session_prompt']) {
+    return jsx(Fragment, {
+      get children() {
+        const entry = activeEntry();
+        const directory =
+          api.state.session.get(props.session_id)?.directory ||
+          api.state.path.directory ||
+          process.cwd();
+        if (entry?.kind === 'fs-query') {
+          const verb = entry.operation === 'read' ? 'Read' : 'Write';
+          return jsx(LandstripPermissionPrompt, {
+            icon: '→',
+            title: `${verb} ${formatPath(entry.path, directory)}`,
+            options: [
+              { label: 'Allow once', value: 'once' },
+              { label: 'Allow for session', value: 'session' },
+              { label: 'Allow for project', value: 'project' },
+              { label: 'Allow globally', value: 'global' },
+              { label: 'Deny', value: 'deny' },
+            ],
+            onSelect: (choice: QueryChoice) => resolveFsQuery(entry, choice),
+            onCancel: () => resolveFsQuery(entry, 'deny'),
+          });
+        }
+        if (entry?.kind === 'net-query') {
+          const verb = entry.operation
+            ? entry.operation[0]?.toUpperCase() + entry.operation.slice(1)
+            : 'Network';
+          return jsx(LandstripPermissionPrompt, {
+            icon: '%',
+            title: `${verb} ${entry.target}`,
+            options: [
+              { label: 'Allow once', value: 'once' },
+              { label: 'Allow for session', value: 'session' },
+              { label: 'Deny', value: 'deny' },
+            ],
+            onSelect: (choice: NetworkQueryChoice) => resolveNetworkQuery(entry, choice),
+            onCancel: () => resolveNetworkQuery(entry, 'deny'),
+          });
+        }
+        return api.ui.Prompt({
+          sessionID: props.session_id,
+          ...(props.visible === undefined ? {} : { visible: props.visible }),
+          ...(props.disabled === undefined ? {} : { disabled: props.disabled }),
+          ...(props.on_submit === undefined ? {} : { onSubmit: props.on_submit }),
+          ...(props.ref === undefined ? {} : { ref: props.ref }),
+          right: api.ui.Slot({
+            name: 'session_prompt_right',
+            session_id: props.session_id,
+          }),
+        });
       },
-    );
-    api.ui.dialog.setSize('xlarge');
+    });
   }
 
   function respondQuery(socket: NetSocket, queryId: string, action: 'allow' | 'deny'): void {
@@ -442,7 +422,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
 
   function showFsQuery(entry: FsQueryEntry): void {
     activeId = entry.id;
-    const verb = entry.operation === 'read' ? 'Read' : 'Write';
+    setActiveEntry(entry);
 
     void api.attention.notify({
       title: `Sandbox ${entry.operation} blocked`,
@@ -450,37 +430,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
       sound: { name: 'permission' },
       notification: true,
     });
-
-    // A selection pops the dialog (firing `onClose`); track it so the esc-path
-    // deny does not override the user's choice. A held syscall must always be
-    // answered, so esc/dismiss denies rather than leaving it unresolved.
-    let selectionMade = false;
-
-    api.ui.dialog.replace(
-      () =>
-        renderPermissionPrompt<QueryChoice>({
-          title: 'Sandbox access blocked',
-          icon: '→',
-          detail: `${verb}: ${entry.path}`,
-          options: [
-            { label: 'Allow once', value: 'once' },
-            { label: 'Allow for session', value: 'session' },
-            { label: 'Allow for project', value: 'project' },
-            { label: 'Allow globally', value: 'global' },
-            { label: 'Deny', value: 'deny' },
-          ],
-          onSelect: (choice) => {
-            selectionMade = true;
-            resolveFsQuery(entry, choice);
-          },
-        }),
-      () => {
-        if (!selectionMade) resolveFsQuery(entry, 'deny');
-      },
-    );
-    api.ui.dialog.setSize('xlarge');
   }
-
   function resolveNetworkQuery(entry: NetworkQueryEntry, choice: NetworkQueryChoice): void {
     if (resolved.has(entry.id)) return;
     const action = choice === 'deny' ? 'deny' : 'allow';
@@ -505,6 +455,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
 
   function showNetworkQuery(entry: NetworkQueryEntry): void {
     activeId = entry.id;
+    setActiveEntry(entry);
 
     void api.attention.notify({
       title: `Sandbox ${entry.operation} blocked`,
@@ -512,45 +463,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
       sound: { name: 'permission' },
       notification: true,
     });
-
-    // Same esc-denies-a-held-syscall reasoning as showFsQuery.
-    let selectionMade = false;
-
-    api.ui.dialog.replace(
-      () =>
-        renderPermissionPrompt<NetworkQueryChoice>({
-          title: 'Sandbox access blocked',
-          icon: '%',
-          detail: `${entry.operation}: ${entry.target}`,
-          options: [
-            { label: 'Allow once', value: 'once' },
-            { label: 'Allow for session', value: 'session' },
-            { label: 'Deny', value: 'deny' },
-          ],
-          onSelect: (choice) => {
-            selectionMade = true;
-            resolveNetworkQuery(entry, choice);
-          },
-        }),
-      () => {
-        if (!selectionMade) resolveNetworkQuery(entry, 'deny');
-      },
-    );
-    api.ui.dialog.setSize('xlarge');
   }
-
-  const unsubscribeAsked = api.event.on('permission.asked', (event) => {
-    const directory = api.state.path.directory;
-    if (!directory) return;
-    if (!loadConfig(directory, optionOverrides).enabled) return;
-    const pending = event.properties as PendingPermission;
-    enqueue(pending);
-    reconcile(pending.sessionID);
-  });
-
-  const unsubscribeReplied = api.event.on('permission.replied', (event) => {
-    finishActive(event.properties.requestID);
-  });
 
   // Query-response socket server (Linux-only — landstrip's socket protocol lives
   // in the seccomp broker). The server plugin connects each sandboxed run's
@@ -746,6 +659,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     const statusSlot: TuiSlotPlugin = {
       slots: {
         home_prompt_right: (ctx) => statusBadge(ctx),
+        session_prompt: (_ctx, props) => renderSessionPrompt(props),
         session_prompt_right: (ctx) => statusBadge(ctx),
       },
     };
@@ -769,9 +683,6 @@ const tui: TuiPlugin = async (api, options, meta) => {
   }
 
   api.lifecycle.onDispose(() => {
-    unsubscribeAsked();
-    unsubscribeReplied();
-
     // Deny any still-held queries so the sandboxed children don't hang, then
     // tear down the socket server and drop the discovery file.
     for (const entry of liveQueries) {

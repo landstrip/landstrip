@@ -789,7 +789,8 @@ function startTrapServer(
             if (allowed) {
               trapSocket.write(controlResponseLine(queryId, 'allow'));
             } else {
-              // Auto-grant via session scope and allow so the command proceeds.
+              // Remember the scope for later commands, but deny this syscall so
+              // a command that may already have side effects is never retried.
               const scope = sessionScopeFor(path, baseDirectory);
               if (operation === 'read') sessionAllowedReadPaths.add(scope);
               else sessionAllowedWritePaths.add(scope);
@@ -842,15 +843,10 @@ function buildWrappedCommand(
   const plain = [landstripBinaryPath(), ...baseArgs].map(shellQuote).join(' ');
   if (trapPort === null) return plain;
 
-  // Connect fd 3 to the TUI's query-response socket BEFORE landstrip applies the
-  // sandbox, so a denied filesystem access can be approved live instead of
-  // forcing a re-run.
-  //
-  // /dev/tcp is a bash/ksh built-in — it does not work in zsh, dash, or fish.
-  // We try the native redirect first (fast path when the host shell supports it)
-  // and fall back to an explicit bash invocation that always speaks /dev/tcp.
-  // If both fail (no bash, dead port, set -e in the outer shell) landstrip runs
-  // without --trap-fd so the toast-notify path still works.
+  // Open fd 3 before landstrip starts the command. The wrapper must never use
+  // the command's exit status to select a fallback: by then the command may
+  // already have changed the workspace. A failed socket setup therefore stops
+  // without invoking landstrip, while every started command runs exactly once.
   const trapped = [
     landstripBinaryPath(),
     'run',
@@ -863,14 +859,14 @@ function buildWrappedCommand(
   ]
     .map(shellQuote)
     .join(' ');
-  const bashTrap = `bash -c ${shellQuote(`exec 3<>/dev/tcp/127.0.0.1/${trapPort} 2>/dev/null && exec "$@"`)} bash ${trapped}`;
-  return `{ exec 3<>/dev/tcp/127.0.0.1/${trapPort} ; } 2>/dev/null && ${trapped} || ${bashTrap} 2>/dev/null || ${plain}`;
+  const openTrap = `exec 3<>/dev/tcp/127.0.0.1/${trapPort} && exec "$@"`;
+  return `bash -c ${shellQuote(openTrap)} bash ${trapped}`;
 }
 
 function isGeneratedWrappedCommand(command: string): boolean {
   return (
-    // `.includes` rather than `.startsWith`: the query-response form prefixes a
-    // `{ exec 3<>/dev/tcp/...; } && ` redirect before the landstrip invocation.
+    // `.includes` rather than `.startsWith`: the query-response form prefixes
+    // the landstrip invocation with a small bash fd-setup wrapper.
     command.includes(`${shellQuote(landstripBinaryPath())} `) &&
     command.includes(` ${shellQuote('-p')} `) &&
     command.includes('opencode-landstrip-')
@@ -921,8 +917,8 @@ function extractOriginalCommand(wrappedCommand: string): string | null {
   const pIdx = args.indexOf('-p');
   const flagIdx = args.findIndex((arg, i) => i > pIdx && (arg === '-lc' || arg === '-c'));
   if (flagIdx === -1) return null;
-  // The query-response form appends `|| <plain invocation>`; stop at that
-  // separator so the fallback branch is not folded into the recovered command.
+  // Old query-response wrappers appended `|| <fallback>`; stop there so
+  // recovering an expired wrapper never folds a fallback into the command.
   const end = args.indexOf('||', flagIdx + 1);
   return (end === -1 ? args.slice(flagIdx + 1) : args.slice(flagIdx + 1, end)).join(' ');
 }

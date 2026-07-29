@@ -1,14 +1,18 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 
 import { binaryPath as installedLandstripBinaryPath } from '@landstrip/landstrip';
 
 import { installLandstripMock, packageRoot, transpile } from './helper.mjs';
+
+const execFileAsync = promisify(execFile);
 
 async function withPlugin(options, run, mock = {}) {
   const tempDir = await mkdtemp(join(tmpdir(), 'opencode-landstrip-test-'));
@@ -97,9 +101,9 @@ test('bash wrapping is idempotent for repeated before hooks', async () => {
 
         assert.equal(output.args.command, wrapped);
         assert.equal(output.args.description, 'Shows concise git status (landstrip)');
-        // Single wrap emits three -p: the trapped socket branch, its bash -c
-        // fallback, and the plain fallback. Idempotency is the equality above.
-        assert.equal(wrapped.match(/'-p'/g)?.length, 3);
+        // A wrapped command contains one landstrip invocation. Idempotency is
+        // primarily guarded by equality above, with this count catching nesting.
+        assert.equal(wrapped.match(/'-p'/g)?.length, 1);
       } finally {
         await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
       }
@@ -616,18 +620,16 @@ test('query-response: bash wrapping injects fd 3 and stays idempotent', linuxOnl
           // endpoint so held filesystem operations can be approved interactively.
           assert.match(wrapped, new RegExp(`/dev/tcp/127\\.0\\.0\\.1/${port}\\b`));
           assert.match(wrapped, /'--trap-fd' '3'/);
-          assert.ok(wrapped.includes(' || '), 'has the plain fallback branch');
-          // Two --trap-fd (native /dev/tcp + bash -c fallback), three -p (both
-          // trapped branches + plain fallback).
-          assert.equal(wrapped.match(/'--trap-fd'/g)?.length, 2);
-          assert.equal(wrapped.match(/'-p'/g)?.length, 3);
+          assert.equal(wrapped.includes(' || '), false, 'has no command retry branch');
+          assert.equal(wrapped.match(/'--trap-fd'/g)?.length, 1);
+          assert.equal(wrapped.match(/'-p'/g)?.length, 1);
           // The original command roundtrips cleanly into the socket branch.
           assert.ok(wrapped.includes("'-lc' 'git status --short'"));
 
           // Re-running the before hook must not double-wrap.
           await hooks['tool.execute.before'](input, output);
           assert.equal(output.args.command, wrapped);
-          assert.equal(wrapped.match(/\/dev\/tcp/g)?.length, 2);
+          assert.equal(wrapped.match(/\/dev\/tcp/g)?.length, 1);
 
           // A fresh call receiving the wrapped command (policy dir still present)
           // is recognized as already-generated and left intact.
@@ -637,6 +639,41 @@ test('query-response: bash wrapping injects fd 3 and stays idempotent', linuxOnl
           await hooks['tool.execute.before']({ callID: 'query-b', tool: 'bash' }, reuse);
           assert.equal(reuse.args.command, wrapped);
           assert.equal(reuse.args.description, 'status again (landstrip)');
+        } finally {
+          await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+        }
+      });
+    },
+  );
+});
+
+test('query-response: a failing command executes only once', linuxOnly, async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      network: { allowedDomains: ['*'], deniedDomains: [] },
+    },
+    async ({ hooks, tempDir }) => {
+      await withQueryServer(tempDir, async () => {
+        await hooks.config({ shell: '/bin/sh' });
+        const counter = join(tempDir, 'attempts');
+        const command = `printf 'attempt\\n' >> ${JSON.stringify(counter)}; exit 17`;
+        const input = { callID: 'single-execution', tool: 'bash' };
+        const output = { args: { command, description: 'write once before failure' } };
+
+        try {
+          await hooks['tool.execute.before'](input, output);
+          const setup = output.args.command.match(/^bash -c '([^']+)' bash /)?.[1];
+          assert.ok(setup, 'uses a single fd-setup wrapper');
+          const offlineSetup = setup.replace(/\/dev\/tcp\/127\.0\.0\.1\/\d+/, '/dev/null');
+          await assert.rejects(
+            execFileAsync('/bin/bash', ['-c', offlineSetup, 'bash', '/bin/sh', '-c', command], {
+              cwd: tempDir,
+            }),
+            (error) => error?.code === 17,
+          );
+          assert.equal(await readFile(counter, 'utf8'), 'attempt\n');
         } finally {
           await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
         }
@@ -668,9 +705,8 @@ test('query-response: recovery re-extracts the original command', linuxOnly, asy
           const rewrapped = outputB.args.command;
 
           assert.notEqual(rewrapped, wrapped, 'a fresh policy dir is generated');
-          // Extraction stopped at `||`: the original command is recovered whole,
-          // not folded together with the old plain fallback branch.
-          assert.equal(rewrapped.match(/'--trap-fd'/g)?.length, 2);
+          // The original command is recovered whole from the expired wrapper.
+          assert.equal(rewrapped.match(/'--trap-fd'/g)?.length, 1);
           assert.ok(rewrapped.includes("'-lc' 'git status --short'"));
         } finally {
           await hooks['tool.execute.after'](inputB, { title: '', output: '', metadata: {} });
@@ -726,10 +762,10 @@ test(
             socket.once('error', rej);
           });
           try {
-            // A path outside allowRead/allowWrite is a miss: startTrapServer
-            // auto-grants (the command itself was already approved), but the
-            // query_id must round-trip as the same string, or landstrip's own
-            // deserializer would reject the answer and the syscall would hang.
+            // A path outside allowRead/allowWrite is remembered for subsequent
+            // commands but denied now. The query_id must round-trip as the same
+            // string, or landstrip's deserializer would reject the answer and
+            // leave the syscall suspended.
             socket.write(
               JSON.stringify({
                 kind: 'filesystem',
