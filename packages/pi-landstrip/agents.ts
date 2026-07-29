@@ -28,6 +28,7 @@ export interface AgentDefinition {
   readonly model?: string;
   readonly variant?: string;
   readonly hidden: boolean;
+  readonly disabled: boolean;
   readonly color?: string;
   readonly steps?: number;
   readonly permissions: PermissionRules;
@@ -92,11 +93,7 @@ function normalizePermissions(value: unknown): PermissionRules {
   );
 }
 
-function normalizeAgent(
-  name: string,
-  raw: ConfigObject,
-  source: AgentSource,
-): AgentDefinition | undefined {
+function normalizeAgent(name: string, raw: ConfigObject, source: AgentSource): AgentDefinition {
   for (const field of ['description', 'prompt', 'model', 'variant', 'color'] as const) {
     if (raw[field] !== undefined && typeof raw[field] !== 'string') {
       throw new Error(`agent ${name} ${field} must be a string`);
@@ -123,7 +120,6 @@ function normalizeAgent(
       throw new Error(`agent ${name} ${field} must be a number`);
     }
   }
-  if (raw.disable === true) return undefined;
   if (
     raw.mode !== undefined &&
     raw.mode !== 'primary' &&
@@ -147,6 +143,7 @@ function normalizeAgent(
     model: typeof raw.model === 'string' ? raw.model : undefined,
     variant: typeof raw.variant === 'string' ? raw.variant : undefined,
     hidden: raw.hidden === true,
+    disabled: raw.disable === true,
     color: typeof raw.color === 'string' ? raw.color : undefined,
     steps: typeof raw.steps === 'number' ? raw.steps : undefined,
     permissions: normalizePermissions(raw.permission),
@@ -190,8 +187,7 @@ export function loadAgentCatalog(
   const normalized = new Map<string, AgentDefinition>();
   for (const imported of openCode.agents.values()) {
     try {
-      const agent = normalizeAgent(imported.name, imported.raw, imported.source);
-      if (agent) normalized.set(imported.name, agent);
+      normalized.set(imported.name, normalizeAgent(imported.name, imported.raw, imported.source));
     } catch (error) {
       diagnostics.push(`${imported.path}: ${formatError(error)}`);
     }
@@ -206,8 +202,7 @@ export function loadAgentCatalog(
   diagnostics.push(...piMarkdown.diagnostics);
   for (const imported of piMarkdown.agents.values()) {
     try {
-      const agent = normalizeAgent(imported.name, imported.raw, imported.source);
-      if (agent) normalized.set(imported.name, agent);
+      normalized.set(imported.name, normalizeAgent(imported.name, imported.raw, imported.source));
     } catch (error) {
       diagnostics.push(`${imported.path}: ${formatError(error)}`);
     }
@@ -219,10 +214,13 @@ export function loadAgentCatalog(
       diagnostics.push(`agent ${name} must be an object`);
       continue;
     }
+    const imported = normalized.get(name);
+    if (Object.keys(value).every((key) => key === 'disable')) {
+      if (imported) normalized.set(name, { ...imported, disabled: value.disable === true });
+      continue;
+    }
     try {
-      const agent = normalizeAgent(name, value, agentSources.get(name) ?? 'built-in');
-      if (agent) normalized.set(name, agent);
-      else normalized.delete(name);
+      normalized.set(name, normalizeAgent(name, value, agentSources.get(name) ?? 'built-in'));
     } catch (error) {
       diagnostics.push(formatError(error));
     }
@@ -262,7 +260,7 @@ export function mergePermissionRules(...values: PermissionRules[]): PermissionRu
 }
 
 export function availableAgents(catalog: AgentCatalog): AgentDefinition[] {
-  return [...catalog.agents.values()].filter((agent) => !agent.hidden);
+  return [...catalog.agents.values()].filter((agent) => !agent.hidden && !agent.disabled);
 }
 
 export function agentSupportsMode(agent: AgentDefinition, mode: 'primary' | 'subagent'): boolean {

@@ -594,6 +594,7 @@ test('lists hidden agents in the task tool description', () => {
           prompt: 'Visible.',
           mode: 'subagent' as const,
           hidden: false,
+          disabled: false,
           permissions: [],
           providerOptions: {},
         },
@@ -607,6 +608,21 @@ test('lists hidden agents in the task tool description', () => {
           prompt: 'Advise.',
           mode: 'subagent' as const,
           hidden: true,
+          disabled: false,
+          permissions: [],
+          providerOptions: {},
+        },
+      ],
+      [
+        'disabled',
+        {
+          name: 'disabled',
+          source: 'local' as const,
+          description: 'Disabled agent',
+          prompt: 'Disabled.',
+          mode: 'subagent' as const,
+          hidden: false,
+          disabled: true,
           permissions: [],
           providerOptions: {},
         },
@@ -618,6 +634,7 @@ test('lists hidden agents in the task tool description', () => {
 
   expect(taskTool?.description).toContain('visible: Visible agent');
   expect(taskTool?.description).toContain('advisor: Hidden advisor');
+  expect(taskTool?.description).not.toContain('disabled: Disabled agent');
 });
 
 test('removes the task tool when maxSubagents is zero', async () => {
@@ -903,6 +920,21 @@ test('inspects and navigates persisted child sessions without switching sessions
     join(agentDir, 'settings.json'),
     JSON.stringify({ landstrip: { maxSubagents: 1 } }),
   );
+  mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(
+    join(cwd, '.pi', 'settings.json'),
+    JSON.stringify({
+      landstrip: {
+        agent: {
+          review: {
+            description: 'Review code',
+            prompt: 'Review.',
+            mode: 'subagent',
+          },
+        },
+      },
+    }),
+  );
   const parentManager = SessionManager.create(cwd, join(cwd, 'parent-sessions'));
   const childManager = SessionManager.create(cwd, join(cwd, 'child-sessions'));
   childManager.appendMessage({
@@ -976,52 +1008,24 @@ test('inspects and navigates persisted child sessions without switching sessions
     sendMessage() {},
     appendEntry() {},
   } as unknown as ExtensionAPI;
-  new SubagentRuntime(pi, {} as LandstripIntegration, undefined, () => ({
-    maxSubagents: 1,
-    agents: new Map([
-      [
-        'build',
-        {
-          name: 'build',
-          source: 'built-in',
-          description: 'Build code',
-          prompt: 'Build.',
-          mode: 'primary' as const,
-          hidden: false,
-          permissions: [],
-          providerOptions: {},
-        },
-      ],
-      [
-        'review',
-        {
-          name: 'review',
-          source: 'local',
-          description: 'Review code',
-          prompt: 'Review.',
-          mode: 'subagent' as const,
-          hidden: false,
-          permissions: [],
-          providerOptions: {},
-        },
-      ],
-      [
-        'general',
-        {
-          name: 'general',
-          source: 'built-in',
-          description: 'General work',
-          prompt: 'Work.',
-          mode: 'all' as const,
-          hidden: false,
-          permissions: [],
-          providerOptions: {},
-        },
-      ],
-    ]),
-    permissions: [],
-    diagnostics: [],
-  })).register();
+  let sandboxGlobal = true;
+  let sandboxProject: boolean | undefined;
+  const integration = {
+    sandboxCallbacks: {
+      load: (_cwd: string, includeProject: boolean) => ({
+        global: sandboxGlobal,
+        project: includeProject ? sandboxProject : undefined,
+      }),
+      async setEnabled(_ctx: ExtensionContext, enabled: boolean, scope: 'global' | 'project') {
+        if (scope === 'global') sandboxGlobal = enabled;
+        else sandboxProject = enabled;
+      },
+      async clearProject() {
+        sandboxProject = undefined;
+      },
+    },
+  } as unknown as LandstripIntegration;
+  new SubagentRuntime(pi, integration).register();
   const theme = {
     fg: (_color: string, value: string) => value,
     bold: (value: string) => value,
@@ -1050,25 +1054,44 @@ test('inspects and navigates persisted child sessions without switching sessions
   await sessionStart?.({}, ctx);
   expect(commandNames).toEqual(['agents']);
   const running = command?.('', ctx);
-  const primary = component?.render(96).join('\n');
-  expect(primary).toContain('[Primary]  Subagent  Tasks  Settings');
-  expect(primary).toContain('@build primary · built-in');
-  expect(primary).toContain('@general all · built-in');
-  expect(primary).not.toContain('@review subagent · local');
+  const agents = component?.render(96).join('\n') ?? '';
+  expect(agents).toContain('[Agents]  Tasks  Settings  · Project scope');
+  expect(agents).toMatch(/Agent\s+Mode\s+Source\s+Model\s+Disabled/);
+  expect(agents).toMatch(/@build\s+primary\s+built-in/);
+  expect(agents).toMatch(/@general\s+subagent\s+built-in/);
+  expect(agents).toMatch(/@review\s+subagent\s+local/);
+
+  component?.handleInput('\x1b[B');
+  component?.handleInput('d');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+    expect(settings.landstrip.agent.explore.disable).toBe(true);
+    expect(component?.render(96).join('\n')).toMatch(/@explore\s+subagent\s+local.*\[x\]/);
+    expect(component?.render(96).join('\n')).not.toContain('Saving…');
+  });
+  component?.handleInput('i');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+    expect(settings.landstrip.agent.explore).toBeUndefined();
+    expect(component?.render(96).join('\n')).toMatch(/@explore\s+subagent\s+built-in.*\[-\]/);
+    expect(component?.render(96).join('\n')).not.toContain('Saving…');
+  });
+  component?.handleInput('\x1b[A');
+
+  component?.handleInput('\x1b[Z');
+  const globalAgents = component?.render(96).join('\n') ?? '';
+  expect(globalAgents).toContain('[Agents]  Tasks  Settings  · Global scope');
+  expect(globalAgents).toMatch(/@review\s+subagent\s+local.*n\/a/);
+  component?.handleInput('\x1b[Z');
+
   component?.handleInput('\t');
-  const subagents = component?.render(96).join('\n');
-  expect(subagents).toContain('Primary  [Subagent]  Tasks  Settings');
-  expect(subagents).toContain('@review subagent · local');
-  expect(subagents).toContain('@general all · built-in');
-  expect(subagents).not.toContain('@build primary · built-in');
-  component?.handleInput('\t');
-  const tasks = component?.render(96).join('\n');
+  const tasks = component?.render(96).join('\n') ?? '';
   expect(tasks).toContain('[Tasks]');
   expect(tasks).not.toContain('Tasks 2');
   expect(tasks).toContain('task-123');
   expect(tasks).toContain('Failed child');
   component?.handleInput('\r');
-  const detail = component?.render(96).join('\n');
+  const detail = component?.render(96).join('\n') ?? '';
   expect(detail).toContain('Inspect this child session.');
   expect(detail).toContain('Parent p/backspace  Prev ←  Next →');
   component?.handleInput('\x1b[C');
@@ -1078,45 +1101,52 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('\x1b');
   expect(component?.render(96).join('\n')).toContain('[Tasks]');
   component?.handleInput('\t');
-  const settings = component?.render(96).join('\n');
-  expect(settings).toContain('[Settings]');
-  expect(settings).toContain('[ 1 ] Maximum subagents (global)');
-  expect(settings).toContain('[ inherited: 1 ] Maximum subagents (local)');
+
+  const projectSettings = component?.render(96).join('\n') ?? '';
+  expect(projectSettings).toContain('[Settings]');
+  expect(projectSettings).toContain('[ - ] Maximum subagents');
+  expect(projectSettings).toContain('[ - ] Sandbox enabled');
 
   component?.handleInput('\x1b[B');
+  component?.handleInput(' ');
+  expect(component?.render(96).join('\n')).toContain('[ off ] Sandbox enabled');
   component?.handleInput('\r');
-  expect(existsSync(join(cwd, '.pi', 'settings.json'))).toBe(false);
+  await vi.waitFor(() => {
+    expect(sandboxProject).toBe(false);
+    expect(component?.render(96).join('\n')).not.toContain('Saving…');
+  });
   component?.handleInput('\x1b[A');
 
+  component?.handleInput('\x1b[Z');
+  expect(component?.render(96).join('\n')).toContain('· Global scope');
+  expect(component?.render(96).join('\n')).toContain('[ 1 ] Maximum subagents');
   component?.handleInput('+');
-  expect(component?.render(96).join('\n')).toContain('[ 2 ] Maximum subagents (global)');
+  expect(component?.render(96).join('\n')).toContain('[ 2 ] Maximum subagents');
   component?.handleInput('\r');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf8'));
     expect(settings.landstrip.maxSubagents).toBe(2);
-  });
-  await vi.waitFor(() => {
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
 
-  component?.handleInput('\x1b[B');
+  component?.handleInput('\x1b[Z');
+  expect(component?.render(96).join('\n')).toContain('· Project scope');
   component?.handleInput('3');
-  expect(component?.render(96).join('\n')).toContain('[ 3 ] Maximum subagents (local)');
+  expect(component?.render(96).join('\n')).toContain('[ 3 ] Maximum subagents');
   component?.handleInput('\r');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.maxSubagents).toBe(3);
-  });
-  await vi.waitFor(() => {
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
 
   component?.handleInput('i');
-  expect(component?.render(96).join('\n')).toContain('[ inherited: 2 ] Maximum subagents (local)');
+  expect(component?.render(96).join('\n')).toContain('[ - ] Maximum subagents');
   component?.handleInput('\r');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
-    expect(settings.landstrip).toBeUndefined();
+    expect(settings.landstrip.maxSubagents).toBeUndefined();
+    expect(settings.landstrip.agent.review).toBeDefined();
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
   finishCustom?.();

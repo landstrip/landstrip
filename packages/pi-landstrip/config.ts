@@ -171,11 +171,11 @@ export async function setMaxSubagentsConfig(
   return 'global';
 }
 
-async function writeMaxSubagentsConfigForScope(
+async function updateLandstripSettingsForScope(
   cwd: string,
-  maxSubagents: number | undefined,
   scope: 'global' | 'project',
   agentDir: string,
+  update: (landstrip: ConfigObject) => void,
 ): Promise<void> {
   const paths = getPiConfigPaths(cwd, 'settings.json', agentDir);
   const path = scope === 'global' ? paths.globalPath : paths.projectPath;
@@ -185,12 +185,23 @@ async function writeMaxSubagentsConfigForScope(
       throw new Error(`${path}: landstrip must be a JSON object`);
     }
     const landstrip = isRecord(settings.landstrip) ? { ...settings.landstrip } : {};
-    if (maxSubagents === undefined) delete landstrip.maxSubagents;
-    else landstrip.maxSubagents = maxSubagents;
+    update(landstrip);
     if (Object.keys(landstrip).length === 0) delete settings.landstrip;
     else settings.landstrip = landstrip;
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
+  });
+}
+
+async function writeMaxSubagentsConfigForScope(
+  cwd: string,
+  maxSubagents: number | undefined,
+  scope: 'global' | 'project',
+  agentDir: string,
+): Promise<void> {
+  await updateLandstripSettingsForScope(cwd, scope, agentDir, (landstrip) => {
+    if (maxSubagents === undefined) delete landstrip.maxSubagents;
+    else landstrip.maxSubagents = maxSubagents;
   });
 }
 
@@ -212,6 +223,70 @@ export async function clearMaxSubagentsConfigForScope(
   agentDir = getAgentDir(),
 ): Promise<void> {
   await writeMaxSubagentsConfigForScope(cwd, undefined, scope, agentDir);
+}
+
+export async function setAgentDisabledForScope(
+  cwd: string,
+  name: string,
+  disabled: boolean,
+  scope: 'global' | 'project',
+  agentDir = getAgentDir(),
+): Promise<void> {
+  await updateLandstripSettingsForScope(cwd, scope, agentDir, (landstrip) => {
+    if (landstrip.agent !== undefined && !isRecord(landstrip.agent)) {
+      throw new Error('landstrip.agent must be an object');
+    }
+    const agents = isRecord(landstrip.agent) ? { ...landstrip.agent } : {};
+    const configured = agents[name];
+    if (configured !== undefined && !isRecord(configured)) {
+      throw new Error(`agent ${name} must be an object`);
+    }
+    agents[name] = { ...(isRecord(configured) ? configured : {}), disable: disabled };
+    landstrip.agent = agents;
+  });
+}
+
+export async function clearAgentDisabledForScope(
+  cwd: string,
+  name: string,
+  scope: 'global' | 'project',
+  agentDir = getAgentDir(),
+): Promise<void> {
+  await updateLandstripSettingsForScope(cwd, scope, agentDir, (landstrip) => {
+    if (!isRecord(landstrip.agent)) return;
+    const agents = { ...landstrip.agent };
+    const configured = agents[name];
+    if (!isRecord(configured)) return;
+    const agent = { ...configured };
+    delete agent.disable;
+    if (Object.keys(agent).length === 0) delete agents[name];
+    else agents[name] = agent;
+    if (Object.keys(agents).length === 0) delete landstrip.agent;
+    else landstrip.agent = agents;
+  });
+}
+
+export function loadAgentDisabledOverrides(
+  cwd: string,
+  includeProject = true,
+  agentDir = getAgentDir(),
+): { global: ReadonlyMap<string, boolean>; project: ReadonlyMap<string, boolean> } {
+  const paths = getPiConfigPaths(cwd, 'settings.json', agentDir);
+  const read = (path: string): ReadonlyMap<string, boolean> => {
+    const result = new Map<string, boolean>();
+    const agents = readLandstripSettings(path).agent;
+    if (!isRecord(agents)) return result;
+    for (const [name, configured] of Object.entries(agents)) {
+      if (isRecord(configured) && typeof configured.disable === 'boolean') {
+        result.set(name, configured.disable);
+      }
+    }
+    return result;
+  };
+  return {
+    global: read(paths.globalPath),
+    project: includeProject ? read(paths.projectPath) : new Map(),
+  };
 }
 
 export function loadLandstripConfig(

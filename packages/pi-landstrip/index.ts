@@ -114,7 +114,7 @@ interface SandboxConfigFile {
   windows?: SandboxWindowsConfigFile;
 }
 
-type SandboxConfigScope = 'global' | 'project';
+export type SandboxConfigScope = 'global' | 'project';
 
 interface LandstripPolicy {
   network: {
@@ -385,19 +385,40 @@ function getSandboxConfigWriteTarget(
   return { scope: 'global', path: globalPath };
 }
 
+async function writeSandboxConfigEnabled(
+  cwd: string,
+  enabled: boolean | undefined,
+  scope: SandboxConfigScope,
+): Promise<void> {
+  const paths = getConfigPaths(cwd);
+  const path = scope === 'project' ? paths.projectPath : paths.globalPath;
+  await withFileMutationQueue(path, async () => {
+    const config = readOrEmptyConfig(path);
+    if (enabled === undefined) delete config.enabled;
+    else config.enabled = enabled;
+    writeConfigFile(path, config);
+  });
+}
+
 async function setSandboxConfigEnabled(
   cwd: string,
   enabled: boolean,
   includeProject = true,
 ): Promise<SandboxConfigScope> {
-  const { scope, path } = getSandboxConfigWriteTarget(cwd, includeProject);
-  await withFileMutationQueue(path, async () => {
-    const config = readOrEmptyConfig(path);
-    config.enabled = enabled;
-    writeConfigFile(path, config);
-  });
-
+  const { scope } = getSandboxConfigWriteTarget(cwd, includeProject);
+  await writeSandboxConfigEnabled(cwd, enabled, scope);
   return scope;
+}
+
+function loadSandboxEnabledSettings(
+  cwd: string,
+  includeProject: boolean,
+): { global: boolean; project?: boolean } {
+  const { projectPath } = getConfigPaths(cwd);
+  const global = loadSandboxConfig(cwd, false).enabled;
+  if (!includeProject || !existsSync(projectPath)) return { global };
+  const project = readOrEmptyConfig(projectPath).enabled;
+  return { global, project };
 }
 
 async function addConfigValue(
@@ -1122,6 +1143,15 @@ export interface LandstripIntegration extends PiLandstripRuntimeV1 {
   register(pi: ExtensionAPI): void;
   /** Publish an integration lifecycle event from an embedded runtime. */
   emit(event: LandstripEvent): void;
+  /** Callbacks for querying and toggling sandbox state. */
+  readonly sandboxCallbacks?: SandboxCallbacks;
+}
+
+/** Callbacks for editing sandbox state from the agents dashboard. */
+export interface SandboxCallbacks {
+  load(cwd: string, includeProject: boolean): { global: boolean; project?: boolean };
+  setEnabled(ctx: ExtensionContext, enabled: boolean, scope: SandboxConfigScope): Promise<void>;
+  clearProject(ctx: ExtensionContext): Promise<void>;
 }
 
 export interface LandstripRpcWorkerOptions extends LandstripProcessOptions {
@@ -2860,6 +2890,26 @@ export function createLandstripIntegration(
     });
   }
 
+  async function applySandboxSetting(
+    ctx: ExtensionContext,
+    enabled: boolean | undefined,
+    scope: SandboxConfigScope,
+  ): Promise<void> {
+    await writeSandboxConfigEnabled(ctx.cwd, enabled, scope);
+    const effectiveEnabled = loadConfig(ctx.cwd).enabled;
+    if (!effectiveEnabled) {
+      disableSandbox(ctx);
+    } else if (!noSandboxFlag) {
+      enableSandbox(ctx);
+    }
+  }
+
+  const sandboxCallbacks: SandboxCallbacks = {
+    load: loadSandboxEnabledSettings,
+    setEnabled: (ctx, enabled, scope) => applySandboxSetting(ctx, enabled, scope),
+    clearProject: (ctx) => applySandboxSetting(ctx, undefined, 'project'),
+  };
+
   const integration: LandstripIntegration = {
     version: LANDSTRIP_RUNTIME_VERSION,
     getContext,
@@ -2871,6 +2921,7 @@ export function createLandstripIntegration(
     on,
     register,
     emit: emitEvent,
+    sandboxCallbacks,
   };
   return integration;
 }

@@ -247,6 +247,32 @@ it('rejects a pre-aborted RPC worker startup before allocating resources', async
   ).rejects.toThrow('Task cancelled');
 });
 
+it('edits sandbox enabled state in the selected scope', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-sandbox-scope-'));
+  const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-sandbox-agent-'));
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  const integration = createLandstripIntegration({ registerBashTool: false });
+  const callbacks = integration.sandboxCallbacks!;
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: { notify() {}, setStatus() {} },
+  } as unknown as ExtensionContext;
+
+  expect(callbacks.load(cwd, true)).toEqual({ global: true });
+  await callbacks.setEnabled(ctx, false, 'global');
+  expect(JSON.parse(readFileSync(join(agentDir, 'sandbox.json'), 'utf8')).enabled).toBe(false);
+
+  await callbacks.setEnabled(ctx, true, 'project');
+  expect(callbacks.load(cwd, true)).toEqual({ global: false, project: true });
+  await callbacks.clearProject(ctx);
+  expect(callbacks.load(cwd, true)).toEqual({ global: false, project: undefined });
+
+  vi.unstubAllEnvs();
+  rmSync(cwd, { recursive: true, force: true });
+  rmSync(agentDir, { recursive: true, force: true });
+});
+
 it('allows RPC workers when sandboxing is explicitly disabled', async () => {
   let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<void> | void) | undefined;
   const notifications: string[] = [];

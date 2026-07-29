@@ -15,9 +15,12 @@ import {
   type PermissionRules,
 } from './agents.ts';
 import {
+  clearAgentDisabledForScope,
   clearMaxSubagentsConfigForScope,
+  loadAgentDisabledOverrides,
   loadMaxSubagentsSettings,
   MAX_SUBAGENTS,
+  setAgentDisabledForScope,
   setMaxSubagentsConfig,
   setMaxSubagentsConfigForScope,
 } from './config.ts';
@@ -198,6 +201,26 @@ describe('landstrip agent configuration', () => {
         .filter((agent) => agentSupportsMode(agent, 'primary'))
         .map((agent) => agent.name),
     ).toEqual(['build', 'plan']);
+  });
+
+  test('keeps disabled agents in the composed catalog while excluding them from execution', async () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+
+    await setAgentDisabledForScope(cwd, 'build', true, 'global', agentDir);
+    let catalog = loadAgentCatalog(cwd, agentDir);
+    expect(catalog.agents.get('build')).toMatchObject({ disabled: true, source: 'global' });
+    expect(availableAgents(catalog).map((agent) => agent.name)).not.toContain('build');
+
+    await setAgentDisabledForScope(cwd, 'build', false, 'project', agentDir);
+    catalog = loadAgentCatalog(cwd, agentDir);
+    expect(catalog.agents.get('build')).toMatchObject({ disabled: false, source: 'local' });
+    expect(loadAgentDisabledOverrides(cwd, true, agentDir).project.get('build')).toBe(false);
+
+    await clearAgentDisabledForScope(cwd, 'build', 'project', agentDir);
+    catalog = loadAgentCatalog(cwd, agentDir);
+    expect(catalog.agents.get('build')?.disabled).toBe(true);
+    expect(loadAgentDisabledOverrides(cwd, true, agentDir).project.has('build')).toBe(false);
   });
 
   test('rejects maxSubagents above the supported limit', () => {

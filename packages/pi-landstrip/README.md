@@ -90,8 +90,8 @@ task's dedicated session directory. These paths are required to construct a
 normal Pi worker and are not persisted into `sandbox.json`. The worker receives
 write access only to its own session and temporary directories.
 
-Use `/sandbox` to inspect or disable the sandbox. Use `/agents` to select a primary
-agent, inspect primary agents, subagents, and tasks, and set subagent limits.
+Use `/sandbox` to inspect or disable the sandbox. Use `/agents` to select and enable or
+disable agents, inspect tasks, and edit agent and sandbox settings.
 
 ## Permission model
 
@@ -231,8 +231,11 @@ Add agent configuration under `landstrip` in Pi `settings.json`:
 }
 ```
 
-`landstrip.maxSubagents` sets the maximum number of concurrent subagents from 0 to 16. The default is 1; zero disables `task`. The `/agents` **Settings** tab provides
-**Maximum subagents (global)** and **Maximum subagents (local)**.
+`landstrip.maxSubagents` sets the maximum number of concurrent subagents from 0 to 16.
+The default is 1; zero disables `task`. In `/agents`, press `Shift+Tab` to switch the
+whole dialog between Project and Global scope. The **Settings** tab edits the selected
+scope's maximum-subagent and sandbox-enabled values; `-` means the project inherits
+the global value.
 
 `landstrip.permission` applies to every agent. Each
 `landstrip.agent.<name>.permission` map adds agent-specific rules; later matching
@@ -242,7 +245,8 @@ references are resolved from the defining `settings.json`. Provider-specific fie
 belong under `options`.
 
 `hidden` removes an agent from `/agents`. A hidden, subagent-capable agent remains
-available to `task`. Agent `mode` controls activation: only `primary` and `all` agents
+available to `task`. Disabled agents remain visible but dimmed and cannot be activated
+or passed to `task`. Agent `mode` controls activation: only `primary` and `all` agents
 can be selected as primary, while only `subagent` and `all` agents can be passed to
 `task`. Missing, ambiguous, or unauthenticated primary-agent models produce an error
 and leave the current agent active.
