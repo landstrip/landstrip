@@ -21,6 +21,7 @@ import landstripExtension, {
   shouldPromptForWrite,
   writeEnvFile,
 } from './index.ts';
+import { PermissionPromptCoordinator } from './util.ts';
 
 describe('main Pi tool composition', () => {
   it('leaves filesystem tool names available to Pi plugins', () => {
@@ -39,6 +40,119 @@ describe('main Pi tool composition', () => {
     expect(tools).not.toContain('read');
     expect(tools).not.toContain('write');
   });
+});
+
+it('skips a queued permission prompt after a concurrent session grant', async () => {
+  const coordinator = new PermissionPromptCoordinator();
+  const path = join(homedir(), '.cargo');
+  const sessionAllowedReadPaths = new Set<string>();
+  let finishPrompt = (): void => {};
+  const promptPending = new Promise<void>((resolve) => {
+    finishPrompt = resolve;
+  });
+  const current = (): boolean | undefined => (sessionAllowedReadPaths.has(path) ? true : undefined);
+  const prompt = vi.fn(async () => {
+    await promptPending;
+    sessionAllowedReadPaths.add(path);
+    return true;
+  });
+
+  const first = coordinator.resolve(current, prompt);
+  await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+  const second = coordinator.resolve(current, prompt);
+  finishPrompt();
+
+  await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+  expect(prompt).toHaveBeenCalledOnce();
+});
+
+it('keeps allow-once permission prompts local to each execution', async () => {
+  const coordinator = new PermissionPromptCoordinator();
+  const path = join(homedir(), '.cargo');
+  const firstAllowances = new Set<string>();
+  const secondAllowances = new Set<string>();
+  let finishFirstPrompt = (): void => {};
+  const firstPromptPending = new Promise<void>((resolve) => {
+    finishFirstPrompt = resolve;
+  });
+  const firstPrompt = vi.fn(async () => {
+    await firstPromptPending;
+    firstAllowances.add(path);
+    return true;
+  });
+  const secondPrompt = vi.fn(async () => {
+    secondAllowances.add(path);
+    return true;
+  });
+
+  const first = coordinator.resolve(
+    () => (firstAllowances.has(path) ? true : undefined),
+    firstPrompt,
+  );
+  await vi.waitFor(() => expect(firstPrompt).toHaveBeenCalledOnce());
+  const second = coordinator.resolve(
+    () => (secondAllowances.has(path) ? true : undefined),
+    secondPrompt,
+  );
+  finishFirstPrompt();
+
+  await expect(Promise.all([first, second])).resolves.toEqual([true, true]);
+  expect(firstPrompt).toHaveBeenCalledOnce();
+  expect(secondPrompt).toHaveBeenCalledOnce();
+});
+
+it('removes cancelled queued permission prompts without blocking successors', async () => {
+  const coordinator = new PermissionPromptCoordinator();
+  const controller = new AbortController();
+  let finishFirstPrompt = (): void => {};
+  const firstPromptPending = new Promise<void>((resolve) => {
+    finishFirstPrompt = resolve;
+  });
+  const firstPrompt = vi.fn(async () => {
+    await firstPromptPending;
+    return true;
+  });
+  const cancelledPrompt = vi.fn(async () => true);
+  const successorPrompt = vi.fn(async () => true);
+
+  const first = coordinator.resolve(() => undefined, firstPrompt);
+  await vi.waitFor(() => expect(firstPrompt).toHaveBeenCalledOnce());
+  const cancelled = coordinator.resolve(() => undefined, cancelledPrompt, controller.signal);
+  const cancelledResult = expect(cancelled).rejects.toThrow('Permission request cancelled');
+  const successor = coordinator.resolve(() => undefined, successorPrompt);
+  controller.abort();
+  await cancelledResult;
+  finishFirstPrompt();
+
+  await expect(Promise.all([first, successor])).resolves.toEqual([true, true]);
+  expect(cancelledPrompt).not.toHaveBeenCalled();
+  expect(successorPrompt).toHaveBeenCalledOnce();
+});
+
+it('releases an active permission prompt after cancellation', async () => {
+  const coordinator = new PermissionPromptCoordinator();
+  const controller = new AbortController();
+  const activePrompt = vi.fn(
+    () =>
+      new Promise<boolean>((_resolve, reject) => {
+        controller.signal.addEventListener(
+          'abort',
+          () => reject(new Error('Permission prompt cancelled')),
+          { once: true },
+        );
+      }),
+  );
+  const successorPrompt = vi.fn(async () => true);
+
+  const active = coordinator.resolve(() => undefined, activePrompt, controller.signal);
+  await vi.waitFor(() => expect(activePrompt).toHaveBeenCalledOnce());
+  const activeResult = expect(active).rejects.toThrow('Permission prompt cancelled');
+  const successor = coordinator.resolve(() => undefined, successorPrompt);
+  controller.abort();
+
+  await activeResult;
+  await expect(successor).resolves.toBe(true);
+  expect(successorPrompt).toHaveBeenCalledOnce();
 });
 
 it('registers the sandbox dashboard independently from agent supervision', async () => {

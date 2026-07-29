@@ -119,6 +119,7 @@ export class AsyncQueue {
     signal?: AbortSignal,
     cancellationMessage = 'Request cancelled',
   ): Promise<() => void> {
+    if (signal?.aborted) throw new Error(cancellationMessage);
     let release: (() => void) | undefined;
     const previous = this.tail;
     this.tail = new Promise<void>((resolve) => {
@@ -150,5 +151,28 @@ export class AsyncQueue {
 
   reset(): void {
     this.tail = Promise.resolve();
+  }
+}
+
+export class PermissionPromptCoordinator {
+  private readonly queue = new AsyncQueue();
+
+  async resolve<T>(
+    current: () => T | undefined,
+    request: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const immediate = current();
+    if (immediate !== undefined) return immediate;
+
+    const release = await this.queue.acquire(signal, 'Permission request cancelled');
+    try {
+      const resolved = current();
+      if (resolved !== undefined) return resolved;
+      if (signal?.aborted) throw new Error('Permission request cancelled');
+      return await request();
+    } finally {
+      release();
+    }
   }
 }

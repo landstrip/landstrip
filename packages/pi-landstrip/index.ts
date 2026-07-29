@@ -73,7 +73,7 @@ import {
 } from './subagents.ts';
 import { boxBottom, boxRow, boxTop } from './box.ts';
 import { getPiConfigPaths } from './config.ts';
-import { AsyncQueue, expandHomePath, formatError } from './util.ts';
+import { expandHomePath, formatError, PermissionPromptCoordinator } from './util.ts';
 
 interface SandboxFilesystemConfig {
   denyRead: string[];
@@ -902,8 +902,6 @@ async function stopPreparedChild(child: ChildProcess | undefined): Promise<void>
   });
 }
 
-const permissionPromptQueue = new AsyncQueue();
-
 async function showPermissionPrompt(
   ctx: ExtensionContext,
   title: string,
@@ -912,28 +910,22 @@ async function showPermissionPrompt(
 ): Promise<PermissionChoice> {
   if (!ctx.hasUI) return 'abort';
 
-  const releasePrompt = await permissionPromptQueue.acquire();
-
-  try {
-    const labels = options.map((option) =>
-      option.hint ? `${option.label} ${option.hint}` : option.label,
+  const labels = options.map((option) =>
+    option.hint ? `${option.label} ${option.hint}` : option.label,
+  );
+  const selected = await ctx.ui.select(title, labels, { signal });
+  const index = selected === undefined ? -1 : labels.indexOf(selected);
+  const option = options[index];
+  if (!option) return 'abort';
+  if (option.confirm) {
+    const confirmed = await ctx.ui.confirm(
+      `Confirm ${option.label.toLowerCase()}`,
+      option.hint ?? 'This changes persisted sandbox policy.',
+      { signal },
     );
-    const selected = await ctx.ui.select(title, labels, { signal });
-    const index = selected === undefined ? -1 : labels.indexOf(selected);
-    const option = options[index];
-    if (!option) return 'abort';
-    if (option.confirm) {
-      const confirmed = await ctx.ui.confirm(
-        `Confirm ${option.label.toLowerCase()}`,
-        option.hint ?? 'This changes persisted sandbox policy.',
-        { signal },
-      );
-      if (!confirmed) return 'abort';
-    }
-    return option.action;
-  } finally {
-    releasePrompt();
+    if (!confirmed) return 'abort';
   }
+  return option.action;
 }
 
 function promptDomainBlock(
@@ -1195,6 +1187,7 @@ export function createLandstripIntegration(
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
   const sessionAllowedTargets: string[] = [];
+  const permissionPrompts = new PermissionPromptCoordinator();
 
   function getContext(ctx = activeContext): LandstripContextV1 {
     return {
@@ -1431,16 +1424,24 @@ export function createLandstripIntegration(
     allowances?: ExecutionAllowances,
     signal?: AbortSignal,
   ): Promise<boolean> {
-    const config = loadConfig(cwd);
+    const current = (): boolean | undefined => {
+      const config = loadConfig(cwd);
+      if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
+      if (domainMatchesAny(domain, getEffectiveAllowedDomains(config, allowances))) return true;
+      return undefined;
+    };
+    if (!ctx.hasUI) return current() ?? false;
 
-    if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
-    if (domainMatchesAny(domain, getEffectiveAllowedDomains(config, allowances))) return true;
-
-    const choice = await promptDomainBlock(ctx, domain, signal);
-    if (choice === 'abort') return false;
-
-    await applyDomainChoice(choice, domain, cwd, allowances);
-    return true;
+    return permissionPrompts.resolve(
+      current,
+      async () => {
+        const choice = await promptDomainBlock(ctx, domain, signal);
+        if (choice === 'abort') return false;
+        await applyDomainChoice(choice, domain, cwd, allowances);
+        return true;
+      },
+      signal,
+    );
   }
 
   function buildLandstripPolicy(
@@ -1721,54 +1722,73 @@ export function createLandstripIntegration(
   ): Promise<TrapQueryResult> {
     if (!isFilesystemTrap(trap)) {
       const key = `${trap.operation}\u0000${trap.target}`;
-      if (sessionAllowedTargets.includes(key) || allowances.targets.includes(key)) {
-        return { action: 'allow' };
-      }
+      const current = (): TrapQueryResult | undefined =>
+        sessionAllowedTargets.includes(key) || allowances.targets.includes(key)
+          ? { action: 'allow' }
+          : undefined;
+      const existing = current();
+      if (existing) return existing;
       if (!ctx.hasUI || !promptOnBlock) return { action: 'deny', reason: 'unprompted' };
 
-      const choice = await promptNetworkBlock(ctx, trap.operation, trap.target, signal);
-      if (choice === 'abort') return { action: 'deny', reason: 'rejected' };
-      const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
-      targets.push(key);
-      return { action: 'allow' };
+      return permissionPrompts.resolve(
+        current,
+        async () => {
+          const choice = await promptNetworkBlock(ctx, trap.operation, trap.target, signal);
+          if (choice === 'abort') return { action: 'deny', reason: 'rejected' };
+          const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
+          if (!targets.includes(key)) targets.push(key);
+          return { action: 'allow' };
+        },
+        signal,
+      );
     }
 
     const path = normalizeBlockedPath(trap.path, cwd);
-    const config = loadConfig(cwd);
-    const allowed =
-      trap.operation === 'read'
-        ? readAllowed(
-            path,
-            getEffectiveAllowRead(config, cwd, allowances),
-            config.filesystem.denyRead,
-            cwd,
-          )
-        : !matchesPattern(path, config.filesystem.denyWrite, cwd) &&
-          !shouldPromptForWrite(path, getEffectiveAllowWrite(config, allowances), cwd);
-    if (allowed) return { action: 'allow' };
-    if (trap.operation === 'write' && matchesPattern(path, config.filesystem.denyWrite, cwd)) {
-      return { action: 'deny', reason: 'hard-deny' };
-    }
+    const current = (): TrapQueryResult | undefined => {
+      const config = loadConfig(cwd);
+      if (trap.operation === 'write' && matchesPattern(path, config.filesystem.denyWrite, cwd)) {
+        return { action: 'deny', reason: 'hard-deny' };
+      }
+      const allowed =
+        trap.operation === 'read'
+          ? readAllowed(
+              path,
+              getEffectiveAllowRead(config, cwd, allowances),
+              config.filesystem.denyRead,
+              cwd,
+            )
+          : !shouldPromptForWrite(path, getEffectiveAllowWrite(config, allowances), cwd);
+      return allowed ? { action: 'allow' } : undefined;
+    };
+    const existing = current();
+    if (existing) return existing;
     if (!ctx.hasUI || !promptOnBlock) return { action: 'deny', reason: 'unprompted' };
 
-    const choice =
-      trap.operation === 'read'
-        ? await promptReadBlock(
-            ctx,
-            path,
-            matchesPattern(path, config.filesystem.denyRead, cwd)
-              ? 'granting allowRead will override it'
-              : undefined,
-            signal,
-          )
-        : await promptWriteBlock(ctx, path, signal);
-    if (choice === 'abort') return { action: 'deny', reason: 'rejected' };
-    if (trap.operation === 'read') {
-      await applyReadChoice(ctx, choice, path, cwd, allowances);
-    } else {
-      await applyWriteChoice(ctx, choice, path, cwd, allowances);
-    }
-    return { action: 'allow' };
+    return permissionPrompts.resolve(
+      current,
+      async () => {
+        const config = loadConfig(cwd);
+        const choice =
+          trap.operation === 'read'
+            ? await promptReadBlock(
+                ctx,
+                path,
+                matchesPattern(path, config.filesystem.denyRead, cwd)
+                  ? 'granting allowRead will override it'
+                  : undefined,
+                signal,
+              )
+            : await promptWriteBlock(ctx, path, signal);
+        if (choice === 'abort') return { action: 'deny', reason: 'rejected' };
+        if (trap.operation === 'read') {
+          await applyReadChoice(ctx, choice, path, cwd, allowances);
+        } else {
+          await applyWriteChoice(ctx, choice, path, cwd, allowances);
+        }
+        return { action: 'allow' };
+      },
+      signal,
+    );
   }
 
   function attachWorkerTrap(
@@ -2313,49 +2333,70 @@ export function createLandstripIntegration(
     ): Promise<AgentToolResult<BashToolDetails | undefined> | null> => {
       if (!ctx.hasUI) return null;
 
-      let config = loadConfig(ctx.cwd);
       const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
-      if (
-        operation === 'write' &&
-        matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)
-      ) {
-        notify(
-          ctx,
-          `"${blockedPath}" is blocked by denyWrite. Check:\n  ${projectPath}\n  ${globalPath}`,
-          'warning',
-        );
+      const current = (): boolean | undefined => {
+        const config = loadConfig(ctx.cwd);
+        if (
+          operation === 'write' &&
+          matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)
+        ) {
+          return false;
+        }
+        const needsPrompt =
+          operation === 'read'
+            ? !matchesPattern(
+                blockedPath,
+                getEffectiveAllowRead(config, ctx.cwd, allowances),
+                ctx.cwd,
+              )
+            : shouldPromptForWrite(
+                blockedPath,
+                getEffectiveAllowWrite(config, allowances),
+                ctx.cwd,
+              );
+        return needsPrompt ? undefined : true;
+      };
+      const access = await permissionPrompts.resolve(
+        current,
+        async () => {
+          const config = loadConfig(ctx.cwd);
+          const choice =
+            operation === 'read'
+              ? await promptReadBlock(
+                  ctx,
+                  blockedPath,
+                  matchesPattern(blockedPath, config.filesystem.denyRead, ctx.cwd)
+                    ? 'granting allowRead will override it'
+                    : undefined,
+                  signal,
+                )
+              : await promptWriteBlock(ctx, blockedPath, signal);
+          if (choice === 'abort') return false;
+          if (operation === 'read') {
+            await applyReadChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
+          } else {
+            await applyWriteChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
+          }
+          return true;
+        },
+        signal,
+      );
+      if (!access) {
+        const config = loadConfig(ctx.cwd);
+        if (
+          operation === 'write' &&
+          matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)
+        ) {
+          notify(
+            ctx,
+            `"${blockedPath}" is blocked by denyWrite. Check:\n  ${projectPath}\n  ${globalPath}`,
+            'warning',
+          );
+        }
         return null;
       }
 
-      const needsPrompt =
-        operation === 'read'
-          ? !matchesPattern(
-              blockedPath,
-              getEffectiveAllowRead(config, ctx.cwd, allowances),
-              ctx.cwd,
-            )
-          : shouldPromptForWrite(blockedPath, getEffectiveAllowWrite(config, allowances), ctx.cwd);
-      if (needsPrompt) {
-        const choice =
-          operation === 'read'
-            ? await promptReadBlock(
-                ctx,
-                blockedPath,
-                matchesPattern(blockedPath, config.filesystem.denyRead, ctx.cwd)
-                  ? 'granting allowRead will override it'
-                  : undefined,
-                signal,
-              )
-            : await promptWriteBlock(ctx, blockedPath, signal);
-        if (choice === 'abort') return null;
-        if (operation === 'read') {
-          await applyReadChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
-        } else {
-          await applyWriteChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
-        }
-      }
-
-      config = loadConfig(ctx.cwd);
+      let config = loadConfig(ctx.cwd);
       if (
         operation === 'write' &&
         matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)
