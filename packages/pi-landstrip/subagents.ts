@@ -40,6 +40,11 @@ import {
   permissionDecision,
   type PermissionRules,
 } from './agents.ts';
+import {
+  canDeleteProjectAgent,
+  deleteProjectAgent,
+  prepareProjectAgentEditor,
+} from './agent-files.ts';
 import { boxBottom, boxRow, boxTop } from './box.ts';
 import {
   clearAgentDisabledForScope,
@@ -898,6 +903,7 @@ export class SubagentRuntime {
     const dirtySettings = new Set<number>();
     let saving = false;
     let editing = false;
+    let confirmingDeleteAgent: string | undefined;
     let detail = requested.length > 0;
     let scroll = 0;
 
@@ -917,6 +923,14 @@ export class SubagentRuntime {
     const reloadSettings = (): void => {
       maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
       sandboxSettings = sandboxCallbacks?.load(ctx.cwd, projectTrusted) ?? { global: true };
+    };
+    const refreshAgentRuntime = async (name: string): Promise<void> => {
+      reloadAgents();
+      if (this.primaryAgent?.name === name) {
+        await this.restorePrimaryAgent(ctx);
+      } else {
+        this.pi.registerTool(this.createTaskTool(undefined, this.primaryRules, ctx));
+      }
     };
     const scopedAgent = (agent: AgentDefinition): AgentDefinition | undefined =>
       scope === 'global' ? globalCatalog.agents.get(agent.name) : agent;
@@ -1001,6 +1015,7 @@ export class SubagentRuntime {
               const unavailable = current === undefined;
               const scopedDisabled = current?.disabled ?? false;
               const disabled = agent.disabled;
+              const deleting = confirmingDeleteAgent === agent.name;
               const inherited = scope === 'project' && !disabledOverrides.project.has(agent.name);
               const toggle = unavailable
                 ? 'n/a'
@@ -1009,19 +1024,21 @@ export class SubagentRuntime {
                   : scopedDisabled
                     ? '[x]'
                     : '[ ]';
-              const color = disabled ? 'muted' : 'text';
+              const color = deleting ? 'error' : disabled ? 'muted' : 'text';
               const plainName = pad(`@${agent.name}`, nameWidth);
-              const name = disabled
-                ? theme.fg('muted', plainName)
-                : colorizeAgentText(agent.color, plainName, (agentColor, text) =>
-                    theme.fg(agentColor as Parameters<Theme['fg']>[0], text),
-                  );
+              const name = deleting
+                ? theme.fg('error', plainName)
+                : disabled
+                  ? theme.fg('muted', plainName)
+                  : colorizeAgentText(agent.color, plainName, (agentColor, text) =>
+                      theme.fg(agentColor as Parameters<Theme['fg']>[0], text),
+                    );
               lines.push(
                 `${cursor} ${active} ${name} ${theme.fg(color, pad(agent.mode, modeWidth))} ${theme.fg(
                   color,
                   pad(agent.source, sourceWidth),
                 )} ${theme.fg(color, pad(agent.model ?? 'current model', modelWidth))} ${theme.fg(
-                  unavailable ? 'muted' : scopedDisabled ? 'warning' : color,
+                  deleting ? 'error' : unavailable ? 'muted' : scopedDisabled ? 'warning' : color,
                   pad(toggle, disabledWidth),
                 )}`,
               );
@@ -1074,12 +1091,14 @@ export class SubagentRuntime {
               agent !== undefined && !agent.disabled && agentSupportsMode(agent, 'primary');
             lines.push(
               '',
-              theme.fg(
-                'dim',
-                saving
-                  ? 'Saving…'
-                  : `↑↓ select${canActivate ? '  enter activate' : ''}  d/space disable  i inherit  tab next  ⇧tab scope  esc close`,
-              ),
+              confirmingDeleteAgent
+                ? theme.fg('error', `Delete @${confirmingDeleteAgent}?  enter confirm  esc cancel`)
+                : theme.fg(
+                    'dim',
+                    saving
+                      ? 'Saving…'
+                      : `↑↓ select${canActivate ? '  enter activate' : ''}  d toggle  ctrl+d delete  ctrl+g edit  tab next  ⇧tab scope  esc`,
+                  ),
             );
             return box(lines);
           }
@@ -1194,6 +1213,38 @@ export class SubagentRuntime {
           return box(lines.map((line) => truncateToWidth(line, contentWidth)));
         },
         handleInput: (data: string) => {
+          if (confirmingDeleteAgent !== undefined) {
+            if (matchesKey(data, 'escape')) {
+              confirmingDeleteAgent = undefined;
+              tui.requestRender();
+              return;
+            }
+            if (matchesKey(data, 'return')) {
+              const name = confirmingDeleteAgent;
+              const agent = agents.find((candidate) => candidate.name === name);
+              confirmingDeleteAgent = undefined;
+              if (!agent) {
+                tui.requestRender();
+                return;
+              }
+              saving = true;
+              void deleteProjectAgent(ctx.cwd, agent)
+                .then(async (deleted) => {
+                  if (!deleted) return;
+                  await refreshAgentRuntime(name);
+                  ctx.ui.notify(`Deleted project agent ${name}`, 'info');
+                })
+                .catch((error: unknown) =>
+                  ctx.ui.notify(`Could not delete agent: ${formatError(error)}`, 'error'),
+                )
+                .finally(() => {
+                  saving = false;
+                  tui.requestRender();
+                });
+              return;
+            }
+            return;
+          }
           if (matchesKey(data, 'shift+tab')) {
             if (saving) return;
             if (!projectTrusted && scope === 'global') {
@@ -1227,6 +1278,30 @@ export class SubagentRuntime {
             if (matchesKey(data, 'up')) selectedAgent = Math.max(0, selectedAgent - 1);
             else if (matchesKey(data, 'down') && agents.length > 0) {
               selectedAgent = Math.min(agents.length - 1, selectedAgent + 1);
+            } else if (matchesKey(data, 'ctrl+d') && agent && !saving) {
+              if (!projectTrusted || !canDeleteProjectAgent(ctx.cwd, agent)) return;
+              confirmingDeleteAgent = agent.name;
+              tui.requestRender();
+              return;
+            } else if (matchesKey(data, 'ctrl+g') && agent && !saving) {
+              if (!projectTrusted) return;
+              saving = true;
+              void (async () => {
+                const document = prepareProjectAgentEditor(ctx.cwd, agent);
+                const edited = await ctx.ui.editor(document.title, document.content);
+                if (edited === undefined) return;
+                await document.save(edited);
+                await refreshAgentRuntime(agent.name);
+                ctx.ui.notify(`Updated project agent ${agent.name}`, 'info');
+              })()
+                .catch((error: unknown) =>
+                  ctx.ui.notify(`Could not edit agent: ${formatError(error)}`, 'error'),
+                )
+                .finally(() => {
+                  saving = false;
+                  tui.requestRender();
+                });
+              return;
             } else if ((data === 'd' || data === ' ') && agent && !saving) {
               const current = scopedAgent(agent);
               if (!current) {
@@ -1237,11 +1312,7 @@ export class SubagentRuntime {
               saving = true;
               void setAgentDisabledForScope(ctx.cwd, agent.name, disabled, scope)
                 .then(async () => {
-                  reloadAgents();
-                  const effective = catalog.agents.get(agent.name);
-                  if (this.primaryAgent?.name === agent.name && effective?.disabled) {
-                    await this.restorePrimaryAgent(ctx);
-                  }
+                  await refreshAgentRuntime(agent.name);
                   ctx.ui.notify(
                     `${agent.name} ${disabled ? 'disabled' : 'enabled'} in ${scope} settings`,
                     'info',
@@ -1260,11 +1331,7 @@ export class SubagentRuntime {
               saving = true;
               void clearAgentDisabledForScope(ctx.cwd, agent.name, 'project')
                 .then(async () => {
-                  reloadAgents();
-                  const effective = catalog.agents.get(agent.name);
-                  if (this.primaryAgent?.name === agent.name && effective?.disabled) {
-                    await this.restorePrimaryAgent(ctx);
-                  }
+                  await refreshAgentRuntime(agent.name);
                   ctx.ui.notify(`${agent.name} now inherits its global state`, 'info');
                 })
                 .catch((error: unknown) =>

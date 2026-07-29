@@ -918,7 +918,18 @@ test('inspects and navigates persisted child sessions without switching sessions
   vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
   writeFileSync(
     join(agentDir, 'settings.json'),
-    JSON.stringify({ landstrip: { maxSubagents: 1 } }),
+    JSON.stringify({
+      landstrip: {
+        maxSubagents: 1,
+        agent: {
+          'global-review': {
+            description: 'Global review',
+            prompt: 'Review globally.',
+            mode: 'subagent',
+          },
+        },
+      },
+    }),
   );
   mkdirSync(join(cwd, '.pi'), { recursive: true });
   writeFileSync(
@@ -1040,6 +1051,13 @@ test('inspects and navigates persisted child sessions without switching sessions
       notify() {},
       setStatus() {},
       setWidget() {},
+      async editor(_title: string, prefill = '') {
+        const snippet = JSON.parse(prefill);
+        const configured = snippet.landstrip?.agent ?? snippet.agent;
+        const name = Object.keys(configured)[0];
+        configured[name].description = `Edited ${name}`;
+        return `${JSON.stringify(snippet, null, 2)}\n`;
+      },
       custom(
         factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => typeof component,
       ) {
@@ -1061,6 +1079,28 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(agents).toMatch(/@general\s+subagent\s+built-in/);
   expect(agents).toMatch(/@review\s+subagent\s+local/);
 
+  component?.handleInput('\x07');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+    expect(settings.landstrip.agent.build.description).toBe('Edited build');
+    expect(component?.render(96).join('\n')).not.toContain('Saving…');
+  });
+  component?.handleInput('\x04');
+  expect(component?.render(96).join('\n')).toContain('Delete @build?  enter confirm  esc cancel');
+  component?.handleInput('\x1b');
+  expect(component?.render(96).join('\n')).not.toContain('Delete @build?');
+  expect(
+    JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8')).landstrip.agent.build,
+  ).toBeDefined();
+  component?.handleInput('\x04');
+  component?.handleInput('\r');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+    expect(settings.landstrip.agent.build).toBeUndefined();
+    expect(component?.render(96).join('\n')).toMatch(/@build\s+primary\s+built-in/);
+    expect(component?.render(96).join('\n')).not.toContain('Saving…');
+  });
+
   component?.handleInput('\x1b[B');
   component?.handleInput('d');
   await vi.waitFor(() => {
@@ -1076,6 +1116,21 @@ test('inspects and navigates persisted child sessions without switching sessions
     expect(component?.render(96).join('\n')).toMatch(/@explore\s+subagent\s+built-in.*\[-\]/);
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
+  component?.handleInput('\x1b[A');
+
+  component?.handleInput('\x1b[B');
+  component?.handleInput('\x1b[B');
+  component?.handleInput('\x1b[B');
+  component?.handleInput('\x04');
+  expect(component?.render(96).join('\n')).not.toContain('Delete @global-review?');
+  component?.handleInput('\x07');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+    expect(settings.landstrip.agent['global-review'].description).toBe('Edited global-review');
+    expect(component?.render(96).join('\n')).not.toContain('Saving…');
+  });
+  component?.handleInput('\x1b[A');
+  component?.handleInput('\x1b[A');
   component?.handleInput('\x1b[A');
 
   component?.handleInput('\x1b[Z');

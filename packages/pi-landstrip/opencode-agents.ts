@@ -15,6 +15,7 @@ export interface OpenCodeAgentRaw {
   readonly name: string;
   readonly source: AgentSource;
   readonly path: string;
+  readonly format: 'json' | 'markdown';
   readonly raw: ConfigObject;
 }
 
@@ -154,6 +155,11 @@ export function normalizeOpenCodeAgentRaw(data: ConfigObject, prompt: string): C
   return raw;
 }
 
+export function parseMarkdownAgentRaw(content: string): ConfigObject {
+  const { data, body } = parseFrontmatter(content);
+  return normalizeOpenCodeAgentRaw(data, body.trim());
+}
+
 function parseOpenCodeConfig(path: string): ConfigObject {
   const errors: ParseError[] = [];
   const value: unknown = parseJsonc(readFileSync(path, 'utf8'), errors, {
@@ -188,7 +194,7 @@ function loadAgentsFromConfigFile(
         const prompt =
           typeof value.prompt === 'string' ? expandFileReferences(value.prompt, dirname(path)) : '';
         const raw = normalizeOpenCodeAgentRaw(value, prompt);
-        agents.set(name, { name, source, path, raw });
+        agents.set(name, { name, source, path, format: 'json', raw });
       } catch (error) {
         diagnostics.push(`${path}: ${formatError(error)}`);
       }
@@ -219,14 +225,13 @@ function loadAgentsFromRoot(
   for (const filePath of listMarkdownFiles(root)) {
     try {
       const content = readFileSync(filePath, 'utf8');
-      const { data, body } = parseFrontmatter(content);
+      const raw = parseMarkdownAgentRaw(content);
       const name = agentNameFromPath(nameRoot, filePath);
       if (!name) {
         diagnostics.push(`${filePath}: agent name is empty`);
         continue;
       }
-      const raw = normalizeOpenCodeAgentRaw(data, body.trim());
-      agents.set(name, { name, source, path: filePath, raw });
+      agents.set(name, { name, source, path: filePath, format: 'markdown', raw });
     } catch (error) {
       diagnostics.push(`${filePath}: ${formatError(error)}`);
     }

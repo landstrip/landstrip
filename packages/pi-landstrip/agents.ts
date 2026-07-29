@@ -5,7 +5,12 @@ import { join } from 'node:path';
 import { minimatch } from 'minimatch';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 
-import { loadLandstripConfig, type AgentSource, type ConfigObject } from './config.ts';
+import {
+  getPiConfigPaths,
+  loadLandstripConfig,
+  type AgentSource,
+  type ConfigObject,
+} from './config.ts';
 import { loadOpenCodeAgents, loadPiMarkdownAgents } from './opencode-agents.ts';
 import { expandHomePath, formatError, isAgentColor, isRecord } from './util.ts';
 
@@ -18,6 +23,12 @@ export interface PermissionRule {
 }
 
 export type PermissionRules = readonly PermissionRule[];
+
+export interface AgentOrigin {
+  readonly kind: 'built-in' | 'settings' | 'pi-markdown' | 'opencode-json' | 'opencode-markdown';
+  readonly source: AgentSource;
+  readonly path?: string;
+}
 
 export interface AgentDefinition {
   readonly name: string;
@@ -33,6 +44,8 @@ export interface AgentDefinition {
   readonly steps?: number;
   readonly permissions: PermissionRules;
   readonly providerOptions: Readonly<Record<string, unknown>>;
+  readonly origin?: AgentOrigin;
+  readonly raw?: Readonly<ConfigObject>;
 }
 
 export interface AgentCatalog {
@@ -93,7 +106,12 @@ function normalizePermissions(value: unknown): PermissionRules {
   );
 }
 
-function normalizeAgent(name: string, raw: ConfigObject, source: AgentSource): AgentDefinition {
+function normalizeAgent(
+  name: string,
+  raw: ConfigObject,
+  source: AgentSource,
+  origin: AgentOrigin,
+): AgentDefinition {
   for (const field of ['description', 'prompt', 'model', 'variant', 'color'] as const) {
     if (raw[field] !== undefined && typeof raw[field] !== 'string') {
       throw new Error(`agent ${name} ${field} must be a string`);
@@ -148,7 +166,13 @@ function normalizeAgent(name: string, raw: ConfigObject, source: AgentSource): A
     steps: typeof raw.steps === 'number' ? raw.steps : undefined,
     permissions: normalizePermissions(raw.permission),
     providerOptions,
+    origin,
+    raw: { ...raw },
   };
+}
+
+export function validateAgentRaw(name: string, raw: ConfigObject): void {
+  normalizeAgent(name, raw, 'local', { kind: 'settings', source: 'local' });
 }
 
 export function loadAgentCatalog(
@@ -187,7 +211,15 @@ export function loadAgentCatalog(
   const normalized = new Map<string, AgentDefinition>();
   for (const imported of openCode.agents.values()) {
     try {
-      normalized.set(imported.name, normalizeAgent(imported.name, imported.raw, imported.source));
+      const kind = imported.format === 'markdown' ? 'opencode-markdown' : 'opencode-json';
+      normalized.set(
+        imported.name,
+        normalizeAgent(imported.name, imported.raw, imported.source, {
+          kind,
+          source: imported.source,
+          path: imported.path,
+        }),
+      );
     } catch (error) {
       diagnostics.push(`${imported.path}: ${formatError(error)}`);
     }
@@ -202,7 +234,14 @@ export function loadAgentCatalog(
   diagnostics.push(...piMarkdown.diagnostics);
   for (const imported of piMarkdown.agents.values()) {
     try {
-      normalized.set(imported.name, normalizeAgent(imported.name, imported.raw, imported.source));
+      normalized.set(
+        imported.name,
+        normalizeAgent(imported.name, imported.raw, imported.source, {
+          kind: 'pi-markdown',
+          source: imported.source,
+          path: imported.path,
+        }),
+      );
     } catch (error) {
       diagnostics.push(`${imported.path}: ${formatError(error)}`);
     }
@@ -216,11 +255,31 @@ export function loadAgentCatalog(
     }
     const imported = normalized.get(name);
     if (Object.keys(value).every((key) => key === 'disable')) {
-      if (imported) normalized.set(name, { ...imported, disabled: value.disable === true });
+      if (imported) {
+        normalized.set(name, {
+          ...imported,
+          disabled: value.disable === true,
+          raw: { ...imported.raw, disable: value.disable },
+        });
+      }
       continue;
     }
     try {
-      normalized.set(name, normalizeAgent(name, value, agentSources.get(name) ?? 'built-in'));
+      const source = agentSources.get(name) ?? 'built-in';
+      const paths = getPiConfigPaths(cwd, 'settings.json', piAgentDir);
+      normalized.set(
+        name,
+        normalizeAgent(name, value, source, {
+          kind: source === 'built-in' ? 'built-in' : 'settings',
+          source,
+          path:
+            source === 'local'
+              ? paths.projectPath
+              : source === 'global'
+                ? paths.globalPath
+                : undefined,
+        }),
+      );
     } catch (error) {
       diagnostics.push(formatError(error));
     }

@@ -115,6 +115,12 @@ restrictions still apply to the resulting process.
 visible primary agent. The built-in primary agents are `build` and `plan`. Build has
 normal development access; plan asks before shell commands and file edits.
 
+Press `Ctrl+G` to edit the selected agent into project scope. Markdown agents open as
+their complete Markdown file; JSON-backed agents open as a one-agent JSON snippet that
+is substituted back into the project configuration. Press `Ctrl+D`, then `Enter`, to
+delete a project agent or override. Deletion is silently ignored for built-in and
+global-only agents.
+
 The selected prompt and permissions are stored in the session. Press `Ctrl+Shift+A`
 while Pi is idle to cycle through visible primary agents.
 
