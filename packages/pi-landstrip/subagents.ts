@@ -78,6 +78,8 @@ const MAX_DEPTH = 3;
 const packageDir = dirname(fileURLToPath(import.meta.url));
 const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
 const INSPECTOR_BODY_LINES = 16;
+const TASK_PREVIEW_MIN_WIDTH = 92;
+const TASK_PREVIEW_LINES = 7;
 const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const AGENTS_HELP_ROWS = [
   ['Tab', 'Next tab'],
@@ -1241,9 +1243,9 @@ export class SubagentRuntime {
           }
 
           if (!detail) {
-            const lines = [tabs, ''];
+            const listLines: string[] = [];
             if (tasks.length === 0) {
-              lines.push('No task sessions in this session.');
+              listLines.push('No task sessions in this session.');
             } else {
               const start = Math.max(0, Math.min(selectedTask - 5, tasks.length - 11));
               const shown = tasks.slice(start, start + 11);
@@ -1251,12 +1253,46 @@ export class SubagentRuntime {
                 const index = start + offset;
                 const cursor = index === selectedTask ? theme.fg('accent', '›') : ' ';
                 const indent = '  '.repeat(Math.max(0, task.depth - 1));
-                lines.push(
+                listLines.push(
                   `${cursor} ${indent}${taskState(theme, task)} ${theme.fg('accent', `@${task.agent}`)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
                 );
               }
             }
-            return box(lines);
+            if (width < TASK_PREVIEW_MIN_WIDTH || tasks.length === 0) {
+              return box([tabs, '', ...listLines]);
+            }
+
+            const task = tasks[selectedTask];
+            if (!task) return box([tabs, '', ...listLines]);
+            const leftWidth = Math.max(44, Math.min(64, Math.floor(contentWidth * 0.52)));
+            const rightWidth = Math.max(1, contentWidth - leftWidth - 3);
+            const transcript = taskTranscript(task).flatMap((line) =>
+              wrapTextWithAnsi(line, rightWidth),
+            );
+            const duration = taskDuration(taskDetails(task));
+            const metrics = [
+              task.currentTool ? `→ ${task.currentTool}` : undefined,
+              task.toolCalls === undefined
+                ? undefined
+                : `${task.toolCalls} tool call${task.toolCalls === 1 ? '' : 's'}`,
+              duration,
+              task.retryAttempt ? `retry ${task.retryAttempt}` : undefined,
+            ].filter(Boolean);
+            const previewLines = [
+              `${theme.fg('accent', theme.bold(`@${task.agent}`))} ${theme.fg('text', task.description)}`,
+              `${taskState(theme, task)} ${theme.fg('dim', task.id)}`,
+              metrics.length > 0 ? theme.fg('dim', metrics.join(' · ')) : '',
+              theme.fg('dim', 'Latest activity'),
+              ...transcript.slice(-TASK_PREVIEW_LINES).map((line) => theme.fg('toolOutput', line)),
+            ];
+            const divider = theme.fg('border', '│');
+            const rowCount = Math.max(listLines.length, previewLines.length);
+            const lines = Array.from({ length: rowCount }, (_, index) => {
+              const left = pad(listLines[index] ?? '', leftWidth);
+              const right = truncateToWidth(previewLines[index] ?? '', rightWidth);
+              return `${left} ${divider} ${right}`;
+            });
+            return box([tabs, '', ...lines]);
           }
 
           const task = tasks[selectedTask];

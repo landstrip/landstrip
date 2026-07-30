@@ -1284,6 +1284,22 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(tasks).not.toContain('Tasks 2');
   expect(tasks).toContain('task-123');
   expect(tasks).toContain('Failed child');
+  expect(tasks).toContain('Latest activity');
+  expect(tasks).toContain('2 tool calls · 1.0s');
+  expect(tasks).toContain('Task log entry 40');
+  expect(component?.render(96).every((line) => visibleWidth(line) <= 96)).toBe(true);
+
+  const narrowTasks = component?.render(80).join('\n') ?? '';
+  expect(narrowTasks).not.toContain('Latest activity');
+  expect(narrowTasks).not.toContain('Task log entry 40');
+  expect(component?.render(80).every((line) => visibleWidth(line) <= 80)).toBe(true);
+
+  component?.handleInput('\x1b[B');
+  const failedPreview = component?.render(96).join('\n') ?? '';
+  expect(failedPreview).toContain('Child failed visibly');
+  expect(failedPreview).not.toContain('Task log entry 40');
+  component?.handleInput('\x1b[A');
+  expect(component?.render(96).join('\n')).toContain('Task log entry 40');
   component?.handleInput('\x1b[D');
   expect(component?.render(96).join('\n')).toContain('[Tasks]');
   component?.handleInput('\x1b[C');
