@@ -175,16 +175,17 @@ it('registers the sandbox dashboard independently from agent supervision', async
   } as unknown as ExtensionAPI;
   createLandstripIntegration({ registerBashTool: false }).register(pi);
   let customResult: unknown;
+  let projectTrusted = true;
   const ctx = {
     cwd: join(tmpdir(), 'pi-landstrip-overlay-test'),
     hasUI: true,
     mode: 'tui',
-    isProjectTrusted: () => false,
+    isProjectTrusted: () => projectTrusted,
     ui: {
       async custom(factory: (...args: unknown[]) => unknown) {
         component = factory(
           { requestRender() {} },
-          { fg: (_color: string, value: string) => value },
+          { fg: (_color: string, value: string) => value, bold: (value: string) => value },
           undefined,
           (value: unknown) => {
             customResult = value;
@@ -197,14 +198,20 @@ it('registers the sandbox dashboard independently from agent supervision', async
   await commandHandlers.get('sandbox')?.('', ctx);
   const sandboxView = component?.render(78).join('\n') ?? '';
   expect(sandboxView).toContain('Sandbox');
-  expect(sandboxView).toContain('Config');
-  expect(sandboxView).toContain('Network');
+  expect(sandboxView).toContain('[Overview]  Policy');
+  expect(sandboxView).toContain('Protection');
   expect(sandboxView).toContain('Filesystem');
-  expect(sandboxView).toMatch(/enter (?:enable|disable)  esc close/);
+  expect(sandboxView).toContain('Tab next tab  ·  Enter disable in project  ·  Esc close');
+  component?.handleInput('\t');
+  expect(component?.render(78).join('\n')).toContain('Allowed domains');
   component?.handleInput('\r');
   expect(customResult).toBe(true);
   component?.handleInput('\x1b');
   expect(customResult).toBe(false);
+
+  projectTrusted = false;
+  await commandHandlers.get('sandbox')?.('', ctx);
+  expect(component?.render(78).join('\n')).toContain('Enter disable in global');
 
   expect(commandNames).toEqual(['sandbox']);
   expect(commandNames).not.toContain('landstrip');

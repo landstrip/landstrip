@@ -71,7 +71,7 @@ import {
   registerSubagentWorker,
   workerConfigFromEnvironment,
 } from './subagents.ts';
-import { boxBottom, boxRow, boxTop } from './box.ts';
+import { boxBottom, boxRow, boxTop, dialogKeys, dialogTabs } from './box.ts';
 import { getPiConfigPaths } from './config.ts';
 import { expandHomePath, formatError, PermissionPromptCoordinator } from './util.ts';
 
@@ -376,10 +376,9 @@ function getSandboxConfigWriteTarget(
   includeProject = true,
 ): { scope: SandboxConfigScope; path: string } {
   const { globalPath, projectPath } = getConfigPaths(cwd);
-  if (includeProject && existsSync(projectPath)) {
-    return { scope: 'project', path: projectPath };
-  }
-  return { scope: 'global', path: globalPath };
+  return includeProject
+    ? { scope: 'project', path: projectPath }
+    : { scope: 'global', path: globalPath };
 }
 
 async function writeSandboxConfigEnabled(
@@ -2733,123 +2732,151 @@ export function createLandstripIntegration(
       description: 'Inspect and toggle the sandbox',
       handler: async (_args, ctx) => {
         if (!ctx.hasUI) return;
-        const config = loadConfig(ctx.cwd);
+        const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
+        const projectTrusted = trustContext.isProjectTrusted?.() ?? projectConfigTrusted;
+        const config = loadSandboxConfig(ctx.cwd, projectTrusted);
         const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
         const windowsImplementation =
           process.platform === 'win32' ? activeWindowsImplementation() : undefined;
+        const target = getSandboxConfigWriteTarget(ctx.cwd, projectTrusted);
+        let tab: 'Overview' | 'Policy' = 'Overview';
         const shouldToggle = await ctx.ui.custom<boolean>(
-          (_tui, theme, _kb, done) => {
-            const { dim, muted, accent, text } = themeColors(theme);
+          (tui, theme, _kb, done) => {
+            const { muted, accent, text } = themeColors(theme);
 
-            function sandboxStatus(): { color: 'success' | 'warning'; label: string } {
-              if (noSandboxFlag) return { color: 'warning', label: 'Disabled (--no-sandbox)' };
-              if (!config.enabled) return { color: 'warning', label: 'Disabled' };
+            const sandboxStatus = (): { color: 'success' | 'warning'; label: string } => {
+              if (noSandboxFlag) return { color: 'warning', label: 'Disabled by --no-sandbox' };
+              if (!config.enabled) return { color: 'warning', label: 'Disabled by configuration' };
               if (!sandboxEnabled || !sandboxReady) return { color: 'warning', label: 'Inactive' };
               return { color: 'success', label: 'Active' };
-            }
-
-            function boolValue(value: boolean): string {
-              return value ? theme.fg('warning', 'yes') : theme.fg('success', 'no');
-            }
+            };
+            const networkMode = config.network.allowNetwork
+              ? 'Unrestricted'
+              : windowsImplementation === 'appContainer' && !config.windows.allowLoopback
+                ? 'Blocked'
+                : 'Proxied';
 
             return {
               render(width: number): string[] {
                 const innerWidth = Math.max(1, width - 4);
-                const row = (content = '') => boxRow(theme, width, content);
-                const lines = [boxTop(theme, width, 'Sandbox')];
                 const status = sandboxStatus();
-                const statusDot = theme.fg(status.color, '●');
-                const pathSnippet = text(
-                  truncateToWidth(landstripDisplayPath(), Math.max(20, innerWidth - 28)),
-                );
-                const section = (title: string, detail?: string): void => {
-                  lines.push(row(''));
-                  lines.push(row(`${accent(title)}${detail ? dim(` · ${detail}`) : ''}`));
-                };
-                const item = (label: string, value: string): void => {
-                  lines.push(row(`  ${dim('•')} ${muted(label.padEnd(13))} ${value}`));
-                };
+                const tabs = dialogTabs(theme, ['Overview', 'Policy'], tab);
                 const listValue = (values: string[]): string => {
                   const value = values.join(', ') || 'none';
-                  return text(truncateToWidth(value, Math.max(10, innerWidth - 17)));
+                  return text(truncateToWidth(value, Math.max(10, innerWidth - 20)));
                 };
+                const item = (label: string, value: string): string =>
+                  `  ${muted(label.padEnd(16))} ${value}`;
+                const footer = dialogKeys(theme, [
+                  ['Tab', 'next tab'],
+                  ['Enter', `${config.enabled ? 'disable' : 'enable'} in ${target.scope}`],
+                  ['Esc', 'close'],
+                ]);
+                const content: string[] = [tabs, ''];
 
-                lines.push(
-                  row(
-                    `${statusDot} ${text(status.label)} ${dim('·')} ${muted('landstrip')} ${pathSnippet}`,
-                  ),
-                );
-
-                section('Config');
-                item('project', text(projectPath));
-                item('global', text(globalPath));
-
-                const networkMode = config.network.allowNetwork
-                  ? 'unrestricted'
-                  : windowsImplementation === 'appContainer' && !config.windows.allowLoopback
-                    ? 'blocked'
-                    : 'proxied';
-                section('Network', networkMode);
-                item('allow network', boolValue(config.network.allowNetwork));
-                item('allowed', listValue(config.network.allowedDomains));
-                item('denied', listValue(config.network.deniedDomains));
-                item(
-                  'unix sockets',
-                  config.network.allowAllUnixSockets
-                    ? text('all')
-                    : listValue(config.network.allowUnixSockets),
-                );
-                if (sessionAllowedDomains.length > 0) {
-                  item('session', theme.fg('accent', sessionAllowedDomains.join(', ')));
-                }
-
-                section('Filesystem');
-                item('deny read', listValue(config.filesystem.denyRead));
-                item('allow read', listValue(config.filesystem.allowRead));
-                item('allow write', listValue(config.filesystem.allowWrite));
-                item('deny write', listValue(config.filesystem.denyWrite));
-
-                if (windowsImplementation !== undefined) {
-                  section('Windows');
-                  item(
-                    'implementation',
-                    text(
-                      windowsImplementation === 'restrictedUser'
-                        ? 'restricted user'
-                        : 'AppContainer',
+                if (tab === 'Overview') {
+                  content.push(
+                    `${theme.fg(status.color, '●')} ${text(status.label)}`,
+                    item(
+                      'Configured',
+                      config.enabled ? text('Enabled') : theme.fg('warning', 'Disabled'),
+                    ),
+                    item(
+                      'Runtime',
+                      sandboxEnabled && sandboxReady
+                        ? theme.fg('success', 'Running')
+                        : muted('Not running'),
+                    ),
+                    '',
+                    accent('Protection'),
+                    item('Network', text(networkMode)),
+                    item(
+                      'Filesystem',
+                      text(
+                        `${config.filesystem.denyRead.length + config.filesystem.allowRead.length} read rules, ${config.filesystem.allowWrite.length + config.filesystem.denyWrite.length} write rules`,
+                      ),
+                    ),
+                    item(
+                      'Session grants',
+                      text(
+                        String(
+                          sessionAllowedDomains.length +
+                            sessionAllowedReadPaths.length +
+                            sessionAllowedWritePaths.length,
+                        ),
+                      ),
+                    ),
+                    '',
+                    accent('Configuration'),
+                    item('Change scope', text(target.scope === 'project' ? 'Project' : 'Global')),
+                    item(
+                      'Change file',
+                      text(truncateToWidth(target.path, Math.max(10, innerWidth - 20))),
+                    ),
+                    item(
+                      'Project file',
+                      text(truncateToWidth(projectPath, Math.max(10, innerWidth - 20))),
+                    ),
+                    item(
+                      'Global file',
+                      text(truncateToWidth(globalPath, Math.max(10, innerWidth - 20))),
+                    ),
+                    item(
+                      'Landstrip binary',
+                      text(truncateToWidth(landstripDisplayPath(), Math.max(10, innerWidth - 20))),
                     ),
                   );
-                  if (windowsImplementation === 'appContainer') {
-                    const mode = config.windows.appContainerMode;
-                    item(
-                      'container',
-                      mode === 'standard' ? theme.fg('warning', `${mode} (weaker)`) : text(mode),
+                  if (windowsImplementation !== undefined) {
+                    content.push(
+                      item(
+                        'Windows mode',
+                        text(
+                          windowsImplementation === 'restrictedUser'
+                            ? 'Restricted user'
+                            : `AppContainer (${config.windows.appContainerMode})`,
+                        ),
+                      ),
                     );
-                    item('loopback', boolValue(config.windows.allowLoopback));
                   }
+                } else {
+                  content.push(
+                    accent(`Network · ${networkMode}`),
+                    item('Allowed domains', listValue(config.network.allowedDomains)),
+                    item('Denied domains', listValue(config.network.deniedDomains)),
+                    item(
+                      'Unix sockets',
+                      config.network.allowAllUnixSockets
+                        ? text('all')
+                        : listValue(config.network.allowUnixSockets),
+                    ),
+                    '',
+                    accent('Filesystem'),
+                    item('Denied reads', listValue(config.filesystem.denyRead)),
+                    item('Allowed reads', listValue(config.filesystem.allowRead)),
+                    item('Allowed writes', listValue(config.filesystem.allowWrite)),
+                    item('Denied writes', listValue(config.filesystem.denyWrite)),
+                    '',
+                    accent('Session grants'),
+                    item('Domains', listValue(sessionAllowedDomains)),
+                    item('Read paths', listValue(sessionAllowedReadPaths)),
+                    item('Write paths', listValue(sessionAllowedWritePaths)),
+                  );
                 }
 
-                if (sessionAllowedReadPaths.length > 0 || sessionAllowedWritePaths.length > 0) {
-                  section('Session grants');
-                  if (sessionAllowedReadPaths.length > 0) {
-                    item('read', theme.fg('accent', sessionAllowedReadPaths.join(', ')));
-                  }
-                  if (sessionAllowedWritePaths.length > 0) {
-                    item('write', theme.fg('accent', sessionAllowedWritePaths.join(', ')));
-                  }
-                }
-
-                lines.push(
-                  row(''),
-                  row(
-                    `${dim('enter')} ${muted(config.enabled ? 'disable' : 'enable')}  ${dim('esc')} ${muted('close')}`,
-                  ),
+                content.push('', footer);
+                return [
+                  boxTop(theme, width, 'Sandbox'),
+                  ...content.map((line) => boxRow(theme, width, line)),
                   boxBottom(theme, width),
-                );
-                return lines;
+                ];
               },
 
               handleInput(data: string): void {
+                if (matchesKey(data, 'tab')) {
+                  tab = tab === 'Overview' ? 'Policy' : 'Overview';
+                  tui.requestRender();
+                  return;
+                }
                 if (matchesKey(data, 'return')) {
                   done(true);
                   return;
@@ -2868,8 +2895,15 @@ export function createLandstripIntegration(
         if (!shouldToggle) return;
 
         const enabled = !config.enabled;
+        if (!enabled) {
+          const confirmed = await ctx.ui.confirm(
+            'Disable sandbox?',
+            `Commands will run without OS isolation.\n\nChange: ${target.scope} configuration\n${target.path}`,
+          );
+          if (!confirmed) return;
+        }
         try {
-          const scope = await setSandboxConfigEnabled(ctx.cwd, enabled, projectConfigTrusted);
+          const scope = await setSandboxConfigEnabled(ctx.cwd, enabled, projectTrusted);
           if (!enabled) {
             disableSandbox(ctx);
           } else if (!noSandboxFlag) {
