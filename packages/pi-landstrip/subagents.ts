@@ -26,7 +26,13 @@ import {
   type Theme,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
-import { matchesKey, Text, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
+import {
+  matchesKey,
+  Text,
+  truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
+} from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 
 import { encodeLandstripContext, type LandstripContextV1, LANDSTRIP_CONTEXT_ENV } from './api.ts';
@@ -45,7 +51,7 @@ import {
   deleteProjectAgent,
   prepareProjectAgentEditor,
 } from './agent-files.ts';
-import { boxBottom, boxRow, boxTop } from './box.ts';
+import { boxBottom, boxRow, boxTop, dialogKeys, dialogTabs } from './box.ts';
 import {
   clearAgentDisabledForScope,
   clearMaxSubagentsConfigForScope,
@@ -73,22 +79,6 @@ const packageDir = dirname(fileURLToPath(import.meta.url));
 const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
 const INSPECTOR_BODY_LINES = 16;
 const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
-const AGENTS_HELP_ROWS = [
-  ['Tab', 'Next tab'],
-  ['Shift+Tab', 'Change scope'],
-  ['↑ / ↓', 'Select item or scroll task output'],
-  ['← / →', 'Previous / next task with same parent'],
-  ['Enter', 'Open / activate / save'],
-  ['Esc', 'Back / close'],
-  ['Ctrl+C', 'Close'],
-  ['D / Space', 'Toggle agent'],
-  ['Space', 'Toggle sandbox'],
-  ['I', 'Use global value'],
-  ['0-9 / + / -', 'Set subagent limit'],
-  ['P / Backspace', 'Parent task'],
-  ['Ctrl+G', 'Edit agent'],
-  ['Ctrl+D', 'Delete agent'],
-] as const;
 type PiThinkingLevel = Parameters<ExtensionAPI['setThinkingLevel']>[0];
 
 interface PiPackage {
@@ -892,7 +882,7 @@ export class SubagentRuntime {
     }
 
     const projectTrusted = isProjectTrusted(ctx);
-    const tasks = [...this.tasks.values()];
+    let tasks = [...this.tasks.values()];
     const requested = args.trim();
     let scope: SandboxConfigScope = projectTrusted ? 'project' : 'global';
     let catalog = this.getAgentCatalog(ctx);
@@ -905,7 +895,7 @@ export class SubagentRuntime {
     let maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
     const sandboxCallbacks = this.integration.sandboxCallbacks;
     let sandboxSettings = sandboxCallbacks?.load(ctx.cwd, projectTrusted) ?? { global: true };
-    let tab: 'agents' | 'tasks' | 'settings' | 'help' = requested ? 'tasks' : 'agents';
+    let tab: 'agents' | 'tasks' | 'settings' = requested ? 'tasks' : 'agents';
     let selectedAgent = Math.max(
       0,
       agents.findIndex((agent) => agent.name === this.primaryAgent?.name),
@@ -941,6 +931,14 @@ export class SubagentRuntime {
     const reloadSettings = (): void => {
       maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
       sandboxSettings = sandboxCallbacks?.load(ctx.cwd, projectTrusted) ?? { global: true };
+    };
+    const refreshTasks = (): void => {
+      const selectedId = tasks[selectedTask]?.id;
+      tasks = [...this.tasks.values()];
+      const nextSelected = selectedId
+        ? tasks.findIndex((task) => task.id === selectedId)
+        : selectedTask;
+      selectedTask = Math.max(0, Math.min(nextSelected < 0 ? 0 : nextSelected, tasks.length - 1));
     };
     const refreshAgentRuntime = async (name: string): Promise<void> => {
       reloadAgents();
@@ -988,15 +986,12 @@ export class SubagentRuntime {
             const clipped = truncateToWidth(value, cellWidth);
             return `${clipped}${' '.repeat(Math.max(0, cellWidth - visibleWidth(clipped)))}`;
           };
-          const tabLabel = (label: string, active: boolean) =>
-            active ? theme.fg('accent', theme.bold(`[${label}]`)) : theme.fg('muted', label);
-          const tabs = `${tabLabel('Agents', tab === 'agents')}  ${tabLabel(
-            'Tasks',
-            tab === 'tasks',
-          )}  ${tabLabel('Settings', tab === 'settings')}  ${tabLabel('Help', tab === 'help')}  ${theme.fg(
-            'dim',
-            `· ${scope === 'project' ? 'Project' : 'Global'} scope`,
-          )}`;
+          refreshTasks();
+          const tabs = `${dialogTabs(theme, ['Agents', 'Tasks', 'Settings'], `${tab[0]?.toUpperCase()}${tab.slice(1)}`)}${
+            tab === 'tasks'
+              ? ''
+              : theme.fg('dim', `  ·  Scope: ${scope === 'project' ? 'Project' : 'Global'}`)
+          }`;
 
           if (tab === 'agents') {
             const start = Math.max(0, Math.min(selectedAgent - 3, agents.length - 7));
@@ -1005,43 +1000,42 @@ export class SubagentRuntime {
               20,
               Math.max(5, ...agents.map((agent) => visibleWidth(`@${agent.name}`))),
             );
+            const primaryWidth = 7;
             const modeWidth = 8;
             const sourceWidth = 8;
-            const disabledWidth = 8;
-            const fixedWidth = 4 + nameWidth + 1 + modeWidth + 1 + sourceWidth + 1 + disabledWidth;
+            const stateWidth = 13;
+            const fixedWidth =
+              2 + primaryWidth + 1 + nameWidth + 1 + modeWidth + 1 + sourceWidth + 1 + stateWidth;
             const modelWidth = Math.max(10, Math.min(30, contentWidth - fixedWidth - 1));
             const lines = [
               tabs,
               '',
               theme.fg(
                 'dim',
-                `    ${pad('Agent', nameWidth)} ${pad('Mode', modeWidth)} ${pad(
+                `  ${pad('Primary', primaryWidth)} ${pad('Agent', nameWidth)} ${pad('Mode', modeWidth)} ${pad(
                   'Source',
                   sourceWidth,
-                )} ${pad('Model', modelWidth)} ${pad('Disabled', disabledWidth)}`,
+                )} ${pad('Model', modelWidth)} ${pad('State', stateWidth)}`,
               ),
             ];
             for (const [offset, agent] of shown.entries()) {
               const index = start + offset;
               const selected = index === selectedAgent;
               const cursor = selected ? theme.fg('accent', '›') : ' ';
-              const active =
-                agent.name === this.primaryAgent?.name
-                  ? theme.fg('success', '●')
-                  : theme.fg('dim', '○');
+              const primary = agent.name === this.primaryAgent?.name ? 'yes' : '';
               const current = scopedAgent(agent);
               const unavailable = current === undefined;
               const scopedDisabled = current?.disabled ?? false;
               const disabled = agent.disabled;
               const deleting = confirmingDeleteAgent === agent.name;
               const inherited = scope === 'project' && !disabledOverrides.project.has(agent.name);
-              const toggle = unavailable
-                ? 'n/a'
+              const state = unavailable
+                ? 'unavailable'
                 : inherited
-                  ? '[-]'
+                  ? `inherited ${scopedDisabled ? 'off' : 'on'}`
                   : scopedDisabled
-                    ? '[x]'
-                    : '[ ]';
+                    ? 'disabled'
+                    : 'enabled';
               const color = deleting ? 'error' : disabled ? 'muted' : 'text';
               const plainName = pad(`@${agent.name}`, nameWidth);
               const name = deleting
@@ -1052,12 +1046,15 @@ export class SubagentRuntime {
                       theme.fg(agentColor as Parameters<Theme['fg']>[0], text),
                     );
               lines.push(
-                `${cursor} ${active} ${name} ${theme.fg(color, pad(agent.mode, modeWidth))} ${theme.fg(
+                `${cursor} ${theme.fg(primary ? 'success' : 'dim', pad(primary, primaryWidth))} ${name} ${theme.fg(
                   color,
-                  pad(agent.source, sourceWidth),
-                )} ${theme.fg(color, pad(agent.model ?? 'current model', modelWidth))} ${theme.fg(
+                  pad(agent.mode, modeWidth),
+                )} ${theme.fg(color, pad(agent.source, sourceWidth))} ${theme.fg(
+                  color,
+                  pad(agent.model ?? 'current model', modelWidth),
+                )} ${theme.fg(
                   deleting ? 'error' : unavailable ? 'muted' : scopedDisabled ? 'warning' : color,
-                  pad(toggle, disabledWidth),
+                  pad(state, stateWidth),
                 )}`,
               );
             }
@@ -1095,9 +1092,11 @@ export class SubagentRuntime {
               if (agent.variant && !PI_THINKING_LEVELS.has(agent.variant)) {
                 unsupported.push(`variant=${agent.variant}`);
               }
-              lines.push(
-                `${theme.fg('dim', 'Unsupported RPC options:')} ${theme.fg('text', unsupported.join(', ') || 'none')}`,
-              );
+              if (unsupported.length > 0) {
+                lines.push(
+                  `${theme.fg('dim', 'Unsupported RPC options:')} ${theme.fg('text', unsupported.join(', '))}`,
+                );
+              }
             }
             if (catalog.diagnostics.length > 0) {
               lines.push(theme.fg('error', 'Catalog diagnostics'));
@@ -1105,13 +1104,37 @@ export class SubagentRuntime {
                 lines.push(`  ${theme.fg('error', diagnostic)}`);
               }
             }
+            lines.push('');
             if (confirmingDeleteAgent) {
               lines.push(
-                '',
-                theme.fg('error', `Delete @${confirmingDeleteAgent}?  enter confirm  esc cancel`),
+                theme.fg(
+                  'error',
+                  `Delete @${confirmingDeleteAgent}? This removes its project file.`,
+                ),
+                dialogKeys(theme, [
+                  ['Y', 'delete'],
+                  ['N / Esc', 'cancel'],
+                ]),
               );
             } else if (saving) {
-              lines.push('', theme.fg('dim', 'Saving…'));
+              lines.push(theme.fg('dim', 'Saving…'));
+            } else {
+              const mainHints: Array<readonly [string, string]> = [['↑↓', 'select']];
+              if (agent && !agent.disabled && agentSupportsMode(agent, 'primary')) {
+                mainHints.push(['Enter', 'set primary']);
+              }
+              if (agent && scopedAgent(agent)) mainHints.push(['Space', 'enable / disable']);
+              const actionHints: Array<readonly [string, string]> = [];
+              if (agent && projectTrusted) actionHints.push(['E', 'edit']);
+              if (agent && projectTrusted && canDeleteProjectAgent(ctx.cwd, agent)) {
+                actionHints.push(['X', 'delete']);
+              }
+              if (agent && scope === 'project' && disabledOverrides.project.has(agent.name)) {
+                actionHints.push(['I', 'inherit']);
+              }
+              if (projectTrusted) actionHints.push(['S', 'scope']);
+              actionHints.push(['Tab', 'next tab'], ['Esc', 'close']);
+              lines.push(dialogKeys(theme, mainHints), dialogKeys(theme, actionHints));
             }
             return box(lines);
           }
@@ -1144,33 +1167,39 @@ export class SubagentRuntime {
                 ? theme.fg('accent', text)
                 : theme.fg(row.unavailable ? 'muted' : 'text', text);
               const label = theme.fg(row.unavailable ? 'muted' : 'text', row.label);
-              lines.push(`${cursor} ${value} ${label}`);
+              const dirty = dirtySettings.has(index) ? theme.fg('warning', ' *') : '';
+              lines.push(`${cursor} ${value} ${label}${dirty}`);
             }
-            if (selectedMaxSubagents() === 0) {
-              lines.push(`    ${theme.fg('dim', 'Subagents disabled')}`);
-            }
-            if (saving) lines.push('', theme.fg('dim', 'Saving…'));
-            return box(lines);
-          }
-
-          if (tab === 'help') {
-            const shortcutWidth = Math.max(
-              visibleWidth('Shortcut'),
-              ...AGENTS_HELP_ROWS.map(([shortcut]) => visibleWidth(shortcut)),
-            );
-            const descriptionWidth = Math.max(1, contentWidth - shortcutWidth - 4);
-            const lines = [
-              tabs,
+            lines.push(
               '',
-              theme.fg('dim', `  ${pad('Shortcut', shortcutWidth)}  Description`),
-              ...AGENTS_HELP_ROWS.map(
-                ([shortcut, description]) =>
-                  `  ${theme.fg('accent', pad(shortcut, shortcutWidth))}  ${theme.fg(
-                    'text',
-                    truncateToWidth(description, descriptionWidth),
-                  )}`,
+              theme.fg(
+                'dim',
+                selectedSetting === 0
+                  ? 'Sets concurrent subagents. Zero disables the task tool.'
+                  : 'Controls OS sandboxing. Use /sandbox to inspect its policy.',
               ),
-            ];
+            );
+            if (saving) {
+              lines.push('', theme.fg('dim', 'Saving…'));
+            } else {
+              const editHints: Array<readonly [string, string]> = [['↑↓', 'select']];
+              if (selectedSetting === 0) editHints.push(['0–9 / +−', 'change limit']);
+              else if (sandboxCallbacks) editHints.push(['Space', 'toggle']);
+              const canInherit =
+                scope === 'project' &&
+                (selectedSetting === 0
+                  ? maxSubagentsSettings.project !== undefined
+                  : sandboxSettings.project !== undefined);
+              if (canInherit) editHints.push(['I', 'inherit']);
+              const actionHints: Array<readonly [string, string]> = [];
+              if (dirtySettings.size > 0) {
+                if (dirtySettings.has(selectedSetting)) actionHints.push(['Enter', 'save']);
+                actionHints.push(['R', 'discard']);
+              } else {
+                actionHints.push(['S', 'scope'], ['Tab', 'next tab'], ['Esc', 'close']);
+              }
+              lines.push('', dialogKeys(theme, editHints), dialogKeys(theme, actionHints));
+            }
             return box(lines);
           }
 
@@ -1190,23 +1219,29 @@ export class SubagentRuntime {
                 );
               }
             }
+            lines.push(
+              '',
+              dialogKeys(theme, [
+                ['↑↓', 'select'],
+                ['Enter', 'inspect'],
+                ['Tab', 'next tab'],
+                ['Esc', 'close'],
+              ]),
+            );
             return box(lines);
           }
 
           const task = tasks[selectedTask];
           if (!task) return box([tabs, '', 'No task sessions in this session.']);
-          const siblings = tasks.filter(
-            (candidate) => candidate.parentTaskId === task.parentTaskId,
+          const transcript = taskTranscript(task).flatMap((line) =>
+            wrapTextWithAnsi(line, contentWidth),
           );
-          const siblingIndex = siblings.findIndex((candidate) => candidate.id === task.id);
-          const transcript = taskTranscript(task).flatMap((line) => line.split('\n'));
           const maxScroll = Math.max(0, transcript.length - INSPECTOR_BODY_LINES);
           scroll = Math.min(scroll, maxScroll);
           const shown = transcript.slice(scroll, scroll + INSPECTOR_BODY_LINES);
           const duration = taskDuration(taskDetails(task));
           const metrics = [
             task.id,
-            `${siblingIndex + 1} of ${siblings.length}`,
             task.toolCalls === undefined
               ? undefined
               : `${task.toolCalls} tool call${task.toolCalls === 1 ? '' : 's'}`,
@@ -1223,19 +1258,28 @@ export class SubagentRuntime {
           while (lines.length < INSPECTOR_BODY_LINES + 5) lines.push('');
           if (transcript.length > INSPECTOR_BODY_LINES) {
             lines.push(
-              theme.fg('dim', `${scroll + 1}-${scroll + shown.length} of ${transcript.length}`),
+              theme.fg('dim', `${scroll + 1}–${scroll + shown.length} of ${transcript.length}`),
             );
           }
+          lines.push(
+            '',
+            dialogKeys(theme, [
+              ['↑↓', 'scroll'],
+              ...(task.parentTaskId ? ([['Backspace', 'parent']] as const) : []),
+              ['Esc', 'task list'],
+              ['Tab', 'next tab'],
+            ]),
+          );
           return box(lines.map((line) => truncateToWidth(line, contentWidth)));
         },
         handleInput: (data: string) => {
           if (confirmingDeleteAgent !== undefined) {
-            if (matchesKey(data, 'escape')) {
+            if (matchesKey(data, 'escape') || data.toLowerCase() === 'n') {
               confirmingDeleteAgent = undefined;
               tui.requestRender();
               return;
             }
-            if (matchesKey(data, 'return')) {
+            if (data.toLowerCase() === 'y') {
               const name = confirmingDeleteAgent;
               const agent = agents.find((candidate) => candidate.name === name);
               confirmingDeleteAgent = undefined;
@@ -1261,14 +1305,17 @@ export class SubagentRuntime {
             }
             return;
           }
-          if (matchesKey(data, 'shift+tab')) {
+          if (data.toLowerCase() === 's' && tab !== 'tasks') {
             if (saving) return;
+            if (dirtySettings.size > 0) {
+              ctx.ui.notify('Save or discard settings changes before changing scope', 'warning');
+              return;
+            }
             if (!projectTrusted && scope === 'global') {
               ctx.ui.notify('Project settings require a trusted project', 'warning');
               return;
             }
             scope = scope === 'project' ? 'global' : 'project';
-            dirtySettings.clear();
             editing = false;
             reloadAgents();
             reloadSettings();
@@ -1276,7 +1323,14 @@ export class SubagentRuntime {
             return;
           }
           if (matchesKey(data, 'tab')) {
-            const tabs = ['agents', 'tasks', 'settings', 'help'] as const;
+            if (tab === 'settings' && dirtySettings.size > 0) {
+              ctx.ui.notify(
+                'Save changes with Enter or discard them with R before leaving',
+                'warning',
+              );
+              return;
+            }
+            const tabs = ['agents', 'tasks', 'settings'] as const;
             tab = tabs[(tabs.indexOf(tab) + 1) % tabs.length] ?? 'agents';
             detail = false;
             editing = false;
@@ -1294,13 +1348,19 @@ export class SubagentRuntime {
             if (matchesKey(data, 'up')) selectedAgent = Math.max(0, selectedAgent - 1);
             else if (matchesKey(data, 'down') && agents.length > 0) {
               selectedAgent = Math.min(agents.length - 1, selectedAgent + 1);
-            } else if (matchesKey(data, 'ctrl+d') && agent && !saving) {
-              if (!projectTrusted || !canDeleteProjectAgent(ctx.cwd, agent)) return;
+            } else if (data.toLowerCase() === 'x' && agent && !saving) {
+              if (!projectTrusted || !canDeleteProjectAgent(ctx.cwd, agent)) {
+                ctx.ui.notify('Only project agent files can be deleted here', 'warning');
+                return;
+              }
               confirmingDeleteAgent = agent.name;
               tui.requestRender();
               return;
-            } else if (matchesKey(data, 'ctrl+g') && agent && !saving) {
-              if (!projectTrusted) return;
+            } else if (data.toLowerCase() === 'e' && agent && !saving) {
+              if (!projectTrusted) {
+                ctx.ui.notify('Agent editing requires a trusted project', 'warning');
+                return;
+              }
               saving = true;
               void (async () => {
                 const document = prepareProjectAgentEditor(ctx.cwd, agent);
@@ -1318,7 +1378,7 @@ export class SubagentRuntime {
                   tui.requestRender();
                 });
               return;
-            } else if ((data === 'd' || data === ' ') && agent && !saving) {
+            } else if (data === ' ' && agent && !saving) {
               const current = scopedAgent(agent);
               if (!current) {
                 ctx.ui.notify('Local-only agents are unavailable in Global scope', 'warning');
@@ -1342,7 +1402,7 @@ export class SubagentRuntime {
                   tui.requestRender();
                 });
               return;
-            } else if (data === 'i' && scope === 'project' && agent && !saving) {
+            } else if (data.toLowerCase() === 'i' && scope === 'project' && agent && !saving) {
               if (!disabledOverrides.project.has(agent.name)) return;
               saving = true;
               void clearAgentDisabledForScope(ctx.cwd, agent.name, 'project')
@@ -1370,6 +1430,14 @@ export class SubagentRuntime {
                   ctx.ui.notify(`Could not select primary agent: ${formatError(error)}`, 'error'),
                 );
               return;
+            } else if (matchesKey(data, 'return') && agent) {
+              ctx.ui.notify(
+                agent.disabled
+                  ? 'Enable this agent before setting it as primary'
+                  : 'This agent cannot be used as the primary agent',
+                'warning',
+              );
+              return;
             } else return;
             tui.requestRender();
             return;
@@ -1378,7 +1446,21 @@ export class SubagentRuntime {
           if (tab === 'settings') {
             if (saving) return;
             if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) {
+              if (dirtySettings.size > 0) {
+                ctx.ui.notify(
+                  'Save changes with Enter or discard them with R before closing',
+                  'warning',
+                );
+                return;
+              }
               done();
+              return;
+            }
+            if (data.toLowerCase() === 'r') {
+              reloadSettings();
+              dirtySettings.clear();
+              editing = false;
+              tui.requestRender();
               return;
             }
             if (matchesKey(data, 'up')) {
@@ -1471,11 +1553,6 @@ export class SubagentRuntime {
             return;
           }
 
-          if (tab === 'help') {
-            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
-            return;
-          }
-
           if (!detail) {
             if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
             else if (matchesKey(data, 'up')) selectedTask = Math.max(0, selectedTask - 1);
@@ -1500,21 +1577,12 @@ export class SubagentRuntime {
             scroll = Math.max(0, scroll - 1);
           } else if (matchesKey(data, 'down')) {
             scroll += 1;
-          } else if (data === 'p' || matchesKey(data, 'backspace')) {
+          } else if (matchesKey(data, 'backspace')) {
             const parentIndex = task.parentTaskId
               ? tasks.findIndex((candidate) => candidate.id === task.parentTaskId)
               : -1;
             if (parentIndex >= 0) selectedTask = parentIndex;
             else detail = false;
-            scroll = 0;
-          } else if (matchesKey(data, 'left') || matchesKey(data, 'right')) {
-            const siblings = tasks.filter(
-              (candidate) => candidate.parentTaskId === task.parentTaskId,
-            );
-            const siblingIndex = siblings.findIndex((candidate) => candidate.id === task.id);
-            const offset = matchesKey(data, 'left') ? -1 : 1;
-            const sibling = siblings[siblingIndex + offset];
-            if (sibling) selectedTask = tasks.indexOf(sibling);
             scroll = 0;
           } else return;
           tui.requestRender();
