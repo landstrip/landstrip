@@ -76,8 +76,8 @@ const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', '
 const AGENTS_HELP_ROWS = [
   ['Tab', 'Next tab'],
   ['Shift+Tab', 'Change scope'],
-  ['↑ / ↓', 'Select or scroll'],
-  ['← / →', 'Sibling task'],
+  ['↑ / ↓', 'Select item or scroll task output'],
+  ['← / →', 'Previous / next task with same parent'],
   ['Enter', 'Open / activate / save'],
   ['Esc', 'Back / close'],
   ['Ctrl+C', 'Close'],
@@ -1478,8 +1478,6 @@ export class SubagentRuntime {
 
           if (!detail) {
             if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
-            else if (matchesKey(data, 'left')) tab = 'agents';
-            else if (matchesKey(data, 'right')) tab = 'settings';
             else if (matchesKey(data, 'up')) selectedTask = Math.max(0, selectedTask - 1);
             else if (matchesKey(data, 'down') && tasks.length > 0) {
               selectedTask = Math.min(tasks.length - 1, selectedTask + 1);

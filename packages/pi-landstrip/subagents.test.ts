@@ -1148,6 +1148,10 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(tasks).not.toContain('Tasks 2');
   expect(tasks).toContain('task-123');
   expect(tasks).toContain('Failed child');
+  component?.handleInput('\x1b[D');
+  expect(component?.render(96).join('\n')).toContain('[Tasks]');
+  component?.handleInput('\x1b[C');
+  expect(component?.render(96).join('\n')).toContain('[Tasks]');
   component?.handleInput('\r');
   const detail = component?.render(96).join('\n') ?? '';
   expect(detail).toContain('Inspect this child session.');
@@ -1214,6 +1218,8 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(help).toMatch(/Shortcut\s+Description/);
   expect(help).toMatch(/Ctrl\+G\s+Edit agent/);
   expect(help).toMatch(/P \/ Backspace\s+Parent task/);
+  expect(help).toMatch(/↑ \/ ↓\s+Select item or scroll task output/);
+  expect(help).toMatch(/← \/ →\s+Previous \/ next task with same parent/);
   expect(help).not.toContain('tab next');
   component?.handleInput('\t');
   expect(component?.render(96).join('\n')).toContain('[Agents]  Tasks  Settings  Help');
