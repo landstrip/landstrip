@@ -57,7 +57,7 @@ function updateLock(lockPath, packageNamesToUpdate) {
   fs.writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
 }
 
-updateLock("package-lock.json", platformPackages);
+updateLock("package-lock.json", packageNames);
 for (const extensionDir of extensionDirs) {
   updateLock(`${extensionDir}/package-lock.json`, packageNames);
 }

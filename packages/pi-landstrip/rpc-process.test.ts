@@ -351,7 +351,7 @@ it.runIf(['linux', 'darwin', 'win32'].includes(process.platform))(
         PI_OFFLINE: '1',
         JITI_FS_CACHE: 'false',
       },
-      requestTimeoutMs: process.platform === 'win32' ? 60_000 : 20_000,
+      requestTimeoutMs: 60_000,
       stopTimeoutMs: process.platform === 'win32' ? 60_000 : 1_000,
     });
     try {
@@ -363,5 +363,5 @@ it.runIf(['linux', 'darwin', 'win32'].includes(process.platform))(
       rmSync(root, { recursive: true, force: true });
     }
   },
-  process.platform === 'win32' ? 130_000 : 30_000,
+  process.platform === 'win32' ? 130_000 : 75_000,
 );

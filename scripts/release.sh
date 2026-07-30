@@ -172,11 +172,16 @@ rootLock.version = nextVersion;
 rootLock.packages[''].version = nextVersion;
 for (const packageName of platformDependencies) {
   rootLock.packages[''].optionalDependencies[packageName] = nextVersion;
-  updateLockedPackage(rootLock, packageName);
 }
-fs.writeFileSync(rootLockPath, `${JSON.stringify(rootLock, null, 2)}\n`);
+updateExtensionLock(rootLock);
 
 for (const packageDir of packageDirs) {
+  const workspacePackage = rootLock.packages[packageDir];
+  if (!workspacePackage) {
+    throw new Error(`package-lock.json does not contain workspace ${packageDir}`);
+  }
+  workspacePackage.version = nextVersion;
+  workspacePackage.dependencies[landstripDependency] = landstripRange;
   const packagePath = `${packageDir}/package.json`;
   const data = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
   data.version = nextVersion;
@@ -191,6 +196,7 @@ for (const packageDir of packageDirs) {
   updateExtensionLock(lock);
   fs.writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
 }
+fs.writeFileSync(rootLockPath, `${JSON.stringify(rootLock, null, 2)}\n`);
 NODE
 
 sed -E -i.bak "s/^([[:space:]]*version[[:space:]]*=[[:space:]]*)\"${core_ver//./\\.}\"/\1\"$next_ver\"/" Cargo.toml
