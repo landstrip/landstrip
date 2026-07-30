@@ -190,36 +190,33 @@ type NotificationLevel = Parameters<ExtensionContext['ui']['notify']>[1];
 
 interface PromptOption {
   label: string;
-  key: string;
   action: PermissionChoice;
   confirm?: boolean;
   hint?: string;
 }
 
 const PERMISSION_OPTIONS: PromptOption[] = [
-  { label: 'Allow once', key: 'o', action: 'once' },
-  { label: 'Allow for this session only', key: 's', action: 'session' },
-  { label: 'Abort (keep blocked)', key: 'esc', action: 'abort' },
+  { label: 'Allow once', action: 'once' },
+  { label: 'Allow for this session', action: 'session' },
   {
     label: 'Allow for this project',
-    key: 'P',
     action: 'project',
     confirm: true,
-    hint: '-> .pi/sandbox.json',
+    hint: 'save to .pi/sandbox.json',
   },
   {
     label: 'Allow for all projects',
-    key: 'A',
     action: 'global',
     confirm: true,
-    hint: '-> ~/.pi/agent/sandbox.json',
+    hint: 'save to ~/.pi/agent/sandbox.json',
   },
+  { label: 'Keep blocked', action: 'abort' },
 ];
 
 const NETWORK_PERMISSION_OPTIONS: PromptOption[] = [
-  { label: 'Allow once', key: 'o', action: 'once' },
-  { label: 'Allow for this session only', key: 's', action: 'session' },
-  { label: 'Abort (keep blocked)', key: 'esc', action: 'abort' },
+  { label: 'Allow once', action: 'once' },
+  { label: 'Allow for this session', action: 'session' },
+  { label: 'Keep blocked', action: 'abort' },
 ];
 
 function loadSandboxConfig(cwd: string, includeProject: boolean): SandboxConfig {
@@ -932,7 +929,7 @@ async function showPermissionPrompt(
   if (!ctx.hasUI) return 'abort';
 
   const labels = options.map((option) =>
-    option.hint ? `${option.label} ${option.hint}` : option.label,
+    option.hint ? `${option.label} — ${option.hint}` : option.label,
   );
   const selected = await ctx.ui.select(title, labels, { signal });
   const index = selected === undefined ? -1 : labels.indexOf(selected);
@@ -940,8 +937,8 @@ async function showPermissionPrompt(
   if (!option) return 'abort';
   if (option.confirm) {
     const confirmed = await ctx.ui.confirm(
-      `Confirm ${option.label.toLowerCase()}`,
-      option.hint ?? 'This changes persisted sandbox policy.',
+      'Save this permission?',
+      `${title}\n\n${option.hint ?? 'This changes persisted sandbox policy.'}`,
       { signal },
     );
     if (!confirmed) return 'abort';
@@ -956,7 +953,7 @@ function promptDomainBlock(
 ): Promise<PermissionChoice> {
   return showPermissionPrompt(
     ctx,
-    `Network blocked: "${domain}" is not in allowedDomains`,
+    `Network blocked: "${domain}" is not in the allowed domains list`,
     PERMISSION_OPTIONS,
     signal,
   );
@@ -1000,7 +997,7 @@ function promptNetworkBlock(
 ): Promise<PermissionChoice> {
   return showPermissionPrompt(
     ctx,
-    `Network blocked: ${operation} to "${target}"`,
+    `Network blocked: ${operation} "${target}"`,
     NETWORK_PERMISSION_OPTIONS,
     signal,
   );

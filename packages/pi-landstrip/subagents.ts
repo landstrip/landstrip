@@ -473,7 +473,7 @@ class PermissionBroker {
       if (signal?.aborted) throw new Error('Permission request cancelled');
       const choice = await ctx.ui.select(
         `${task}: permission required\n${permission}: ${resource}`,
-        ['Allow once', 'Allow for this session', 'Reject'],
+        ['Allow once', 'Allow for this session', 'Keep blocked'],
         { signal },
       );
       if (choice === 'Allow for this session') this.grants.add(key);
