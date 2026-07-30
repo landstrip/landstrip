@@ -1,6 +1,6 @@
 {
   "name": "opencode-landstrip",
-  "version": "0.18.5",
+  "version": "0.18.6",
   "description": "OS-level AI command sandboxing for OpenCode with Landstrip",
   "keywords": [
     "landlock",
@@ -48,7 +48,7 @@
     "ci:test": "npm test"
   },
   "dependencies": {
-    "@landstrip/landstrip": "^0.18.5",
+    "@landstrip/landstrip": "^0.18.6",
     "@opentui/solid": ">=0.3.4",
     "solid-js": "1.9.12"
   },
