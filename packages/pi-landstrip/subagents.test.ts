@@ -862,7 +862,7 @@ test('runs a foreground task in an injected RPC worker', async () => {
       {} as never,
     )
     .render(100);
-  expect(callLines?.join('\n')).toContain('Agent Task (background) — Review implementation');
+  expect(callLines?.join('\n')).toContain('Agent (background) — Review implementation');
 
   const collapsedLines = taskTool
     ?.renderResult?.(

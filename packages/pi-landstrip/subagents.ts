@@ -1673,7 +1673,7 @@ export class SubagentRuntime {
         const background = input.background ? theme.fg('muted', ' (background)') : '';
         const description = input.description?.trim() || '...';
         const agent = input.subagent_type?.trim() || '...';
-        const title = theme.fg('toolTitle', theme.bold('Agent Task'));
+        const title = theme.fg('toolTitle', theme.bold('Agent'));
         return new Text(
           `${title}${background}${theme.fg('muted', ' — ')}${theme.fg('text', description)}\n` +
             theme.fg('dim', `  @${agent}`),
