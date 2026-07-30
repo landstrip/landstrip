@@ -4,7 +4,7 @@
 //! OS-specific sandbox implementations that enforce a lowered engine policy.
 //!
 //! Each target selects its implementation and re-exports its [`execute`] entry
-//! point, so callers depend on `crate::platform::execute` without naming an OS.
+//! point, so callers use this module without naming an OS.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod fallback;
@@ -15,11 +15,24 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use crate::outcome::DoctorReport;
+use crate::engine::outcome::DoctorReport;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::outcome::SandboxImplementation;
+use crate::engine::outcome::SandboxImplementation;
 #[cfg(target_os = "windows")]
-use crate::outcome::WindowsStatusReport;
+use crate::engine::outcome::WindowsStatusReport;
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub(crate) enum WindowsCommand {
+    Install {
+        restricted_accounts: u16,
+        unrestricted_accounts: u16,
+        proxy_port_low: u16,
+        proxy_port_high: u16,
+    },
+    Status,
+    Uninstall,
+}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) use fallback::execute;
@@ -56,9 +69,7 @@ pub(crate) fn validate(_policy: &crate::engine::policy::AccessPolicy) -> anyhow:
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn manage_windows(
-    command: &crate::cli::WindowsCommand,
-) -> anyhow::Result<WindowsStatusReport> {
+pub(crate) fn manage_windows(command: &WindowsCommand) -> anyhow::Result<WindowsStatusReport> {
     windows::manage(command)
 }
 

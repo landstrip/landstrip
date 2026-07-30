@@ -23,7 +23,7 @@ impl TrapFd {
     #[cfg(target_os = "linux")]
     pub(crate) fn is_socket(&self) -> bool {
         self.fd.is_some_and(|fd| {
-            crate::platform::fd::getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE).is_ok()
+            crate::engine::platform::fd::getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE).is_ok()
         })
     }
 

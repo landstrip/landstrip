@@ -3,13 +3,13 @@
 
 //! Windows sandbox implementations.
 
-use crate::cli::WindowsCommand;
+use super::WindowsCommand;
 
 mod appcontainer;
 mod restricted_user;
 
+use crate::engine::outcome::WindowsStatusReport;
 use crate::engine::policy::AccessPolicy;
-use crate::outcome::WindowsStatusReport;
 use anyhow::Result;
 use std::ffi::{OsStr, OsString};
 

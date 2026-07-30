@@ -73,6 +73,22 @@ const packageDir = dirname(fileURLToPath(import.meta.url));
 const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
 const INSPECTOR_BODY_LINES = 16;
 const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const AGENTS_HELP_ROWS = [
+  ['Tab', 'Next tab'],
+  ['Shift+Tab', 'Change scope'],
+  ['↑ / ↓', 'Select or scroll'],
+  ['← / →', 'Sibling task'],
+  ['Enter', 'Open / activate / save'],
+  ['Esc', 'Back / close'],
+  ['Ctrl+C', 'Close'],
+  ['D / Space', 'Toggle agent'],
+  ['Space', 'Toggle sandbox'],
+  ['I', 'Use global value'],
+  ['0-9 / + / -', 'Set subagent limit'],
+  ['P / Backspace', 'Parent task'],
+  ['Ctrl+G', 'Edit agent'],
+  ['Ctrl+D', 'Delete agent'],
+] as const;
 type PiThinkingLevel = Parameters<ExtensionAPI['setThinkingLevel']>[0];
 
 interface PiPackage {
@@ -889,7 +905,7 @@ export class SubagentRuntime {
     let maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
     const sandboxCallbacks = this.integration.sandboxCallbacks;
     let sandboxSettings = sandboxCallbacks?.load(ctx.cwd, projectTrusted) ?? { global: true };
-    let tab: 'agents' | 'tasks' | 'settings' = requested ? 'tasks' : 'agents';
+    let tab: 'agents' | 'tasks' | 'settings' | 'help' = requested ? 'tasks' : 'agents';
     let selectedAgent = Math.max(
       0,
       agents.findIndex((agent) => agent.name === this.primaryAgent?.name),
@@ -968,12 +984,16 @@ export class SubagentRuntime {
             ...lines.map((line) => boxRow(theme, width, line)),
             boxBottom(theme, width),
           ];
+          const pad = (value: string, cellWidth: number): string => {
+            const clipped = truncateToWidth(value, cellWidth);
+            return `${clipped}${' '.repeat(Math.max(0, cellWidth - visibleWidth(clipped)))}`;
+          };
           const tabLabel = (label: string, active: boolean) =>
             active ? theme.fg('accent', theme.bold(`[${label}]`)) : theme.fg('muted', label);
           const tabs = `${tabLabel('Agents', tab === 'agents')}  ${tabLabel(
             'Tasks',
             tab === 'tasks',
-          )}  ${tabLabel('Settings', tab === 'settings')}  ${theme.fg(
+          )}  ${tabLabel('Settings', tab === 'settings')}  ${tabLabel('Help', tab === 'help')}  ${theme.fg(
             'dim',
             `· ${scope === 'project' ? 'Project' : 'Global'} scope`,
           )}`;
@@ -990,10 +1010,6 @@ export class SubagentRuntime {
             const disabledWidth = 8;
             const fixedWidth = 4 + nameWidth + 1 + modeWidth + 1 + sourceWidth + 1 + disabledWidth;
             const modelWidth = Math.max(10, Math.min(30, contentWidth - fixedWidth - 1));
-            const pad = (value: string, cellWidth: number): string => {
-              const clipped = truncateToWidth(value, cellWidth);
-              return `${clipped}${' '.repeat(Math.max(0, cellWidth - visibleWidth(clipped)))}`;
-            };
             const lines = [
               tabs,
               '',
@@ -1089,19 +1105,14 @@ export class SubagentRuntime {
                 lines.push(`  ${theme.fg('error', diagnostic)}`);
               }
             }
-            const canActivate =
-              agent !== undefined && !agent.disabled && agentSupportsMode(agent, 'primary');
-            lines.push(
-              '',
-              confirmingDeleteAgent
-                ? theme.fg('error', `Delete @${confirmingDeleteAgent}?  enter confirm  esc cancel`)
-                : theme.fg(
-                    'dim',
-                    saving
-                      ? 'Saving…'
-                      : `↑↓ select${canActivate ? '  enter activate' : ''}  d toggle  ctrl+d delete  ctrl+g edit  tab next  ⇧tab scope  esc`,
-                  ),
-            );
+            if (confirmingDeleteAgent) {
+              lines.push(
+                '',
+                theme.fg('error', `Delete @${confirmingDeleteAgent}?  enter confirm  esc cancel`),
+              );
+            } else if (saving) {
+              lines.push('', theme.fg('dim', 'Saving…'));
+            }
             return box(lines);
           }
 
@@ -1138,15 +1149,28 @@ export class SubagentRuntime {
             if (selectedMaxSubagents() === 0) {
               lines.push(`    ${theme.fg('dim', 'Subagents disabled')}`);
             }
-            lines.push(
-              '',
-              theme.fg(
-                'dim',
-                saving
-                  ? 'Saving…'
-                  : '↑↓ select  0-9/+/- max  space toggle  i inherit  enter save  tab next  ⇧tab scope  esc close',
-              ),
+            if (saving) lines.push('', theme.fg('dim', 'Saving…'));
+            return box(lines);
+          }
+
+          if (tab === 'help') {
+            const shortcutWidth = Math.max(
+              visibleWidth('Shortcut'),
+              ...AGENTS_HELP_ROWS.map(([shortcut]) => visibleWidth(shortcut)),
             );
+            const descriptionWidth = Math.max(1, contentWidth - shortcutWidth - 4);
+            const lines = [
+              tabs,
+              '',
+              theme.fg('dim', `  ${pad('Shortcut', shortcutWidth)}  Description`),
+              ...AGENTS_HELP_ROWS.map(
+                ([shortcut, description]) =>
+                  `  ${theme.fg('accent', pad(shortcut, shortcutWidth))}  ${theme.fg(
+                    'text',
+                    truncateToWidth(description, descriptionWidth),
+                  )}`,
+              ),
+            ];
             return box(lines);
           }
 
@@ -1166,10 +1190,6 @@ export class SubagentRuntime {
                 );
               }
             }
-            lines.push(
-              '',
-              theme.fg('dim', '↑↓ select  enter inspect  tab next  ⇧tab scope  esc close'),
-            );
             return box(lines);
           }
 
@@ -1206,12 +1226,6 @@ export class SubagentRuntime {
               theme.fg('dim', `${scroll + 1}-${scroll + shown.length} of ${transcript.length}`),
             );
           }
-          lines.push(
-            theme.fg(
-              'dim',
-              'Parent p/backspace  Prev ←  Next →  ↑↓ scroll  tab next  ⇧tab scope  esc back',
-            ),
-          );
           return box(lines.map((line) => truncateToWidth(line, contentWidth)));
         },
         handleInput: (data: string) => {
@@ -1262,7 +1276,7 @@ export class SubagentRuntime {
             return;
           }
           if (matchesKey(data, 'tab')) {
-            const tabs = ['agents', 'tasks', 'settings'] as const;
+            const tabs = ['agents', 'tasks', 'settings', 'help'] as const;
             tab = tabs[(tabs.indexOf(tab) + 1) % tabs.length] ?? 'agents';
             detail = false;
             editing = false;
@@ -1454,6 +1468,11 @@ export class SubagentRuntime {
               return;
             } else return;
             tui.requestRender();
+            return;
+          }
+
+          if (tab === 'help') {
+            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
             return;
           }
 

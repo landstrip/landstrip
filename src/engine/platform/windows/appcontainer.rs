@@ -3,7 +3,7 @@
 
 //! Windows sandbox platform using `AppContainer`.
 
-use crate::config::AppContainerMode;
+use crate::engine::config::AppContainerMode;
 use crate::engine::error::{Cause, Error as LandstripError, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;

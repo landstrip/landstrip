@@ -7,8 +7,8 @@ use super::account;
 use super::lease;
 use super::state::{self, INSTALLATION_VERSION, Installation, NetworkMode};
 use super::wfp;
-use crate::cli::WindowsCommand;
-use crate::outcome::{SandboxImplementation, WindowsStatusReport};
+use crate::engine::outcome::{SandboxImplementation, WindowsStatusReport};
+use crate::engine::platform::WindowsCommand;
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::ffi::OsStr;
@@ -201,7 +201,7 @@ fn uninstall() -> Result<WindowsStatusReport> {
     Ok(WindowsStatusReport::app_container())
 }
 
-pub(in crate::platform::windows) fn status() -> Result<WindowsStatusReport> {
+pub(in crate::engine::platform::windows) fn status() -> Result<WindowsStatusReport> {
     let Some(installation) = state::load_optional()? else {
         return Ok(WindowsStatusReport::app_container());
     };
@@ -236,7 +236,7 @@ pub(in crate::platform::windows) fn status() -> Result<WindowsStatusReport> {
     })
 }
 
-pub(in crate::platform::windows) fn active_implementation() -> Result<&'static str> {
+pub(in crate::engine::platform::windows) fn active_implementation() -> Result<&'static str> {
     let Some(installation) = state::load_optional()? else {
         return Ok("appContainer");
     };

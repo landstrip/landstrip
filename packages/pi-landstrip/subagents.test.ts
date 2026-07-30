@@ -1075,11 +1075,12 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(commandNames).toEqual(['agents']);
   const running = command?.('', ctx);
   const agents = component?.render(96).join('\n') ?? '';
-  expect(agents).toContain('[Agents]  Tasks  Settings  · Project scope');
+  expect(agents).toContain('[Agents]  Tasks  Settings  Help  · Project scope');
   expect(agents).toMatch(/Agent\s+Mode\s+Source\s+Model\s+Disabled/);
   expect(agents).toMatch(/@build\s+primary\s+built-in/);
   expect(agents).toMatch(/@general\s+subagent\s+built-in/);
   expect(agents).toMatch(/@review\s+subagent\s+local/);
+  expect(agents).not.toContain('tab next');
 
   component?.handleInput('\x07');
   await vi.waitFor(() => {
@@ -1137,7 +1138,7 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   component?.handleInput('\x1b[Z');
   const globalAgents = component?.render(96).join('\n') ?? '';
-  expect(globalAgents).toContain('[Agents]  Tasks  Settings  · Global scope');
+  expect(globalAgents).toContain('[Agents]  Tasks  Settings  Help  · Global scope');
   expect(globalAgents).toMatch(/@review\s+subagent\s+local.*n\/a/);
   component?.handleInput('\x1b[Z');
 
@@ -1150,7 +1151,7 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('\r');
   const detail = component?.render(96).join('\n') ?? '';
   expect(detail).toContain('Inspect this child session.');
-  expect(detail).toContain('Parent p/backspace  Prev ←  Next →');
+  expect(detail).not.toContain('Parent p/backspace');
   component?.handleInput('\x1b[C');
   expect(component?.render(96).join('\n')).toContain('Child failed visibly');
   component?.handleInput('\x1b[D');
@@ -1206,6 +1207,16 @@ test('inspects and navigates persisted child sessions without switching sessions
     expect(settings.landstrip.agent.review).toBeDefined();
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
+
+  component?.handleInput('\t');
+  const help = component?.render(96).join('\n') ?? '';
+  expect(help).toContain('Agents  Tasks  Settings  [Help]  · Project scope');
+  expect(help).toMatch(/Shortcut\s+Description/);
+  expect(help).toMatch(/Ctrl\+G\s+Edit agent/);
+  expect(help).toMatch(/P \/ Backspace\s+Parent task/);
+  expect(help).not.toContain('tab next');
+  component?.handleInput('\t');
+  expect(component?.render(96).join('\n')).toContain('[Agents]  Tasks  Settings  Help');
   finishCustom?.();
   await running;
 

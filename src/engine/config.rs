@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::cli::PolicyFormat;
 use crate::engine::error::Error;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -11,6 +10,13 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum PolicyFormat {
+    #[default]
+    Json,
+    Yaml,
+}
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]

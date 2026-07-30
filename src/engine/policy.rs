@@ -12,7 +12,7 @@
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
 //! while lowering the policy.
 
-use crate::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows};
+use crate::engine::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows};
 use crate::engine::error::Error;
 #[cfg(not(target_os = "macos"))]
 use crate::engine::paths::normalize_path;

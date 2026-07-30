@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
+use crate::engine::config::PolicyFormat;
 use crate::engine::error::Error;
+#[cfg(target_os = "windows")]
+use crate::engine::platform::WindowsCommand;
 use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
-use serde::Serialize;
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -15,19 +17,19 @@ const PROGRAM_NAME: &str = "landstrip";
 const RESTRICTED_USER_RUNNER: &str = "landstrip-restricted-user-runner.exe";
 
 #[derive(Debug)]
-pub(crate) struct Invocation {
-    pub(crate) debug: bool,
-    pub(crate) command: Command,
+pub(super) struct Invocation {
+    pub(super) debug: bool,
+    pub(super) command: Command,
 }
 
 #[derive(Debug)]
-pub(crate) enum ParseOutcome {
+pub(super) enum ParseOutcome {
     Invocation(Invocation),
     Display(String),
 }
 
 #[derive(Debug)]
-pub(crate) enum Command {
+pub(super) enum Command {
     Run(RunCommand),
     Policy(PolicyCommand),
     Doctor,
@@ -40,51 +42,45 @@ pub(crate) enum Command {
 }
 
 #[derive(Debug)]
-pub(crate) struct RunCommand {
-    pub(crate) policy: PolicyInput,
+pub(super) struct RunCommand {
+    pub(super) policy: PolicyInput,
     #[cfg(unix)]
-    pub(crate) trap_fd: Option<i32>,
-    pub(crate) tool: OsString,
-    pub(crate) tool_args: Vec<OsString>,
+    pub(super) trap_fd: Option<i32>,
+    pub(super) tool: OsString,
+    pub(super) tool_args: Vec<OsString>,
 }
 
 #[derive(Debug)]
-pub(crate) enum PolicyCommand {
+pub(super) enum PolicyCommand {
     Validate(PolicyRequest),
     Resolve(PolicyRequest),
 }
 
 #[derive(Debug)]
-pub(crate) struct PolicyRequest {
-    pub(crate) policy: PolicyInput,
-    pub(crate) tool: Option<OsString>,
+pub(super) struct PolicyRequest {
+    pub(super) policy: PolicyInput,
+    pub(super) tool: Option<OsString>,
 }
 
-#[cfg(target_os = "windows")]
-#[derive(Debug)]
-pub(crate) enum WindowsCommand {
-    Install {
-        restricted_accounts: u16,
-        unrestricted_accounts: u16,
-        proxy_port_low: u16,
-        proxy_port_high: u16,
-    },
-    Status,
-    Uninstall,
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum PolicyFormat {
-    #[default]
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PolicyFormatArg {
     Json,
     Yaml,
 }
 
+impl From<PolicyFormatArg> for PolicyFormat {
+    fn from(format: PolicyFormatArg) -> Self {
+        match format {
+            PolicyFormatArg::Json => Self::Json,
+            PolicyFormatArg::Yaml => Self::Yaml,
+        }
+    }
+}
+
 #[derive(Debug)]
-pub(crate) struct PolicyInput {
-    pub(crate) paths: Vec<PathBuf>,
-    pub(crate) format: Option<PolicyFormat>,
+pub(super) struct PolicyInput {
+    pub(super) paths: Vec<PathBuf>,
+    format: Option<PolicyFormatArg>,
 }
 
 #[derive(Debug, Parser)]
@@ -134,7 +130,7 @@ struct PolicyInputArgs {
 
     /// Policy format. Required when a policy is read from standard input.
     #[arg(long = "policy-format", value_enum, value_name = "FORMAT")]
-    policy_format: Option<PolicyFormat>,
+    policy_format: Option<PolicyFormatArg>,
 }
 
 #[derive(Debug, Args)]
@@ -222,7 +218,7 @@ impl FromStr for ProxyPortRange {
     }
 }
 
-pub(crate) fn parse_cli() -> Result<ParseOutcome, Error> {
+pub(super) fn parse_cli() -> Result<ParseOutcome, Error> {
     let mut args = env::args_os();
     let program = args.next().unwrap_or_else(|| OsString::from(PROGRAM_NAME));
     let args = args.collect::<Vec<_>>();
@@ -395,7 +391,7 @@ fn parse_port(value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
-pub(crate) fn policy_format(input: &PolicyInput) -> Result<PolicyFormat, Error> {
+pub(super) fn policy_format(input: &PolicyInput) -> Result<PolicyFormat, Error> {
     let stdin_count = input
         .paths
         .iter()
@@ -411,5 +407,5 @@ pub(crate) fn policy_format(input: &PolicyInput) -> Result<PolicyFormat, Error> 
             message: "--policy-format is required when --policy - is used".to_owned(),
         });
     }
-    Ok(input.format.unwrap_or_default())
+    Ok(input.format.map(PolicyFormat::from).unwrap_or_default())
 }
