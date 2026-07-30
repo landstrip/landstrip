@@ -290,6 +290,39 @@ function taskDuration(details: TaskDetails): string | undefined {
   return seconds < 10 ? `${seconds.toFixed(1)}s` : `${Math.round(seconds)}s`;
 }
 
+function activeTaskRecords(tasks: readonly TaskRecord[]): TaskRecord[] {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const visibleIds = new Set<string>();
+
+  for (const task of tasks) {
+    if (task.state !== 'queued' && task.state !== 'running') continue;
+    const seen = new Set<string>();
+    let current: TaskRecord | undefined = task;
+    while (current && !seen.has(current.id)) {
+      seen.add(current.id);
+      visibleIds.add(current.id);
+      current = current.parentTaskId ? byId.get(current.parentTaskId) : undefined;
+    }
+  }
+
+  return tasks.filter((task) => visibleIds.has(task.id));
+}
+
+function taskProgress(task: TaskRecord): string[] {
+  if (task.state === 'queued') return ['waiting for slot'];
+  if (task.state !== 'running') return [];
+
+  const progress: string[] = [];
+  if (task.currentTool) progress.push(`→ ${task.currentTool}`);
+  if (task.toolCalls !== undefined) {
+    progress.push(`${task.toolCalls} call${task.toolCalls === 1 ? '' : 's'}`);
+  }
+  const duration = taskDuration(taskDetails(task));
+  if (duration) progress.push(duration);
+  if (task.retryAttempt) progress.push(`retry ${task.retryAttempt}`);
+  return progress;
+}
+
 function taskOutput(details: TaskDetails, fallback: string): string {
   return details.error ?? details.output ?? fallback;
 }
@@ -2464,35 +2497,30 @@ export class SubagentRuntime {
     if (!ctx.hasUI || (ctx.mode !== undefined && ctx.mode !== 'tui')) return;
 
     const tasks = [...this.tasks.values()];
-    const byId = new Map(tasks.map((task) => [task.id, task]));
-    const rootId = (task: TaskRecord): string => {
-      const seen = new Set<string>();
-      let current = task;
-      while (current.parentTaskId && !seen.has(current.id)) {
-        seen.add(current.id);
-        const parent = byId.get(current.parentTaskId);
-        if (!parent) break;
-        current = parent;
-      }
-      return current.id;
-    };
     const active = tasks.filter((task) => task.state === 'queued' || task.state === 'running');
-    const activeRoots = new Set(active.map(rootId));
-    if (activeRoots.size === 0) {
+    if (active.length === 0) {
       ctx.ui.setWidget(TASK_WIDGET, undefined);
       return;
     }
-    const visible = tasks.filter((task) => activeRoots.has(rootId(task)));
+
+    const visible = activeTaskRecords(tasks);
+    const byId = new Map(tasks.map((task) => [task.id, task]));
+    const running = active.filter((task) => task.state === 'running').length;
+    const queued = active.length - running;
+    const runningSummary =
+      this.maxSubagents > 0 ? `${running}/${this.maxSubagents} running` : `${running} running`;
+    const summary = queued > 0 ? `${runningSummary} · ${queued} queued` : runningSummary;
 
     ctx.ui.setWidget(TASK_WIDGET, (_tui, theme) => ({
       render: (width: number) => {
         const header =
-          theme.fg('accent', theme.bold('Subagents')) +
-          theme.fg('dim', `  ${active.length} active`);
+          theme.fg('accent', theme.bold('Subagents')) + theme.fg('dim', `  ${summary}`);
         const tree = taskTreeLines(visible, (task) => {
           const agent = theme.fg('accent', `@${task.agent}`);
           const description = theme.fg('text', task.description);
-          return `${taskState(theme, task)}  ${agent}  ${description}`;
+          const progress = taskProgress(byId.get(task.id)!);
+          const suffix = progress.length > 0 ? theme.fg('dim', `  ·  ${progress.join(' · ')}`) : '';
+          return `${taskState(theme, task)}  ${agent}  ${description}${suffix}`;
         });
         const shown = tree.slice(0, 8);
         if (tree.length > shown.length) {

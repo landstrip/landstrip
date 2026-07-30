@@ -11,6 +11,7 @@ import {
   SessionManager,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
+import { visibleWidth } from '@earendil-works/pi-tui';
 import { expect, test, vi } from 'vitest';
 
 import { loadAgentCatalog } from './agents.ts';
@@ -199,6 +200,131 @@ test('renders nested tasks as a tree', () => {
       '└─ cancelled   @general  Independent work  other-ro',
     ].join('\n'),
   );
+});
+
+test('renders active task progress without completed siblings', () => {
+  type WidgetFactory = (
+    tui: unknown,
+    theme: {
+      fg: (_color: string, value: string) => string;
+      bold: (value: string) => string;
+    },
+  ) => { render(width: number): string[] };
+
+  let widget: WidgetFactory | undefined;
+  let cleared = false;
+  const pi = {
+    getActiveTools: () => ['task'],
+    setActiveTools() {},
+  } as unknown as ExtensionAPI;
+  const runtime = new SubagentRuntime(pi, {} as LandstripIntegration);
+  runtime.setMaxSubagents(4);
+  const privateRuntime = runtime as unknown as {
+    tasks: Map<string, unknown>;
+    updateTaskWidget(ctx: ExtensionContext): void;
+  };
+  const root = {
+    id: 'root',
+    parentSessionId: 'parent',
+    agent: 'general',
+    description: 'Coordinate work',
+    depth: 0,
+    state: 'completed',
+  };
+  const completedSibling = {
+    id: 'completed-sibling',
+    parentSessionId: 'parent',
+    parentTaskId: root.id,
+    agent: 'scout',
+    description: 'Old completed work',
+    depth: 1,
+    state: 'completed',
+  };
+  const runningTask = {
+    id: 'running-child',
+    parentSessionId: 'parent',
+    parentTaskId: root.id,
+    agent: 'review',
+    description: 'Inspect implementation',
+    depth: 1,
+    state: 'running',
+    currentTool: 'read',
+    toolCalls: 3,
+    retryAttempt: 2,
+    startedAt: Date.now() - 5_000,
+  };
+  const queuedTask = {
+    id: 'queued-root',
+    parentSessionId: 'parent',
+    agent: 'general',
+    description: 'Waiting task',
+    depth: 0,
+    state: 'queued',
+  };
+  const failedSibling = {
+    id: 'failed-sibling',
+    parentSessionId: 'parent',
+    parentTaskId: root.id,
+    agent: 'scout',
+    description: 'Old failed work',
+    depth: 1,
+    state: 'error',
+  };
+  for (const task of [root, completedSibling, runningTask, queuedTask, failedSibling]) {
+    privateRuntime.tasks.set(task.id, task);
+  }
+
+  const ctx = {
+    hasUI: true,
+    mode: 'tui',
+    ui: {
+      setWidget(_key: string, value: unknown) {
+        if (typeof value === 'function') widget = value as WidgetFactory;
+        if (value === undefined) cleared = true;
+      },
+    },
+  } as unknown as ExtensionContext;
+  const theme = {
+    fg: (_color: string, value: string) => value,
+    bold: (value: string) => value,
+  };
+
+  privateRuntime.updateTaskWidget(ctx);
+  const text = widget?.(undefined, theme).render(120).join('\n') ?? '';
+  expect(text).toContain('Subagents  1/4 running · 1 queued');
+  expect(text).toContain('Coordinate work');
+  expect(text).toContain('@review  Inspect implementation');
+  expect(text).toContain('→ read · 3 calls');
+  expect(text).toMatch(/5\.\ds/);
+  expect(text).toContain('retry 2');
+  expect(text).toContain('@general  Waiting task  ·  waiting for slot');
+  expect(text).not.toContain('Old completed work');
+  expect(text).not.toContain('Old failed work');
+
+  const overflowTasks = Array.from({ length: 10 }, (_, index) => ({
+    id: `queued-${index}`,
+    parentSessionId: 'parent',
+    agent: 'general',
+    description: `Queued task ${index}`,
+    depth: 0,
+    state: 'queued',
+  }));
+  for (const task of overflowTasks) privateRuntime.tasks.set(task.id, task);
+  privateRuntime.updateTaskWidget(ctx);
+  const overflow = widget?.(undefined, theme).render(120).join('\n') ?? '';
+  expect(overflow).toContain('Subagents  1/4 running · 11 queued');
+  expect(overflow).toContain('… 5 more');
+
+  const narrow = widget?.(undefined, theme).render(36) ?? [];
+  expect(narrow.every((line) => visibleWidth(line) <= 36)).toBe(true);
+  expect(narrow.join('\n')).toContain('@review');
+
+  runningTask.state = 'completed';
+  queuedTask.state = 'completed';
+  for (const task of overflowTasks) task.state = 'completed';
+  cleared = false;
+  privateRuntime.updateTaskWidget(ctx);
+  expect(cleared).toBe(true);
 });
 
 test('selects a primary agent and applies its prompt', async () => {
@@ -909,7 +1035,7 @@ test('runs a foreground task in an injected RPC worker', async () => {
     fg: (_color, value) => value,
     bold: (value) => value,
   }).render(80);
-  expect(lines?.join('\n')).toContain('Subagents  1 active');
+  expect(lines?.join('\n')).toContain('Subagents  0 running · 1 queued');
   expect(lines?.join('\n')).toContain('@review  Review implementation');
   expect(widgets.at(-1)).toBeUndefined();
 });
