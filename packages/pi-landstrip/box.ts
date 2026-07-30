@@ -4,6 +4,24 @@
 import type { Theme } from '@earendil-works/pi-coding-agent';
 import { truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 
+export function dialogTabs(theme: Theme, tabs: readonly string[], active: string): string {
+  return tabs
+    .map((tab) =>
+      tab === active ? theme.fg('accent', theme.bold(`[${tab}]`)) : theme.fg('muted', tab),
+    )
+    .join('  ');
+}
+
+export function dialogKeys(
+  theme: Theme,
+  hints: ReadonlyArray<readonly [key: string, description: string]>,
+): string {
+  const separator = theme.fg('dim', '  ·  ');
+  return hints
+    .map(([key, description]) => `${theme.fg('accent', key)} ${theme.fg('muted', description)}`)
+    .join(separator);
+}
+
 export function boxTop(theme: Theme, width: number, title: string): string {
   if (width < 5) return truncateToWidth(theme.fg('accent', title), Math.max(1, width));
   const label = theme.fg('accent', ` ${title} `);
