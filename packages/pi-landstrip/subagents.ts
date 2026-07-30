@@ -82,7 +82,10 @@ const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', '
 const AGENTS_HELP_ROWS = [
   ['Tab', 'Next tab'],
   ['Shift+Tab / S', 'Switch scope in Agents or Settings'],
-  ['↑ / ↓', 'Select item or scroll task output'],
+  ['↑ / ↓', 'Select item or scroll when follow is off'],
+  ['F', 'Toggle task log follow'],
+  ['Page Up / Down', 'Scroll task output by page'],
+  ['Home / End', 'Jump to task output boundary'],
   ['Enter', 'Inspect task, set primary, or save'],
   ['Esc', 'Back or close'],
   ['Ctrl+C', 'Close'],
@@ -929,6 +932,7 @@ export class SubagentRuntime {
     let editing = false;
     let confirmingDeleteAgent: string | undefined;
     let detail = requested.length > 0;
+    let follow = detail;
     let scroll = 0;
 
     const reloadAgents = (): void => {
@@ -1228,7 +1232,7 @@ export class SubagentRuntime {
             wrapTextWithAnsi(line, contentWidth),
           );
           const maxScroll = Math.max(0, transcript.length - INSPECTOR_BODY_LINES);
-          scroll = Math.min(scroll, maxScroll);
+          scroll = follow ? maxScroll : Math.min(scroll, maxScroll);
           const shown = transcript.slice(scroll, scroll + INSPECTOR_BODY_LINES);
           const duration = taskDuration(taskDetails(task));
           const metrics = [
@@ -1242,7 +1246,7 @@ export class SubagentRuntime {
             tabs,
             '',
             `${theme.fg('accent', theme.bold(`@${task.agent}`))} ${theme.fg('text', task.description)}`,
-            `${taskState(theme, task)} ${theme.fg('dim', metrics.join(' · '))}`,
+            `${taskState(theme, task)} ${theme.fg('dim', metrics.join(' · '))} ${theme.fg('dim', '·')} ${theme.fg(follow ? 'accent' : 'muted', `Follow: ${follow ? 'on' : 'off'}`)}`,
             '',
             ...shown.map((line) => theme.fg('toolOutput', line)),
           ];
@@ -1318,6 +1322,7 @@ export class SubagentRuntime {
             const tabs = ['agents', 'tasks', 'settings', 'help'] as const;
             tab = tabs[(tabs.indexOf(tab) + 1) % tabs.length] ?? 'agents';
             detail = false;
+            follow = false;
             editing = false;
             scroll = 0;
             tui.requestRender();
@@ -1550,6 +1555,7 @@ export class SubagentRuntime {
               selectedTask = Math.min(tasks.length - 1, selectedTask + 1);
             } else if (matchesKey(data, 'return') && tasks.length > 0) {
               detail = true;
+              follow = true;
               scroll = 0;
             } else return;
             tui.requestRender();
@@ -1560,19 +1566,35 @@ export class SubagentRuntime {
           if (!task) return;
           if (matchesKey(data, 'escape')) {
             detail = false;
+            follow = false;
             scroll = 0;
           } else if (matchesKey(data, 'ctrl+c')) {
             done();
-          } else if (matchesKey(data, 'up')) {
+          } else if (data.toLowerCase() === 'f') {
+            follow = !follow;
+          } else if (!follow && matchesKey(data, 'up')) {
             scroll = Math.max(0, scroll - 1);
-          } else if (matchesKey(data, 'down')) {
+          } else if (!follow && matchesKey(data, 'down')) {
             scroll += 1;
+          } else if (!follow && matchesKey(data, 'pageUp')) {
+            scroll = Math.max(0, scroll - INSPECTOR_BODY_LINES);
+          } else if (!follow && matchesKey(data, 'pageDown')) {
+            scroll += INSPECTOR_BODY_LINES;
+          } else if (!follow && matchesKey(data, 'home')) {
+            scroll = 0;
+          } else if (!follow && matchesKey(data, 'end')) {
+            scroll = Number.MAX_SAFE_INTEGER;
           } else if (matchesKey(data, 'backspace')) {
             const parentIndex = task.parentTaskId
               ? tasks.findIndex((candidate) => candidate.id === task.parentTaskId)
               : -1;
-            if (parentIndex >= 0) selectedTask = parentIndex;
-            else detail = false;
+            if (parentIndex >= 0) {
+              selectedTask = parentIndex;
+              follow = true;
+            } else {
+              detail = false;
+              follow = false;
+            }
             scroll = 0;
           } else return;
           tui.requestRender();

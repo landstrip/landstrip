@@ -972,6 +972,13 @@ test('inspects and navigates persisted child sessions without switching sessions
     stopReason: 'stop',
     timestamp: Date.now(),
   } as never);
+  for (let index = 1; index <= 40; index += 1) {
+    childManager.appendMessage({
+      role: 'user',
+      content: `Task log entry ${index}`,
+      timestamp: Date.now(),
+    });
+  }
   parentManager.appendCustomEntry('landstrip.task', {
     version: 1,
     id: 'task-12345678',
@@ -1157,12 +1164,62 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(component?.render(96).join('\n')).toContain('[Tasks]');
   component?.handleInput('\r');
   const detail = component?.render(96).join('\n') ?? '';
-  expect(detail).toContain('Inspect this child session.');
-  expect(detail).not.toContain('Esc task list');
+  expect(detail).toContain('Follow: on');
+  expect(detail).toContain('Task log entry 40');
+  expect(detail).toContain('27–42 of 42');
+  expect(detail).not.toContain('Inspect this child session.');
+  component?.handleInput('\x1b[A');
+  expect(component?.render(96).join('\n')).toBe(detail);
   component?.handleInput('\x1b[C');
   expect(component?.render(96).join('\n')).toBe(detail);
   component?.handleInput('\x1b[D');
   expect(component?.render(96).join('\n')).toBe(detail);
+
+  childManager.appendMessage({
+    role: 'user',
+    content: 'Task log entry 41',
+    timestamp: Date.now(),
+  });
+  const followed = component?.render(96).join('\n') ?? '';
+  expect(followed).toContain('Task log entry 41');
+  expect(followed).toContain('28–43 of 43');
+
+  component?.handleInput('f');
+  expect(component?.render(96).join('\n')).toContain('Follow: off');
+  component?.handleInput('\x1b[H');
+  expect(component?.render(96).join('\n')).toContain('1–16 of 43');
+  expect(component?.render(96).join('\n')).toContain('Inspect this child session.');
+
+  childManager.appendMessage({
+    role: 'user',
+    content: 'Task log entry 42',
+    timestamp: Date.now(),
+  });
+  const anchored = component?.render(96).join('\n') ?? '';
+  expect(anchored).toContain('1–16 of 44');
+  expect(anchored).not.toContain('Task log entry 42');
+
+  component?.handleInput('\x1b[B');
+  expect(component?.render(96).join('\n')).toContain('2–17 of 44');
+  component?.handleInput('\x1b[A');
+  expect(component?.render(96).join('\n')).toContain('1–16 of 44');
+  component?.handleInput('\x1b[6~');
+  expect(component?.render(96).join('\n')).toContain('17–32 of 44');
+  component?.handleInput('\x1b[5~');
+  expect(component?.render(96).join('\n')).toContain('1–16 of 44');
+  component?.handleInput('\x1b[F');
+  const ended = component?.render(96).join('\n') ?? '';
+  expect(ended).toContain('29–44 of 44');
+  expect(ended).toContain('Task log entry 42');
+  expect(ended).toContain('Follow: off');
+
+  component?.handleInput('\x1b[H');
+  component?.handleInput('f');
+  const resumed = component?.render(96).join('\n') ?? '';
+  expect(resumed).toContain('Follow: on');
+  expect(resumed).toContain('29–44 of 44');
+  expect(resumed).toContain('Task log entry 42');
+
   component?.handleInput('\x1b');
   expect(component?.render(96).join('\n')).toContain('[Tasks]');
   component?.handleInput('\t');
@@ -1228,6 +1285,9 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(help).toMatch(/Shortcut\s+Description/);
   expect(help).toMatch(/Shift\+Tab \/ S\s+Switch scope in Agents or Settings/);
   expect(help).toMatch(/Backspace\s+Open parent task/);
+  expect(help).toMatch(/F\s+Toggle task log follow/);
+  expect(help).toMatch(/Page Up \/ Down\s+Scroll task output by page/);
+  expect(help).toMatch(/Home \/ End\s+Jump to task output boundary/);
 
   component?.handleInput('\t');
   const cycledAgents = component?.render(96).join('\n') ?? '';
@@ -1237,7 +1297,8 @@ test('inspects and navigates persisted child sessions without switching sessions
   await running;
 
   const direct = command?.('task-123', ctx);
-  expect(component?.render(96).join('\n')).toContain('Inspect this child session.');
+  expect(component?.render(96).join('\n')).toContain('Task log entry 42');
+  expect(component?.render(96).join('\n')).toContain('Follow: on');
   finishCustom?.();
   await direct;
   vi.unstubAllEnvs();
