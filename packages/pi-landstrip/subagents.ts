@@ -79,6 +79,22 @@ const packageDir = dirname(fileURLToPath(import.meta.url));
 const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
 const INSPECTOR_BODY_LINES = 16;
 const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const AGENTS_HELP_ROWS = [
+  ['Tab', 'Next tab'],
+  ['Shift+Tab / S', 'Switch scope in Agents or Settings'],
+  ['↑ / ↓', 'Select item or scroll task output'],
+  ['Enter', 'Inspect task, set primary, or save'],
+  ['Esc', 'Back or close'],
+  ['Ctrl+C', 'Close'],
+  ['Space', 'Enable agent or toggle sandbox'],
+  ['E', 'Edit project agent'],
+  ['X', 'Delete project agent'],
+  ['Y / N', 'Confirm or cancel deletion'],
+  ['I', 'Use global value'],
+  ['R', 'Discard setting changes'],
+  ['0-9 / + / -', 'Set subagent limit'],
+  ['Backspace', 'Open parent task'],
+] as const;
 type PiThinkingLevel = Parameters<ExtensionAPI['setThinkingLevel']>[0];
 
 interface PiPackage {
@@ -895,7 +911,7 @@ export class SubagentRuntime {
     let maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
     const sandboxCallbacks = this.integration.sandboxCallbacks;
     let sandboxSettings = sandboxCallbacks?.load(ctx.cwd, projectTrusted) ?? { global: true };
-    let tab: 'agents' | 'tasks' | 'settings' = requested ? 'tasks' : 'agents';
+    let tab: 'agents' | 'tasks' | 'settings' | 'help' = requested ? 'tasks' : 'agents';
     let selectedAgent = Math.max(
       0,
       agents.findIndex((agent) => agent.name === this.primaryAgent?.name),
@@ -987,7 +1003,7 @@ export class SubagentRuntime {
             return `${clipped}${' '.repeat(Math.max(0, cellWidth - visibleWidth(clipped)))}`;
           };
           refreshTasks();
-          const tabs = `${dialogTabs(theme, ['Agents', 'Tasks', 'Settings'], `${tab[0]?.toUpperCase()}${tab.slice(1)}`)}${
+          const tabs = `${dialogTabs(theme, ['Agents', 'Tasks', 'Settings', 'Help'], `${tab[0]?.toUpperCase()}${tab.slice(1)}`)}${
             tab === 'tasks'
               ? ''
               : theme.fg('dim', `  ·  Scope: ${scope === 'project' ? 'Project' : 'Global'}`)
@@ -1104,9 +1120,9 @@ export class SubagentRuntime {
                 lines.push(`  ${theme.fg('error', diagnostic)}`);
               }
             }
-            lines.push('');
             if (confirmingDeleteAgent) {
               lines.push(
+                '',
                 theme.fg(
                   'error',
                   `Delete @${confirmingDeleteAgent}? This removes its project file.`,
@@ -1117,24 +1133,7 @@ export class SubagentRuntime {
                 ]),
               );
             } else if (saving) {
-              lines.push(theme.fg('dim', 'Saving…'));
-            } else {
-              const mainHints: Array<readonly [string, string]> = [['↑↓', 'select']];
-              if (agent && !agent.disabled && agentSupportsMode(agent, 'primary')) {
-                mainHints.push(['Enter', 'set primary']);
-              }
-              if (agent && scopedAgent(agent)) mainHints.push(['Space', 'enable / disable']);
-              const actionHints: Array<readonly [string, string]> = [];
-              if (agent && projectTrusted) actionHints.push(['E', 'edit']);
-              if (agent && projectTrusted && canDeleteProjectAgent(ctx.cwd, agent)) {
-                actionHints.push(['X', 'delete']);
-              }
-              if (agent && scope === 'project' && disabledOverrides.project.has(agent.name)) {
-                actionHints.push(['I', 'inherit']);
-              }
-              if (projectTrusted) actionHints.push(['S', 'scope']);
-              actionHints.push(['Tab', 'next tab'], ['Esc', 'close']);
-              lines.push(dialogKeys(theme, mainHints), dialogKeys(theme, actionHints));
+              lines.push('', theme.fg('dim', 'Saving…'));
             }
             return box(lines);
           }
@@ -1179,27 +1178,28 @@ export class SubagentRuntime {
                   : 'Controls OS sandboxing. Use /sandbox to inspect its policy.',
               ),
             );
-            if (saving) {
-              lines.push('', theme.fg('dim', 'Saving…'));
-            } else {
-              const editHints: Array<readonly [string, string]> = [['↑↓', 'select']];
-              if (selectedSetting === 0) editHints.push(['0–9 / +−', 'change limit']);
-              else if (sandboxCallbacks) editHints.push(['Space', 'toggle']);
-              const canInherit =
-                scope === 'project' &&
-                (selectedSetting === 0
-                  ? maxSubagentsSettings.project !== undefined
-                  : sandboxSettings.project !== undefined);
-              if (canInherit) editHints.push(['I', 'inherit']);
-              const actionHints: Array<readonly [string, string]> = [];
-              if (dirtySettings.size > 0) {
-                if (dirtySettings.has(selectedSetting)) actionHints.push(['Enter', 'save']);
-                actionHints.push(['R', 'discard']);
-              } else {
-                actionHints.push(['S', 'scope'], ['Tab', 'next tab'], ['Esc', 'close']);
-              }
-              lines.push('', dialogKeys(theme, editHints), dialogKeys(theme, actionHints));
-            }
+            if (saving) lines.push('', theme.fg('dim', 'Saving…'));
+            return box(lines);
+          }
+
+          if (tab === 'help') {
+            const shortcutWidth = Math.max(
+              visibleWidth('Shortcut'),
+              ...AGENTS_HELP_ROWS.map(([shortcut]) => visibleWidth(shortcut)),
+            );
+            const descriptionWidth = Math.max(1, contentWidth - shortcutWidth - 4);
+            const lines = [
+              tabs,
+              '',
+              theme.fg('dim', `  ${pad('Shortcut', shortcutWidth)}  Description`),
+              ...AGENTS_HELP_ROWS.map(
+                ([shortcut, description]) =>
+                  `  ${theme.fg('accent', pad(shortcut, shortcutWidth))}  ${theme.fg(
+                    'text',
+                    truncateToWidth(description, descriptionWidth),
+                  )}`,
+              ),
+            ];
             return box(lines);
           }
 
@@ -1219,15 +1219,6 @@ export class SubagentRuntime {
                 );
               }
             }
-            lines.push(
-              '',
-              dialogKeys(theme, [
-                ['↑↓', 'select'],
-                ['Enter', 'inspect'],
-                ['Tab', 'next tab'],
-                ['Esc', 'close'],
-              ]),
-            );
             return box(lines);
           }
 
@@ -1261,15 +1252,6 @@ export class SubagentRuntime {
               theme.fg('dim', `${scroll + 1}–${scroll + shown.length} of ${transcript.length}`),
             );
           }
-          lines.push(
-            '',
-            dialogKeys(theme, [
-              ['↑↓', 'scroll'],
-              ...(task.parentTaskId ? ([['Backspace', 'parent']] as const) : []),
-              ['Esc', 'task list'],
-              ['Tab', 'next tab'],
-            ]),
-          );
           return box(lines.map((line) => truncateToWidth(line, contentWidth)));
         },
         handleInput: (data: string) => {
@@ -1305,7 +1287,10 @@ export class SubagentRuntime {
             }
             return;
           }
-          if (data.toLowerCase() === 's' && tab !== 'tasks') {
+          if (
+            (matchesKey(data, 'shift+tab') || data.toLowerCase() === 's') &&
+            (tab === 'agents' || tab === 'settings')
+          ) {
             if (saving) return;
             if (dirtySettings.size > 0) {
               ctx.ui.notify('Save or discard settings changes before changing scope', 'warning');
@@ -1330,7 +1315,7 @@ export class SubagentRuntime {
               );
               return;
             }
-            const tabs = ['agents', 'tasks', 'settings'] as const;
+            const tabs = ['agents', 'tasks', 'settings', 'help'] as const;
             tab = tabs[(tabs.indexOf(tab) + 1) % tabs.length] ?? 'agents';
             detail = false;
             editing = false;
@@ -1550,6 +1535,11 @@ export class SubagentRuntime {
               return;
             } else return;
             tui.requestRender();
+            return;
+          }
+
+          if (tab === 'help') {
+            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
             return;
           }
 

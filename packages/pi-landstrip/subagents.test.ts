@@ -1075,12 +1075,12 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(commandNames).toEqual(['agents']);
   const running = command?.('', ctx);
   const agents = component?.render(96).join('\n') ?? '';
-  expect(agents).toContain('[Agents]  Tasks  Settings  ·  Scope: Project');
+  expect(agents).toContain('[Agents]  Tasks  Settings  Help  ·  Scope: Project');
   expect(agents).toContain('@build');
   expect(agents).toMatch(/@build\s+primary\s+built-in/);
   expect(agents).toMatch(/@general\s+subagent\s+built-in/);
   expect(agents).toMatch(/@review\s+subagent\s+local/);
-  expect(agents).toContain('Tab next tab');
+  expect(agents).not.toContain('Tab next tab');
 
   component?.handleInput('e');
   await vi.waitFor(() => {
@@ -1138,11 +1138,12 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('\x1b[A');
   component?.handleInput('\x1b[A');
 
-  component?.handleInput('s');
+  component?.handleInput('\x1b[Z');
   const globalAgents = component?.render(96).join('\n') ?? '';
-  expect(globalAgents).toContain('[Agents]  Tasks  Settings  ·  Scope: Global');
+  expect(globalAgents).toContain('[Agents]  Tasks  Settings  Help  ·  Scope: Global');
   expect(globalAgents).toMatch(/@review\s+subagent\s+local.*unavailable/);
   component?.handleInput('s');
+  expect(component?.render(96).join('\n')).toContain('Scope: Project');
 
   component?.handleInput('\t');
   const tasks = component?.render(96).join('\n') ?? '';
@@ -1157,7 +1158,7 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('\r');
   const detail = component?.render(96).join('\n') ?? '';
   expect(detail).toContain('Inspect this child session.');
-  expect(detail).toContain('Esc task list');
+  expect(detail).not.toContain('Esc task list');
   component?.handleInput('\x1b[C');
   expect(component?.render(96).join('\n')).toBe(detail);
   component?.handleInput('\x1b[D');
@@ -1170,6 +1171,7 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(projectSettings).toContain('[Settings]');
   expect(projectSettings).toContain('[ - ] Maximum subagents');
   expect(projectSettings).toContain('[ - ] Sandbox enabled');
+  expect(projectSettings).not.toContain('change limit');
 
   component?.handleInput('\x1b[B');
   component?.handleInput(' ');
@@ -1221,9 +1223,16 @@ test('inspects and navigates persisted child sessions without switching sessions
   });
 
   component?.handleInput('\t');
+  const help = component?.render(96).join('\n') ?? '';
+  expect(help).toContain('Agents  Tasks  Settings  [Help]  ·  Scope: Project');
+  expect(help).toMatch(/Shortcut\s+Description/);
+  expect(help).toMatch(/Shift\+Tab \/ S\s+Switch scope in Agents or Settings/);
+  expect(help).toMatch(/Backspace\s+Open parent task/);
+
+  component?.handleInput('\t');
   const cycledAgents = component?.render(96).join('\n') ?? '';
-  expect(cycledAgents).toContain('[Agents]  Tasks  Settings  ·  Scope: Project');
-  expect(cycledAgents).toContain('Tab next tab');
+  expect(cycledAgents).toContain('[Agents]  Tasks  Settings  Help  ·  Scope: Project');
+  expect(cycledAgents).not.toContain('Tab next tab');
   finishCustom?.();
   await running;
 
