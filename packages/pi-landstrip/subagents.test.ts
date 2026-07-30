@@ -319,7 +319,9 @@ test('selects a primary agent and applies its prompt', async () => {
   expect(thinkingLevels).toEqual(['high']);
 
   const result = await beforeAgentStart?.({ systemPrompt: 'Base prompt' }, ctx);
-  expect(result?.systemPrompt).toContain('Base prompt\n\nWork in plan mode.');
+  expect(result?.systemPrompt).toContain(
+    'Analyze the request and produce a clear plan before making changes.',
+  );
   await expect(
     toolCall?.({ toolName: 'bash', input: { command: 'git status' } }, ctx),
   ).resolves.toBe(undefined);

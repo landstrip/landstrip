@@ -164,12 +164,14 @@ function readPiPackage(pkgPath: string): PiPackage | undefined {
 }
 
 const taskParameters = Type.Object({
-  description: Type.String({ description: 'A short 3-5 word description of the task' }),
-  prompt: Type.String({ description: 'The complete task for the subagent' }),
-  subagent_type: Type.String({ description: 'The configured subagent name' }),
-  task_id: Type.Optional(Type.String({ description: 'An existing task ID to continue' })),
-  command: Type.Optional(Type.String({ description: 'The command that originated this task' })),
-  background: Type.Optional(Type.Boolean({ description: 'Run without blocking the parent task' })),
+  description: Type.String({ description: 'Short task label (3-5 words)' }),
+  prompt: Type.String({ description: 'Full instructions for the subagent' }),
+  subagent_type: Type.String({ description: 'Subagent name' }),
+  task_id: Type.Optional(Type.String({ description: 'Task ID to resume' })),
+  command: Type.Optional(Type.String({ description: 'Originating command, if any' })),
+  background: Type.Optional(
+    Type.Boolean({ description: 'Return immediately and run in background' }),
+  ),
 });
 
 interface TaskInput {
@@ -713,7 +715,7 @@ export function registerSubagentWorker(pi: ExtensionAPI, config: WorkerConfig): 
     pi.registerTool({
       name: 'task',
       label: 'Task',
-      description: 'Delegate work to a process-backed subagent managed by the root supervisor.',
+      description: 'Delegate a task to a Pi subagent process.',
       parameters: taskParameters,
       executionMode: 'parallel',
       async execute(_id, input, signal, _onUpdate, ctx) {
@@ -778,7 +780,7 @@ export class SubagentRuntime {
   register(): void {
     this.pi.registerTool(this.createTaskTool());
     this.pi.registerCommand('agents', {
-      description: 'Select agents, inspect task sessions, and configure task concurrency',
+      description: 'Manage agents, tasks, and concurrency',
       handler: async (args, ctx) => this.openAgents(args, ctx),
     });
     this.pi.registerShortcut('ctrl+shift+a', {
@@ -1578,7 +1580,7 @@ export class SubagentRuntime {
       name: 'task',
       label: 'Task',
       description:
-        'Delegate a task to a sandboxed Pi RPC process.' +
+        'Delegate a task to a Pi subagent process.' +
         (descriptions ? `\n\nAvailable subagents:\n${descriptions}` : ''),
       parameters: taskParameters,
       executionMode: 'parallel',

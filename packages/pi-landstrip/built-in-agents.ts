@@ -5,30 +5,29 @@ export const BUILT_IN_LANDSTRIP_CONFIG = {
   maxSubagents: 1,
   agent: {
     build: {
-      description: 'Default primary agent with full development access',
+      description: 'Implement and test requested changes',
       mode: 'primary',
       color: 'success',
-      prompt: 'Work in build mode. Implement, test, and complete the requested changes.',
+      prompt: 'Implement, test, and complete the request.',
     },
     plan: {
-      description: 'Planning agent that asks before shell commands and file edits',
+      description: 'Plan before running commands or editing files',
       mode: 'primary',
       color: 'warning',
-      prompt:
-        'Work in plan mode. Analyze the problem and produce a clear plan before making changes.',
+      prompt: 'Analyze the request and produce a clear plan before making changes.',
       permission: { edit: 'ask', bash: 'ask', task: 'ask' },
     },
     general: {
       description: 'General-purpose agent for complex tasks',
       mode: 'subagent',
-      prompt: 'Complete the delegated task autonomously. Return one concise result to the parent.',
+      prompt: 'Complete the task and return a concise result.',
       permission: { todowrite: 'deny' },
     },
     scout: {
-      description: 'Fast codebase reconnaissance',
+      description: 'Read-only codebase reconnaissance',
       mode: 'subagent',
       prompt:
-        'Scout the codebase without modifying it. Return concise findings with exact file references, key code, architecture, and a recommended starting point.',
+        'Inspect the codebase without editing. Return concise findings with exact file references and a recommended starting point.',
       permission: {
         '*': 'deny',
         read: {
@@ -43,10 +42,10 @@ export const BUILT_IN_LANDSTRIP_CONFIG = {
       },
     },
     explore: {
-      description: 'Fast codebase exploration',
+      description: 'Codebase research with shell and web access',
       mode: 'subagent',
       prompt:
-        'Explore the codebase without modifying it. Report findings with file references. Use bash and network fetch tools when needed for git, PR metadata, or remote docs; do not edit files.',
+        'Explore without editing. Use shell or web tools when needed, then return concise findings with file references.',
       permission: {
         '*': 'deny',
         read: {

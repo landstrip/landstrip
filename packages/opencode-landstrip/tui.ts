@@ -616,7 +616,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
         namespace: 'palette',
         name: 'sandbox',
         title: 'Sandbox',
-        desc: 'Show config and toggle the sandbox',
+        desc: 'Inspect and toggle the sandbox',
         category: 'Sandbox',
         suggested: true,
         slash: { name: 'sandbox' },
@@ -630,7 +630,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     {
       title: 'Sandbox',
       value: 'sandbox',
-      description: 'Show config and toggle the sandbox',
+      description: 'Inspect and toggle the sandbox',
       category: 'Sandbox',
       suggested: true,
       slash: { name: 'sandbox' },
@@ -676,7 +676,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     api.kv.set('onboarded', true);
     api.ui.toast({
       title: 'Sandbox active',
-      message: 'Landlock policy is on (default strict). Run /sandbox to inspect it.',
+      message: 'Landstrip sandbox is on. Run /sandbox to inspect it.',
       variant: 'info',
       duration: 8000,
     });

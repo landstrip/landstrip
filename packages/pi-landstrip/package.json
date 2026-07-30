@@ -1,7 +1,7 @@
 {
   "name": "pi-landstrip",
   "version": "0.18.4",
-  "description": "Sandbox-aware Pi subagents and interactive command permissions",
+  "description": "Sandboxed Bash and process-backed agents for Pi",
   "keywords": [
     "landstrip",
     "pi-extension",

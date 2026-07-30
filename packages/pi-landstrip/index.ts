@@ -2686,7 +2686,7 @@ export function createLandstripIntegration(
     };
 
     maybePi.registerFlag?.('no-sandbox', {
-      description: 'Disable landstrip sandboxing for bash commands',
+      description: 'Disable Landstrip OS sandboxing',
       type: 'boolean',
       default: false,
     });
@@ -2733,7 +2733,7 @@ export function createLandstripIntegration(
       unpublishRuntime = undefined;
     });
     maybePi.registerCommand?.('sandbox', {
-      description: 'Show config and toggle the sandbox',
+      description: 'Inspect and toggle the sandbox',
       handler: async (_args, ctx) => {
         if (!ctx.hasUI) return;
         const config = loadConfig(ctx.cwd);

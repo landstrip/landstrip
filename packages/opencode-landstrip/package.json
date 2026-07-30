@@ -1,7 +1,7 @@
 {
   "name": "opencode-landstrip",
   "version": "0.18.4",
-  "description": "Landlock-based sandboxing for opencode with landstrip",
+  "description": "OS-level AI command sandboxing for OpenCode with Landstrip",
   "keywords": [
     "landlock",
     "landstrip",
