@@ -79,8 +79,6 @@ const MAX_DEPTH = 3;
 const packageDir = dirname(fileURLToPath(import.meta.url));
 const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
 const INSPECTOR_BODY_LINES = 16;
-const TASK_PREVIEW_MIN_WIDTH = 92;
-const TASK_PREVIEW_LINES = 7;
 const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const AGENTS_HELP_ROWS = [
   ['Tab', 'Next tab'],
@@ -89,7 +87,7 @@ const AGENTS_HELP_ROWS = [
   ['F', 'Toggle task log follow'],
   ['Page Up / Down', 'Scroll task output by page'],
   ['Home / End', 'Jump to task output boundary'],
-  ['Enter', 'Inspect task, set primary, or save'],
+  ['Enter', 'Open logs, set primary, or save'],
   ['Esc', 'Back or close'],
   ['Ctrl+C', 'Close'],
   ['Space', 'Enable agent or toggle sandbox'],
@@ -964,7 +962,7 @@ export class SubagentRuntime {
     let maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
     const sandboxCallbacks = this.integration.sandboxCallbacks;
     let sandboxSettings = sandboxCallbacks?.load(ctx.cwd, projectTrusted) ?? { global: true };
-    let tab: 'agents' | 'tasks' | 'settings' | 'help' = requested ? 'tasks' : 'agents';
+    let tab: 'agents' | 'tasks' | 'logs' | 'settings' | 'help' = requested ? 'logs' : 'agents';
     let selectedAgent = Math.max(
       0,
       agents.findIndex((agent) => agent.name === this.primaryAgent?.name),
@@ -981,8 +979,7 @@ export class SubagentRuntime {
     let saving = false;
     let editing = false;
     let confirmingDeleteAgent: string | undefined;
-    let detail = requested.length > 0;
-    let follow = detail;
+    let follow = requested.length > 0;
     let scroll = 0;
 
     const reloadAgents = (): void => {
@@ -1057,8 +1054,8 @@ export class SubagentRuntime {
             return `${clipped}${' '.repeat(Math.max(0, cellWidth - visibleWidth(clipped)))}`;
           };
           refreshTasks();
-          const tabs = `${dialogTabs(theme, ['Agents', 'Tasks', 'Settings', 'Help'], `${tab[0]?.toUpperCase()}${tab.slice(1)}`)}${
-            tab === 'tasks'
+          const tabs = `${dialogTabs(theme, ['Agents', 'Tasks', 'Logs', 'Settings', 'Help'], `${tab[0]?.toUpperCase()}${tab.slice(1)}`)}${
+            tab === 'tasks' || tab === 'logs'
               ? ''
               : theme.fg('dim', `  ·  Scope: ${scope === 'project' ? 'Project' : 'Global'}`)
           }`;
@@ -1193,21 +1190,20 @@ export class SubagentRuntime {
           }
 
           if (tab === 'settings') {
-            const maxSubagents =
-              scope === 'project' && maxSubagentsSettings.project === undefined
-                ? '-'
-                : String(selectedMaxSubagents());
-            const sandbox =
-              scope === 'project' && sandboxSettings.project === undefined
-                ? '-'
-                : selectedSandboxEnabled()
-                  ? 'on'
-                  : 'off';
+            const maxSubagentsInherited =
+              scope === 'project' && maxSubagentsSettings.project === undefined;
+            const sandboxInherited = scope === 'project' && sandboxSettings.project === undefined;
             const rows = [
-              { label: 'Maximum subagents', value: maxSubagents, unavailable: false },
+              {
+                label: 'Maximum subagents',
+                value: String(selectedMaxSubagents()),
+                inherited: maxSubagentsInherited,
+                unavailable: false,
+              },
               {
                 label: 'Sandbox enabled',
-                value: sandbox,
+                value: selectedSandboxEnabled() ? 'on' : 'off',
+                inherited: sandboxInherited,
                 unavailable: sandboxCallbacks === undefined,
               },
             ];
@@ -1216,9 +1212,11 @@ export class SubagentRuntime {
               const selected = index === selectedSetting;
               const cursor = selected ? theme.fg('accent', '›') : ' ';
               const text = `[ ${row.value} ]`;
-              const value = selected
-                ? theme.fg('accent', text)
-                : theme.fg(row.unavailable ? 'muted' : 'text', text);
+              const value = row.inherited
+                ? theme.fg('dim', text)
+                : selected
+                  ? theme.fg('accent', text)
+                  : theme.fg(row.unavailable ? 'muted' : 'text', text);
               const label = theme.fg(row.unavailable ? 'muted' : 'text', row.label);
               const dirty = dirtySettings.has(index) ? theme.fg('warning', ' *') : '';
               lines.push(`${cursor} ${value} ${label}${dirty}`);
@@ -1228,8 +1226,12 @@ export class SubagentRuntime {
               theme.fg(
                 'dim',
                 selectedSetting === 0
-                  ? 'Sets concurrent subagents. Zero disables the task tool.'
-                  : 'Controls OS sandboxing. Use /sandbox to inspect its policy.',
+                  ? rows[0]?.inherited
+                    ? 'Sets concurrent subagents. Zero disables the task tool. Using the Global value.'
+                    : 'Sets concurrent subagents. Zero disables the task tool.'
+                  : rows[1]?.inherited
+                    ? 'Controls OS sandboxing. Use /sandbox to inspect its policy. Using the Global value.'
+                    : 'Controls OS sandboxing. Use /sandbox to inspect its policy.',
               ),
             );
             if (saving) lines.push('', theme.fg('dim', 'Saving…'));
@@ -1257,7 +1259,7 @@ export class SubagentRuntime {
             return box(lines);
           }
 
-          if (!detail) {
+          if (tab === 'tasks') {
             const listLines: string[] = [];
             if (tasks.length === 0) {
               listLines.push('No task sessions in this session.');
@@ -1273,41 +1275,7 @@ export class SubagentRuntime {
                 );
               }
             }
-            if (width < TASK_PREVIEW_MIN_WIDTH || tasks.length === 0) {
-              return box([tabs, '', ...listLines]);
-            }
-
-            const task = tasks[selectedTask];
-            if (!task) return box([tabs, '', ...listLines]);
-            const leftWidth = Math.max(44, Math.min(64, Math.floor(contentWidth * 0.52)));
-            const rightWidth = Math.max(1, contentWidth - leftWidth - 3);
-            const transcript = taskTranscript(task).flatMap((line) =>
-              wrapTextWithAnsi(line, rightWidth),
-            );
-            const duration = taskDuration(taskDetails(task));
-            const metrics = [
-              task.currentTool ? `→ ${task.currentTool}` : undefined,
-              task.toolCalls === undefined
-                ? undefined
-                : `${task.toolCalls} tool call${task.toolCalls === 1 ? '' : 's'}`,
-              duration,
-              task.retryAttempt ? `retry ${task.retryAttempt}` : undefined,
-            ].filter(Boolean);
-            const previewLines = [
-              `${theme.fg('accent', theme.bold(`@${task.agent}`))} ${theme.fg('text', task.description)}`,
-              `${taskState(theme, task)} ${theme.fg('dim', task.id)}`,
-              metrics.length > 0 ? theme.fg('dim', metrics.join(' · ')) : '',
-              theme.fg('dim', 'Latest activity'),
-              ...transcript.slice(-TASK_PREVIEW_LINES).map((line) => theme.fg('toolOutput', line)),
-            ];
-            const divider = theme.fg('border', '│');
-            const rowCount = Math.max(listLines.length, previewLines.length);
-            const lines = Array.from({ length: rowCount }, (_, index) => {
-              const left = pad(listLines[index] ?? '', leftWidth);
-              const right = truncateToWidth(previewLines[index] ?? '', rightWidth);
-              return `${left} ${divider} ${right}`;
-            });
-            return box([tabs, '', ...lines]);
+            return box([tabs, '', ...listLines]);
           }
 
           const task = tasks[selectedTask];
@@ -1403,10 +1371,10 @@ export class SubagentRuntime {
               );
               return;
             }
-            const tabs = ['agents', 'tasks', 'settings', 'help'] as const;
+            const tabs = ['agents', 'tasks', 'logs', 'settings', 'help'] as const;
             tab = tabs[(tabs.indexOf(tab) + 1) % tabs.length] ?? 'agents';
-            detail = false;
-            follow = false;
+            if (tab === 'logs' && tasks.length > 0) follow = true;
+            else follow = false;
             editing = false;
             scroll = 0;
             tui.requestRender();
@@ -1632,13 +1600,13 @@ export class SubagentRuntime {
             return;
           }
 
-          if (!detail) {
+          if (tab === 'tasks') {
             if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
             else if (matchesKey(data, 'up')) selectedTask = Math.max(0, selectedTask - 1);
             else if (matchesKey(data, 'down') && tasks.length > 0) {
               selectedTask = Math.min(tasks.length - 1, selectedTask + 1);
             } else if (matchesKey(data, 'return') && tasks.length > 0) {
-              detail = true;
+              tab = 'logs';
               follow = true;
               scroll = 0;
             } else return;
@@ -1646,10 +1614,15 @@ export class SubagentRuntime {
             return;
           }
 
+          if (tab !== 'logs') return;
+
           const task = tasks[selectedTask];
-          if (!task) return;
+          if (!task) {
+            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
+            return;
+          }
           if (matchesKey(data, 'escape')) {
-            detail = false;
+            tab = 'tasks';
             follow = false;
             scroll = 0;
           } else if (matchesKey(data, 'ctrl+c')) {
@@ -1676,7 +1649,7 @@ export class SubagentRuntime {
               selectedTask = parentIndex;
               follow = true;
             } else {
-              detail = false;
+              tab = 'tasks';
               follow = false;
             }
             scroll = 0;
