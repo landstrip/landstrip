@@ -43,6 +43,7 @@ import {
   availableAgents,
   loadAgentCatalog,
   mergePermissionRules,
+  permissionAlwaysDenied,
   permissionDecision,
   type PermissionRules,
 } from './agents.ts';
@@ -640,6 +641,16 @@ function permissionName(tool: string): string {
   return tool;
 }
 
+function permittedToolNames(tools: readonly string[], rules: PermissionRules): string[] {
+  return tools.filter((tool) => !permissionAlwaysDenied(rules, permissionName(tool)));
+}
+
+function enforcePermittedTools(pi: ExtensionAPI, rules: PermissionRules): void {
+  const active = pi.getActiveTools();
+  const permitted = permittedToolNames(active, rules);
+  if (permitted.join('\0') !== active.join('\0')) pi.setActiveTools(permitted);
+}
+
 function canonicalPermissionPath(path: string, seen = new Set<string>()): string {
   const missing: string[] = [];
   let existing = path;
@@ -746,6 +757,10 @@ function parseControlResponse(value: string | undefined): ControlResponse {
 export function registerSubagentWorker(pi: ExtensionAPI, config: WorkerConfig): void {
   pi.on('session_start', () => {
     delete process.env[WORKER_ENV];
+    enforcePermittedTools(pi, config.rules);
+  });
+  pi.on('before_agent_start', () => {
+    enforcePermittedTools(pi, config.rules);
   });
   pi.on('tool_call', async (event, ctx) => {
     // Nested task requests are validated by the root scheduler after transport.
@@ -2193,9 +2208,10 @@ export class SubagentRuntime {
     const taskEnabled = agent.permissions.some(
       (rule) => rule.permission === 'task' && rule.action !== 'deny',
     );
-    const tools = taskEnabled
+    const activeTools = taskEnabled
       ? [...new Set([...this.pi.getActiveTools(), 'task'])]
       : this.pi.getActiveTools().filter((tool) => tool !== 'task');
+    const tools = permittedToolNames(activeTools, rules);
     const workerExtensions = this.integration.getWorkerExtensions?.() ?? [];
     const args = [
       ...invocation.args,

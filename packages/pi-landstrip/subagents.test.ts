@@ -62,7 +62,7 @@ test('propagates registered extensions and public context to workers', async () 
     },
   } as unknown as LandstripIntegration;
   const pi = {
-    getActiveTools: () => ['read', 'bash'],
+    getActiveTools: () => ['read', 'bash', 'custom_inspect'],
     getThinkingLevel: () => 'medium',
   } as unknown as ExtensionAPI;
   const runtime = new SubagentRuntime(pi, integration);
@@ -108,7 +108,11 @@ test('propagates registered extensions and public context to workers', async () 
         permissions: [],
         providerOptions: {},
       },
-      [],
+      [
+        { permission: '*', pattern: '*', action: 'allow' },
+        { permission: '*', pattern: '*', action: 'deny' },
+        { permission: 'read', pattern: '*', action: 'allow' },
+      ],
       ctx,
       new AbortController().signal,
       async () => undefined,
@@ -118,6 +122,8 @@ test('propagates registered extensions and public context to workers', async () 
   expect(prepared?.args).toContain(extensionEntry);
   expect(prepared?.readPaths).toContain(extensionEntry);
   expect(prepared?.readPaths).toContain(cwd);
+  const toolsIndex = prepared?.args.indexOf('--tools') ?? -1;
+  expect(prepared?.args[toolsIndex + 1]).toBe('read');
   const context = contextFromEnvironment({
     [LANDSTRIP_CONTEXT_ENV]: prepared?.env[LANDSTRIP_CONTEXT_ENV],
   });
@@ -1837,6 +1843,39 @@ test('rejects an unknown continuation ID instead of creating a new task', async 
       ctx,
     ),
   ).rejects.toThrow('Unknown task: missing');
+});
+
+test('worker mode removes tools denied for every resource', () => {
+  let activeTools = ['read', 'bash', 'custom_inspect'];
+  let sessionStart: (() => void) | undefined;
+  let beforeAgentStart: (() => void) | undefined;
+  const pi = {
+    on(event: string, handler: () => void) {
+      if (event === 'session_start') sessionStart = handler;
+      if (event === 'before_agent_start') beforeAgentStart = handler;
+    },
+    getActiveTools: () => activeTools,
+    setActiveTools(tools: string[]) {
+      activeTools = tools;
+    },
+  } as unknown as ExtensionAPI;
+  registerSubagentWorker(pi, {
+    rules: [
+      { permission: '*', pattern: '*', action: 'allow' },
+      { permission: '*', pattern: '*', action: 'deny' },
+      { permission: 'read', pattern: '*', action: 'allow' },
+      { permission: 'bash', pattern: 'git status', action: 'allow' },
+    ],
+    task: { id: 'parent', description: 'Parent', depth: 0 },
+    taskEnabled: false,
+  });
+
+  sessionStart?.();
+  expect(activeTools).toEqual(['read', 'bash']);
+
+  activeTools.push('late_custom');
+  beforeAgentStart?.();
+  expect(activeTools).toEqual(['read', 'bash']);
 });
 
 test('worker mode enforces permissions and sends nested tasks over reserved UI input', async () => {

@@ -294,6 +294,10 @@ export function loadAgentCatalog(
   return { agents: normalized, permissions, diagnostics, maxSubagents };
 }
 
+function permissionMatches(pattern: string, permission: string): boolean {
+  return pattern === '*' || minimatch(permission, pattern, { dot: true });
+}
+
 export function permissionDecision(
   rules: PermissionRules,
   permission: string,
@@ -301,17 +305,25 @@ export function permissionDecision(
 ): PermissionAction {
   let decision: PermissionAction = 'ask';
   for (const rule of rules) {
-    const matchesPermission =
-      rule.permission === '*' || minimatch(permission, rule.permission, { dot: true });
     const matchesResource =
       rule.pattern === '*' ||
       minimatch(normalizeAbsolutePath(resource), normalizeAbsolutePath(rule.pattern), {
         dot: true,
         matchBase: false,
       });
-    if (matchesPermission && matchesResource) decision = rule.action;
+    if (permissionMatches(rule.permission, permission) && matchesResource) decision = rule.action;
   }
   return decision;
+}
+
+export function permissionAlwaysDenied(rules: PermissionRules, permission: string): boolean {
+  let denied = false;
+  for (const rule of rules) {
+    if (!permissionMatches(rule.permission, permission)) continue;
+    if (rule.pattern === '*') denied = rule.action === 'deny';
+    else if (rule.action !== 'deny') denied = false;
+  }
+  return denied;
 }
 
 export function mergePermissionRules(...values: PermissionRules[]): PermissionRules {

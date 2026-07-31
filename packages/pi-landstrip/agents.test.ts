@@ -11,6 +11,7 @@ import {
   availableAgents,
   loadAgentCatalog,
   mergePermissionRules,
+  permissionAlwaysDenied,
   permissionDecision,
   type PermissionRules,
 } from './agents.ts';
@@ -379,6 +380,26 @@ describe('permissions', () => {
 
     expect(permissionDecision(rules, 'bash', 'rm -rf build')).toBe('ask');
     expect(permissionDecision(rules, 'bash', 'git status')).toBe('allow');
+  });
+
+  test('detects only permissions denied for every resource', () => {
+    const rules: PermissionRules = [
+      { permission: '*', pattern: '*', action: 'allow' },
+      { permission: '*', pattern: '*', action: 'deny' },
+      { permission: 'read', pattern: '*', action: 'allow' },
+      { permission: 'bash', pattern: 'git status', action: 'allow' },
+    ];
+
+    expect(permissionAlwaysDenied(rules, 'custom_tool')).toBe(true);
+    expect(permissionAlwaysDenied(rules, 'read')).toBe(false);
+    expect(permissionAlwaysDenied(rules, 'bash')).toBe(false);
+    expect(permissionAlwaysDenied([], 'custom_tool')).toBe(false);
+    expect(
+      permissionAlwaysDenied(
+        [...rules, { permission: 'bash', pattern: '*', action: 'deny' }],
+        'bash',
+      ),
+    ).toBe(true);
   });
 
   test('matches absolute Windows paths', () => {
