@@ -219,6 +219,15 @@ const TASK_STATES = new Set<TaskState>([
   'interrupted',
 ]);
 
+interface TaskUsage {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+  turns: number;
+}
+
 interface TaskRecord {
   version?: 1;
   id: string;
@@ -240,6 +249,7 @@ interface TaskRecord {
   currentTool?: string;
   toolCalls?: number;
   retryAttempt?: number;
+  usage?: TaskUsage;
   startedAt?: number;
   finishedAt?: number;
 }
@@ -261,6 +271,7 @@ interface TaskDetails {
   currentTool?: string;
   toolCalls?: number;
   retryAttempt?: number;
+  usage?: TaskUsage;
   startedAt?: number;
   finishedAt?: number;
   output?: string;
@@ -277,6 +288,7 @@ function taskDetails(task: TaskRecord, state: TaskState = task.state): TaskDetai
     currentTool: task.currentTool,
     toolCalls: task.toolCalls,
     retryAttempt: task.retryAttempt,
+    usage: task.usage ? { ...task.usage } : undefined,
     startedAt: task.startedAt,
     finishedAt: task.finishedAt,
     output: task.output,
@@ -289,6 +301,87 @@ function taskDuration(details: TaskDetails): string | undefined {
   const end = details.finishedAt ?? Date.now();
   const seconds = Math.max(0, end - details.startedAt) / 1000;
   return seconds < 10 ? `${seconds.toFixed(1)}s` : `${Math.round(seconds)}s`;
+}
+
+function usageNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function isTaskUsage(value: unknown): value is TaskUsage {
+  return (
+    isRecord(value) &&
+    usageNumber(value.input) &&
+    usageNumber(value.output) &&
+    usageNumber(value.cacheRead) &&
+    usageNumber(value.cacheWrite) &&
+    usageNumber(value.cost) &&
+    usageNumber(value.turns) &&
+    Number.isInteger(value.turns)
+  );
+}
+
+function taskUsageFromMessage(message: unknown): TaskUsage | undefined {
+  if (!isRecord(message) || message.role !== 'assistant' || !isRecord(message.usage))
+    return undefined;
+  const usage = message.usage;
+  if (
+    !usageNumber(usage.input) ||
+    !usageNumber(usage.output) ||
+    !usageNumber(usage.cacheRead) ||
+    !usageNumber(usage.cacheWrite) ||
+    !isRecord(usage.cost) ||
+    !usageNumber(usage.cost.total)
+  ) {
+    return undefined;
+  }
+  return {
+    input: usage.input,
+    output: usage.output,
+    cacheRead: usage.cacheRead,
+    cacheWrite: usage.cacheWrite,
+    cost: usage.cost.total,
+    turns: 1,
+  };
+}
+
+function addTaskUsage(current: TaskUsage | undefined, added: TaskUsage): TaskUsage {
+  return {
+    input: (current?.input ?? 0) + added.input,
+    output: (current?.output ?? 0) + added.output,
+    cacheRead: (current?.cacheRead ?? 0) + added.cacheRead,
+    cacheWrite: (current?.cacheWrite ?? 0) + added.cacheWrite,
+    cost: (current?.cost ?? 0) + added.cost,
+    turns: (current?.turns ?? 0) + added.turns,
+  };
+}
+
+function formatTokens(count: number): string {
+  if (count < 1_000) return String(count);
+  if (count < 10_000) return `${(count / 1_000).toFixed(1)}k`;
+  if (count < 1_000_000) return `${Math.round(count / 1_000)}k`;
+  if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  return `${Math.round(count / 1_000_000)}M`;
+}
+
+function formatTaskUsage(usage: TaskUsage | undefined): string | undefined {
+  if (!usage) return undefined;
+  const parts: string[] = [];
+  if (usage.turns) parts.push(`${usage.turns} turn${usage.turns === 1 ? '' : 's'}`);
+  if (usage.input) parts.push(`in:${formatTokens(usage.input)}`);
+  if (usage.output) parts.push(`out:${formatTokens(usage.output)}`);
+  if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
+  if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
+  if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+  return parts.length > 0 ? parts.join(' ') : undefined;
+}
+
+function formatTaskUsageSummary(usage: TaskUsage | undefined): string | undefined {
+  if (!usage) return undefined;
+  const parts: string[] = [];
+  const tokens = usage.input + usage.output;
+  if (tokens) parts.push(`${formatTokens(tokens)} tok`);
+  if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
+  return parts.length > 0 ? parts.join(' ') : undefined;
 }
 
 function activeTaskRecords(tasks: readonly TaskRecord[]): TaskRecord[] {
@@ -318,6 +411,8 @@ function taskProgress(task: TaskRecord): string[] {
   if (task.toolCalls !== undefined) {
     progress.push(`${task.toolCalls} call${task.toolCalls === 1 ? '' : 's'}`);
   }
+  const usage = formatTaskUsageSummary(task.usage);
+  if (usage) progress.push(usage);
   const duration = taskDuration(taskDetails(task));
   if (duration) progress.push(duration);
   if (task.retryAttempt) progress.push(`retry ${task.retryAttempt}`);
@@ -738,15 +833,17 @@ function parseControlResponse(value: string | undefined): ControlResponse {
   if (response.value !== undefined && typeof response.value !== 'string') {
     throw new Error('Invalid supervisor response value');
   }
-  if (
-    response.task !== undefined &&
-    (!isRecord(response.task) ||
+  if (response.task !== undefined) {
+    if (
+      !isRecord(response.task) ||
       typeof response.task.taskId !== 'string' ||
       typeof response.task.state !== 'string' ||
       !TASK_STATES.has(response.task.state as TaskState) ||
-      typeof response.task.agent !== 'string')
-  ) {
-    throw new Error('Invalid supervisor task response');
+      typeof response.task.agent !== 'string' ||
+      (response.task.usage !== undefined && !isTaskUsage(response.task.usage))
+    ) {
+      throw new Error('Invalid supervisor task response');
+    }
   }
   return response as unknown as ControlResponse;
 }
@@ -1294,11 +1391,13 @@ export class SubagentRuntime {
               : `${task.toolCalls} tool call${task.toolCalls === 1 ? '' : 's'}`,
             duration,
           ].filter(Boolean);
+          const usage = formatTaskUsage(task.usage);
           const lines = [
             tabs,
             '',
             `${theme.fg('accent', theme.bold(`@${task.agent}`))} ${theme.fg('text', task.description)}`,
             `${taskState(theme, task)} ${theme.fg('dim', metrics.join(' · '))} ${theme.fg('dim', '·')} ${theme.fg(follow ? 'accent' : 'muted', `Follow: ${follow ? 'on' : 'off'}`)}`,
+            ...(usage ? [theme.fg('dim', usage)] : []),
             '',
             ...shown.map((line) => theme.fg('toolOutput', line)),
           ];
@@ -1797,6 +1896,8 @@ export class SubagentRuntime {
         }
         const duration = taskDuration(details);
         if (duration) metrics.push(duration);
+        const usage = formatTaskUsage(details.usage);
+        if (usage) metrics.push(usage);
         if (metrics.length > 0) text += `\n${theme.fg('dim', metrics.join(' · '))}`;
 
         const output = taskOutput(details, '');
@@ -2063,6 +2164,15 @@ export class SubagentRuntime {
           if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string') {
             streamedText += messageEvent.delta;
             update(streamedText);
+          }
+        }
+        if (event.type === 'message_end') {
+          const usage = taskUsageFromMessage(event.message);
+          if (usage) {
+            task.usage = addTaskUsage(task.usage, usage);
+            this.persist(task);
+            this.updateTaskWidget(ctx);
+            update(streamedText || 'Subagent running');
           }
         }
         if (event.type === 'tool_execution_start' && typeof event.toolName === 'string') {
@@ -2541,11 +2651,18 @@ export class SubagentRuntime {
         const header =
           theme.fg('accent', theme.bold('Subagents')) + theme.fg('dim', `  ${summary}`);
         const tree = taskTreeLines(visible, (task) => {
+          const state = taskState(theme, task);
           const agent = theme.fg('accent', `@${task.agent}`);
-          const description = theme.fg('text', task.description);
-          const progress = taskProgress(byId.get(task.id)!);
+          const record = byId.get(task.id)!;
+          const progress = taskProgress(record);
           const suffix = progress.length > 0 ? theme.fg('dim', `  ·  ${progress.join(' · ')}`) : '';
-          return `${taskState(theme, task)}  ${agent}  ${description}${suffix}`;
+          const indentWidth = 3 + Math.max(0, record.depth) * 3;
+          const descriptionWidth = Math.max(
+            1,
+            width - indentWidth - visibleWidth(`${state}  ${agent}  ${suffix}`),
+          );
+          const description = theme.fg('text', truncateToWidth(task.description, descriptionWidth));
+          return `${state}  ${agent}  ${description}${suffix}`;
         });
         const shown = tree.slice(0, 8);
         if (tree.length > shown.length) {
@@ -2565,6 +2682,7 @@ export class SubagentRuntime {
       if (!task?.id || task.parentSessionId !== ctx.sessionManager.getSessionId()) continue;
       this.tasks.set(task.id, {
         ...task,
+        usage: isTaskUsage(task.usage) ? { ...task.usage } : undefined,
         state: task.state === 'running' || task.state === 'queued' ? 'interrupted' : task.state,
       });
     }

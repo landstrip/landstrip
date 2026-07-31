@@ -258,6 +258,7 @@ test('renders active task progress without completed siblings', () => {
     toolCalls: 3,
     retryAttempt: 2,
     startedAt: Date.now() - 5_000,
+    usage: { input: 1_200, output: 345, cacheRead: 400, cacheWrite: 50, cost: 0.01234, turns: 2 },
   };
   const queuedTask = {
     id: 'queued-root',
@@ -301,11 +302,17 @@ test('renders active task progress without completed siblings', () => {
   expect(text).toContain('Coordinate work');
   expect(text).toContain('@review  Inspect implementation');
   expect(text).toContain('→ read · 3 calls');
+  expect(text).toContain('1.5k tok $0.0123');
   expect(text).toMatch(/5\.\ds/);
   expect(text).toContain('retry 2');
   expect(text).toContain('@general  Waiting task  ·  waiting for slot');
   expect(text).not.toContain('Old completed work');
   expect(text).not.toContain('Old failed work');
+
+  runningTask.description = `Inspect ${'implementation '.repeat(12)}`;
+  privateRuntime.updateTaskWidget(ctx);
+  const longDescription = widget?.(undefined, theme).render(120).join('\n') ?? '';
+  expect(longDescription).toContain('1.5k tok $0.0123');
 
   const overflowTasks = Array.from({ length: 10 }, (_, index) => ({
     id: `queued-${index}`,
@@ -891,6 +898,46 @@ test('runs a foreground task in an injected RPC worker', async () => {
         type: 'message_update',
         assistantMessageEvent: { type: 'text_delta', delta: 'ed.' },
       });
+      emit?.({ type: 'message_end', message: { role: 'user', content: 'ignored' } });
+      emit?.({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          usage: {
+            input: -1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            cost: { total: 1 },
+          },
+        },
+      });
+      emit?.({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          usage: {
+            input: 1_200,
+            output: 300,
+            cacheRead: 400,
+            cacheWrite: 0,
+            cost: { total: 0.01234 },
+          },
+        },
+      });
+      emit?.({
+        type: 'message_end',
+        message: {
+          role: 'assistant',
+          usage: {
+            input: 800,
+            output: 45,
+            cacheRead: 100,
+            cacheWrite: 50,
+            cost: { total: 0.002 },
+          },
+        },
+      });
       await forwardRequest?.({ method: 'select', title: 'Choose item', options: ['one'] });
       await forwardRequest?.({ method: 'confirm', title: 'Confirm action', message: 'Proceed?' });
       await forwardRequest?.({ method: 'input', title: 'Enter value', placeholder: 'value' });
@@ -967,7 +1014,7 @@ test('runs a foreground task in an injected RPC worker', async () => {
     onUpdate.mock.calls.map(
       ([update]) => (update as { content: Array<{ type: string; text: string }> }).content[0]?.text,
     ),
-  ).toEqual(['Running read', 'Review', 'Review', 'Reviewed.']);
+  ).toEqual(['Running read', 'Review', 'Review', 'Reviewed.', 'Reviewed.', 'Reviewed.']);
   expect(onUpdate.mock.calls[0]?.[0]).toMatchObject({
     details: { currentTool: 'read', toolCalls: 1, state: 'running' },
   });
@@ -976,6 +1023,14 @@ test('runs a foreground task in an injected RPC worker', async () => {
     state: 'completed',
     toolCalls: 1,
     output: 'Reviewed.\nline 2\nline 3\nline 4',
+    usage: {
+      input: 2_000,
+      output: 345,
+      cacheRead: 500,
+      cacheWrite: 50,
+      cost: 0.01434,
+      turns: 2,
+    },
   });
   initTheme('dark', false);
   const theme = {
@@ -1006,6 +1061,7 @@ test('runs a foreground task in an injected RPC worker', async () => {
     .render(100);
   expect(collapsedLines?.join('\n')).toContain('completed');
   expect(collapsedLines?.join('\n')).toContain('1 tool call');
+  expect(collapsedLines?.join('\n')).toContain('2 turns in:2.0k out:345 R500 W50 $0.0143');
   expect(collapsedLines?.join('\n')).not.toContain('line 4');
 
   const expandedLines = taskTool
@@ -1123,6 +1179,7 @@ test('inspects and navigates persisted child sessions without switching sessions
     state: 'completed',
     output: 'Done',
     toolCalls: 2,
+    usage: { input: 2_000, output: 345, cacheRead: 500, cacheWrite: 50, cost: 0.01434, turns: 2 },
     startedAt: 1,
     finishedAt: 1001,
   });
@@ -1312,6 +1369,7 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(logs).toContain('27–42 of 42');
   expect(logs).not.toContain('Inspect this child session.');
   expect(logs).toContain('2 tool calls · 1.0s');
+  expect(logs).toContain('2 turns in:2.0k out:345 R500 W50 $0.0143');
   component?.handleInput('\x1b[A');
   expect(component?.render(96).join('\n')).toBe(logs);
   component?.handleInput('\x1b[C');
@@ -1724,10 +1782,27 @@ test('delivers a completed task when it is continued in background', async () =>
   let workerCount = 0;
   const createWorker = vi.fn(async () => {
     const worker = workerCount++;
+    let emit: ((event: Record<string, unknown>) => void) | undefined;
     return {
       rpc: {
-        onEvent: () => () => {},
+        onEvent(listener: (event: Record<string, unknown>) => void) {
+          emit = listener;
+          return () => {};
+        },
         async prompt() {
+          emit?.({
+            type: 'message_end',
+            message: {
+              role: 'assistant',
+              usage: {
+                input: worker === 0 ? 100 : 200,
+                output: worker === 0 ? 10 : 20,
+                cacheRead: 0,
+                cacheWrite: 0,
+                cost: { total: worker === 0 ? 0.01 : 0.02 },
+              },
+            },
+          });
           if (worker === 1) await continuation;
         },
         async getLastAssistantText() {
@@ -1788,6 +1863,19 @@ test('delivers a completed task when it is continued in background', async () =>
   await vi.waitFor(() => expect(sendMessage).toHaveBeenCalledOnce());
   expect(sendMessage.mock.calls[0]?.[0]).toMatchObject({
     content: expect.stringContaining('Continued result.'),
+  });
+  const continuedTask = (
+    runtime as unknown as {
+      tasks: Map<string, { usage?: Record<string, number> }>;
+    }
+  ).tasks.get(taskId!);
+  expect(continuedTask?.usage).toEqual({
+    input: 300,
+    output: 30,
+    cacheRead: 0,
+    cacheWrite: 0,
+    cost: 0.03,
+    turns: 2,
   });
 });
 
