@@ -392,6 +392,9 @@ fn supervise_child(
                 // window. On failure grant_open responds with an errno itself.
                 grant_open(notify_fd, request.id, &grant);
             }
+            HandleResult::RunMutation(grant) => {
+                grant_mutation(notify_fd, request.id, &grant);
+            }
         }
     }
 }
@@ -486,6 +489,9 @@ enum HandleResult {
     // instead of letting the kernel re-run open in the child. Used for every
     // allowed open so CONTINUE cannot TOCTOU-bypass denyRead/denyWrite.
     AddFd(OpenGrant),
+    // Broker-mediated mutation: re-issue rename/unlink/chmod/etc outside the
+    // child so a path swap cannot race past a denyWrite check.
+    RunMutation(MutationGrant),
     Pending(u64, Option<Grant>),
 }
 
@@ -551,6 +557,7 @@ fn handle_notification(
             HandleResult::Respond(notification_continue(request.id))
         }
         Ok(NotificationResult::Open(grant)) => HandleResult::AddFd(grant),
+        Ok(NotificationResult::Mutation(grant)) => HandleResult::RunMutation(grant),
         Ok(NotificationResult::Query(decision)) => {
             denials.trap_fd.write(&decision.trap);
             HandleResult::Pending(decision.query_id, decision.grant)
@@ -1618,6 +1625,29 @@ fn handle_mutation(
     }
 
     let Some((index, reason)) = denial else {
+        // Allowed mutations still race under CONTINUE when denyWrite sits under
+        // an allowWrite root (Landlock cannot express those holes). Fulfill the
+        // op in the broker whenever any denyWrite list is present; otherwise
+        // landlock-backed ops may CONTINUE under the child's write roots.
+        let must_pin = !policy.write_denied_roots.is_empty()
+            || !policy.write_denied_patterns.is_empty()
+            || !policy.write_denied_links.is_empty()
+            || !spec.landlock_backed;
+        if must_pin {
+            match Grant::mutation(spec, request, pid, &slots)? {
+                Some(Grant::Mutation(grant)) => {
+                    return Ok(NotificationResult::Mutation(grant));
+                }
+                Some(Grant::Open(grant)) => {
+                    // creat is modelled as an Open grant.
+                    return Ok(NotificationResult::Open(grant));
+                }
+                Some(Grant::Socket(_)) | None => {
+                    // Pin failed (vanished parent, etc.): do not CONTINUE into a race.
+                    return Err(BrokerError::SystemCall { errno: libc::EIO });
+                }
+            }
+        }
         return Ok(NotificationResult::Continue);
     };
     let (resolved, path) = slots[index].clone().ok_or(BrokerError::InvalidAddress)?;
@@ -2458,6 +2488,7 @@ enum NotificationResult {
     Continue,
     Query(QueryDecision),
     Open(OpenGrant),
+    Mutation(MutationGrant),
 }
 
 struct QueryDecision {
