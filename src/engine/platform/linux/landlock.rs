@@ -40,6 +40,9 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
 }
 
 pub(super) fn enforce_broker_access_policy(policy: &AccessPolicy) -> Result<()> {
+    // Leave Read unhandled on the broker. Nested denyRead is mediated by seccomp;
+    // handling Read without Execute would still block execve of denyRead binaries
+    // because Landlock Execute is required for the open that feeds the loader.
     enforce_access_policy_with(policy, false)
 }
 
@@ -155,8 +158,6 @@ fn add_path_rules(
     access: BitFlags<AccessFs>,
     label: &str,
 ) -> Result<RulesetCreated> {
-    let mut seen_ancestors: Vec<PathBuf> = Vec::new();
-
     for path in paths {
         let fd = match open_path(path) {
             Ok(fd) => fd,
@@ -166,39 +167,17 @@ fn add_path_rules(
                     || error.raw_os_error() == Some(libc::EIO)
                     || error.raw_os_error() == Some(libc::ENOTCONN) =>
             {
-                // Walk up to the nearest existing ancestor directory so that
-                // allowWrite rules for files that do not exist yet (e.g. a
-                // .git/index.lock) still grant MAKE_REG access on the parent.
-                let mut ancestor = path.clone();
-                loop {
-                    match ancestor.parent() {
-                        Some(parent) if !parent.as_os_str().is_empty() => {
-                            match std::fs::symlink_metadata(parent) {
-                                Ok(metadata) if metadata.is_dir() => {
-                                    ancestor = parent.to_path_buf();
-                                    break;
-                                }
-                                _ => ancestor = parent.to_path_buf(),
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-                if seen_ancestors.iter().any(|seen| seen == &ancestor) {
-                    continue;
-                }
-                let fd = match open_path(&ancestor) {
-                    Ok(fd) => fd,
-                    Err(error) => {
-                        log::debug!(
-                            "landlock: {label} ancestor {} unreachable: {error}",
-                            ancestor.display()
-                        );
-                        continue;
-                    }
-                };
-                seen_ancestors.push(ancestor);
-                fd
+                // Missing / unreachable targets must not promote the parent
+                // directory into the ruleset. Granting from_write on that
+                // ancestor would let the sandboxed process create and mutate
+                // sibling names (e.g. allowWrite of .git/index.lock would open
+                // the whole .git tree). The seccomp broker still opens exact
+                // allowWrite file paths via ADDFD when they are policy-allowed.
+                log::debug!(
+                    "landlock: {label} {} unreachable, skipping parent grant: {error}",
+                    path.display()
+                );
+                continue;
             }
             Err(error) => return Err(setup_failed(error).into()),
         };
