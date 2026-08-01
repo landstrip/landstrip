@@ -1318,19 +1318,17 @@ export class SubagentRuntime {
               const dirty = dirtySettings.has(index) ? theme.fg('warning', ' *') : '';
               lines.push(`${cursor} ${value} ${label}${dirty}`);
             }
-            lines.push(
-              '',
-              theme.fg(
-                'dim',
-                selectedSetting === 0
-                  ? rows[0]?.inherited
-                    ? 'Sets concurrent subagents. Zero disables the task tool. Using the Global value.'
-                    : 'Sets concurrent subagents. Zero disables the task tool.'
-                  : rows[1]?.inherited
+            if (selectedSetting === 1) {
+              lines.push(
+                '',
+                theme.fg(
+                  'dim',
+                  rows[1]?.inherited
                     ? 'Controls OS sandboxing. Use /sandbox to inspect its policy. Using the Global value.'
                     : 'Controls OS sandboxing. Use /sandbox to inspect its policy.',
-              ),
-            );
+                ),
+              );
+            }
             if (saving) lines.push('', theme.fg('dim', 'Saving…'));
             return box(lines);
           }
