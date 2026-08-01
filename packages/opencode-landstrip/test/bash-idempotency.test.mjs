@@ -367,13 +367,33 @@ test('proxy refuses private destinations without connecting', async () => {
 
         const env = {};
         await hooks['shell.env'](input, { env });
-        const port = Number(new URL(env.HTTP_PROXY).port);
+        const proxyUrl = new URL(env.HTTP_PROXY);
+        const port = Number(proxyUrl.port);
+        const authorization = `Basic ${Buffer.from(
+          `${proxyUrl.username}:${proxyUrl.password}`,
+        ).toString('base64')}`;
 
         try {
-          const response = await new Promise((resolveResponse, rejectResponse) => {
+          const unauthenticated = await new Promise((resolveResponse, rejectResponse) => {
             const socket = connect(port, '127.0.0.1', () => {
               socket.write(
                 `CONNECT 127.0.0.1:${address.port} HTTP/1.1\r\nHost: 127.0.0.1:${address.port}\r\n\r\n`,
+              );
+            });
+            let data = '';
+            socket.setEncoding('utf-8');
+            socket.on('data', (chunk) => {
+              data += chunk;
+            });
+            socket.on('close', () => resolveResponse(data));
+            socket.on('error', rejectResponse);
+          });
+          assert.match(unauthenticated, /^HTTP\/1\.1 407 Proxy Authentication Required/);
+
+          const response = await new Promise((resolveResponse, rejectResponse) => {
+            const socket = connect(port, '127.0.0.1', () => {
+              socket.write(
+                `CONNECT 127.0.0.1:${address.port} HTTP/1.1\r\nHost: 127.0.0.1:${address.port}\r\nProxy-Authorization: ${authorization}\r\n\r\n`,
               );
             });
             let data = '';

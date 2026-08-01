@@ -3,6 +3,7 @@
 
 import type { Hooks, Plugin, PluginInput, PluginOptions } from '@opencode-ai/plugin';
 
+import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -51,6 +52,7 @@ interface BashSandboxState {
   wrappedCommand: string;
   policyDir: string;
   port: number | null;
+  proxyToken: string | null;
   stop: (() => Promise<void>) | null;
   trapServer: ReturnType<typeof createServer> | null;
   trapServerPort: number | null;
@@ -566,8 +568,22 @@ function writePolicyFile(
   return { dir, path };
 }
 
-function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => Promise<void> }> {
+function startProxy(
+  config: SandboxConfig,
+  authorization?: string,
+): Promise<{ port: number; stop: () => Promise<void> }> {
   const sockets = new Set<Socket>();
+
+  // Track the upstream socket so stop() tears it down, and abandon a still-
+  // connecting upstream when its client goes away — otherwise a connect to a
+  // black-holed host lingers in SYN-retry (~2 min), leaking an fd per request.
+  function trackUpstream(upstream: Socket, client: Socket, settled: () => boolean): void {
+    sockets.add(upstream);
+    upstream.once('close', () => sockets.delete(upstream));
+    client.once('close', () => {
+      if (!settled()) upstream.destroy();
+    });
+  }
 
   async function handleConnect(client: Socket, target: string, rest: Buffer): Promise<void> {
     const endpoint = splitHostPort(target, 443);
@@ -582,17 +598,20 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
     }
 
     const resolved = await resolveProxyEndpoint(endpoint.host);
-    let connected = false;
+    let settled = false;
     const upstream = connectNet(
       { host: resolved.address, port: endpoint.port, family: resolved.family },
       () => {
-        connected = true;
+        settled = true;
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         pipeSockets(client, upstream, rest);
       },
     );
-    upstream.on('error', () => {
-      if (!connected) denyProxyRequest(client, '502 Bad Gateway');
+    trackUpstream(upstream, client, () => settled);
+    upstream.once('error', () => {
+      if (settled) return;
+      settled = true;
+      denyProxyRequest(client, '502 Bad Gateway');
     });
   }
 
@@ -641,17 +660,24 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
     lines[0] = `${method} ${path} ${version}`;
 
     const rewrittenHeader = lines
-      .filter((line) => !line.toLowerCase().startsWith('proxy-connection:'))
+      .filter(
+        (line) =>
+          !line.toLowerCase().startsWith('proxy-connection:') &&
+          !line.toLowerCase().startsWith('proxy-authorization:'),
+      )
       .join('\r\n');
     const resolved = await resolveProxyEndpoint(url.hostname);
-    let connected = false;
+    let settled = false;
     const upstream = connectNet({ host: resolved.address, port, family: resolved.family }, () => {
-      connected = true;
+      settled = true;
       upstream.write(`${rewrittenHeader}\r\n\r\n`);
       pipeSockets(client, upstream, rest);
     });
-    upstream.on('error', () => {
-      if (!connected) denyProxyRequest(client, '502 Bad Gateway');
+    trackUpstream(upstream, client, () => settled);
+    upstream.once('error', () => {
+      if (settled) return;
+      settled = true;
+      denyProxyRequest(client, '502 Bad Gateway');
     });
   }
 
@@ -679,6 +705,17 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
 
       const header = buffered.subarray(0, headerEnd).toString('utf-8');
       const rest = buffered.subarray(headerEnd + 4);
+      if (authorization) {
+        const supplied = header
+          .split(/\r?\n/)
+          .find((line) => line.toLowerCase().startsWith('proxy-authorization:'))
+          ?.slice('proxy-authorization:'.length)
+          .trim();
+        if (supplied !== authorization) {
+          denyProxyRequest(client, '407 Proxy Authentication Required');
+          return;
+        }
+      }
       const firstLine = header.split(/\r?\n/, 1)[0];
       const [method, target] = (firstLine ?? '').split(' ');
 
@@ -716,9 +753,13 @@ function startProxy(config: SandboxConfig): Promise<{ port: number; stop: () => 
   });
 }
 
-function proxyEnv(port: number | null): Record<string, string> | undefined {
+function proxyEnv(
+  port: number | null,
+  proxyToken?: string | null,
+): Record<string, string> | undefined {
   if (port === null) return undefined;
-  const url = `http://127.0.0.1:${port}`;
+  const credentials = proxyToken ? `landstrip:${proxyToken}@` : '';
+  const url = `http://${credentials}127.0.0.1:${port}`;
 
   return {
     HTTP_PROXY: url,
@@ -1305,7 +1346,12 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       };
     }
 
-    const proxy = allowNetwork ? null : await startProxy(effectiveConfig);
+    const proxyToken = allowNetwork ? null : randomBytes(32).toString('base64url');
+    const proxyAuthorization =
+      proxyToken === null
+        ? undefined
+        : `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
+    const proxy = allowNetwork ? null : await startProxy(effectiveConfig, proxyAuthorization);
     const proxyPort = proxy ? proxy.port : null;
     let policy: { dir: string; path: string };
 
@@ -1348,6 +1394,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       wrappedCommand,
       policyDir: policy.dir,
       port: proxyPort,
+      proxyToken,
       stop: proxy ? proxy.stop : null,
       trapServer: trapServer?.server ?? null,
       trapServerPort: trapPort,
@@ -1437,7 +1484,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       const state = activeBash.get(input.callID);
       if (!state) return;
 
-      const envVars = proxyEnv(state.port);
+      const envVars = proxyEnv(state.port, state.proxyToken);
       if (envVars) Object.assign(output.env, envVars);
     },
 
