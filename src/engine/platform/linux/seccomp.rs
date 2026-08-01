@@ -528,6 +528,9 @@ fn handle_notification(
             ctx.query_enabled,
             next_query_id,
         )
+    } else if ctx.notify_filesystem && ctx.syscalls.is_handle_syscall(syscall) {
+        // name_to_handle_at / open_by_handle_at bypass path mediation. Deny hard.
+        Err(BrokerError::PolicyDenied)
     } else if ctx.notify_filesystem {
         handle_mutation(
             ctx.policy,
@@ -2586,6 +2589,8 @@ pub(super) struct NotificationSyscalls {
     openat: i64,
     openat2: i64,
     open: Option<i64>,
+    name_to_handle_at: i64,
+    open_by_handle_at: i64,
 }
 
 impl NotificationSyscalls {
@@ -2597,6 +2602,8 @@ impl NotificationSyscalls {
             openat: libc::SYS_openat,
             openat2: libc::SYS_openat2,
             open: legacy_syscall::OPEN,
+            name_to_handle_at: libc::SYS_name_to_handle_at,
+            open_by_handle_at: libc::SYS_open_by_handle_at,
         }
     }
 
@@ -2606,12 +2613,22 @@ impl NotificationSyscalls {
             || self.open.is_some_and(|open| open == syscall)
     }
 
+    fn is_handle_syscall(&self, syscall: i64) -> bool {
+        syscall == self.name_to_handle_at || syscall == self.open_by_handle_at
+    }
+
     // stat (newfstatat/statx) is intentionally not mediated: blocking metadata
     // reads breaks directory traversal (git, shells, build tools all stat
     // ancestor dirs to canonicalise paths), and denyRead still blocks reading
-    // file contents and listing directories via openat.
+    // file contents and listing directories via openat. Handle-based open APIs
+    // are notified so the broker can hard-deny them.
     pub(super) fn filesystem_syscalls(&self) -> Vec<i64> {
-        let mut nrs = vec![self.openat, self.openat2];
+        let mut nrs = vec![
+            self.openat,
+            self.openat2,
+            self.name_to_handle_at,
+            self.open_by_handle_at,
+        ];
         if let Some(open) = self.open {
             nrs.push(open);
         }
