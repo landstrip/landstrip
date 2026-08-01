@@ -2,7 +2,7 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, relative, sep } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 
 import { getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent';
 import {
@@ -14,15 +14,14 @@ import {
 } from 'jsonc-parser';
 
 import { type AgentDefinition, validateAgentRaw } from './agents.ts';
-import { type ConfigObject, getPiConfigPaths, loadLandstripConfig } from './config.ts';
-import { normalizeOpenCodeAgentRaw, parseMarkdownAgentRaw } from './opencode-agents.ts';
+import { type ConfigObject, getPiConfigPaths } from './config.ts';
+import { parseMarkdownAgentRaw } from './opencode-agents.ts';
 import { expandFileReferences, isRecord } from './util.ts';
 
 const JSON_FORMAT = {
   formattingOptions: { insertSpaces: true, tabSize: 2, eol: '\n' },
 };
 
-type JsonAgentKind = 'landstrip' | 'opencode';
 type JsonPath = (string | number)[];
 
 export interface AgentEditorDocument {
@@ -51,28 +50,21 @@ function valueAtPath(root: unknown, path: JsonPath): unknown {
   return value;
 }
 
-function agentJsonPath(kind: JsonAgentKind, name: string): JsonPath {
-  return kind === 'landstrip' ? ['landstrip', 'agent', name] : ['agent', name];
+function agentJsonPath(name: string): JsonPath {
+  return ['landstrip', 'agent', name];
 }
 
-function agentContainerPath(kind: JsonAgentKind): JsonPath {
-  return kind === 'landstrip' ? ['landstrip', 'agent'] : ['agent'];
+function editorSnippet(name: string, raw: ConfigObject): string {
+  return `${JSON.stringify({ landstrip: { agent: { [name]: raw } } }, null, 2)}\n`;
 }
 
-function editorSnippet(kind: JsonAgentKind, name: string, raw: ConfigObject): string {
-  const value =
-    kind === 'landstrip' ? { landstrip: { agent: { [name]: raw } } } : { agent: { [name]: raw } };
-  return `${JSON.stringify(value, null, 2)}\n`;
-}
-
-function parseEditorSnippet(content: string, kind: JsonAgentKind, name: string): ConfigObject {
+function parseEditorSnippet(content: string, name: string): ConfigObject {
   const root = parseJsonDocument(content, 'Edited agent');
-  const parent = kind === 'landstrip' ? valueAtPath(root, ['landstrip']) : root;
-  const container = valueAtPath(root, agentContainerPath(kind));
-  const rootKey = kind === 'landstrip' ? 'landstrip' : 'agent';
+  const parent = valueAtPath(root, ['landstrip']);
+  const container = valueAtPath(root, ['landstrip', 'agent']);
   if (
     Object.keys(root).length !== 1 ||
-    root[rootKey] === undefined ||
+    root.landstrip === undefined ||
     !isRecord(parent) ||
     Object.keys(parent).length !== 1 ||
     parent.agent === undefined ||
@@ -83,18 +75,6 @@ function parseEditorSnippet(content: string, kind: JsonAgentKind, name: string):
     throw new Error(`Edited JSON must contain only agent ${name}`);
   }
   return container[name];
-}
-
-function validateEditedAgent(kind: JsonAgentKind, name: string, raw: ConfigObject): void {
-  if (kind === 'landstrip') {
-    validateAgentRaw(name, raw);
-    return;
-  }
-  const prompt = raw.prompt;
-  if (prompt !== undefined && typeof prompt !== 'string') {
-    throw new Error(`agent ${name} prompt must be a string`);
-  }
-  validateAgentRaw(name, normalizeOpenCodeAgentRaw(raw, typeof prompt === 'string' ? prompt : ''));
 }
 
 function ensureFinalNewline(content: string): string {
@@ -136,10 +116,10 @@ async function deleteJsonNode(
   return deleted;
 }
 
-function readAgentNode(path: string, kind: JsonAgentKind, name: string): ConfigObject | undefined {
+function readAgentNode(path: string, name: string): ConfigObject | undefined {
   if (!existsSync(path)) return undefined;
   const root = parseJsonDocument(readFileSync(path, 'utf8'), path);
-  const value = valueAtPath(root, agentJsonPath(kind, name));
+  const value = valueAtPath(root, agentJsonPath(name));
   return isRecord(value) ? { ...value } : undefined;
 }
 
@@ -195,14 +175,7 @@ function projectMarkdownPath(cwd: string, agentDir: string, agent: AgentDefiniti
     const suffix = safeRelative(join(agentDir, 'agents'), origin.path) ?? `${agent.name}.md`;
     return join(cwd, '.pi', 'agents', suffix);
   }
-  if (origin.kind === 'opencode-markdown' && origin.path) {
-    return join(cwd, '.opencode', 'agents', `${agent.name}.md`);
-  }
   throw new Error(`Agent ${agent.name} has no Markdown source`);
-}
-
-function openCodeProjectPath(cwd: string, sourcePath: string): string {
-  return join(cwd, '.opencode', basename(sourcePath));
 }
 
 function projectSettingsPath(cwd: string, agentDir: string): string {
@@ -210,7 +183,7 @@ function projectSettingsPath(cwd: string, agentDir: string): string {
 }
 
 function projectSettingsHasAgent(cwd: string, name: string, agentDir: string): boolean {
-  return readAgentNode(projectSettingsPath(cwd, agentDir), 'landstrip', name) !== undefined;
+  return readAgentNode(projectSettingsPath(cwd, agentDir), name) !== undefined;
 }
 
 export function canDeleteProjectAgent(
@@ -224,13 +197,7 @@ export function canDeleteProjectAgent(
     return false;
   }
   const origin = agent.origin;
-  return Boolean(
-    origin?.source === 'local' &&
-    origin.path &&
-    (origin.kind === 'pi-markdown' ||
-      origin.kind === 'opencode-markdown' ||
-      origin.kind === 'opencode-json'),
-  );
+  return Boolean(origin?.source === 'local' && origin.path && origin.kind === 'pi-markdown');
 }
 
 export async function deleteProjectAgent(
@@ -239,21 +206,13 @@ export async function deleteProjectAgent(
   agentDir = getAgentDir(),
 ): Promise<boolean> {
   const settingsPath = projectSettingsPath(cwd, agentDir);
-  const deletedOverride = await deleteJsonNode(
-    settingsPath,
-    agentJsonPath('landstrip', agent.name),
-    [['landstrip', 'agent'], ['landstrip']],
-  );
+  const deletedOverride = await deleteJsonNode(settingsPath, agentJsonPath(agent.name), [
+    ['landstrip', 'agent'],
+    ['landstrip'],
+  ]);
 
   const origin = agent.origin;
-  if (origin?.source !== 'local' || !origin.path) return deletedOverride;
-  if (origin.kind === 'opencode-json') {
-    const deletedSource = await deleteJsonNode(origin.path, agentJsonPath('opencode', agent.name), [
-      ['agent'],
-    ]);
-    return deletedOverride || deletedSource;
-  }
-  if (origin.kind !== 'pi-markdown' && origin.kind !== 'opencode-markdown') {
+  if (origin?.source !== 'local' || !origin.path || origin.kind !== 'pi-markdown') {
     return deletedOverride;
   }
   if (!existsSync(origin.path)) return deletedOverride;
@@ -267,36 +226,13 @@ export function prepareProjectAgentEditor(
   agentDir = getAgentDir(),
 ): AgentEditorDocument {
   const origin = agent.origin;
-  const openCodeProjectEnabled = loadLandstripConfig(cwd, true, agentDir).opencode.showLocalAgents;
-  if (origin?.path && (origin.kind === 'pi-markdown' || origin.kind === 'opencode-markdown')) {
-    const useMarkdown =
-      origin.kind === 'pi-markdown' || origin.source === 'local' || openCodeProjectEnabled;
-    const target = useMarkdown
-      ? projectMarkdownPath(cwd, agentDir, agent)
-      : projectSettingsPath(cwd, agentDir);
-    const projectOverride = useMarkdown
-      ? undefined
-      : readAgentNode(target, 'landstrip', agent.name);
-    const disabledOverride =
-      projectOverride &&
-      Object.keys(projectOverride).length === 1 &&
-      typeof projectOverride.disable === 'boolean'
-        ? projectOverride.disable
-        : undefined;
+  if (origin?.path && origin.kind === 'pi-markdown') {
+    const target = projectMarkdownPath(cwd, agentDir, agent);
     return {
       title: `Edit @${agent.name}`,
       content: readFileSync(origin.path, 'utf8'),
       async save(content) {
-        const edited = parseMarkdownAgentRaw(content);
-        const raw =
-          !useMarkdown && edited.disable === undefined && disabledOverride !== undefined
-            ? { ...edited, disable: disabledOverride }
-            : edited;
-        validateAgentRaw(agent.name, raw);
-        if (!useMarkdown) {
-          await writeJsonNode(target, agentJsonPath('landstrip', agent.name), raw);
-          return;
-        }
+        validateAgentRaw(agent.name, parseMarkdownAgentRaw(content));
         await withFileMutationQueue(target, async () => {
           mkdirSync(dirname(target), { recursive: true });
           writeFileSync(target, ensureFinalNewline(content), { mode: 0o600 });
@@ -304,36 +240,22 @@ export function prepareProjectAgentEditor(
       },
     };
   }
-  const useOpenCode =
-    origin?.kind === 'opencode-json' &&
-    origin.path !== undefined &&
-    (origin.source === 'local' || openCodeProjectEnabled);
-  const kind: JsonAgentKind = useOpenCode ? 'opencode' : 'landstrip';
   const sourcePath = origin?.path;
-  const sourceKind: JsonAgentKind = origin?.kind === 'opencode-json' ? 'opencode' : 'landstrip';
-  const sourceRaw = sourcePath ? readAgentNode(sourcePath, sourceKind, agent.name) : undefined;
+  const sourceRaw =
+    origin?.kind === 'settings' && sourcePath ? readAgentNode(sourcePath, agent.name) : undefined;
   const raw = relocateGlobalPrompt(
-    sourceKind === kind && sourceRaw
-      ? sourceRaw
-      : agent.raw
-        ? { ...agent.raw }
-        : normalizedAgentRaw(agent),
+    sourceRaw ? sourceRaw : agent.raw ? { ...agent.raw } : normalizedAgentRaw(agent),
     agent,
   );
-  const target =
-    kind === 'opencode' && sourcePath
-      ? origin?.source === 'local'
-        ? sourcePath
-        : openCodeProjectPath(cwd, sourcePath)
-      : projectSettingsPath(cwd, agentDir);
+  const target = projectSettingsPath(cwd, agentDir);
 
   return {
     title: `Edit @${agent.name}`,
-    content: editorSnippet(kind, agent.name, raw),
+    content: editorSnippet(agent.name, raw),
     async save(content) {
-      const edited = parseEditorSnippet(content, kind, agent.name);
-      validateEditedAgent(kind, agent.name, edited);
-      await writeJsonNode(target, agentJsonPath(kind, agent.name), edited);
+      const edited = parseEditorSnippet(content, agent.name);
+      validateAgentRaw(agent.name, edited);
+      await writeJsonNode(target, agentJsonPath(agent.name), edited);
     },
   };
 }

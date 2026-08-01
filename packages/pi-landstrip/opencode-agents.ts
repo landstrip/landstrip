@@ -2,34 +2,23 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { dirname, extname, join, relative, sep } from 'node:path';
+import { extname, join, relative, sep } from 'node:path';
 
 import { parse as parseYaml } from 'yaml';
-import { parse as parseJsonc, printParseErrorCode, type ParseError } from 'jsonc-parser';
 
 import type { AgentSource, ConfigObject } from './config.ts';
-import { expandFileReferences, formatError, isRecord } from './util.ts';
+import { formatError, isRecord } from './util.ts';
 
-export interface OpenCodeAgentRaw {
+export interface MarkdownAgentRaw {
   readonly name: string;
   readonly source: AgentSource;
   readonly path: string;
-  readonly format: 'json' | 'markdown';
   readonly raw: ConfigObject;
 }
 
-export interface OpenCodeAgentLoadResult {
-  readonly agents: ReadonlyMap<string, OpenCodeAgentRaw>;
+export interface MarkdownAgentLoadResult {
+  readonly agents: ReadonlyMap<string, MarkdownAgentRaw>;
   readonly diagnostics: readonly string[];
-}
-
-const AGENT_DIR_PREFIXES = ['agent/', 'agents/'] as const;
-
-function openCodeGlobalConfigDir(): string {
-  if (process.env.OPENCODE_CONFIG_DIR) return process.env.OPENCODE_CONFIG_DIR;
-  const xdg = process.env.XDG_CONFIG_HOME;
-  return join(xdg && xdg.length > 0 ? xdg : join(homedir(), '.config'), 'opencode');
 }
 
 function listMarkdownFiles(root: string): string[] {
@@ -60,13 +49,6 @@ function listMarkdownFiles(root: string): string[] {
 
 function agentNameFromPath(dir: string, filePath: string): string {
   const relativePath = relative(dir, filePath).split(sep).join('/');
-  for (const prefix of AGENT_DIR_PREFIXES) {
-    if (relativePath.startsWith(prefix)) {
-      const candidate = relativePath.slice(prefix.length);
-      const extension = extname(candidate);
-      return extension.length > 0 ? candidate.slice(0, -extension.length) : candidate;
-    }
-  }
   const extension = extname(relativePath);
   return extension.length > 0 ? relativePath.slice(0, -extension.length) : relativePath;
 }
@@ -97,8 +79,8 @@ function convertToolsToPermission(tools: unknown): ConfigObject {
   return permission;
 }
 
-/** Normalize OpenCode markdown agent fields into pi-landstrip agent shape. */
-export function normalizeOpenCodeAgentRaw(data: ConfigObject, prompt: string): ConfigObject {
+/** Normalize markdown agent fields into pi-landstrip agent shape. */
+export function normalizeMarkdownAgentRaw(data: ConfigObject, prompt: string): ConfigObject {
   const known = new Set([
     'name',
     'model',
@@ -157,127 +139,29 @@ export function normalizeOpenCodeAgentRaw(data: ConfigObject, prompt: string): C
 
 export function parseMarkdownAgentRaw(content: string): ConfigObject {
   const { data, body } = parseFrontmatter(content);
-  return normalizeOpenCodeAgentRaw(data, body.trim());
-}
-
-function parseOpenCodeConfig(path: string): ConfigObject {
-  const errors: ParseError[] = [];
-  const value: unknown = parseJsonc(readFileSync(path, 'utf8'), errors, {
-    allowTrailingComma: true,
-  });
-  if (errors.length > 0) {
-    const error = errors[0];
-    throw new Error(`${printParseErrorCode(error.error)} at offset ${error.offset}`);
-  }
-  if (!isRecord(value)) throw new Error('config must contain a JSON object');
-  return value;
-}
-
-function loadAgentsFromConfigFile(
-  path: string,
-  source: AgentSource,
-  agents: Map<string, OpenCodeAgentRaw>,
-  diagnostics: string[],
-): void {
-  if (!existsSync(path)) return;
-  try {
-    const config = parseOpenCodeConfig(path);
-    if (config.agent === undefined) return;
-    if (!isRecord(config.agent)) throw new Error('agent must be a JSON object');
-    for (const [name, value] of Object.entries(config.agent)) {
-      try {
-        if (!name) throw new Error('agent name is empty');
-        if (!isRecord(value)) throw new Error(`agent ${name} must be a JSON object`);
-        if (value.prompt !== undefined && typeof value.prompt !== 'string') {
-          throw new Error(`agent ${name} prompt must be a string`);
-        }
-        const prompt =
-          typeof value.prompt === 'string' ? expandFileReferences(value.prompt, dirname(path)) : '';
-        const raw = normalizeOpenCodeAgentRaw(value, prompt);
-        agents.set(name, { name, source, path, format: 'json', raw });
-      } catch (error) {
-        diagnostics.push(`${path}: ${formatError(error)}`);
-      }
-    }
-  } catch (error) {
-    diagnostics.push(`${path}: ${formatError(error)}`);
-  }
-}
-
-function loadConfigAgentsFromDir(
-  dir: string,
-  source: AgentSource,
-  agents: Map<string, OpenCodeAgentRaw>,
-  diagnostics: string[],
-): void {
-  for (const file of ['opencode.json', 'opencode.jsonc']) {
-    loadAgentsFromConfigFile(join(dir, file), source, agents, diagnostics);
-  }
-}
-
-function loadAgentsFromRoot(
-  root: string,
-  nameRoot: string,
-  source: AgentSource,
-  agents: Map<string, OpenCodeAgentRaw>,
-  diagnostics: string[],
-): void {
-  for (const filePath of listMarkdownFiles(root)) {
-    try {
-      const content = readFileSync(filePath, 'utf8');
-      const raw = parseMarkdownAgentRaw(content);
-      const name = agentNameFromPath(nameRoot, filePath);
-      if (!name) {
-        diagnostics.push(`${filePath}: agent name is empty`);
-        continue;
-      }
-      agents.set(name, { name, source, path: filePath, format: 'markdown', raw });
-    } catch (error) {
-      diagnostics.push(`${filePath}: ${formatError(error)}`);
-    }
-  }
-}
-
-function loadAgentsFromDir(
-  dir: string,
-  source: AgentSource,
-  agents: Map<string, OpenCodeAgentRaw>,
-  diagnostics: string[],
-): void {
-  for (const subdir of ['agent', 'agents']) {
-    loadAgentsFromRoot(join(dir, subdir), dir, source, agents, diagnostics);
-  }
+  return normalizeMarkdownAgentRaw(data, body.trim());
 }
 
 export function loadPiMarkdownAgents(options: {
   directories: readonly { path: string; source: AgentSource }[];
-}): OpenCodeAgentLoadResult {
-  const agents = new Map<string, OpenCodeAgentRaw>();
+}): MarkdownAgentLoadResult {
+  const agents = new Map<string, MarkdownAgentRaw>();
   const diagnostics: string[] = [];
   for (const directory of options.directories) {
-    loadAgentsFromRoot(directory.path, directory.path, directory.source, agents, diagnostics);
-  }
-  return { agents, diagnostics };
-}
-
-export function loadOpenCodeAgents(options: {
-  cwd: string;
-  includeGlobal: boolean;
-  includeProject: boolean;
-  globalConfigDir?: string;
-}): OpenCodeAgentLoadResult {
-  const agents = new Map<string, OpenCodeAgentRaw>();
-  const diagnostics: string[] = [];
-  if (options.includeGlobal) {
-    const globalDir = options.globalConfigDir ?? openCodeGlobalConfigDir();
-    loadConfigAgentsFromDir(globalDir, 'global', agents, diagnostics);
-    loadAgentsFromDir(globalDir, 'global', agents, diagnostics);
-  }
-  if (options.includeProject) {
-    loadConfigAgentsFromDir(options.cwd, 'local', agents, diagnostics);
-    const projectDir = join(options.cwd, '.opencode');
-    loadConfigAgentsFromDir(projectDir, 'local', agents, diagnostics);
-    loadAgentsFromDir(projectDir, 'local', agents, diagnostics);
+    for (const filePath of listMarkdownFiles(directory.path)) {
+      try {
+        const content = readFileSync(filePath, 'utf8');
+        const raw = parseMarkdownAgentRaw(content);
+        const name = agentNameFromPath(directory.path, filePath);
+        if (!name) {
+          diagnostics.push(`${filePath}: agent name is empty`);
+          continue;
+        }
+        agents.set(name, { name, source: directory.source, path: filePath, raw });
+      } catch (error) {
+        diagnostics.push(`${filePath}: ${formatError(error)}`);
+      }
+    }
   }
   return { agents, diagnostics };
 }

@@ -11,7 +11,7 @@ import {
   type AgentSource,
   type ConfigObject,
 } from './config.ts';
-import { loadOpenCodeAgents, loadPiMarkdownAgents } from './opencode-agents.ts';
+import { loadPiMarkdownAgents } from './opencode-agents.ts';
 import { expandHomePath, formatError, isAgentColor, isRecord } from './util.ts';
 
 export type PermissionAction = 'allow' | 'ask' | 'deny';
@@ -25,7 +25,7 @@ export interface PermissionRule {
 export type PermissionRules = readonly PermissionRule[];
 
 export interface AgentOrigin {
-  readonly kind: 'built-in' | 'settings' | 'pi-markdown' | 'opencode-json' | 'opencode-markdown';
+  readonly kind: 'built-in' | 'settings' | 'pi-markdown';
   readonly source: AgentSource;
   readonly path?: string;
 }
@@ -185,46 +185,17 @@ export function loadAgentCatalog(
   let configuredAgents: ConfigObject = {};
   let configuredPermission: unknown;
   let agentSources = new Map<string, AgentSource>();
-  let showGlobalAgents = false;
-  let showLocalAgents = false;
   try {
     const config = loadLandstripConfig(cwd, includeProject, piAgentDir);
     maxSubagents = config.maxSubagents;
     configuredAgents = config.agent;
     configuredPermission = config.permission;
     agentSources = new Map(config.agentSources);
-    showGlobalAgents = config.opencode.showGlobalAgents;
-    showLocalAgents = config.opencode.showLocalAgents;
   } catch (error) {
     diagnostics.push(formatError(error));
   }
 
-  // OpenCode agents fill gaps only. Pi definitions win silently on name conflict:
-  // OpenCode global < OpenCode project < Pi built-in/global/local.
-  const openCode = loadOpenCodeAgents({
-    cwd,
-    includeGlobal: showGlobalAgents,
-    includeProject: showLocalAgents && includeProject,
-  });
-  diagnostics.push(...openCode.diagnostics);
-
   const normalized = new Map<string, AgentDefinition>();
-  for (const imported of openCode.agents.values()) {
-    try {
-      const kind = imported.format === 'markdown' ? 'opencode-markdown' : 'opencode-json';
-      normalized.set(
-        imported.name,
-        normalizeAgent(imported.name, imported.raw, imported.source, {
-          kind,
-          source: imported.source,
-          path: imported.path,
-        }),
-      );
-    } catch (error) {
-      diagnostics.push(`${imported.path}: ${formatError(error)}`);
-    }
-  }
-
   const piMarkdown = loadPiMarkdownAgents({
     directories: [
       { path: join(piAgentDir, 'agents'), source: 'global' },

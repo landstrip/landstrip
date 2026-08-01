@@ -4,7 +4,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, test } from 'vitest';
+import { describe, expect, test } from 'vitest';
 
 import {
   agentSupportsMode,
@@ -37,17 +37,6 @@ function write(path: string, value: unknown): void {
 }
 
 describe('landstrip agent configuration', () => {
-  let previousOpenCodeConfigDir: string | undefined;
-
-  beforeEach(() => {
-    previousOpenCodeConfigDir = process.env.OPENCODE_CONFIG_DIR;
-    process.env.OPENCODE_CONFIG_DIR = temporaryDirectory();
-  });
-
-  afterEach(() => {
-    if (previousOpenCodeConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR;
-    else process.env.OPENCODE_CONFIG_DIR = previousOpenCodeConfigDir;
-  });
   test('provides one default agent catalog with mode capabilities', () => {
     const catalog = loadAgentCatalog(temporaryDirectory(), temporaryDirectory());
 
@@ -182,7 +171,6 @@ describe('landstrip agent configuration', () => {
       landstrip: {
         maxSubagents: 8,
         agent: { project: { mode: 'subagent' } },
-        opencode: { showGlobalAgents: false },
       },
     });
 

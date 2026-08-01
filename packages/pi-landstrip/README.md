@@ -143,11 +143,6 @@ Pi Markdown agents are loaded from `~/.pi/agent/agents/` and `.pi/agents/`.
 `landstrip.agent` settings override Markdown agents with the same name.
 Project definitions override global definitions.
 
-OpenCode agent imports are enabled by default. Set
-`landstrip.opencode.showGlobalAgents` or `showLocalAgents` to `false` to disable
-a source. OpenCode agents fill missing names; Pi agents take precedence.
-Project imports require a trusted project.
-
 See the main [Landstrip documentation](https://github.com/landstrip/landstrip#readme)
 for `sandbox.json` fields and platform policy semantics.
 
