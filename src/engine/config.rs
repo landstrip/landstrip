@@ -265,8 +265,10 @@ fn read_xattr(path: &Path, name: &str) -> std::result::Result<Option<Vec<u8>>, E
         return Ok(Some(Vec::new()));
     }
 
-    #[allow(clippy::cast_sign_loss)]
-    let mut buffer = vec![0u8; needed as usize];
+    let needed = usize::try_from(needed).map_err(|_| Error::PolicyIoFailed {
+        source: io::Error::new(io::ErrorKind::InvalidData, "xattr size does not fit usize"),
+    })?;
+    let mut buffer = vec![0u8; needed];
     // SAFETY: buffer is valid for writes of its own length, which is passed
     // as the size bound alongside it.
     let got = unsafe {
@@ -281,8 +283,10 @@ fn read_xattr(path: &Path, name: &str) -> std::result::Result<Option<Vec<u8>>, E
         return classify_xattr_error();
     }
 
-    #[allow(clippy::cast_sign_loss)]
-    buffer.truncate(got as usize);
+    let got = usize::try_from(got).map_err(|_| Error::PolicyIoFailed {
+        source: io::Error::new(io::ErrorKind::InvalidData, "xattr size does not fit usize"),
+    })?;
+    buffer.truncate(got);
     Ok(Some(buffer))
 }
 
