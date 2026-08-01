@@ -2,26 +2,20 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
+import type { Readable, Writable } from 'node:stream';
 
-import {
-  createBashToolDefinition,
-  type ExtensionAPI,
-  type ExtensionContext,
-} from '@earendil-works/pi-coding-agent';
-
-import type { RpcChildProcess } from './rpc-process.ts';
+import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 
 export const LANDSTRIP_CONTEXT_ENV = 'LANDSTRIP_CONTEXT';
-export const LANDSTRIP_RUNTIME_VERSION = 1;
+export const LANDSTRIP_RUNTIME_VERSION = 2;
 
-const RUNTIME_REGISTER_EVENT = 'landstrip:runtime:register:v1';
-const RUNTIME_DISCOVER_EVENT = 'landstrip:runtime:discover:v1';
+const RUNTIME_REGISTER_EVENT = 'landstrip:runtime:register:v2';
+const RUNTIME_DISCOVER_EVENT = 'landstrip:runtime:discover:v2';
 
 export type LandstripSandboxState = 'enabled' | 'disabled' | 'unavailable';
-export type LandstripBashTool = ReturnType<typeof createBashToolDefinition>;
 
-export interface LandstripContextV1 {
-  readonly version: 1;
+export interface LandstripContextV2 {
+  readonly version: 2;
   readonly host: 'pi';
   readonly role: 'primary' | 'subagent';
   readonly sandbox: LandstripSandboxState;
@@ -36,6 +30,30 @@ export interface LandstripContextV1 {
 export interface LandstripWorkerExtension {
   readonly id: string;
   readonly entry: string;
+}
+
+export interface LandstripShellPrepareOptions {
+  readonly command: string;
+  readonly cwd: string;
+  /** Composed command environment; transport it without copying secrets into launcherEnv. */
+  readonly env: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
+}
+
+export interface LandstripShellInvocation {
+  readonly executable: string;
+  readonly args: readonly string[];
+  /** Minimal environment for the Landstrip launcher and shell bootstrap process. */
+  readonly launcherEnv: NodeJS.ProcessEnv;
+  readonly readPaths?: readonly string[];
+  dispose?(): void | Promise<void>;
+}
+
+export interface LandstripShellProvider {
+  readonly id: string;
+  prepare(
+    options: LandstripShellPrepareOptions,
+  ): LandstripShellInvocation | Promise<LandstripShellInvocation>;
 }
 
 export interface LandstripProcessOptions {
@@ -58,25 +76,42 @@ export interface LandstripPreparedProcess {
   dispose(): Promise<void>;
 }
 
+export interface LandstripRpcChildProcess {
+  readonly stdin: Writable;
+  readonly stdout: Readable;
+  readonly stderr: Readable;
+  readonly exitCode: number | null;
+  readonly signalCode: NodeJS.Signals | null;
+  kill(signal?: NodeJS.Signals | number): boolean;
+  on(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  on(event: 'error', listener: (error: Error) => void): this;
+  once(event: 'spawn', listener: () => void): this;
+  once(event: 'error', listener: (error: Error) => void): this;
+  once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  off(event: 'spawn', listener: () => void): this;
+  off(event: 'error', listener: (error: Error) => void): this;
+  off(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+}
+
 export type LandstripSpawn = (
   command: string,
   args: readonly string[],
   options: SpawnOptions,
-) => ChildProcess | RpcChildProcess;
+) => ChildProcess | LandstripRpcChildProcess;
 
 export type LandstripEvent =
-  | { readonly type: 'sandbox.changed'; readonly context: LandstripContextV1 }
-  | { readonly type: 'subagent.start'; readonly context: LandstripContextV1 }
+  | { readonly type: 'sandbox.changed'; readonly context: LandstripContextV2 }
+  | { readonly type: 'subagent.start'; readonly context: LandstripContextV2 }
   | {
       readonly type: 'subagent.end';
-      readonly context: LandstripContextV1;
+      readonly context: LandstripContextV2;
       readonly status: 'completed' | 'cancelled' | 'error';
     };
 
-export interface PiLandstripRuntimeV1 {
-  readonly version: 1;
-  getContext(ctx?: ExtensionContext): LandstripContextV1;
-  createBashTool(cwd: string, ctx?: ExtensionContext): LandstripBashTool;
+export interface PiLandstripRuntimeV2 {
+  readonly version: 2;
+  getContext(ctx?: ExtensionContext): LandstripContextV2;
+  registerShellProvider(provider: LandstripShellProvider): () => void;
   prepareProcess(options: LandstripProcessOptions): Promise<LandstripPreparedProcess>;
   registerWorkerExtension(extension: LandstripWorkerExtension): () => void;
   getWorkerExtensions(): readonly LandstripWorkerExtension[];
@@ -87,13 +122,13 @@ export interface PiLandstripRuntimeV1 {
 }
 
 interface RuntimeRegistration {
-  readonly version: 1;
-  readonly runtime: PiLandstripRuntimeV1;
+  readonly version: 2;
+  readonly runtime: PiLandstripRuntimeV2;
 }
 
 interface RuntimeDiscovery {
-  readonly version: 1;
-  register(runtime: PiLandstripRuntimeV1): void;
+  readonly version: 2;
+  register(runtime: PiLandstripRuntimeV2): void;
 }
 
 interface EventBusLike {
@@ -109,12 +144,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function isRuntime(value: unknown): value is PiLandstripRuntimeV1 {
+function isRuntime(value: unknown): value is PiLandstripRuntimeV2 {
   return (
     isRecord(value) &&
     value.version === LANDSTRIP_RUNTIME_VERSION &&
     typeof value.getContext === 'function' &&
-    typeof value.createBashTool === 'function' &&
+    typeof value.registerShellProvider === 'function' &&
     typeof value.prepareProcess === 'function' &&
     typeof value.registerWorkerExtension === 'function' &&
     typeof value.getWorkerExtensions === 'function' &&
@@ -124,13 +159,13 @@ function isRuntime(value: unknown): value is PiLandstripRuntimeV1 {
 
 export function useLandstrip(
   pi: ExtensionAPI,
-  callback: (runtime: PiLandstripRuntimeV1) => void,
+  callback: (runtime: PiLandstripRuntimeV2) => void,
 ): () => void {
   const events = eventBus(pi);
   if (!events) return () => undefined;
 
-  let current: PiLandstripRuntimeV1 | undefined;
-  const register = (runtime: PiLandstripRuntimeV1): void => {
+  let current: PiLandstripRuntimeV2 | undefined;
+  const register = (runtime: PiLandstripRuntimeV2): void => {
     if (runtime === current) return;
     current = runtime;
     callback(runtime);
@@ -139,16 +174,37 @@ export function useLandstrip(
     if (!isRecord(value) || value.version !== LANDSTRIP_RUNTIME_VERSION) return;
     if (isRuntime(value.runtime)) register(value.runtime);
   });
-  events.emit(RUNTIME_DISCOVER_EVENT, {
-    version: LANDSTRIP_RUNTIME_VERSION,
-    register,
-  } satisfies RuntimeDiscovery);
-  return unsubscribe;
+  try {
+    events.emit(RUNTIME_DISCOVER_EVENT, {
+      version: LANDSTRIP_RUNTIME_VERSION,
+      register,
+    } satisfies RuntimeDiscovery);
+    return unsubscribe;
+  } catch (error) {
+    unsubscribe();
+    throw error;
+  }
+}
+
+export function provideLandstripShell(
+  pi: ExtensionAPI,
+  provider: LandstripShellProvider,
+): () => void {
+  let unregisterProvider: (() => void) | undefined;
+  const stopDiscovery = useLandstrip(pi, (runtime) => {
+    const unregisterNext = runtime.registerShellProvider(provider);
+    unregisterProvider?.();
+    unregisterProvider = unregisterNext;
+  });
+  return () => {
+    stopDiscovery();
+    unregisterProvider?.();
+  };
 }
 
 export function publishLandstripRuntime(
   pi: ExtensionAPI,
-  runtime: PiLandstripRuntimeV1,
+  runtime: PiLandstripRuntimeV2,
 ): () => void {
   const events = eventBus(pi);
   if (!events) return () => undefined;
@@ -157,20 +213,25 @@ export function publishLandstripRuntime(
     if (!isRecord(value) || value.version !== LANDSTRIP_RUNTIME_VERSION) return;
     if (typeof value.register === 'function') value.register(runtime);
   });
-  events.emit(RUNTIME_REGISTER_EVENT, {
-    version: LANDSTRIP_RUNTIME_VERSION,
-    runtime,
-  } satisfies RuntimeRegistration);
-  return unsubscribe;
+  try {
+    events.emit(RUNTIME_REGISTER_EVENT, {
+      version: LANDSTRIP_RUNTIME_VERSION,
+      runtime,
+    } satisfies RuntimeRegistration);
+    return unsubscribe;
+  } catch (error) {
+    unsubscribe();
+    throw error;
+  }
 }
 
-export function encodeLandstripContext(context: LandstripContextV1): string {
+export function encodeLandstripContext(context: LandstripContextV2): string {
   return Buffer.from(JSON.stringify(context)).toString('base64url');
 }
 
 export function contextFromEnvironment(
   env: NodeJS.ProcessEnv = process.env,
-): LandstripContextV1 | undefined {
+): LandstripContextV2 | undefined {
   const encoded = env[LANDSTRIP_CONTEXT_ENV];
   if (!encoded) return undefined;
 
@@ -191,7 +252,7 @@ export function contextFromEnvironment(
     ) {
       return undefined;
     }
-    return value as unknown as LandstripContextV1;
+    return value as unknown as LandstripContextV2;
   } catch {
     return undefined;
   }

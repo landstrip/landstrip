@@ -14,6 +14,9 @@ import { describe, expect, it, vi } from 'vitest';
 
 import landstripExtension, {
   createLandstripIntegration,
+  createLandstripLauncherEnvironment,
+  createPosixShellProvider,
+  createWindowsDenyRead,
   matchesPattern,
   isPublicProxyAddress,
   readAllowed,
@@ -21,7 +24,35 @@ import landstripExtension, {
   shouldPromptForWrite,
   writeEnvFile,
 } from './index.ts';
+
 import { AsyncQueue, PermissionPromptCoordinator } from './util.ts';
+
+describe('Landstrip launcher environment', () => {
+  it('preserves the host ProgramData path on Windows', () => {
+    expect(
+      createLandstripLauncherEnvironment(
+        { PATH: 'provider-path', ProgramData: 'provider-data' },
+        { ProgramData: 'C:\\ProgramData' },
+        'win32',
+      ),
+    ).toEqual({ PATH: 'provider-path', ProgramData: 'C:\\ProgramData' });
+  });
+
+  it('does not add ProgramData when the host does not require or provide it', () => {
+    const providerEnv = { PATH: 'provider-path' };
+    expect(createLandstripLauncherEnvironment(providerEnv, {}, 'linux')).toBe(providerEnv);
+    expect(createLandstripLauncherEnvironment(providerEnv, {}, 'win32')).toBe(providerEnv);
+  });
+});
+
+describe('Windows read policy', () => {
+  it('drops POSIX-only deny paths before applying filesystem ACLs', () => {
+    expect(createWindowsDenyRead(['/Users', '/home', 'C:\\Secrets'], 'C:\\')).toEqual([
+      'C:\\Secrets',
+      'C:\\',
+    ]);
+  });
+});
 
 describe('main Pi tool composition', () => {
   it('leaves filesystem tool names available to Pi plugins', () => {
@@ -40,6 +71,101 @@ describe('main Pi tool composition', () => {
     expect(tools).not.toContain('read');
     expect(tools).not.toContain('write');
   });
+});
+
+it('prepares the default POSIX shell invocation and disposes its environment file', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-shell-provider-'));
+  const invocation = await createPosixShellProvider().prepare({
+    command: 'printf ready',
+    cwd,
+    env: { TEST_VALUE: 'provider-value' },
+  });
+  const envPath = invocation.readPaths?.[0];
+
+  expect(envPath).toBeDefined();
+  expect(readFileSync(envPath!, 'utf8')).toContain("export TEST_VALUE='provider-value'");
+  expect(invocation.args.at(-1)).toContain(`source '${envPath}' && printf ready`);
+
+  await invocation.dispose?.();
+  expect(existsSync(envPath!)).toBe(false);
+  rmSync(cwd, { recursive: true, force: true });
+});
+
+it('uses the active shell provider for the bash tool and user shell', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-active-shell-'));
+  const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-active-shell-agent-'));
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  const handlers = new Map<string, unknown>();
+  let bashTool: ToolDefinition | undefined;
+  const pi = {
+    registerTool(tool: ToolDefinition) {
+      if (tool.name === 'bash') bashTool = tool;
+    },
+    registerFlag() {},
+    registerCommand() {},
+    getFlag() {
+      return false;
+    },
+    on(event: string, handler: unknown) {
+      handlers.set(event, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const ctx = {
+    cwd,
+    hasUI: false,
+    mode: 'rpc',
+    isProjectTrusted: () => true,
+    sessionManager: { getSessionId: () => 'test-session', getSessionFile: () => undefined },
+    ui: { notify() {}, setStatus() {} },
+  } as unknown as ExtensionContext;
+  const disposeInvocation = vi.fn();
+  const prepare = vi.fn((options: { command: string; env: NodeJS.ProcessEnv }) => ({
+    executable: process.execPath,
+    args: ['-e', `process.stdout.write(${JSON.stringify(options.command)})`],
+    launcherEnv: { PATH: options.env.PATH, HOME: options.env.HOME },
+    readPaths: [process.execPath],
+    dispose: disposeInvocation,
+  }));
+  const integration = createLandstripIntegration();
+  integration.registerShellProvider({ id: 'test-shell', prepare });
+  integration.register(pi);
+
+  try {
+    const sessionStart = handlers.get('session_start') as (
+      event: unknown,
+      context: ExtensionContext,
+    ) => Promise<void>;
+    await sessionStart({}, ctx);
+    expect(bashTool).toBeDefined();
+    await bashTool!.execute('tool-call', { command: 'tool-provider' }, undefined, undefined, ctx);
+
+    const userBash = handlers.get('user_bash') as (
+      event: unknown,
+      context: ExtensionContext,
+    ) => Promise<{
+      operations: {
+        exec(
+          command: string,
+          cwd: string,
+          options: { onData(data: Buffer): void },
+        ): Promise<unknown>;
+      };
+    }>;
+    const userShell = await userBash({}, ctx);
+    await userShell.operations.exec('user-provider', cwd, { onData() {} });
+
+    expect(prepare.mock.calls.map(([options]) => options.command)).toEqual([
+      'tool-provider',
+      'user-provider',
+    ]);
+    expect(disposeInvocation).toHaveBeenCalledTimes(2);
+  } finally {
+    const shutdown = handlers.get('session_shutdown') as (() => void) | undefined;
+    shutdown?.();
+    vi.unstubAllEnvs();
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
 });
 
 it('skips a queued permission prompt after a concurrent session grant', async () => {

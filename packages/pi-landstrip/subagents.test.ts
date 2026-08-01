@@ -48,7 +48,7 @@ test('propagates registered extensions and public context to workers', async () 
   const integration = {
     getWorkerExtensions: () => [{ id: 'test', entry: extensionEntry }],
     getContext: () => ({
-      version: 1,
+      version: 2,
       host: 'pi',
       role: 'primary',
       sandbox: 'enabled',

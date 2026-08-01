@@ -176,6 +176,27 @@ appContainerWindowsIt(
   30_000,
 );
 
+restrictedWindowsIt('starts when a denyWrite ACL target does not exist', async () => {
+  const root = temporaryDirectory('landstrip-windows-missing-deny-');
+  const workspace = join(root, 'work', 'project');
+  mkdirSync(workspace, { recursive: true });
+  const { shell, args } = getShellConfig(gitBash());
+  const filesystem = {
+    ...filesystemPolicy(workspace),
+    denyWrite: [join(workspace, '.pi', 'sandbox.json')],
+  };
+
+  const result = await runPolicy(
+    workspace,
+    { network: { allowNetwork: false }, filesystem },
+    shell,
+    [...args, 'printf ready'],
+  );
+
+  expect(result.code, result.stderr).toBe(0);
+  expect(result.stdout).toContain('ready');
+});
+
 restrictedWindowsIt(
   'runs Git Bash with restricted-user filesystem isolation',
   async () => {

@@ -54,15 +54,17 @@ import {
   type LandstripTrap,
 } from '@landstrip/landstrip';
 import {
-  type LandstripBashTool,
-  type LandstripContextV1,
+  type LandstripContextV2,
   type LandstripEvent,
   type LandstripPreparedProcess,
   type LandstripProcessOptions,
   type LandstripSandboxState,
+  type LandstripShellInvocation,
+  type LandstripShellPrepareOptions,
+  type LandstripShellProvider,
   type LandstripWorkerExtension,
   LANDSTRIP_RUNTIME_VERSION,
-  type PiLandstripRuntimeV1,
+  type PiLandstripRuntimeV2,
   publishLandstripRuntime,
 } from './api.ts';
 import type { RpcSpawn } from './rpc-process.ts';
@@ -74,6 +76,8 @@ import {
 import { boxBottom, boxRow, boxTop, dialogKeys, dialogTabs } from './box.ts';
 import { getPiConfigPaths } from './config.ts';
 import { expandHomePath, formatError, PermissionPromptCoordinator } from './util.ts';
+
+type LandstripBashTool = ReturnType<typeof createBashToolDefinition>;
 
 interface SandboxFilesystemConfig {
   denyRead: string[];
@@ -1058,6 +1062,62 @@ export function writeEnvFile(
   return { dir, path };
 }
 
+export const POSIX_SHELL_PROVIDER_ID = 'posix';
+
+export function createPosixShellProvider(): LandstripShellProvider {
+  return {
+    id: POSIX_SHELL_PROVIDER_ID,
+    prepare(options: LandstripShellPrepareOptions): LandstripShellInvocation {
+      if (options.signal?.aborted) throw new Error('aborted');
+      const { shell, args } = getShellConfig(SettingsManager.create(options.cwd).getShellPath());
+      const envFile = writeEnvFile(options.env, null);
+      let disposed = false;
+
+      return {
+        executable: shell,
+        args: [...args, `source '${envFile.path}' && ${options.command}`],
+        launcherEnv: { PATH: process.env.PATH, HOME: process.env.HOME },
+        readPaths: [envFile.path],
+        dispose() {
+          if (disposed) return;
+          disposed = true;
+          rmSync(envFile.dir, { recursive: true, force: true });
+        },
+      };
+    },
+  };
+}
+
+function shellEnvironment(
+  env: NodeJS.ProcessEnv | undefined,
+  cwd: string,
+  proxyPort: number | null,
+  proxyToken?: string,
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = { ...process.env, ...env, PWD: resolve(cwd) };
+  if (proxyPort === null) return result;
+
+  const credentials = proxyToken === undefined ? '' : `landstrip:${proxyToken}@`;
+  const url = `http://${credentials}127.0.0.1:${proxyPort}`;
+  for (const name of PROXY_ENVIRONMENT_VARIABLES) result[name] = url;
+  result.NO_PROXY = '';
+  result.no_proxy = '';
+  return result;
+}
+
+export function createLandstripLauncherEnvironment(
+  providerEnv: NodeJS.ProcessEnv,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  if (platform !== 'win32' || hostEnv.ProgramData === undefined) return providerEnv;
+  return { ...providerEnv, ProgramData: hostEnv.ProgramData };
+}
+
+export function createWindowsDenyRead(denyRead: readonly string[], volumeRoot: string): string[] {
+  return [...new Set([...denyRead.filter((path) => !path.startsWith('/')), volumeRoot])];
+}
+
 function parseProxyPort(value: string | undefined, defaultPort: number): number | null {
   const rawPort = value ?? String(defaultPort);
   if (!/^\d+$/.test(rawPort)) return null;
@@ -1134,7 +1194,7 @@ export interface LandstripIntegrationOptions {
 }
 
 /** Landstrip sandbox integration hooks for Pi. */
-export interface LandstripIntegration extends PiLandstripRuntimeV1 {
+export interface LandstripIntegration extends PiLandstripRuntimeV2 {
   /** Prepare a full Pi RPC process constrained by the effective sandbox policy. */
   prepareRpcWorker(options: LandstripRpcWorkerOptions): Promise<LandstripRpcWorkerLaunch>;
   /** Register the integration's tools, events, flags, and commands with Pi. */
@@ -1163,14 +1223,16 @@ export interface LandstripRpcWorkerLaunch extends LandstripPreparedProcess {
 }
 
 export type {
-  LandstripBashTool,
-  LandstripContextV1,
+  LandstripContextV2,
   LandstripEvent,
   LandstripPreparedProcess,
   LandstripProcessOptions,
   LandstripSandboxState,
+  LandstripShellInvocation,
+  LandstripShellPrepareOptions,
+  LandstripShellProvider,
   LandstripWorkerExtension,
-  PiLandstripRuntimeV1,
+  PiLandstripRuntimeV2,
 } from './api.ts';
 
 /** Register the landstrip extension with Pi. */
@@ -1209,6 +1271,8 @@ export function createLandstripIntegration(
   let unsandboxedWorkerWarningShown = false;
   let activeContext: ExtensionContext | undefined;
   let unpublishRuntime: (() => void) | undefined;
+  const defaultShellProvider = createPosixShellProvider();
+  let externalShellProvider: LandstripShellProvider | undefined;
   const eventHandlers = new Set<(event: LandstripEvent) => void>();
   const workerExtensions = new Map<string, { entry: string; registrations: number }>();
   const sessionAllowedDomains: string[] = [];
@@ -1217,7 +1281,7 @@ export function createLandstripIntegration(
   const sessionAllowedTargets: string[] = [];
   const permissionPrompts = new PermissionPromptCoordinator();
 
-  function getContext(ctx = activeContext): LandstripContextV1 {
+  function getContext(ctx = activeContext): LandstripContextV2 {
     return {
       version: LANDSTRIP_RUNTIME_VERSION,
       host: 'pi',
@@ -1254,6 +1318,31 @@ export function createLandstripIntegration(
     };
     eventHandlers.add(listener);
     return () => eventHandlers.delete(listener);
+  }
+
+  function registerShellProvider(provider: LandstripShellProvider): () => void {
+    const id = provider.id.trim();
+    if (!id) throw new Error('Shell provider id must not be empty');
+    if (id === POSIX_SHELL_PROVIDER_ID) {
+      throw new Error(`Shell provider id "${POSIX_SHELL_PROVIDER_ID}" is reserved`);
+    }
+    if (externalShellProvider) {
+      throw new Error(
+        `Shell provider "${externalShellProvider.id}" is already registered; cannot register "${id}"`,
+      );
+    }
+
+    externalShellProvider = provider;
+    let disposed = false;
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      if (externalShellProvider === provider) externalShellProvider = undefined;
+    };
+  }
+
+  function activeShellProvider(): LandstripShellProvider {
+    return externalShellProvider ?? defaultShellProvider;
   }
 
   function registerWorkerExtension(extension: LandstripWorkerExtension): () => void {
@@ -1344,9 +1433,10 @@ export function createLandstripIntegration(
     if (process.platform !== 'win32') return config.filesystem.denyRead;
 
     // Windows sandbox ACLs propagate to existing descendants, so make read policy
-    // an explicit allowlist instead of scanning and granting a volume tree.
+    // an explicit allowlist instead of scanning and granting a volume tree. Ignore
+    // POSIX-only absolute paths because no corresponding ACL target exists.
     const volumeRoot = parse(resolve(cwd)).root;
-    return [...new Set([...config.filesystem.denyRead, volumeRoot])];
+    return createWindowsDenyRead(config.filesystem.denyRead, volumeRoot);
   }
 
   function hasBaselineWindowsApplicationAccess(filePath: string): boolean {
@@ -1515,6 +1605,7 @@ export function createLandstripIntegration(
 
   function startProxy(
     ctx: ExtensionContext,
+    cwd: string,
     allowances: ExecutionAllowances,
     signal?: AbortSignal,
     authorization?: string,
@@ -1523,9 +1614,9 @@ export function createLandstripIntegration(
     const sockets = new Set<Socket>();
 
     async function domainAllowed(domain: string): Promise<boolean> {
-      const config = loadConfig(ctx.cwd);
+      const config = loadConfig(cwd);
       if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
-      return ensureDomainAllowed(ctx, domain, ctx.cwd, allowances, signal);
+      return ensureDomainAllowed(ctx, domain, cwd, allowances, signal);
     }
 
     // Track the upstream socket so stop() tears it down, and abandon a still-
@@ -1945,6 +2036,7 @@ export function createLandstripIntegration(
     const proxy = shouldStartProxy(config)
       ? await startProxy(
           options.ctx,
+          options.cwd,
           processAllowances,
           options.signal,
           proxyAuthorization,
@@ -2058,13 +2150,14 @@ export function createLandstripIntegration(
       async exec(command, cwd, { onData, signal, timeout, env }) {
         if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
 
-        const { shell, args } = getShellConfig(SettingsManager.create(cwd).getShellPath());
+        const provider = activeShellProvider();
         const config = loadConfig(cwd);
         const proxyToken = randomBytes(32).toString('base64url');
         const proxyAuthorization = `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
         const proxy = shouldStartProxy(config)
           ? await startProxy(
               ctx,
+              cwd,
               allowances,
               signal,
               proxyAuthorization,
@@ -2072,33 +2165,52 @@ export function createLandstripIntegration(
             )
           : null;
 
-        // Started/created before the child exists, so tear them down on any early
-        // failure too — the env file holds a copy of the environment (secrets),
-        // and the proxy keeps a listening socket. Idempotent: safe to call twice.
         let policy: ReturnType<typeof writePolicyFile> | undefined;
-        let envFile: ReturnType<typeof writeEnvFile> | undefined;
+        let invocation: LandstripShellInvocation | undefined;
         let processAllowances = allowances;
         let teardownPromise: Promise<void> | undefined;
         const teardownResources = (): Promise<void> => {
-          teardownPromise ??= (async () => {
-            await proxy?.stop();
-            if (policy) rmSync(policy.dir, { recursive: true, force: true });
-            if (envFile) rmSync(envFile.dir, { recursive: true, force: true });
-          })();
+          teardownPromise ??= Promise.all([
+            Promise.resolve().then(() => invocation?.dispose?.()),
+            Promise.resolve().then(() => {
+              if (policy) rmSync(policy.dir, { recursive: true, force: true });
+            }),
+            Promise.resolve().then(() => proxy?.stop()),
+          ]).then(() => undefined);
           return teardownPromise;
         };
 
         let landstripArgs: string[];
         try {
-          envFile = writeEnvFile(
-            { ...process.env, ...env, PWD: resolve(cwd) },
-            proxy?.port ?? null,
-            proxy ? proxyToken : undefined,
+          invocation = await provider.prepare({
+            command,
+            cwd,
+            env: shellEnvironment(env, cwd, proxy?.port ?? null, proxy ? proxyToken : undefined),
+            signal,
+          });
+          if (!invocation.executable.trim()) {
+            throw new Error(`Shell provider "${provider.id}" returned an empty executable`);
+          }
+          if (signal?.aborted) throw new Error('aborted');
+
+          processAllowances = {
+            ...allowances,
+            readPaths: [...allowances.readPaths, ...(invocation.readPaths ?? [])],
+          };
+          processAllowances = withWindowsProcessReadAccess(
+            processAllowances,
+            invocation.executable,
+            cwd,
           );
-          processAllowances = withWindowsProcessReadAccess(allowances, shell, cwd, [envFile.path]);
           policy = writePolicyFile(cwd, proxy?.port ?? null, processAllowances);
-          const wrappedCommand = `source '${envFile.path}' && ${command}`;
-          landstripArgs = ['run', '-p', policy.path, '--', shell, ...args, wrappedCommand];
+          landstripArgs = [
+            'run',
+            '-p',
+            policy.path,
+            '--',
+            invocation.executable,
+            ...invocation.args,
+          ];
           if (process.platform !== 'win32') landstripArgs.splice(1, 0, '--trap-fd', '3');
         } catch (error) {
           await teardownResources();
@@ -2106,14 +2218,18 @@ export function createLandstripIntegration(
         }
 
         return new Promise((resolvePromise, reject) => {
+          let pendingSocketPair: [NetSocket, NetSocket] | undefined;
           (async () => {
             let timeoutHandle: NodeJS.Timeout | undefined;
             let timedOut = false;
             let cleaned = false;
             let trapSocket: NetSocket | undefined;
             let childEnd: NetSocket | undefined;
-            if (process.platform !== 'win32') [trapSocket, childEnd] = await createSocketPair();
-
+            if (process.platform !== 'win32') {
+              pendingSocketPair = await createSocketPair();
+              [trapSocket, childEnd] = pendingSocketPair;
+            }
+            if (signal?.aborted) throw new Error('aborted');
             const cleanup = async () => {
               if (cleaned) return;
               cleaned = true;
@@ -2128,7 +2244,7 @@ export function createLandstripIntegration(
               : ['ignore', 'pipe', 'pipe'];
             const child: ChildProcess = spawn(binaryPath(), landstripArgs, {
               cwd,
-              env: { PATH: process.env.PATH, HOME: process.env.HOME },
+              env: createLandstripLauncherEnvironment(invocation.launcherEnv),
               detached: true,
               stdio,
             });
@@ -2136,6 +2252,7 @@ export function createLandstripIntegration(
 
             // Child has dup'd its end; parent can close its copy.
             childEnd?.destroy();
+            pendingSocketPair = undefined;
 
             function killChild(): void {
               child.kill('SIGKILL');
@@ -2153,6 +2270,7 @@ export function createLandstripIntegration(
             }
 
             signal?.addEventListener('abort', onAbort, { once: true });
+            if (signal?.aborted) onAbort();
             let stderrAcc = '';
             let errorFdAcc = '';
 
@@ -2311,11 +2429,15 @@ export function createLandstripIntegration(
               }
             });
             child.once('close', (code) => finalizeExec(code));
-          })().catch(async (error: unknown) => {
+          })().catch((error: unknown) => {
             // A failure before the child is wired (for example, creating the trap
             // channel) never reaches cleanup(), so free temporary resources here.
-            await teardownResources();
-            reject(error);
+            pendingSocketPair?.forEach((socket) => socket.destroy());
+            void teardownResources().then(
+              () => reject(error),
+              (cleanupError) =>
+                reject(new AggregateError([error, cleanupError], 'Shell setup and cleanup failed')),
+            );
           });
         });
       },
@@ -2583,9 +2705,8 @@ export function createLandstripIntegration(
 
   const headlessWarnings = new Set<string>();
 
-  // When sandboxing cannot be applied, bash falls back to running unsandboxed.
-  // notify() is a no-op without a UI, so in headless/RPC mode also print to
-  // stderr (once per message) rather than failing open silently.
+  // Explicitly disabling sandboxing permits the legacy unsandboxed fallback.
+  // Initialization failures remain fail-closed so commands never bypass policy silently.
   function warnUnsandboxed(ctx: ExtensionContext, message: string, level: NotificationLevel): void {
     notify(ctx, message, level);
     if (!ctx.hasUI && !headlessWarnings.has(message)) {
@@ -2654,24 +2775,23 @@ export function createLandstripIntegration(
     return true;
   }
 
-  function createBashTool(
-    cwd: string,
-    ctx?: ExtensionContext,
-    requireSandbox = false,
-  ): LandstripBashTool {
+  function createBashTool(cwd: string): LandstripBashTool {
     const localBash = createPlainBashTool(cwd);
 
     return {
       ...localBash,
       label: 'bash (landstrip)',
-      async execute(id, params, signal, onUpdate, callCtx) {
-        const effectiveCtx = ctx ?? callCtx;
-        if (!effectiveCtx || !ensureSandboxState(effectiveCtx)) {
-          if (requireSandbox) throw new Error('Sandbox is unavailable; refusing subagent command');
-          return localBash.execute(id, params, signal, onUpdate, effectiveCtx);
+      description: 'Execute commands with the active Landstrip shell provider.',
+      async execute(id, params, signal, onUpdate, ctx) {
+        if (!ctx) throw new Error('Sandbox context is unavailable');
+        if (!ensureSandboxState(ctx)) {
+          if (sandboxState === 'unavailable') {
+            throw new Error('Sandbox is unavailable; refusing command');
+          }
+          return localBash.execute(id, params, signal, onUpdate, ctx);
         }
 
-        return runBashWithOptionalRetry(id, params, signal, onUpdate, effectiveCtx);
+        return runBashWithOptionalRetry(id, params, signal, onUpdate, ctx);
       },
     };
   }
@@ -2695,7 +2815,12 @@ export function createLandstripIntegration(
     if (shouldRegisterBashTool) pi.registerTool(createBashTool(localCwd));
 
     pi.on('user_bash', async (_event, ctx) => {
-      if (!ensureSandboxState(ctx)) return;
+      if (!ensureSandboxState(ctx)) {
+        if (sandboxState === 'unavailable') {
+          throw new Error('Sandbox is unavailable; refusing command');
+        }
+        return;
+      }
 
       return { operations: createLandstripBashOps(ctx, { promptOnBlock: true }) };
     });
@@ -2946,7 +3071,7 @@ export function createLandstripIntegration(
   const integration: LandstripIntegration = {
     version: LANDSTRIP_RUNTIME_VERSION,
     getContext,
-    createBashTool,
+    registerShellProvider,
     prepareProcess,
     prepareRpcWorker,
     registerWorkerExtension,

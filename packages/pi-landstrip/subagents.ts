@@ -35,7 +35,7 @@ import {
 } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 
-import { encodeLandstripContext, type LandstripContextV1, LANDSTRIP_CONTEXT_ENV } from './api.ts';
+import { encodeLandstripContext, type LandstripContextV2, LANDSTRIP_CONTEXT_ENV } from './api.ts';
 import {
   type AgentCatalog,
   type AgentDefinition,
@@ -2413,9 +2413,9 @@ export class SubagentRuntime {
     }
   }
 
-  private taskContext(task: TaskRecord, ctx: ExtensionContext): LandstripContextV1 {
+  private taskContext(task: TaskRecord, ctx: ExtensionContext): LandstripContextV2 {
     const context = this.integration.getContext?.(ctx) ?? {
-      version: 1,
+      version: 2,
       host: 'pi',
       role: 'primary',
       sandbox: 'unavailable',

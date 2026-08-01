@@ -168,18 +168,30 @@ Remove it with `npx @landstrip/landstrip windows uninstall`.
 
 ## Plugin API
 
-Other Pi extensions can discover the runtime with `useLandstrip` from
-`pi-landstrip/api`. The versioned runtime provides:
+Other Pi extensions can discover the v2 runtime with `useLandstrip` from
+`pi-landstrip/api`. The runtime provides:
 
 - `getContext()` for sandbox and task context.
-- `createBashTool()` for Landstrip-backed command tools.
+- `registerShellProvider()` for replacing POSIX shell invocation preparation.
 - `prepareProcess()` for one policy-aware process launch.
 - `registerWorkerExtension()` for trusted worker extensions.
 - `on()` for sandbox and subagent lifecycle events.
 
-Discovery is callback-based and independent of extension load order. Worker
-extensions are trusted code. Workers also receive an informational
-`LANDSTRIP_CONTEXT` environment value; it is not proof of authorization.
+A shell provider receives the command, working directory, composed command
+environment, and abort signal. It returns an executable, arguments, minimal
+launcher environment, required read paths, and optional cleanup. Landstrip adds
+platform variables required by its launcher, such as Windows `ProgramData`.
+Providers should pass the composed environment through a private temporary file,
+include that file in `readPaths`, and remove it in `dispose()`; do not copy secrets
+into `launcherEnv`. Landstrip remains responsible for starting the process, applying
+policy, proxying network access, handling traps, and prompting for additional
+access. Only one external provider can be active; disposing it restores the
+built-in POSIX provider.
+
+Use `provideLandstripShell()` to register a provider independently of extension
+load order. Shell providers and worker extensions are trusted code. Workers also
+receive an informational `LANDSTRIP_CONTEXT` environment value; it is not proof
+of authorization.
 
 ## Limits
 

@@ -218,6 +218,13 @@ pub(crate) fn resolve_policy(
     let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
     let (write_deny, write_denied_patterns) =
         resolve_deny_paths(&filesystem.deny_write, &policy_base, home)?;
+    // Windows ACLs cannot attach deny entries to paths that do not exist. Glob
+    // denials have the same snapshot limitation on both Windows backends.
+    #[cfg(target_os = "windows")]
+    let write_deny = write_deny
+        .into_iter()
+        .filter(|path| path.try_exists().unwrap_or(true))
+        .collect();
     let write_denied_links = collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
 
     let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;

@@ -2,10 +2,11 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { spawn, type SpawnOptions } from 'node:child_process';
-import type { Readable, Writable } from 'node:stream';
+import type { Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 
 import { formatError, isRecord } from './util.ts';
+import type { LandstripRpcChildProcess } from './api.ts';
 
 export type RpcRecord = Readonly<Record<string, unknown>>;
 
@@ -30,22 +31,7 @@ export type ExtensionUiResult =
   | { readonly cancelled: true }
   | void;
 
-export interface RpcChildProcess {
-  readonly stdin: Writable;
-  readonly stdout: Readable;
-  readonly stderr: Readable;
-  readonly exitCode: number | null;
-  readonly signalCode: NodeJS.Signals | null;
-  kill(signal?: NodeJS.Signals | number): boolean;
-  on(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
-  on(event: 'error', listener: (error: Error) => void): this;
-  once(event: 'spawn', listener: () => void): this;
-  once(event: 'error', listener: (error: Error) => void): this;
-  once(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
-  off(event: 'spawn', listener: () => void): this;
-  off(event: 'error', listener: (error: Error) => void): this;
-  off(event: 'exit', listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
-}
+export type RpcChildProcess = LandstripRpcChildProcess;
 
 export type RpcSpawn = (
   command: string,

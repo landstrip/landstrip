@@ -12,8 +12,9 @@ import {
   contextFromEnvironment,
   encodeLandstripContext,
   LANDSTRIP_CONTEXT_ENV,
+  provideLandstripShell,
   publishLandstripRuntime,
-  type PiLandstripRuntimeV1,
+  type PiLandstripRuntimeV2,
   useLandstrip,
 } from './api.ts';
 import { createLandstripIntegration } from './index.ts';
@@ -36,10 +37,18 @@ function extensionApi(): ExtensionAPI {
   } as unknown as ExtensionAPI;
 }
 
-function runtime(): PiLandstripRuntimeV1 {
+function runtime(): PiLandstripRuntimeV2 {
   return createLandstripIntegration({ registerBashTool: false });
 }
 
+function shellProvider(id: string) {
+  return {
+    id,
+    prepare() {
+      return { executable: 'shell', args: [], launcherEnv: {} };
+    },
+  };
+}
 test('discovers the runtime regardless of extension load order', () => {
   const beforePi = extensionApi();
   const beforeRuntime = runtime();
@@ -61,6 +70,65 @@ test('discovers the runtime regardless of extension load order', () => {
   unpublishBefore();
   disposeAfter();
   unpublishAfter();
+});
+
+test('registers shell providers regardless of extension load order', () => {
+  for (const providerFirst of [true, false]) {
+    const pi = extensionApi();
+    const landstrip = runtime();
+    const provider = shellProvider(`nu-${providerFirst}`);
+    let stopProvider: (() => void) | undefined;
+    let stopRuntime: (() => void) | undefined;
+
+    if (providerFirst) stopProvider = provideLandstripShell(pi, provider);
+    stopRuntime = publishLandstripRuntime(pi, landstrip);
+    if (!providerFirst) stopProvider = provideLandstripShell(pi, provider);
+
+    expect(() => landstrip.registerShellProvider(shellProvider('other'))).toThrow(
+      `Shell provider "${provider.id}" is already registered`,
+    );
+    stopProvider?.();
+    const stopReplacement = landstrip.registerShellProvider(shellProvider('other'));
+    stopReplacement();
+    stopRuntime?.();
+  }
+});
+
+test('keeps the current shell provider when replacement registration fails', () => {
+  const pi = extensionApi();
+  const firstRuntime = runtime();
+  const secondRuntime = runtime();
+  const stopProvider = provideLandstripShell(pi, shellProvider('nu'));
+  const stopFirstRuntime = publishLandstripRuntime(pi, firstRuntime);
+  const stopBlocker = secondRuntime.registerShellProvider(shellProvider('blocker'));
+
+  expect(() => publishLandstripRuntime(pi, secondRuntime)).toThrow(
+    'Shell provider "blocker" is already registered',
+  );
+  expect(() => firstRuntime.registerShellProvider(shellProvider('other'))).toThrow(
+    'Shell provider "nu" is already registered',
+  );
+
+  stopProvider();
+  const stopReplacement = firstRuntime.registerShellProvider(shellProvider('other'));
+  stopReplacement();
+  stopBlocker();
+  stopFirstRuntime();
+});
+
+test('rejects invalid and conflicting shell provider registrations', () => {
+  const landstrip = runtime();
+  expect(() => landstrip.registerShellProvider(shellProvider(''))).toThrow('must not be empty');
+  expect(() => landstrip.registerShellProvider(shellProvider('posix'))).toThrow('is reserved');
+
+  const stop = landstrip.registerShellProvider(shellProvider('nu'));
+  expect(() => landstrip.registerShellProvider(shellProvider('fish'))).toThrow(
+    'Shell provider "nu" is already registered',
+  );
+  stop();
+  stop();
+  const stopFish = landstrip.registerShellProvider(shellProvider('fish'));
+  stopFish();
 });
 
 test('republishes the runtime when a new session starts', async () => {
@@ -96,7 +164,7 @@ test('republishes the runtime when a new session starts', async () => {
 
 test('encodes and validates public subagent context', () => {
   const context = {
-    version: 1,
+    version: 2,
     host: 'pi',
     role: 'subagent',
     sandbox: 'enabled',
@@ -113,7 +181,7 @@ test('encodes and validates public subagent context', () => {
   expect(contextFromEnvironment({ [LANDSTRIP_CONTEXT_ENV]: 'invalid' })).toBeUndefined();
   expect(
     contextFromEnvironment({
-      [LANDSTRIP_CONTEXT_ENV]: Buffer.from(JSON.stringify({ ...context, version: 2 })).toString(
+      [LANDSTRIP_CONTEXT_ENV]: Buffer.from(JSON.stringify({ ...context, version: 1 })).toString(
         'base64url',
       ),
     }),
