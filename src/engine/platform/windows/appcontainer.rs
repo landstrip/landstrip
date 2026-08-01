@@ -30,9 +30,9 @@ use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
     NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, REVOKE_ACCESS,
-    SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
-    TRUSTEE_W,
+    ACCESS_MODE, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+    REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
+    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -46,8 +46,9 @@ use windows_sys::Win32::Security::{
     WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING,
+    CreateFileW, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -529,6 +530,16 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess
         )?;
     }
 
+    // DENY ACEs after grants so evaluation order still denies nested holes under
+    // allow roots. Patterns are not expressible as static ACLs on AppContainer;
+    // restricted_user has the same root-only limitation today.
+    for path in &policy.write_denied_roots {
+        deny_subtree_access(&mut granted, path, FILE_GENERIC_WRITE | FILE_DELETE_CHILD)?;
+    }
+    for path in &policy.read_denied_roots {
+        deny_subtree_access(&mut granted, path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
+    }
+
     Ok(granted)
 }
 
@@ -578,6 +589,15 @@ fn grant_path_access(
     propagate: bool,
 ) -> Result<()> {
     set_path_access(path, sid, access, GRANT_ACCESS, inherit, propagate)
+}
+
+fn deny_subtree_access(granted: &mut GrantedAccess, path: &Path, access: u32) -> Result<()> {
+    set_path_access(path, granted.sid, access, DENY_ACCESS, true, true)?;
+    granted.paths.push(GrantedPath {
+        path: path.to_path_buf(),
+        propagate: true,
+    });
+    Ok(())
 }
 
 fn revoke_path_access(path: &Path, sid: PSID, propagate: bool) -> Result<()> {
