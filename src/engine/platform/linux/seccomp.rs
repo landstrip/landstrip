@@ -52,6 +52,9 @@ use std::ptr;
 const POLL_MS: u16 = 100;
 const SECCOMP_IOC_MAGIC: u8 = b'!';
 const USER_NOTIF_FLAG_CONTINUE: u32 = 1 << 0;
+// fchmodat2 (Linux 6.6+) is 452 on every landstrip target. libc only exports the
+// constant on some arches, so pin the number here for portable mediation.
+const SYS_FCHMODAT2: i64 = 452;
 
 nix::ioctl_readwrite!(
     seccomp_notif_recv,
@@ -1377,7 +1380,7 @@ impl Syscall {
         match self.name {
             "lchown" | "lsetxattr" | "lremovexattr" | "link" => true,
             "fchownat" => flag(4),
-            "fchmodat" | "utimensat" => flag(3),
+            "fchmodat" | "fchmodat2" | "utimensat" => flag(3),
             // linkat(2) links the symlink itself unless AT_SYMLINK_FOLLOW is set;
             // link(2) has no flags and never dereferences.
             "linkat" => !follow(4),
@@ -1442,6 +1445,14 @@ const MUTATION_SYSCALLS: &[Syscall] = &[
     Syscall {
         nr: Some(libc::SYS_fchmodat),
         name: "fchmodat",
+        paths: &[(Some(0), 1)],
+        landlock_backed: false,
+    },
+    Syscall {
+        // fchmodat2 is Linux 6.6+ (nr 452 on all landstrip targets). glibc may
+        // implement fchmodat via it; without mediation, mode changes bypass the broker.
+        nr: Some(SYS_FCHMODAT2),
+        name: "fchmodat2",
         paths: &[(Some(0), 1)],
         landlock_backed: false,
     },
@@ -1709,7 +1720,7 @@ impl Grant {
             "truncate" => MutationOp::Truncate {
                 length: syscall_i64(args[1]),
             },
-            "fchmodat" => MutationOp::Chmod {
+            "fchmodat" | "fchmodat2" => MutationOp::Chmod {
                 mode: syscall_u32(args[2]),
             },
             "chmod" => MutationOp::Chmod {
