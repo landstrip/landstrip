@@ -1235,9 +1235,13 @@ test('inspects and navigates persisted child sessions without switching sessions
     },
   } as unknown as LandstripIntegration;
   new SubagentRuntime(pi, integration).register();
+  const bolded: string[] = [];
   const theme = {
     fg: (_color: string, value: string) => value,
-    bold: (value: string) => value,
+    bold: (value: string) => {
+      bolded.push(value);
+      return value;
+    },
   };
   const ctx = {
     cwd,
@@ -1271,11 +1275,16 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(commandNames).toEqual(['agents']);
   const running = command?.('', ctx);
   const agents = component?.render(96).join('\n') ?? '';
-  expect(agents).toContain('[Agents]  Tasks  Logs  Settings  Help  ·  Scope: Project');
+  expect(agents).toContain('[Primary]  Subagent  Tasks  Log  Settings  Help  ·  Scope: Project');
   expect(agents).toContain('@build');
-  expect(agents).toMatch(/@build\s+primary\s+built-in/);
-  expect(agents).toMatch(/@general\s+subagent\s+built-in/);
-  expect(agents).toMatch(/@review\s+subagent\s+local/);
+  expect(agents).toContain('@plan');
+  expect(agents).not.toContain('@general');
+  const primaryHeader = agents
+    .split('\n')
+    .find((line) => line.includes('Agent') && line.includes('Source'));
+  expect(primaryHeader).not.toContain('Primary');
+  expect(primaryHeader).not.toMatch(/\bMode\b/);
+  expect(bolded.some((value) => value.includes('@build') && value.includes('built-in'))).toBe(true);
   expect(agents).not.toContain('Tab next tab');
 
   component?.handleInput('e');
@@ -1296,30 +1305,38 @@ test('inspects and navigates persisted child sessions without switching sessions
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.agent.build).toBeUndefined();
-    expect(component?.render(96).join('\n')).toMatch(/@build\s+primary\s+built-in/);
+    expect(component?.render(96).join('\n')).toMatch(/@build\s+built-in/);
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
 
-  component?.handleInput('\x1b[B');
+  component?.handleInput('\t');
+  const subagents = component?.render(96).join('\n') ?? '';
+  expect(subagents).toContain('Primary  [Subagent]  Tasks  Log  Settings  Help');
+  expect(subagents).toContain('@explore');
+  expect(subagents).toContain('@general');
+  expect(subagents).toContain('@review');
+  expect(subagents).not.toContain('@build');
+  const subagentHeader = subagents
+    .split('\n')
+    .find((line) => line.includes('Agent') && line.includes('Source'));
+  expect(subagentHeader).not.toContain('Primary');
+  expect(subagentHeader).not.toMatch(/\bMode\b/);
+
   component?.handleInput(' ');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.agent.explore.disable).toBe(true);
-    expect(component?.render(96).join('\n')).toMatch(/@explore\s+subagent\s+local.*disabled/);
+    expect(component?.render(96).join('\n')).toMatch(/@explore\s+local.*disabled/);
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
   component?.handleInput('i');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.agent.explore).toBeUndefined();
-    expect(component?.render(96).join('\n')).toMatch(
-      /@explore\s+subagent\s+built-in.*inherited on/,
-    );
+    expect(component?.render(96).join('\n')).toMatch(/@explore\s+built-in.*inherited on/);
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
-  component?.handleInput('\x1b[A');
 
-  component?.handleInput('\x1b[B');
   component?.handleInput('\x1b[B');
   component?.handleInput('\x1b[B');
   component?.handleInput('x');
@@ -1332,12 +1349,13 @@ test('inspects and navigates persisted child sessions without switching sessions
   });
   component?.handleInput('\x1b[A');
   component?.handleInput('\x1b[A');
-  component?.handleInput('\x1b[A');
 
   component?.handleInput('\x1b[Z');
   const globalAgents = component?.render(96).join('\n') ?? '';
-  expect(globalAgents).toContain('[Agents]  Tasks  Logs  Settings  Help  ·  Scope: Global');
-  expect(globalAgents).toMatch(/@review\s+subagent\s+local.*unavailable/);
+  expect(globalAgents).toContain(
+    'Primary  [Subagent]  Tasks  Log  Settings  Help  ·  Scope: Global',
+  );
+  expect(globalAgents).toMatch(/@review\s+local.*unavailable/);
   component?.handleInput('s');
   expect(component?.render(96).join('\n')).toContain('Scope: Project');
 
@@ -1363,7 +1381,7 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(component?.render(96).join('\n')).toContain('task-123');
   component?.handleInput('\r');
   const logs = component?.render(96).join('\n') ?? '';
-  expect(logs).toContain('[Logs]');
+  expect(logs).toContain('[Log]');
   expect(logs).toContain('Follow: on');
   expect(logs).toContain('Task log entry 40');
   expect(logs).toContain('27–42 of 42');
@@ -1425,7 +1443,7 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('\x1b');
   expect(component?.render(96).join('\n')).toContain('[Tasks]');
   component?.handleInput('\t');
-  expect(component?.render(96).join('\n')).toContain('[Logs]');
+  expect(component?.render(96).join('\n')).toContain('[Log]');
   component?.handleInput('\t');
 
   const projectSettings = component?.render(96).join('\n') ?? '';
@@ -1485,9 +1503,9 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   component?.handleInput('\t');
   const help = component?.render(96).join('\n') ?? '';
-  expect(help).toContain('Agents  Tasks  Logs  Settings  [Help]  ·  Scope: Project');
+  expect(help).toContain('Primary  Subagent  Tasks  Log  Settings  [Help]  ·  Scope: Project');
   expect(help).toMatch(/Shortcut\s+Description/);
-  expect(help).toMatch(/Shift\+Tab \/ S\s+Switch scope in Agents or Settings/);
+  expect(help).toMatch(/Shift\+Tab \/ S\s+Switch scope in Primary, Subagent, or Settings/);
   expect(help).toMatch(/Backspace\s+Open parent task/);
   expect(help).toMatch(/F\s+Toggle task log follow/);
   expect(help).toMatch(/Page Up \/ Down\s+Scroll task output by page/);
@@ -1495,13 +1513,15 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   component?.handleInput('\t');
   const cycledAgents = component?.render(96).join('\n') ?? '';
-  expect(cycledAgents).toContain('[Agents]  Tasks  Logs  Settings  Help  ·  Scope: Project');
+  expect(cycledAgents).toContain(
+    '[Primary]  Subagent  Tasks  Log  Settings  Help  ·  Scope: Project',
+  );
   expect(cycledAgents).not.toContain('Tab next tab');
   finishCustom?.();
   await running;
 
   const direct = command?.('task-123', ctx);
-  expect(component?.render(96).join('\n')).toContain('[Logs]');
+  expect(component?.render(96).join('\n')).toContain('[Log]');
   expect(component?.render(96).join('\n')).toContain('Follow: on');
   finishCustom?.();
   await direct;
