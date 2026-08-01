@@ -21,7 +21,7 @@ import landstripExtension, {
   shouldPromptForWrite,
   writeEnvFile,
 } from './index.ts';
-import { PermissionPromptCoordinator } from './util.ts';
+import { AsyncQueue, PermissionPromptCoordinator } from './util.ts';
 
 describe('main Pi tool composition', () => {
   it('leaves filesystem tool names available to Pi plugins', () => {
@@ -304,6 +304,17 @@ it('refuses to write over a corrupt sandbox.json', async () => {
   vi.unstubAllEnvs();
   rmSync(cwd, { recursive: true, force: true });
   rmSync(agentDir, { recursive: true, force: true });
+});
+
+it('rejects in-flight AsyncQueue waiters after reset', async () => {
+  const queue = new AsyncQueue();
+  const first = await queue.acquire();
+  const waiting = queue.acquire();
+  queue.reset();
+  await expect(waiting).rejects.toThrow('Request cancelled');
+  first();
+  const after = await queue.acquire();
+  after();
 });
 
 it('allows RPC workers when sandboxing is explicitly disabled', async () => {

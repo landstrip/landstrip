@@ -114,43 +114,74 @@ export function colorizeAgentText(
 
 export class AsyncQueue {
   private tail = Promise.resolve();
+  private generation = 0;
+  private resetWaiters: Array<() => void> = [];
 
   async acquire(
     signal?: AbortSignal,
     cancellationMessage = 'Request cancelled',
   ): Promise<() => void> {
     if (signal?.aborted) throw new Error(cancellationMessage);
+    const generation = this.generation;
     let release: (() => void) | undefined;
     const previous = this.tail;
     this.tail = new Promise<void>((resolve) => {
       release = resolve;
     });
 
-    if (!signal) {
-      await previous;
-      return release!;
-    }
+    const finish = (): void => {
+      release?.();
+    };
 
-    let abort: (() => void) | undefined;
+    let wakeReset: (() => void) | undefined;
+    const resetSignal = new Promise<void>((resolve) => {
+      wakeReset = resolve;
+      this.resetWaiters.push(resolve);
+    });
+
+    const dropResetWaiter = (): void => {
+      if (!wakeReset) return;
+      const index = this.resetWaiters.indexOf(wakeReset);
+      if (index >= 0) this.resetWaiters.splice(index, 1);
+      wakeReset = undefined;
+    };
+
     try {
-      await Promise.race([
-        previous,
-        new Promise<never>((_resolve, reject) => {
-          abort = () => reject(new Error(cancellationMessage));
-          signal.addEventListener('abort', abort, { once: true });
-        }),
-      ]);
+      if (!signal) {
+        await Promise.race([previous, resetSignal]);
+      } else {
+        let abort: (() => void) | undefined;
+        try {
+          await Promise.race([
+            previous,
+            resetSignal,
+            new Promise<never>((_resolve, reject) => {
+              abort = () => reject(new Error(cancellationMessage));
+              signal.addEventListener('abort', abort, { once: true });
+            }),
+          ]);
+        } finally {
+          if (abort) signal.removeEventListener('abort', abort);
+        }
+      }
+      if (this.generation !== generation) {
+        throw new Error(cancellationMessage);
+      }
+      return finish;
     } catch (error) {
-      void previous.finally(() => release?.());
+      // Advance the abandoned chain so later waiters still make progress.
+      void previous.finally(finish);
       throw error;
     } finally {
-      if (abort) signal.removeEventListener('abort', abort);
+      dropResetWaiter();
     }
-    return release!;
   }
 
   reset(): void {
+    this.generation += 1;
     this.tail = Promise.resolve();
+    const waiters = this.resetWaiters.splice(0);
+    for (const wake of waiters) wake();
   }
 }
 
