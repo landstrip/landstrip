@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -274,6 +274,32 @@ it('edits sandbox enabled state in the selected scope', async () => {
   expect(callbacks.load(cwd, true)).toEqual({ global: false, project: true });
   await callbacks.clearProject(ctx);
   expect(callbacks.load(cwd, true)).toEqual({ global: false, project: undefined });
+
+  vi.unstubAllEnvs();
+  rmSync(cwd, { recursive: true, force: true });
+  rmSync(agentDir, { recursive: true, force: true });
+});
+
+it('refuses to write over a corrupt sandbox.json', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-corrupt-sandbox-'));
+  const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-corrupt-agent-'));
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  const integration = createLandstripIntegration({ registerBashTool: false });
+  const callbacks = integration.sandboxCallbacks!;
+  const ctx = {
+    cwd,
+    hasUI: true,
+    ui: { notify() {}, setStatus() {} },
+  } as unknown as ExtensionContext;
+
+  const projectDir = join(cwd, '.pi');
+  mkdirSync(projectDir, { recursive: true });
+  const projectPath = join(projectDir, 'sandbox.json');
+  const corrupt = '{ "enabled": true, "filesystem": { "denyWrite": ["/secret"] },';
+  writeFileSync(projectPath, corrupt, 'utf8');
+
+  await expect(callbacks.setEnabled(ctx, false, 'project')).rejects.toThrow(/sandbox\.json/);
+  expect(readFileSync(projectPath, 'utf8')).toBe(corrupt);
 
   vi.unstubAllEnvs();
   rmSync(cwd, { recursive: true, force: true });

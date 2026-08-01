@@ -361,8 +361,10 @@ function readOrEmptyConfig(configPath: string): SandboxConfigFile {
   if (!existsSync(configPath)) return {};
   try {
     return JSON.parse(readFileSync(configPath, 'utf-8'));
-  } catch {
-    return {};
+  } catch (error) {
+    // Never treat corrupt JSON as an empty object: writers that start from
+    // this helper would otherwise overwrite denyWrite/allowRead/etc. with {}.
+    throw new Error(`${configPath}: ${formatError(error)}`);
   }
 }
 
