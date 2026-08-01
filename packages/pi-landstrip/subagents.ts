@@ -559,14 +559,14 @@ class Semaphore {
   tryAcquire(): (() => void) | undefined {
     if (this.active >= this.limit) return undefined;
     this.active += 1;
-    return () => this.release();
+    return this.releaseOnce();
   }
 
   async acquire(signal?: AbortSignal): Promise<() => void> {
     if (signal?.aborted) throw new Error('Task cancelled');
     if (this.active < this.limit) {
       this.active += 1;
-      return () => this.release();
+      return this.releaseOnce();
     }
     await new Promise<void>((resolve, reject) => {
       const abort = () => {
@@ -582,12 +582,17 @@ class Semaphore {
       this.waiters.push(start);
       signal?.addEventListener('abort', abort, { once: true });
     });
-    return () => this.release();
+    return this.releaseOnce();
   }
 
-  private release(): void {
-    this.active -= 1;
-    this.waiters.shift()?.();
+  private releaseOnce(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.active -= 1;
+      this.waiters.shift()?.();
+    };
   }
 }
 
@@ -2491,7 +2496,9 @@ export class SubagentRuntime {
           try {
             result = await this.execute(input, ctx, signal, task, rules, () => undefined);
           } finally {
-            if (handedOff) await this.restoreLease(task.id, signal);
+            // Reclaim capacity even if the parent is already aborted; never let
+            // restore failure mask a successful nested-task result.
+            if (handedOff) await this.restoreLease(task.id).catch(() => undefined);
           }
           response = {
             ok: true,
@@ -2839,10 +2846,11 @@ export class SubagentRuntime {
     return true;
   }
 
-  private async restoreLease(taskId: string, signal?: AbortSignal): Promise<void> {
+  private async restoreLease(taskId: string): Promise<void> {
     const lease = this.leases.get(taskId);
     if (!lease || lease.release) return;
-    const release = await this.semaphore.acquire(signal);
+    // No abort signal: parent cancellation must not drop the slot permanently.
+    const release = await this.semaphore.acquire();
     const current = this.leases.get(taskId);
     if (!current || current.release) {
       release();
