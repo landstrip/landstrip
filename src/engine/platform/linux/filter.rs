@@ -248,13 +248,18 @@ pub(super) fn add_unix_socket_filters(
     // path before they carry data, so the broker mediates them there with
     // EACCES. SOCK_DGRAM has no such gate: sendto/sendmsg deliver to a path or
     // abstract address without connect/bind, and those syscalls are not brokered.
-    // Under a deny-all unix-socket policy, deny datagram creation at the errno
-    // filter so a sandboxed child cannot exfil via an unconnected datagram
-    // socket. This restores the pre-cf119cf gate that the unification removed.
+    // Under DenyAll or PathMediated unix-socket policy, deny datagram creation
+    // at the errno filter so a sandboxed child cannot exfil via an unconnected
+    // datagram socket (PathMediated only authorizes pathname connect/bind).
+    // This restores the pre-cf119cf gate that the unification removed for DenyAll
+    // and closes the same hole for allowUnixSockets path lists.
     //
     // socketpair is unaffected: it carries no path and no remote address, so it
     // never reaches the broker's path authorization.
-    if matches!(policy, UnixSocketFilter::DenyAll) {
+    if matches!(
+        policy,
+        UnixSocketFilter::DenyAll | UnixSocketFilter::PathMediated
+    ) {
         let domain = u64::try_from(libc::AF_UNIX).map_err(|_| LandstripError::IntegerTooLarge)?;
         let dgram = u64::try_from(libc::SOCK_DGRAM).map_err(|_| LandstripError::IntegerTooLarge)?;
         add_conditional_rule(
