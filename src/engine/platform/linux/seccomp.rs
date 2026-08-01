@@ -480,10 +480,8 @@ impl Denials {
 enum HandleResult {
     Respond(libc::seccomp_notif_resp),
     // Broker-mediated open: inject a broker-opened fd via SECCOMP_IOCTL_NOTIF_ADDFD
-    // instead of letting the kernel re-run openat in the child. Used for reads,
-    // which are not Landlock-backed in the brokered child, so CONTINUE would be
-    // TOCTOU-bypassable (a sibling thread could swap the path between the
-    // broker's process_vm_readv check and the kernel's re-execution).
+    // instead of letting the kernel re-run open in the child. Used for every
+    // allowed open so CONTINUE cannot TOCTOU-bypass denyRead/denyWrite.
     AddFd(OpenGrant),
     Pending(u64, Option<Grant>),
 }
@@ -519,9 +517,7 @@ fn handle_notification(
             ctx.query_enabled,
             next_query_id,
         )
-    } else if ctx.notify_filesystem
-        && (syscall == ctx.syscalls.openat || syscall == ctx.syscalls.openat2)
-    {
+    } else if ctx.notify_filesystem && ctx.syscalls.is_open(syscall) {
         handle_openat(
             ctx.policy,
             request,
@@ -1097,13 +1093,16 @@ struct Open {
 }
 
 impl Open {
-    // openat passes flags and mode as scalar arguments.
-    fn from_args(request: &libc::seccomp_notif) -> SysResult<Self> {
+    // openat passes flags and mode as scalar arguments at args[2]/args[3].
+    // legacy open(2) uses the same layout at args[1]/args[2].
+    fn from_args(request: &libc::seccomp_notif, legacy_open: bool) -> SysResult<Self> {
         let args = &request.data.args;
-        let flags = i32::try_from(args[2]).map_err(|_| BrokerError::InvalidAddress)?;
+        let flags_arg = if legacy_open { 1 } else { 2 };
+        let mode_arg = if legacy_open { 2 } else { 3 };
+        let flags = i32::try_from(args[flags_arg]).map_err(|_| BrokerError::InvalidAddress)?;
         Ok(Self {
             flags,
-            mode: syscall_u32(args[3]),
+            mode: syscall_u32(args[mode_arg]),
         })
     }
 
@@ -1215,17 +1214,32 @@ fn handle_openat(
     query_enabled: bool,
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
-    // args[0] is dirfd: an i32 (including AT_FDCWD=-100) stored as u64.
-    let dirfd = syscall_i32(request.data.args[0]);
-    let path_ptr = usize::try_from(request.data.args[1]).map_err(|_| BrokerError::BadAddress)?;
+    let nr = i64::from(request.data.nr);
+    let openat2 = nr == libc::SYS_openat2;
+    let legacy_open = matches!(legacy_syscall::OPEN, Some(open) if open == nr);
+    // open(2): path/flags/mode at 0/1/2 with implicit AT_FDCWD.
+    // openat(2)/openat2(2): dirfd/path/... at 0/1/...
+    let dirfd = if legacy_open {
+        libc::AT_FDCWD
+    } else {
+        syscall_i32(request.data.args[0])
+    };
+    let path_arg = usize::from(!legacy_open);
+    let path_ptr =
+        usize::try_from(request.data.args[path_arg]).map_err(|_| BrokerError::BadAddress)?;
     let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
-    let openat2 = i64::from(request.data.nr) == libc::SYS_openat2;
     let Open { flags, mode } = if openat2 {
         Open::from_how(request, pid)?
     } else {
-        Open::from_args(request)?
+        Open::from_args(request, legacy_open)?
     };
-    let syscall_name = if openat2 { "openat2" } else { "openat" };
+    let syscall_name = if openat2 {
+        "openat2"
+    } else if legacy_open {
+        "open"
+    } else {
+        "openat"
+    };
 
     let Some(path) = read_child_path(pid, path_ptr)? else {
         return Ok(NotificationResult::Continue);
@@ -1299,13 +1313,12 @@ fn handle_openat(
         );
     }
 
-    // Reads are not Landlock-backed in the brokered child (f3f2105 dropped read
-    // handling so execve of denyRead binaries works). Re-running openat in the
-    // child via CONTINUE would reopen the classic seccomp-user-notification
-    // TOCTOU, so have the broker open the allowed file itself and inject the fd.
-    // Pure writes skip this: the brokered child still enforces Landlock write
-    // rules, which catch a swapped write target.
-    if wants_read && let Some(grant) = OpenGrant::new(&resolved, flags, mode) {
+    // Re-running openat in the child via CONTINUE would reopen the classic
+    // seccomp-user-notification TOCTOU (a sibling can swap the path after the
+    // broker's policy check). Landlock cannot express denyWrite holes under an
+    // allowWrite root, so pin every allowed open — read or write — with an
+    // OpenGrant and inject the broker's fd via SECCOMP_ADDFD.
+    if let Some(grant) = OpenGrant::new(&resolved, flags, mode) {
         return Ok(NotificationResult::Open(grant));
     }
 
@@ -1314,6 +1327,7 @@ fn handle_openat(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod legacy_syscall {
+    pub const OPEN: Option<i64> = Some(libc::SYS_open);
     pub const RENAME: Option<i64> = Some(libc::SYS_rename);
     pub const LINK: Option<i64> = Some(libc::SYS_link);
     pub const SYMLINK: Option<i64> = Some(libc::SYS_symlink);
@@ -1329,6 +1343,7 @@ mod legacy_syscall {
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 mod legacy_syscall {
+    pub const OPEN: Option<i64> = None;
     pub const RENAME: Option<i64> = None;
     pub const LINK: Option<i64> = None;
     pub const SYMLINK: Option<i64> = None;
@@ -2559,6 +2574,7 @@ pub(super) struct NotificationSyscalls {
     pub(super) socket: i64,
     openat: i64,
     openat2: i64,
+    open: Option<i64>,
 }
 
 impl NotificationSyscalls {
@@ -2569,15 +2585,26 @@ impl NotificationSyscalls {
             socket: libc::SYS_socket,
             openat: libc::SYS_openat,
             openat2: libc::SYS_openat2,
+            open: legacy_syscall::OPEN,
         }
+    }
+
+    fn is_open(&self, syscall: i64) -> bool {
+        syscall == self.openat
+            || syscall == self.openat2
+            || self.open.is_some_and(|open| open == syscall)
     }
 
     // stat (newfstatat/statx) is intentionally not mediated: blocking metadata
     // reads breaks directory traversal (git, shells, build tools all stat
     // ancestor dirs to canonicalise paths), and denyRead still blocks reading
     // file contents and listing directories via openat.
-    pub(super) fn filesystem_syscalls(&self) -> [i64; 2] {
-        [self.openat, self.openat2]
+    pub(super) fn filesystem_syscalls(&self) -> Vec<i64> {
+        let mut nrs = vec![self.openat, self.openat2];
+        if let Some(open) = self.open {
+            nrs.push(open);
+        }
+        nrs
     }
 }
 
