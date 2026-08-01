@@ -164,11 +164,12 @@ export function getPiConfigPaths(
 export async function setMaxSubagentsConfig(
   cwd: string,
   maxSubagents: number,
-  _includeProject = true,
+  includeProject = true,
   agentDir = getAgentDir(),
-): Promise<'global'> {
-  await setMaxSubagentsConfigForScope(cwd, maxSubagents, 'global', agentDir);
-  return 'global';
+): Promise<'global' | 'project'> {
+  const scope = includeProject ? 'project' : 'global';
+  await setMaxSubagentsConfigForScope(cwd, maxSubagents, scope, agentDir);
+  return scope;
 }
 
 async function updateLandstripSettingsForScope(

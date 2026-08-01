@@ -234,7 +234,23 @@ describe('landstrip agent configuration', () => {
     expect(catalog.diagnostics.join('\n')).toContain(`integer from 0 to ${MAX_SUBAGENTS}`);
   });
 
-  test('updates maxSubagents in global settings without replacing other settings', async () => {
+  test('updates maxSubagents in project settings when includeProject is true', async () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    const projectPath = join(cwd, '.pi', 'settings.json');
+    write(projectPath, {
+      theme: 'dark',
+      landstrip: { maxSubagents: 2, permission: { bash: 'ask' } },
+    });
+
+    await expect(setMaxSubagentsConfig(cwd, 6, true, agentDir)).resolves.toBe('project');
+    expect(JSON.parse(readFileSync(projectPath, 'utf8'))).toEqual({
+      theme: 'dark',
+      landstrip: { maxSubagents: 6, permission: { bash: 'ask' } },
+    });
+  });
+
+  test('updates maxSubagents in global settings when includeProject is false', async () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     const path = join(agentDir, 'settings.json');
@@ -243,7 +259,7 @@ describe('landstrip agent configuration', () => {
       landstrip: { maxSubagents: 2, permission: { bash: 'ask' } },
     });
 
-    await expect(setMaxSubagentsConfig(cwd, 6, true, agentDir)).resolves.toBe('global');
+    await expect(setMaxSubagentsConfig(cwd, 6, false, agentDir)).resolves.toBe('global');
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
       theme: 'dark',
       landstrip: { maxSubagents: 6, permission: { bash: 'ask' } },
