@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { writeFileSync } from 'node:fs';
+import { realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -131,7 +131,9 @@ test('validates, deduplicates, and disposes worker extensions', () => {
     entry: pathToFileURL(entry).href,
   });
   const disposeSecond = integration.registerWorkerExtension({ id: 'test-extension', entry });
-  expect(integration.getWorkerExtensions()).toEqual([{ id: 'test-extension', entry }]);
+  expect(integration.getWorkerExtensions()).toEqual([
+    { id: 'test-extension', entry: realpathSync(entry) },
+  ]);
 
   disposeFirst();
   expect(integration.getWorkerExtensions()).toHaveLength(1);

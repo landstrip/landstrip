@@ -731,7 +731,7 @@ export function extractNativeWriteDeniedPath(output: string, cwd: string): strin
   const denial = String.raw`(?:Access is denied\.?|Operation not permitted|Permission denied)`;
   let match = output.match(
     new RegExp(
-      String.raw`(?:[Uu]nable to create|cannot (?:create|touch|mkdir|remove|unlink|rename)|for writing)[^'"\n]*['"]([^'"\n]+)['"][^\r\n]{0,120}${denial}`,
+      String.raw`(?:[Uu]nable to create|failed to create(?: directory)?|cannot (?:create|touch|mkdir|remove|unlink|rename)|for writing)[^'"\x60\r\n]*['"\x60]([^'"\x60\r\n]+)['"\x60](?:[^\r\n]*\r?\n){0,3}[^\r\n]{0,120}${denial}`,
       'im',
     ),
   );

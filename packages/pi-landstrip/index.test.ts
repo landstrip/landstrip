@@ -691,7 +691,7 @@ describe('parseTrapLine', () => {
   });
 });
 
-describe('native Windows denial extraction', () => {
+describe('native denial extraction', () => {
   it('extracts drive-qualified, UNC, and MSYS paths', () => {
     const cwd = process.cwd();
     expect(
@@ -715,6 +715,13 @@ describe('native Windows denial extraction', () => {
         cwd,
       ),
     ).toContain('C:\\Users\\me\\output.txt');
+    const cachePath = join(cwd, 'cache');
+    expect(
+      extractNativeWriteDeniedPath(
+        `error: failed to create directory \`${cachePath}\`\n\nCaused by:\n  Operation not permitted (os error 1)`,
+        cwd,
+      ),
+    ).toBe(cachePath);
     expect(extractNativeDeniedPath('Access is denied.', cwd)).toBeNull();
   });
 });
