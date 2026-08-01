@@ -88,8 +88,8 @@ impl<'a> Lease<'a> {
             file.write_all(&bytes)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
-            state::protect_path(&temporary)?;
             drop(file);
+            state::protect_path(&temporary)?;
 
             state::replace_file(&temporary, &self.journal_path)?;
             state::protect_path(&self.journal_path)
@@ -109,6 +109,12 @@ impl<'a> Lease<'a> {
     }
 
     fn try_account(installation: &Installation, account: &'a Account) -> Result<Option<Self>> {
+        let state_path = state::state_path()?;
+        let journal_path = state_path
+            .parent()
+            .context("restricted-user state path has no parent")?
+            .join("leases")
+            .join(format!("{}.json", account.name));
         let name = format!(
             "Global\\LandstripRestrictedUser-{}-{}",
             installation.id, account.name
@@ -131,12 +137,6 @@ impl<'a> Lease<'a> {
             }
             return Err(io::Error::last_os_error()).context("acquire restricted-user lease mutex");
         }
-        let state_path = state::state_path()?;
-        let journal_path = state_path
-            .parent()
-            .context("restricted-user state path has no parent")?
-            .join("leases")
-            .join(format!("{}.json", account.name));
         Ok(Some(Self {
             account,
             handle,

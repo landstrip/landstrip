@@ -75,6 +75,7 @@ pub(super) fn write_request(
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
+        drop(file);
         state::protect_path(path)
     })();
     if result.is_err() {

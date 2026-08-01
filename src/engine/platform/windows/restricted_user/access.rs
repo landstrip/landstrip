@@ -14,7 +14,7 @@ use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ACCESS_MODE, ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
     GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
@@ -138,6 +138,7 @@ impl GrantPlan {
                 entry.access_mode,
                 entry.inherit,
                 entry.propagate,
+                false,
             ) {
                 for applied_entry in applied.iter().rev() {
                     let _ = set_path_access(
@@ -147,6 +148,7 @@ impl GrantPlan {
                         REVOKE_ACCESS,
                         false,
                         applied_entry.propagate,
+                        true,
                     );
                 }
                 return Err(error);
@@ -158,10 +160,26 @@ impl GrantPlan {
 
     pub(super) fn revoke(&self, sid: &str) -> Result<()> {
         let sid = OwnedSid::parse(sid)?;
+        let mut first_error = None;
         for entry in self.entries.iter().rev() {
-            set_path_access(&entry.path, sid.0, 0, REVOKE_ACCESS, false, entry.propagate)?;
+            let error = set_path_access(
+                &entry.path,
+                sid.0,
+                0,
+                REVOKE_ACCESS,
+                false,
+                entry.propagate,
+                true,
+            )
+            .err();
+            if first_error.is_none() {
+                first_error = error;
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -195,6 +213,7 @@ fn set_path_access(
     mode: ACCESS_MODE,
     inherit: bool,
     propagate: bool,
+    ignore_missing: bool,
 ) -> Result<()> {
     let path = path
         .as_os_str()
@@ -216,6 +235,9 @@ fn set_path_access(
         )
     };
     if status != 0 {
+        if ignore_missing && is_missing_status(status) {
+            return Ok(());
+        }
         return Err(setup_failed(win32_error(status)).into());
     }
 
@@ -248,7 +270,12 @@ fn set_path_access(
         LocalFree(new_dacl.cast());
         LocalFree(security_descriptor);
     }
-    result.map_err(|e| setup_failed(format!("apply_path_dacl: {e}")))?;
+    if let Err(error) = result {
+        if ignore_missing && is_missing_error(&error) {
+            return Ok(());
+        }
+        return Err(setup_failed(format!("apply_path_dacl: {error}")).into());
+    }
     Ok(())
 }
 
@@ -303,6 +330,16 @@ fn setup_failed(source: impl Into<Cause>) -> LandstripError {
 
 fn win32_error(status: u32) -> io::Error {
     io::Error::from_raw_os_error(i32::from_ne_bytes(status.to_ne_bytes()))
+}
+
+fn is_missing_status(status: u32) -> bool {
+    status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND
+}
+
+fn is_missing_error(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|status| is_missing_status(u32::from_ne_bytes(status.to_ne_bytes())))
 }
 
 fn wide(value: &str) -> Vec<u16> {

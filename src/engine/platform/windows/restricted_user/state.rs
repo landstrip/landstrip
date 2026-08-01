@@ -158,8 +158,8 @@ pub(super) fn save(installation: &Installation) -> Result<()> {
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        protect_path(&temporary)?;
         drop(file);
+        protect_path(&temporary)?;
 
         replace_file(&temporary, &path)?;
         protect_path(&path)
