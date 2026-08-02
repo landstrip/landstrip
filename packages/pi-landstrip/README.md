@@ -32,12 +32,14 @@ the sandbox is explicitly disabled.
 
 The root Pi process is trusted. Pi filesystem tools and plugin callbacks run
 outside the OS sandbox. Agent permissions still control tool dispatch, but they
-are not an OS isolation boundary.
+are not an OS isolation boundary. On Linux and macOS, primary Bash reads therefore
+use the same host view by default; writes remain sandboxed. Subagent processes
+retain the configured read and write policy.
 
-The default [sandbox policy](./sandbox.json) limits reads and writes to the
-project and a few bootstrap files. Direct network access is blocked. When the
-platform permits loopback, the extension's proxy filters allowed HTTP and HTTPS
-domains.
+The default [sandbox policy](./sandbox.json) limits writes to the project and
+restricts worker reads within the user's home to the project and a few bootstrap
+files. Direct network access is blocked. When the platform permits loopback, the
+extension's proxy filters allowed HTTP and HTTPS domains.
 
 When a command needs more access, Pi can allow it once, for the session, or in
 the project or global policy. Project approvals go to `.pi/sandbox.json` and
@@ -60,6 +62,15 @@ Use `--no-sandbox` or set `enabled` to `false` in `sandbox.json`:
 Subagents remain separate processes but lose Landstrip OS isolation. Pi warns
 once per session. Trusted project config overrides global config; `/sandbox`
 updates a project sandbox file when present, otherwise the global file.
+
+### Shell read access
+
+`"shell": { "readAccess": "host" }` keeps primary Bash and `!`/`!!` reads
+consistent with trusted Pi filesystem tools. Set `readAccess` to `"policy"` to
+apply `filesystem.denyRead` and `filesystem.allowRead` to shell commands as an
+intentional stricter boundary. Worker processes always use the filesystem read
+policy. Windows always uses policy reads because its sandbox requires an explicit
+read allowlist.
 
 ### Permission layers
 

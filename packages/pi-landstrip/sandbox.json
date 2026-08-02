@@ -1,5 +1,8 @@
 {
   "enabled": true,
+  "shell": {
+    "readAccess": "host"
+  },
   "network": {
     "allowNetwork": false,
     "allowLocalBinding": false,

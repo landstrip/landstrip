@@ -18,9 +18,11 @@ import landstripExtension, {
   createPosixShellProvider,
   createWindowsDenyRead,
   matchesPattern,
+  enforcesShellReadPolicy,
   isPublicProxyAddress,
   readAllowed,
   sessionScopeFor,
+  resolveProcessReadPolicy,
   shouldPromptForWrite,
   writeEnvFile,
 } from './index.ts';
@@ -51,6 +53,46 @@ describe('Windows read policy', () => {
       'C:\\Secrets',
       'C:\\',
     ]);
+  });
+});
+
+describe('process read policy', () => {
+  const denyRead = ['/Users', '/home'];
+  const allowRead = ['.'];
+
+  it('aligns primary shell reads with trusted host tools', () => {
+    expect(resolveProcessReadPolicy('shell', 'host', denyRead, allowRead, 'darwin')).toEqual({
+      denyRead: [],
+      allowRead: [],
+    });
+  });
+
+  it('keeps worker processes confined by the configured read policy', () => {
+    expect(resolveProcessReadPolicy('worker', 'host', denyRead, allowRead, 'darwin')).toEqual({
+      denyRead,
+      allowRead,
+    });
+  });
+
+  it('supports explicit shell read isolation', () => {
+    expect(resolveProcessReadPolicy('shell', 'policy', denyRead, allowRead, 'linux')).toEqual({
+      denyRead,
+      allowRead,
+    });
+  });
+
+  it('retains the required explicit Windows read policy', () => {
+    expect(resolveProcessReadPolicy('shell', 'host', denyRead, allowRead, 'win32')).toEqual({
+      denyRead,
+      allowRead,
+    });
+  });
+
+  it('does not reinterpret host permission failures as sandbox read denials', () => {
+    expect(enforcesShellReadPolicy('host', 'darwin')).toBe(false);
+    expect(enforcesShellReadPolicy('policy', 'darwin')).toBe(true);
+    expect(enforcesShellReadPolicy('host', 'win32')).toBe(true);
+    expect(enforcesShellReadPolicy('invalid', 'darwin')).toBe(true);
   });
 });
 
@@ -326,10 +368,14 @@ it('registers the sandbox dashboard independently from agent supervision', async
   expect(sandboxView).toContain('Sandbox');
   expect(sandboxView).toContain('[Overview]  Policy');
   expect(sandboxView).toContain('Protection');
-  expect(sandboxView).toContain('Filesystem');
+  expect(sandboxView).toContain('Read rules');
+  expect(sandboxView).toContain('Shell reads');
   expect(sandboxView).toContain('Tab next tab  ·  Enter disable in project  ·  Esc close');
   component?.handleInput('\t');
   expect(component?.render(78).join('\n')).toContain('Allowed domains');
+  expect(component?.render(78).join('\n')).toContain(
+    process.platform === 'win32' ? 'Policy (required)' : 'Host-aligned',
+  );
   component?.handleInput('\r');
   expect(customResult).toBe(true);
   component?.handleInput('\x1b');
@@ -654,8 +700,12 @@ describe('readAllowed', () => {
     ).toBe(true);
   });
 
-  it('denies when nothing in allowRead matches', () => {
-    expect(readAllowed('/etc/passwd', ['.'], DENY, cwd)).toBe(false);
+  it('allows a path outside every denyRead root', () => {
+    expect(readAllowed('/etc/passwd', ['.'], DENY, cwd)).toBe(true);
+  });
+
+  it('allows all reads when denyRead is empty', () => {
+    expect(readAllowed(join(HOME, '.ssh', 'id'), [], [], cwd)).toBe(true);
   });
 });
 
@@ -729,6 +779,7 @@ import {
   domainMatchesAny,
   formatLandstripTraps,
   extractNativeDeniedPath,
+  extractRetryableNativeReadDeniedPath,
   extractNativeWriteDeniedPath,
   isQueryTrap,
   parseTrapLine,
@@ -831,6 +882,29 @@ describe('native denial extraction', () => {
     expect(extractNativeDeniedPath('type: ..\\secret.txt: Access is denied.', cwd)).toContain(
       'secret.txt',
     );
+  });
+
+  it('retries native denials only when the read policy covers the path', () => {
+    const cwd = process.cwd();
+    const policyDenied = join(cwd, 'denied');
+    const hostDenied = join(tmpdir(), 'host-denied');
+
+    expect(
+      extractRetryableNativeReadDeniedPath(
+        `cat: '${policyDenied}': Permission denied`,
+        cwd,
+        [],
+        [cwd],
+      ),
+    ).toBe(policyDenied);
+    expect(
+      extractRetryableNativeReadDeniedPath(
+        `cat: '${hostDenied}': Permission denied`,
+        cwd,
+        [],
+        [cwd],
+      ),
+    ).toBeNull();
   });
 
   it('extracts write denials only when they identify a concrete path', () => {

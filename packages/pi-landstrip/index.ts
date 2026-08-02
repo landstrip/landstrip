@@ -86,6 +86,12 @@ interface SandboxFilesystemConfig {
   denyWrite: string[];
 }
 
+export type ShellReadAccess = 'host' | 'policy';
+
+interface SandboxShellConfig {
+  readAccess: ShellReadAccess;
+}
+
 interface SandboxNetworkConfig {
   allowNetwork: boolean;
   allowLocalBinding: boolean;
@@ -102,17 +108,20 @@ interface SandboxWindowsConfig {
 
 interface SandboxConfig {
   enabled: boolean;
+  shell: SandboxShellConfig;
   network: SandboxNetworkConfig;
   filesystem: SandboxFilesystemConfig;
   windows: SandboxWindowsConfig;
 }
 
 type SandboxFilesystemConfigFile = Partial<SandboxFilesystemConfig>;
+type SandboxShellConfigFile = Partial<SandboxShellConfig>;
 type SandboxNetworkConfigFile = Partial<SandboxNetworkConfig>;
 type SandboxWindowsConfigFile = Partial<SandboxWindowsConfig>;
 
 interface SandboxConfigFile {
   enabled?: boolean;
+  shell?: SandboxShellConfigFile;
   network?: SandboxNetworkConfigFile;
   filesystem?: SandboxFilesystemConfigFile;
   windows?: SandboxWindowsConfigFile;
@@ -131,6 +140,28 @@ interface LandstripPolicy {
   };
   filesystem: SandboxFilesystemConfig;
   windows: SandboxWindowsConfig;
+}
+
+export type PolicyAudience = 'shell' | 'worker';
+
+export function enforcesShellReadPolicy(
+  shellReadAccess: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return shellReadAccess !== 'host' || platform === 'win32';
+}
+
+export function resolveProcessReadPolicy(
+  audience: PolicyAudience,
+  shellReadAccess: ShellReadAccess,
+  denyRead: string[],
+  allowRead: string[],
+  platform: NodeJS.Platform = process.platform,
+): Pick<SandboxFilesystemConfig, 'denyRead' | 'allowRead'> {
+  if (audience === 'shell' && !enforcesShellReadPolicy(shellReadAccess, platform)) {
+    return { denyRead: [], allowRead: [] };
+  }
+  return { denyRead, allowRead };
 }
 
 type LandstripDenialTrap = LandstripFilesystemTrap | LandstripNetworkTrap;
@@ -261,12 +292,16 @@ function mergeArray(base: string[], override?: string[]): string[] {
 }
 
 function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxConfig {
+  const shell = overrides.shell;
   const network = overrides.network;
   const filesystem = overrides.filesystem;
   const windows = overrides.windows;
 
   return {
     enabled: overrides.enabled ?? base.enabled,
+    shell: {
+      readAccess: shell?.readAccess ?? base.shell.readAccess,
+    },
     network: {
       allowNetwork: network?.allowNetwork ?? base.network.allowNetwork,
       allowLocalBinding: network?.allowLocalBinding ?? base.network.allowLocalBinding,
@@ -635,20 +670,19 @@ function longestPrefixMatch(path: string, patterns: string[], cwd: string): numb
   return best;
 }
 
-// Most-specific-match wins: a read is allowed when its longest matching
-// allowRead entry is at least as specific as its longest matching denyRead
-// entry. So an explicit allow (e.g. a granted `~/.cache`) overrides the broad
-// `denyRead` gate (`/home`), while a narrow denyRead carve-out still beats a
-// broad allow. Ties favor allow. denyWrite stays an absolute block elsewhere.
+// Reads are unrestricted outside denyRead. Within a denied root, the most
+// specific matching rule wins: an explicit allow (e.g. a granted `~/.cache`)
+// overrides the broad `denyRead` gate (`/home`), while a narrow denyRead
+// carve-out still beats a broad allow. Ties favor allow.
 export function readAllowed(
   path: string,
   allowRead: string[],
   denyRead: string[],
   cwd: string,
 ): boolean {
-  const allow = longestPrefixMatch(path, allowRead, cwd);
-  if (allow < 0) return false;
-  return allow >= longestPrefixMatch(path, denyRead, cwd);
+  const deny = longestPrefixMatch(path, denyRead, cwd);
+  if (deny < 0) return true;
+  return longestPrefixMatch(path, allowRead, cwd) >= deny;
 }
 
 function isPathLike(value: string): boolean {
@@ -729,6 +763,16 @@ export function extractNativeDeniedPath(output: string, cwd: string): string | n
   if (match) return normalizePathMatch(match[1], cwd);
 
   return null;
+}
+
+export function extractRetryableNativeReadDeniedPath(
+  output: string,
+  cwd: string,
+  allowRead: string[],
+  denyRead: string[],
+): string | null {
+  const path = extractNativeDeniedPath(output, cwd);
+  return path && !readAllowed(path, allowRead, denyRead, cwd) ? path : null;
 }
 
 export function extractNativeWriteDeniedPath(output: string, cwd: string): string | null {
@@ -1565,9 +1609,16 @@ export function createLandstripIntegration(
   function buildLandstripPolicy(
     cwd: string,
     proxyPort: number | null,
+    audience: PolicyAudience,
     allowances?: ExecutionAllowances,
   ): LandstripPolicy {
     const config = loadConfig(cwd);
+    const readPolicy = resolveProcessReadPolicy(
+      audience,
+      config.shell.readAccess,
+      getEffectiveDenyRead(config, cwd),
+      getEffectiveAllowRead(config, cwd, allowances),
+    );
 
     return {
       network: {
@@ -1578,8 +1629,7 @@ export function createLandstripIntegration(
         ...(proxyPort !== null ? { httpProxyPort: proxyPort } : {}),
       },
       filesystem: {
-        denyRead: getEffectiveDenyRead(config, cwd),
-        allowRead: getEffectiveAllowRead(config, cwd, allowances),
+        ...readPolicy,
         allowWrite: getEffectiveAllowWrite(config, allowances),
         denyWrite: config.filesystem.denyWrite,
       },
@@ -1590,13 +1640,14 @@ export function createLandstripIntegration(
   function writePolicyFile(
     cwd: string,
     proxyPort: number | null,
+    audience: PolicyAudience,
     allowances?: ExecutionAllowances,
   ): { dir: string; path: string } {
     const dir = mkdtempSync(join(tmpdir(), 'pi-landstrip-'));
     const path = join(dir, 'policy.json');
     writeFileSync(
       path,
-      JSON.stringify(buildLandstripPolicy(cwd, proxyPort, allowances), null, 2) + '\n',
+      JSON.stringify(buildLandstripPolicy(cwd, proxyPort, audience, allowances), null, 2) + '\n',
       'utf-8',
     );
 
@@ -1873,7 +1924,7 @@ export function createLandstripIntegration(
           ? readAllowed(
               path,
               getEffectiveAllowRead(config, cwd, allowances),
-              config.filesystem.denyRead,
+              getEffectiveDenyRead(config, cwd),
               cwd,
             )
           : !shouldPromptForWrite(path, getEffectiveAllowWrite(config, allowances), cwd);
@@ -2049,7 +2100,7 @@ export function createLandstripIntegration(
     let disposed = false;
     try {
       if (options.signal?.aborted) throw new Error('Task cancelled');
-      policy = writePolicyFile(options.cwd, proxy?.port ?? null, processAllowances);
+      policy = writePolicyFile(options.cwd, proxy?.port ?? null, 'worker', processAllowances);
       if (process.platform !== 'win32') {
         [trapSocket, childEnd] = await createSocketPair();
         if (options.signal?.aborted) throw new Error('Task cancelled');
@@ -2202,7 +2253,7 @@ export function createLandstripIntegration(
             invocation.executable,
             cwd,
           );
-          policy = writePolicyFile(cwd, proxy?.port ?? null, processAllowances);
+          policy = writePolicyFile(cwd, proxy?.port ?? null, 'shell', processAllowances);
           landstripArgs = [
             'run',
             '-p',
@@ -2477,6 +2528,20 @@ export function createLandstripIntegration(
     });
 
     const run = () => sandboxedBash.execute(id, params, signal, onUpdate, ctx);
+    const blockedReadPathForRetry = (nativeOutput: string): string | null => {
+      const config = loadConfig(ctx.cwd);
+      if (!enforcesShellReadPolicy(config.shell.readAccess)) return null;
+
+      const trappedPath = extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'read');
+      if (trappedPath) return trappedPath;
+
+      return extractRetryableNativeReadDeniedPath(
+        nativeOutput,
+        ctx.cwd,
+        getEffectiveAllowRead(config, ctx.cwd, allowances),
+        getEffectiveDenyRead(config, ctx.cwd),
+      );
+    };
     const retryWithAccess = async (
       operation: 'read' | 'write',
       blockedPath: string,
@@ -2494,9 +2559,10 @@ export function createLandstripIntegration(
         }
         const needsPrompt =
           operation === 'read'
-            ? !matchesPattern(
+            ? !readAllowed(
                 blockedPath,
                 getEffectiveAllowRead(config, ctx.cwd, allowances),
+                getEffectiveDenyRead(config, ctx.cwd),
                 ctx.cwd,
               )
             : shouldPromptForWrite(
@@ -2587,9 +2653,7 @@ export function createLandstripIntegration(
         if (retryResult) return retryResult;
       }
 
-      const blockedReadPath =
-        extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'read') ??
-        extractNativeDeniedPath(fallbackOutput, ctx.cwd);
+      const blockedReadPath = blockedReadPathForRetry(fallbackOutput);
       if (blockedReadPath) {
         const retryResult = await retryWithAccess('read', blockedReadPath);
         if (retryResult) return retryResult;
@@ -2614,9 +2678,7 @@ export function createLandstripIntegration(
       if (retryResult) return retryResult;
     }
 
-    const blockedReadPath =
-      extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'read') ??
-      extractNativeDeniedPath(stderrOutput, ctx.cwd);
+    const blockedReadPath = blockedReadPathForRetry(stderrOutput);
     if (!blockedReadPath) return result;
 
     const retryResult = await retryWithAccess('read', blockedReadPath);
@@ -2882,6 +2944,15 @@ export function createLandstripIntegration(
               : windowsImplementation === 'appContainer' && !config.windows.allowLoopback
                 ? 'Blocked'
                 : 'Proxied';
+            const shellReadMode =
+              process.platform === 'win32'
+                ? 'Policy (required)'
+                : config.shell.readAccess === 'host'
+                  ? 'Host-aligned'
+                  : 'Policy';
+            const readRuleScope = enforcesShellReadPolicy(config.shell.readAccess)
+              ? 'Workers and shell'
+              : 'Workers only';
 
             return {
               render(width: number): string[] {
@@ -2917,10 +2988,19 @@ export function createLandstripIntegration(
                     '',
                     accent('Protection'),
                     item('Network', text(networkMode)),
+                    item('Shell reads', text(shellReadMode)),
                     item(
-                      'Filesystem',
+                      'Read rules',
                       text(
-                        `${config.filesystem.denyRead.length + config.filesystem.allowRead.length} read rules, ${config.filesystem.allowWrite.length + config.filesystem.denyWrite.length} write rules`,
+                        `${config.filesystem.denyRead.length + config.filesystem.allowRead.length} · ${readRuleScope}`,
+                      ),
+                    ),
+                    item(
+                      'Write rules',
+                      text(
+                        String(
+                          config.filesystem.allowWrite.length + config.filesystem.denyWrite.length,
+                        ),
                       ),
                     ),
                     item(
@@ -2978,6 +3058,8 @@ export function createLandstripIntegration(
                     ),
                     '',
                     accent('Filesystem'),
+                    item('Shell reads', text(shellReadMode)),
+                    item('Read rules for', text(readRuleScope)),
                     item('Denied reads', listValue(config.filesystem.denyRead)),
                     item('Allowed reads', listValue(config.filesystem.allowRead)),
                     item('Allowed writes', listValue(config.filesystem.allowWrite)),
