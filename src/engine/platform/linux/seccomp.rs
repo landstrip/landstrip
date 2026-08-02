@@ -1189,7 +1189,10 @@ fn deny_open(
     if query_enabled {
         let query_id = *next_query_id;
         *next_query_id += 1;
-        let grant = OpenGrant::new(&path, flags, mode).map(Grant::Open);
+        let grant = Some(Grant::Open(
+            OpenGrant::new(&path, flags, mode)
+                .map_err(|errno| BrokerError::SystemCall { errno })?,
+        ));
         return Ok(NotificationResult::query(
             query_id,
             Trap::filesystem(
@@ -1331,11 +1334,9 @@ fn handle_openat(
     // broker's policy check). Landlock cannot express denyWrite holes under an
     // allowWrite root, so pin every allowed open — read or write — with an
     // OpenGrant and inject the broker's fd via SECCOMP_ADDFD.
-    if let Some(grant) = OpenGrant::new(&resolved, flags, mode) {
-        return Ok(NotificationResult::Open(grant));
-    }
-
-    Ok(NotificationResult::Continue)
+    let grant = OpenGrant::new(&resolved, flags, mode)
+        .map_err(|errno| BrokerError::SystemCall { errno })?;
+    Ok(NotificationResult::Open(grant))
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1700,7 +1701,7 @@ impl Grant {
         let args = &request.data.args;
 
         if spec.name == "creat" {
-            return Ok(creat_grant(slots, syscall_u32(args[1])));
+            return creat_grant(slots, syscall_u32(args[1]));
         }
 
         let mut anchors = Vec::with_capacity(slots.len());
@@ -1708,10 +1709,7 @@ impl Grant {
             let Some((resolved, _)) = slot else {
                 return Ok(None);
             };
-            match Anchor::new(resolved) {
-                Some(anchor) => anchors.push(anchor),
-                None => return Ok(None),
-            }
+            anchors.push(Anchor::new(resolved).map_err(|errno| BrokerError::SystemCall { errno })?);
         }
 
         let op = match spec.name {
@@ -1797,14 +1795,17 @@ impl Grant {
     }
 }
 
-fn creat_grant(slots: &[Option<(PathBuf, PathBuf)>], mode: u32) -> Option<Grant> {
-    let (resolved, _) = slots.first()?.as_ref()?;
+fn creat_grant(slots: &[Option<(PathBuf, PathBuf)>], mode: u32) -> SysResult<Option<Grant>> {
+    let Some((resolved, _)) = slots.first().and_then(Option::as_ref) else {
+        return Ok(None);
+    };
     OpenGrant::new(
         resolved,
         libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC,
         mode,
     )
-    .map(Grant::Open)
+    .map(|grant| Some(Grant::Open(grant)))
+    .map_err(|errno| BrokerError::SystemCall { errno })
 }
 
 fn read_child_target(pid: Pid, ptr: u64) -> SysResult<Option<CString>> {
@@ -2193,21 +2194,21 @@ fn pin_target(at: &Anchor) -> std::result::Result<(OwnedFd, CString), i32> {
     Ok((fd, path))
 }
 
-fn open_path(path: &Path, flags: i32) -> Option<OwnedFd> {
-    let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+fn open_path(path: &Path, flags: i32) -> std::result::Result<OwnedFd, i32> {
+    let cpath = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
     // SAFETY: cpath is NUL-terminated and open copies it.
     let fd = unsafe { libc::open(cpath.as_ptr(), flags) };
     if fd < 0 {
-        return None;
+        return Err(Errno::last() as i32);
     }
     // SAFETY: open returned a new owned descriptor.
-    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 // This is deliberately a preflight check: reissuing mkdir could create a path
 // after an entry is removed, while a stale EEXIST result cannot mutate it.
 fn mkdir_target_exists(path: &Path) -> bool {
-    let Some(anchor) = Anchor::new(&normalize_path_nofollow(path)) else {
+    let Ok(anchor) = Anchor::new(&normalize_path_nofollow(path)) else {
         return false;
     };
     // A trailing slash requires the kernel to follow a terminal symlink.
@@ -2230,13 +2231,13 @@ fn mkdir_target_exists(path: &Path) -> bool {
 }
 
 impl Anchor {
-    fn new(resolved: &Path) -> Option<Self> {
-        Some(Self {
-            dir: open_path(
-                resolved.parent()?,
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )?,
-            name: CString::new(resolved.file_name()?.as_bytes()).ok()?,
+    fn new(resolved: &Path) -> std::result::Result<Self, i32> {
+        let parent = resolved.parent().ok_or(libc::EINVAL)?;
+        let name = CString::new(resolved.file_name().ok_or(libc::EINVAL)?.as_bytes())
+            .map_err(|_| libc::EINVAL)?;
+        Ok(Self {
+            dir: open_path(parent, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)?,
+            name,
         })
     }
 }
@@ -2532,18 +2533,16 @@ struct OpenGrant {
 }
 
 impl OpenGrant {
-    fn new(resolved: &Path, flags: i32, mode: u32) -> Option<Self> {
-        let kind = if let Some(handle) =
-            open_path(resolved, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        {
-            OpenKind::Reopen(handle)
-        } else {
-            OpenKind::Create {
+    fn new(resolved: &Path, flags: i32, mode: u32) -> std::result::Result<Self, i32> {
+        let kind = match open_path(resolved, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) {
+            Ok(handle) => OpenKind::Reopen(handle),
+            Err(libc::ENOENT) => OpenKind::Create {
                 anchor: Anchor::new(resolved)?,
                 mode,
-            }
+            },
+            Err(errno) => return Err(errno),
         };
-        Some(Self { flags, kind })
+        Ok(Self { flags, kind })
     }
 }
 
