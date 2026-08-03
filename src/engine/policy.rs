@@ -228,8 +228,22 @@ pub(crate) fn resolve_policy(
     let write_denied_links = collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
 
     let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
+    // Missing Windows allow roots need no ACL entry; skipping them is
+    // fail-closed because sandbox SIDs have no access by default.
+    #[cfg(target_os = "windows")]
+    let read_allow = read_allow
+        .into_iter()
+        .filter(|path| path.try_exists().unwrap_or(false))
+        .collect::<Vec<_>>();
+
     let read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
     let read_denied_roots = effective_denied_roots(&read_deny, &read_allow);
+    // Windows cannot attach deny entries to missing paths.
+    #[cfg(target_os = "windows")]
+    let read_denied_roots = read_denied_roots
+        .into_iter()
+        .filter(|path| path.try_exists().unwrap_or(true))
+        .collect();
     let (read_access, read_symlinks) = if read_deny.is_empty() {
         (ReadAccess::Unrestricted, Vec::new())
     } else if read_allow.iter().any(|root| root == Path::new("/"))
