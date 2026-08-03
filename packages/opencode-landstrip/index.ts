@@ -73,6 +73,7 @@ type ToastVariant = 'info' | 'success' | 'warning' | 'error';
 const LANDSTRIP_VERSION = [0, 17, 0] as const;
 const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
+const DISCOVERY_CONNECT_TIMEOUT_MS = 250;
 
 const prohibitedProxyAddresses = new BlockList();
 
@@ -874,6 +875,31 @@ function startTrapServer(
   });
 }
 
+function trapPortAcceptsConnections(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = connectNet({ host: '127.0.0.1', port });
+    let settled = false;
+    let timer: NodeJS.Timeout;
+    const finish = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(ok);
+    };
+    timer = setTimeout(() => finish(false), DISCOVERY_CONNECT_TIMEOUT_MS);
+
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+  });
+}
+
+async function readLiveDiscoveryPort(baseDirectory: string): Promise<number | null> {
+  const port = readDiscoveryPort(baseDirectory);
+  if (port === null) return null;
+  return (await trapPortAcceptsConnections(port)) ? port : null;
+}
+
 function buildWrappedCommand(
   policyPath: string,
   shell: string,
@@ -1366,7 +1392,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
     // The TUI owns interactive query handling. Fall back to an in-process
     // broker when no TUI endpoint is available (for example, in headless mode).
-    const tuiTrapPort = process.platform === 'linux' ? readDiscoveryPort(directory) : null;
+    const tuiTrapPort =
+      process.platform === 'linux' ? await readLiveDiscoveryPort(directory) : null;
     const trapServer =
       tuiTrapPort === null
         ? await startTrapServer(

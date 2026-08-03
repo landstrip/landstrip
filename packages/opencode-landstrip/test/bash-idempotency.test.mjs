@@ -667,6 +667,41 @@ test('query-response: bash wrapping injects fd 3 and stays idempotent', linuxOnl
   );
 });
 
+test(
+  'query-response: stale discovery port falls back to local trap server',
+  linuxOnly,
+  async () => {
+    await withPlugin(
+      {
+        enabled: true,
+        filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+        network: { allowedDomains: ['*'], deniedDomains: [] },
+      },
+      async ({ hooks, tempDir }) => {
+        const shared = await import(pathToFileURL(join(tempDir, 'shared.js')).href);
+        const staleServer = createServer();
+        await new Promise((res) => staleServer.listen(0, '127.0.0.1', res));
+        const stalePort = staleServer.address().port;
+        shared.writeDiscoveryPort(tempDir, stalePort);
+        await new Promise((res) => staleServer.close(res));
+
+        const input = { callID: 'stale-discovery', tool: 'bash' };
+        const output = { args: { command: 'git status --short', description: 'status' } };
+        try {
+          await hooks['tool.execute.before'](input, output);
+          const wrapped = output.args.command;
+
+          assert.match(wrapped, /'--trap-fd' '3'/);
+          assert.doesNotMatch(wrapped, new RegExp(`/dev/tcp/127\\.0\\.0\\.1/${stalePort}\\b`));
+          assert.match(wrapped, /\/dev\/tcp\/127\.0\.0\.1\/\d+\b/);
+        } finally {
+          shared.removeDiscoveryFile(tempDir);
+          await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+        }
+      },
+    );
+  },
+);
 test('query-response: a failing command executes only once', linuxOnly, async () => {
   await withPlugin(
     {
