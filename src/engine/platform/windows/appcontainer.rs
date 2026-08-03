@@ -544,11 +544,11 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess
 }
 
 fn grant_root_access(granted: &mut GrantedAccess, path: &Path, access: u32) -> Result<()> {
-    // Ancestors grant only traversal plus metadata on each directory itself.
-    // SetFileSecurityW keeps these ACEs local: SetNamedSecurityInfoW would
-    // re-propagate every existing inheritable ACE through each ancestor tree.
+    // Path lookup needs read and execute access on every ancestor. Keep the
+    // ancestor ACEs local to avoid propagating inheritable entries.
+    let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
     for ancestor in path.ancestors().skip(1) {
-        grant_path_access(ancestor, granted.sid, FILE_GENERIC_EXECUTE, false, false)?;
+        grant_path_access(ancestor, granted.sid, ancestor_access, false, false)?;
         granted.paths.push(GrantedPath {
             path: ancestor.to_path_buf(),
             propagate: false,

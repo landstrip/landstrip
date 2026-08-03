@@ -83,11 +83,12 @@ impl GrantPlan {
     }
 
     fn add_root(&mut self, path: &Path, access: u32, access_mode: ACCESS_MODE) {
+        let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
         for ancestor in path.ancestors().skip(1) {
             self.entries.push(GrantEntry {
                 access_mode,
                 path: ancestor.to_path_buf(),
-                access: FILE_GENERIC_EXECUTE,
+                access: ancestor_access,
                 inherit: false,
                 propagate: false,
             });
@@ -112,11 +113,12 @@ impl GrantPlan {
     }
 
     fn add_local(&mut self, path: &Path, access: u32, access_mode: ACCESS_MODE) {
+        let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
         for ancestor in path.ancestors().skip(1) {
             self.entries.push(GrantEntry {
                 access_mode,
                 path: ancestor.to_path_buf(),
-                access: FILE_GENERIC_EXECUTE,
+                access: ancestor_access,
                 inherit: false,
                 propagate: false,
             });
