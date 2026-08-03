@@ -14,7 +14,10 @@ use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, LocalFree};
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    LocalFree,
+};
 use windows_sys::Win32::Security::Authorization::{
     ACCESS_MODE, ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
     GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
@@ -238,6 +241,9 @@ fn set_path_access(
         if ignore_missing && is_missing_status(status) {
             return Ok(());
         }
+        if (mode == GRANT_ACCESS || mode == REVOKE_ACCESS) && is_locked_status(status) {
+            return Ok(());
+        }
         return Err(setup_failed(win32_error(status)).into());
     }
 
@@ -272,6 +278,9 @@ fn set_path_access(
     }
     if let Err(error) = result {
         if ignore_missing && is_missing_error(&error) {
+            return Ok(());
+        }
+        if (mode == GRANT_ACCESS || mode == REVOKE_ACCESS) && is_locked_error(&error) {
             return Ok(());
         }
         return Err(setup_failed(format!("apply_path_dacl: {error}")).into());
@@ -340,6 +349,19 @@ fn is_missing_error(error: &io::Error) -> bool {
     error
         .raw_os_error()
         .is_some_and(|status| is_missing_status(u32::from_ne_bytes(status.to_ne_bytes())))
+}
+
+/// Return whether an ACL target is inaccessible.
+///
+/// Grants remain fail-closed; revokes may leave a stale ACE. Denials fail.
+fn is_locked_status(status: u32) -> bool {
+    status == ERROR_SHARING_VIOLATION || status == ERROR_ACCESS_DENIED
+}
+
+fn is_locked_error(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .is_some_and(|status| is_locked_status(u32::from_ne_bytes(status.to_ne_bytes())))
 }
 
 fn wide(value: &str) -> Vec<u16> {

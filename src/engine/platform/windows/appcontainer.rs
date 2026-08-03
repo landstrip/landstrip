@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, GENERIC_READ,
-    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_ABANDONED,
-    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, ERROR_SHARING_VIOLATION,
+    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+    WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
     NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
@@ -633,6 +633,11 @@ fn set_path_access(
         )
     };
     if status != 0 {
+        // Skipping an inaccessible grant is fail-closed because AppContainer
+        // SIDs have no access by default.
+        if mode == GRANT_ACCESS && is_grant_locked_status(status) {
+            return Ok(());
+        }
         return Err(setup_failed(win32_error(status)).into());
     }
 
@@ -666,9 +671,27 @@ fn set_path_access(
         LocalFree(new_dacl.cast());
         LocalFree(security_descriptor);
     }
+    // A descendant skipped during propagation remains inaccessible.
+    if mode == GRANT_ACCESS && result.as_ref().err().is_some_and(is_grant_locked_error) {
+        return Ok(());
+    }
     result.map_err(setup_failed)?;
 
     Ok(())
+}
+
+/// Return whether an ACL grant failure leaves the path inaccessible.
+///
+/// Deny and revoke operations must still fail to avoid retaining access.
+fn is_grant_locked_status(status: u32) -> bool {
+    status == ERROR_SHARING_VIOLATION || status == ERROR_ACCESS_DENIED
+}
+
+fn is_grant_locked_error(error: &io::Error) -> bool {
+    error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .is_some_and(is_grant_locked_status)
 }
 
 fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> io::Result<()> {
