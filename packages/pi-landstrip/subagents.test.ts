@@ -1448,28 +1448,32 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   const projectSettings = component?.render(96).join('\n') ?? '';
   expect(projectSettings).toContain('[Settings]');
-  expect(projectSettings).toContain('[ 1 ] Maximum subagents');
-  expect(projectSettings).toContain('[ on ] Sandbox enabled');
+  expect(projectSettings).toContain('[ 1 ] maxSubagents');
+  expect(projectSettings).toContain('[ on ] sandboxEnabled');
   expect(projectSettings).not.toContain('change limit');
 
   component?.handleInput('\x1b[B');
-  component?.handleInput(' ');
-  expect(component?.render(96).join('\n')).toContain('[ off ] Sandbox enabled');
-  component?.handleInput('\t');
-  expect(component?.render(96).join('\n')).toContain('[Settings]');
-  expect(component?.render(96).join('\n')).toContain('[ off ] Sandbox enabled');
+  component?.handleInput('\r');
+  expect(component?.render(96).join('\n')).toContain('Project sandboxEnabled · current on');
+  component?.handleInput('o');
+  component?.handleInput('f');
+  component?.handleInput('f');
   component?.handleInput('\r');
   await vi.waitFor(() => {
     expect(sandboxProject).toBe(false);
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
+  expect(component?.render(96).join('\n')).toContain('[ off ] sandboxEnabled');
   component?.handleInput('\x1b[A');
 
   component?.handleInput('s');
   expect(component?.render(96).join('\n')).toContain('Scope: Global');
-  expect(component?.render(96).join('\n')).toContain('[ 1 ] Maximum subagents');
+  expect(component?.render(96).join('\n')).toContain('[ 1 ] maxSubagents');
   component?.handleInput('+');
-  expect(component?.render(96).join('\n')).toContain('[ 2 ] Maximum subagents');
+  expect(component?.render(96).join('\n')).toContain('[ 1 ] maxSubagents');
+  component?.handleInput('\r');
+  expect(component?.render(96).join('\n')).toContain('Global maxSubagents · current 1');
+  component?.handleInput('2');
   component?.handleInput('\r');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(agentDir, 'settings.json'), 'utf8'));
@@ -1480,9 +1484,9 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('s');
   expect(component?.render(96).join('\n')).toContain('Scope: Project');
   component?.handleInput('3');
-  expect(component?.render(96).join('\n')).toContain('[ 3 ] Maximum subagents');
-  component?.handleInput('r');
-  expect(component?.render(96).join('\n')).toContain('[ 2 ] Maximum subagents');
+  expect(component?.render(96).join('\n')).toContain('[ 2 ] maxSubagents');
+  component?.handleInput('\r');
+  expect(component?.render(96).join('\n')).toContain('Project maxSubagents · current 2');
   component?.handleInput('3');
   component?.handleInput('\r');
   await vi.waitFor(() => {
@@ -1491,8 +1495,7 @@ test('inspects and navigates persisted child sessions without switching sessions
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
 
-  component?.handleInput('i');
-  expect(component?.render(96).join('\n')).toContain('[ 2 ] Maximum subagents');
+  component?.handleInput('\r');
   component?.handleInput('\r');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));

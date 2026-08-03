@@ -27,6 +27,7 @@ import {
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import {
+  decodeKittyPrintable,
   matchesKey,
   Text,
   truncateToWidth,
@@ -87,18 +88,24 @@ const AGENTS_HELP_ROWS = [
   ['F', 'Toggle task log follow'],
   ['Page Up / Down', 'Scroll task output by page'],
   ['Home / End', 'Jump to task output boundary'],
-  ['Enter', 'Open log, set primary, or save'],
-  ['Esc', 'Back or close'],
+  ['Enter', 'Open log, set primary, or edit setting'],
+  ['Esc', 'Cancel edit, go back, or close'],
   ['Ctrl+C', 'Close'],
-  ['Space', 'Enable agent or toggle sandbox'],
+  ['Space', 'Enable agent'],
   ['E', 'Edit project agent'],
   ['X', 'Delete project agent'],
   ['Y / N', 'Confirm or cancel deletion'],
-  ['I', 'Use global value'],
-  ['R', 'Discard setting changes'],
-  ['0-9 / + / -', 'Set subagent limit'],
-  ['Backspace', 'Open parent task'],
+  ['Empty + Enter', 'Use global setting in Project scope'],
+  ['Backspace', 'Open parent task or edit setting'],
 ] as const;
+type AgentsSettingField = 'maxSubagents' | 'sandboxEnabled';
+
+interface AgentsSettingEditor {
+  readonly setting: number;
+  readonly scope: SandboxConfigScope;
+  readonly field: AgentsSettingField;
+  value: string;
+}
 type PiThinkingLevel = Parameters<ExtensionAPI['setThinkingLevel']>[0];
 
 interface PiPackage {
@@ -187,6 +194,11 @@ function readPiPackage(pkgPath: string): PiPackage | undefined {
   } catch {
     return undefined;
   }
+}
+
+function isControlChar(char: string): boolean {
+  const code = char.charCodeAt(0);
+  return code < 32 || code === 0x7f || (code >= 0x80 && code <= 0x9f);
 }
 
 const taskParameters = Type.Object({
@@ -1083,9 +1095,8 @@ export class SubagentRuntime {
       return;
     }
     let selectedSetting = 0;
-    const dirtySettings = new Set<number>();
+    let settingEditor: AgentsSettingEditor | undefined;
     let saving = false;
-    let editing = false;
     let confirmingDeleteAgent: string | undefined;
     let follow = requested.length > 0;
     let scroll = 0;
@@ -1133,24 +1144,14 @@ export class SubagentRuntime {
       scope === 'global'
         ? maxSubagentsSettings.global
         : (maxSubagentsSettings.project ?? maxSubagentsSettings.global);
-    const updateSelectedMaxSubagents = (value: number): void => {
-      maxSubagentsSettings =
-        scope === 'global'
-          ? { ...maxSubagentsSettings, global: value }
-          : { ...maxSubagentsSettings, project: value };
-      dirtySettings.add(0);
-    };
+    const settingField = (setting: number): AgentsSettingField =>
+      setting === 0 ? 'maxSubagents' : 'sandboxEnabled';
+    const settingLabel = (settingScope: SandboxConfigScope, field: AgentsSettingField): string =>
+      `${settingScope === 'global' ? 'Global' : 'Project'} ${field}`;
     const selectedSandboxEnabled = (): boolean =>
       scope === 'global'
         ? sandboxSettings.global
         : (sandboxSettings.project ?? sandboxSettings.global);
-    const updateSelectedSandboxEnabled = (value: boolean): void => {
-      sandboxSettings =
-        scope === 'global'
-          ? { ...sandboxSettings, global: value }
-          : { ...sandboxSettings, project: value };
-      dirtySettings.add(1);
-    };
 
     await ctx.ui.custom<void>(
       (tui, theme, _keybindings, done) => ({
@@ -1306,19 +1307,44 @@ export class SubagentRuntime {
             const sandboxInherited = scope === 'project' && sandboxSettings.project === undefined;
             const rows = [
               {
-                label: 'Maximum subagents',
+                label: 'maxSubagents',
                 value: String(selectedMaxSubagents()),
                 inherited: maxSubagentsInherited,
                 unavailable: false,
               },
               {
-                label: 'Sandbox enabled',
+                label: 'sandboxEnabled',
                 value: selectedSandboxEnabled() ? 'on' : 'off',
                 inherited: sandboxInherited,
                 unavailable: sandboxCallbacks === undefined,
               },
             ];
             const lines = [tabs, ''];
+            if (settingEditor) {
+              const current =
+                settingEditor.setting === 0
+                  ? String(selectedMaxSubagents())
+                  : selectedSandboxEnabled()
+                    ? 'on'
+                    : 'off';
+              lines.push(
+                theme.fg(
+                  'dim',
+                  `  ${settingLabel(settingEditor.scope, settingEditor.field)} · current ${current}`,
+                ),
+                '',
+                `  ${theme.fg('accent', '›')} [ ${settingEditor.value}${theme.fg('accent', '█')} ]`,
+                '',
+                theme.fg(
+                  'dim',
+                  settingEditor.scope === 'project'
+                    ? '  empty inherit  ·  enter submit  ·  esc cancel'
+                    : '  enter submit  ·  esc cancel',
+                ),
+              );
+              if (saving) lines.push('', theme.fg('dim', 'Saving…'));
+              return box(lines);
+            }
             for (const [index, row] of rows.entries()) {
               const selected = index === selectedSetting;
               const cursor = selected ? theme.fg('accent', '›') : ' ';
@@ -1329,8 +1355,7 @@ export class SubagentRuntime {
                   ? theme.fg('accent', text)
                   : theme.fg(row.unavailable ? 'muted' : 'text', text);
               const label = theme.fg(row.unavailable ? 'muted' : 'text', row.label);
-              const dirty = dirtySettings.has(index) ? theme.fg('warning', ' *') : '';
-              lines.push(`${cursor} ${value} ${label}${dirty}`);
+              lines.push(`${cursor} ${value} ${label}`);
             }
             if (selectedSetting === 1) {
               lines.push(
@@ -1456,32 +1481,22 @@ export class SubagentRuntime {
           }
           if (
             (matchesKey(data, 'shift+tab') || data.toLowerCase() === 's') &&
-            (tab === 'primary' || tab === 'subagent' || tab === 'settings')
+            (tab === 'primary' || tab === 'subagent' || tab === 'settings') &&
+            settingEditor === undefined
           ) {
             if (saving) return;
-            if (dirtySettings.size > 0) {
-              ctx.ui.notify('Save or discard settings changes before changing scope', 'warning');
-              return;
-            }
             if (!projectTrusted && scope === 'global') {
               ctx.ui.notify('Project settings require a trusted project', 'warning');
               return;
             }
             scope = scope === 'project' ? 'global' : 'project';
-            editing = false;
             reloadAgents();
             reloadSettings();
             tui.requestRender();
             return;
           }
           if (matchesKey(data, 'tab')) {
-            if (tab === 'settings' && dirtySettings.size > 0) {
-              ctx.ui.notify(
-                'Save changes with Enter or discard them with R before leaving',
-                'warning',
-              );
-              return;
-            }
+            if (settingEditor !== undefined) return;
             const selectedName =
               tab === 'primary' || tab === 'subagent'
                 ? agentsForTab()[selectedAgent]?.name
@@ -1502,7 +1517,6 @@ export class SubagentRuntime {
             }
             if (tab === 'log' && tasks.length > 0) follow = true;
             else follow = false;
-            editing = false;
             scroll = 0;
             tui.requestRender();
             return;
@@ -1616,109 +1630,117 @@ export class SubagentRuntime {
 
           if (tab === 'settings') {
             if (saving) return;
-            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) {
-              if (dirtySettings.size > 0) {
-                ctx.ui.notify(
-                  'Save changes with Enter or discard them with R before closing',
-                  'warning',
-                );
-                return;
-              }
+            if (matchesKey(data, 'ctrl+c')) {
               done();
               return;
             }
-            if (data.toLowerCase() === 'r') {
-              reloadSettings();
-              dirtySettings.clear();
-              editing = false;
+            if (settingEditor) {
+              if (matchesKey(data, 'escape')) {
+                settingEditor = undefined;
+                tui.requestRender();
+                return;
+              }
+              if (matchesKey(data, 'backspace')) {
+                settingEditor.value = settingEditor.value.slice(0, -1);
+                tui.requestRender();
+                return;
+              }
+              if (matchesKey(data, 'return')) {
+                const editor = settingEditor;
+                const input = editor.value.trim();
+                let save: Promise<void> | undefined;
+                let notifyMessage: string | undefined;
+                if (input === '') {
+                  if (editor.scope !== 'project') {
+                    settingEditor = undefined;
+                    tui.requestRender();
+                    return;
+                  }
+                  save =
+                    editor.setting === 0
+                      ? clearMaxSubagentsConfigForScope(ctx.cwd, 'project')
+                      : sandboxCallbacks?.clearProject(ctx);
+                  notifyMessage = `${settingLabel(editor.scope, editor.field)} inherits Global`;
+                } else if (editor.setting === 0) {
+                  if (!/^\d+$/.test(input)) {
+                    ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
+                    return;
+                  }
+                  const parsed = Number(input);
+                  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > MAX_SUBAGENTS) {
+                    ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
+                    return;
+                  }
+                  save = setMaxSubagentsConfigForScope(ctx.cwd, parsed, editor.scope);
+                  notifyMessage = `${settingLabel(editor.scope, editor.field)} = ${parsed}`;
+                } else {
+                  const normalized = input.toLowerCase();
+                  const parsed = ['1', 'on', 'true', 'yes'].includes(normalized)
+                    ? true
+                    : ['0', 'off', 'false', 'no'].includes(normalized)
+                      ? false
+                      : undefined;
+                  if (parsed === undefined) {
+                    ctx.ui.notify('Enter on/off, true/false, or 1/0', 'error');
+                    return;
+                  }
+                  save = sandboxCallbacks?.setEnabled(ctx, parsed, editor.scope);
+                  notifyMessage = `${settingLabel(editor.scope, editor.field)} = ${parsed ? 'on' : 'off'}`;
+                }
+                if (!save) {
+                  ctx.ui.notify('Sandbox settings are unavailable', 'warning');
+                  return;
+                }
+                saving = true;
+                settingEditor = undefined;
+                tui.requestRender();
+                void save
+                  .then(() => {
+                    reloadSettings();
+                    const loadedMaxSubagents = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
+                    this.setMaxSubagents(loadedMaxSubagents.project ?? loadedMaxSubagents.global);
+                    maxSubagentsSettings = loadedMaxSubagents;
+                    sandboxSettings = sandboxCallbacks?.load(ctx.cwd, projectTrusted) ?? {
+                      global: true,
+                    };
+                    ctx.ui.notify(notifyMessage ?? 'Setting updated', 'info');
+                  })
+                  .catch((error: unknown) =>
+                    ctx.ui.notify(`Could not save setting: ${formatError(error)}`, 'error'),
+                  )
+                  .finally(() => {
+                    saving = false;
+                    tui.requestRender();
+                  });
+                return;
+              }
+              const kittyChar = decodeKittyPrintable(data);
+              const printable =
+                kittyChar ?? (data.length === 1 && !isControlChar(data) ? data : undefined);
+              if (printable === undefined) return;
+              if (settingEditor.setting === 0 && !/^\d$/.test(printable)) return;
+              if (settingEditor.setting === 1 && !/^[a-zA-Z0-9]$/.test(printable)) return;
+              settingEditor.value += printable;
               tui.requestRender();
               return;
             }
-            if (matchesKey(data, 'up')) {
-              selectedSetting = Math.max(0, selectedSetting - 1);
-              editing = false;
-            } else if (matchesKey(data, 'down')) {
-              selectedSetting = Math.min(1, selectedSetting + 1);
-              editing = false;
-            } else if (selectedSetting === 0 && /^[0-9]$/.test(data)) {
-              const value = Number(editing ? `${selectedMaxSubagents()}${data}` : data);
-              if (value <= MAX_SUBAGENTS) {
-                updateSelectedMaxSubagents(value);
-                editing = true;
-              }
-            } else if (selectedSetting === 0 && (data === '+' || data === '-')) {
-              updateSelectedMaxSubagents(
-                Math.min(
-                  MAX_SUBAGENTS,
-                  Math.max(0, selectedMaxSubagents() + (data === '+' ? 1 : -1)),
-                ),
-              );
-              editing = false;
-            } else if (selectedSetting === 1 && data === ' ' && sandboxCallbacks) {
-              updateSelectedSandboxEnabled(!selectedSandboxEnabled());
-              editing = false;
-            } else if (data === 'i' && scope === 'project') {
-              if (selectedSetting === 0) {
-                maxSubagentsSettings = { ...maxSubagentsSettings, project: undefined };
-              } else {
-                sandboxSettings = { ...sandboxSettings, project: undefined };
-              }
-              dirtySettings.add(selectedSetting);
-              editing = false;
-            } else if (matchesKey(data, 'return')) {
-              const setting = selectedSetting;
-              if (!dirtySettings.has(setting)) return;
-              const pendingMaxSubagents = maxSubagentsSettings;
-              const pendingSandbox = sandboxSettings;
-              const inherited =
-                scope === 'project' &&
-                (setting === 0
-                  ? pendingMaxSubagents.project === undefined
-                  : pendingSandbox.project === undefined);
-              const maxSubagents = selectedMaxSubagents();
-              const sandboxEnabled = selectedSandboxEnabled();
-              let save: Promise<void>;
-              if (setting === 0) {
-                save = inherited
-                  ? clearMaxSubagentsConfigForScope(ctx.cwd, 'project')
-                  : setMaxSubagentsConfigForScope(ctx.cwd, maxSubagents, scope);
-              } else if (!sandboxCallbacks) {
+            if (matchesKey(data, 'escape')) {
+              done();
+              return;
+            }
+            if (matchesKey(data, 'up')) selectedSetting = Math.max(0, selectedSetting - 1);
+            else if (matchesKey(data, 'down')) selectedSetting = Math.min(1, selectedSetting + 1);
+            else if (matchesKey(data, 'return')) {
+              if (selectedSetting === 1 && !sandboxCallbacks) {
                 ctx.ui.notify('Sandbox settings are unavailable', 'warning');
                 return;
-              } else {
-                save = inherited
-                  ? sandboxCallbacks.clearProject(ctx)
-                  : sandboxCallbacks.setEnabled(ctx, sandboxEnabled, scope);
               }
-              saving = true;
-              void save
-                .then(() => {
-                  dirtySettings.delete(setting);
-                  const loadedMaxSubagents = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
-                  const loadedSandbox = sandboxCallbacks?.load(ctx.cwd, projectTrusted) ?? {
-                    global: true,
-                  };
-                  this.setMaxSubagents(loadedMaxSubagents.project ?? loadedMaxSubagents.global);
-                  maxSubagentsSettings = dirtySettings.has(0)
-                    ? pendingMaxSubagents
-                    : loadedMaxSubagents;
-                  sandboxSettings = dirtySettings.has(1) ? pendingSandbox : loadedSandbox;
-                  editing = false;
-                  ctx.ui.notify(
-                    inherited
-                      ? `${setting === 0 ? 'Maximum subagents' : 'Sandbox'} now uses the global value`
-                      : `${setting === 0 ? 'Maximum subagents' : 'Sandbox'} updated in ${scope} settings`,
-                    'info',
-                  );
-                })
-                .catch((error: unknown) =>
-                  ctx.ui.notify(`Could not save setting: ${formatError(error)}`, 'error'),
-                )
-                .finally(() => {
-                  saving = false;
-                  tui.requestRender();
-                });
-              return;
+              settingEditor = {
+                setting: selectedSetting,
+                scope,
+                field: settingField(selectedSetting),
+                value: '',
+              };
             } else return;
             tui.requestRender();
             return;
