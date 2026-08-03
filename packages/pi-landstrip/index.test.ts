@@ -210,6 +210,76 @@ it('uses the active shell provider for the bash tool and user shell', async () =
   }
 });
 
+it('uses the active shell provider when sandboxing is disabled', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-disabled-shell-'));
+  const handlers = new Map<string, unknown>();
+  let bashTool: ToolDefinition | undefined;
+  const pi = {
+    registerTool(tool: ToolDefinition) {
+      if (tool.name === 'bash') bashTool = tool;
+    },
+    registerFlag() {},
+    registerCommand() {},
+    getFlag: (name: string) => name === 'no-sandbox',
+    on(event: string, handler: unknown) {
+      handlers.set(event, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const ctx = {
+    cwd,
+    hasUI: false,
+    mode: 'rpc',
+    isProjectTrusted: () => true,
+    sessionManager: { getSessionId: () => 'disabled-session', getSessionFile: () => undefined },
+    ui: { notify() {}, setStatus() {} },
+  } as unknown as ExtensionContext;
+  const disposeInvocation = vi.fn();
+  const prepare = vi.fn((options: { command: string; env: NodeJS.ProcessEnv }) => ({
+    executable: process.execPath,
+    args: ['-e', `process.stdout.write(${JSON.stringify(options.command)})`],
+    launcherEnv: { PATH: options.env.PATH, HOME: options.env.HOME },
+    dispose: disposeInvocation,
+  }));
+  const integration = createLandstripIntegration();
+  integration.registerShellProvider({ id: 'disabled-shell', prepare });
+  integration.register(pi);
+
+  try {
+    const sessionStart = handlers.get('session_start') as (
+      event: unknown,
+      context: ExtensionContext,
+    ) => Promise<void>;
+    await sessionStart({}, ctx);
+    expect(bashTool).toBeDefined();
+    await bashTool!.execute('tool-call', { command: 'tool-provider' }, undefined, undefined, ctx);
+
+    const userBash = handlers.get('user_bash') as (
+      event: unknown,
+      context: ExtensionContext,
+    ) => Promise<{
+      operations: {
+        exec(
+          command: string,
+          cwd: string,
+          options: { onData(data: Buffer): void },
+        ): Promise<unknown>;
+      };
+    }>;
+    const userShell = await userBash({}, ctx);
+    await userShell.operations.exec('user-provider', cwd, { onData() {} });
+
+    expect(prepare.mock.calls.map(([options]) => options.command)).toEqual([
+      'tool-provider',
+      'user-provider',
+    ]);
+    expect(disposeInvocation).toHaveBeenCalledTimes(2);
+  } finally {
+    const shutdown = handlers.get('session_shutdown') as (() => void) | undefined;
+    shutdown?.();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 it('skips a queued permission prompt after a concurrent session grant', async () => {
   const coordinator = new PermissionPromptCoordinator();
   const path = join(homedir(), '.cargo');

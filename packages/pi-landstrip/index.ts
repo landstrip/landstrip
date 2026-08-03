@@ -2192,6 +2192,112 @@ export function createLandstripIntegration(
     });
   }
 
+  function createProviderBashOps(): BashOperations {
+    return {
+      async exec(command, cwd, { onData, signal, timeout, env }) {
+        if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
+
+        const provider = activeShellProvider();
+        let invocation: LandstripShellInvocation | undefined;
+        try {
+          invocation = await provider.prepare({
+            command,
+            cwd,
+            env: shellEnvironment(env, cwd, null),
+            signal,
+          });
+          if (!invocation.executable.trim()) {
+            throw new Error(`Shell provider "${provider.id}" returned an empty executable`);
+          }
+          if (signal?.aborted) throw new Error('aborted');
+          const prepared = invocation;
+
+          return await new Promise<{ exitCode: number | null }>((resolvePromise, reject) => {
+            let timeoutHandle: NodeJS.Timeout | undefined;
+            let timedOut = false;
+            let settled = false;
+            let childExited = false;
+            let childExitCode: number | null = null;
+            let postExitTimer: NodeJS.Timeout | undefined;
+            let stdoutEnded = false;
+            let stderrEnded = false;
+
+            const child = spawn(prepared.executable, prepared.args, {
+              cwd,
+              env: createLandstripLauncherEnvironment(prepared.launcherEnv),
+              detached: true,
+              stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            patchProcessGroupKill(child);
+
+            const cleanup = async (): Promise<void> => {
+              if (timeoutHandle) clearTimeout(timeoutHandle);
+              if (postExitTimer) clearTimeout(postExitTimer);
+              signal?.removeEventListener('abort', onAbort);
+              const toDispose = invocation;
+              invocation = undefined;
+              await toDispose?.dispose?.();
+            };
+            const finish = (code: number | null): void => {
+              if (settled) return;
+              settled = true;
+              child.stdout?.destroy();
+              child.stderr?.destroy();
+              void cleanup().then(() => {
+                if (signal?.aborted) reject(new Error('aborted'));
+                else if (timedOut) reject(new Error(`timeout:${timeout}`));
+                else resolvePromise({ exitCode: code });
+              }, reject);
+            };
+            const maybeFinishAfterExit = (): void => {
+              if (childExited && stdoutEnded && stderrEnded) finish(childExitCode);
+            };
+            const killChild = (): void => {
+              child.kill('SIGKILL');
+            };
+            function onAbort(): void {
+              killChild();
+            }
+
+            child.stdout?.on('data', onData);
+            child.stderr?.on('data', onData);
+            child.stdout?.once('end', () => {
+              stdoutEnded = true;
+              maybeFinishAfterExit();
+            });
+            child.stderr?.once('end', () => {
+              stderrEnded = true;
+              maybeFinishAfterExit();
+            });
+            child.once('error', (error) => {
+              if (settled) return;
+              settled = true;
+              void cleanup().then(() => reject(error), reject);
+            });
+            child.once('exit', (code) => {
+              childExited = true;
+              childExitCode = code;
+              maybeFinishAfterExit();
+              if (!settled) postExitTimer = setTimeout(() => finish(code), EXIT_STDIO_GRACE_MS);
+            });
+            child.once('close', (code) => finish(code));
+
+            if (timeout !== undefined && timeout > 0) {
+              timeoutHandle = setTimeout(() => {
+                timedOut = true;
+                killChild();
+              }, timeout * 1000);
+            }
+            signal?.addEventListener('abort', onAbort, { once: true });
+            if (signal?.aborted) onAbort();
+          });
+        } catch (error) {
+          await invocation?.dispose?.();
+          throw error;
+        }
+      },
+    };
+  }
   function createLandstripBashOps(
     ctx: ExtensionContext,
     callbacks: LandstripBashCallbacks = {},
@@ -2847,8 +2953,15 @@ export function createLandstripIntegration(
       async execute(id, params, signal, onUpdate, ctx) {
         if (!ctx) throw new Error('Sandbox context is unavailable');
         if (!ensureSandboxState(ctx)) {
-          if (sandboxState === 'unavailable') {
+          if (sandboxState === 'unavailable' && externalShellProvider === undefined) {
             throw new Error('Sandbox is unavailable; refusing command');
+          }
+          if (externalShellProvider !== undefined) {
+            const providerBash = createBashToolDefinition(ctx.cwd, {
+              operations: createProviderBashOps(),
+              shellPath: SettingsManager.create(ctx.cwd).getShellPath(),
+            });
+            return providerBash.execute(id, params, signal, onUpdate, ctx);
           }
           return localBash.execute(id, params, signal, onUpdate, ctx);
         }
@@ -2878,8 +2991,11 @@ export function createLandstripIntegration(
 
     pi.on('user_bash', async (_event, ctx) => {
       if (!ensureSandboxState(ctx)) {
-        if (sandboxState === 'unavailable') {
+        if (sandboxState === 'unavailable' && externalShellProvider === undefined) {
           throw new Error('Sandbox is unavailable; refusing command');
+        }
+        if (externalShellProvider !== undefined) {
+          return { operations: createProviderBashOps() };
         }
         return;
       }
