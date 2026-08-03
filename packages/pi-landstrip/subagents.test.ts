@@ -1442,6 +1442,21 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   component?.handleInput('\x1b');
   expect(component?.render(96).join('\n')).toContain('[Tasks]');
+  component?.handleInput('\x1b[B');
+  component?.handleInput(' ');
+  const selectedTask = component?.render(96).join('\n') ?? '';
+  expect(selectedTask).toContain('1 selected');
+  expect(selectedTask).toContain('✓');
+  component?.handleInput('\x04');
+  expect(component?.render(96).join('\n')).toContain('Delete task-876?');
+  component?.handleInput('\x1b');
+  expect(component?.render(96).join('\n')).toContain('Failed child');
+  component?.handleInput('\x04');
+  expect(component?.render(96).join('\n')).toContain('Delete task-876?');
+  component?.handleInput('\r');
+  const afterTaskDelete = component?.render(96).join('\n') ?? '';
+  expect(afterTaskDelete).not.toContain('Failed child');
+  expect(afterTaskDelete).not.toContain('1 selected');
   component?.handleInput('\t');
   expect(component?.render(96).join('\n')).toContain('[Log]');
   component?.handleInput('\t');
@@ -1509,6 +1524,8 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(help).toContain('Primary  Subagent  Tasks  Log  Settings  [Help]  ·  Scope: Project');
   expect(help).toMatch(/Shortcut\s+Description/);
   expect(help).toMatch(/Shift\+Tab \/ S\s+Switch scope in Primary, Subagent, or Settings/);
+  expect(help).toMatch(/Ctrl\+D\s+Delete selected task sessions/);
+  expect(help).toMatch(/Space\s+Enable agent or select task/);
   expect(help).toMatch(/Backspace\s+Open parent task/);
   expect(help).toMatch(/F\s+Toggle task log follow/);
   expect(help).toMatch(/Page Up \/ Down\s+Scroll task output by page/);

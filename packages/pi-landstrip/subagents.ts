@@ -91,7 +91,8 @@ const AGENTS_HELP_ROWS = [
   ['Enter', 'Open log, set primary, or edit setting'],
   ['Esc', 'Cancel edit, go back, or close'],
   ['Ctrl+C', 'Close'],
-  ['Space', 'Enable agent'],
+  ['Ctrl+D', 'Delete selected task sessions'],
+  ['Space', 'Enable agent or select task'],
   ['E', 'Edit project agent'],
   ['X', 'Delete project agent'],
   ['Y / N', 'Confirm or cancel deletion'],
@@ -105,6 +106,11 @@ interface AgentsSettingEditor {
   readonly scope: SandboxConfigScope;
   readonly field: AgentsSettingField;
   value: string;
+}
+
+interface TaskListAction {
+  readonly type: 'delete';
+  readonly taskIds: string[];
 }
 type PiThinkingLevel = Parameters<ExtensionAPI['setThinkingLevel']>[0];
 
@@ -257,6 +263,7 @@ interface TaskRecord {
   outputFile?: string;
   errorFile?: string;
   delivered?: boolean;
+  deleted?: boolean;
   background?: boolean;
   currentTool?: string;
   toolCalls?: number;
@@ -1098,6 +1105,8 @@ export class SubagentRuntime {
     let settingEditor: AgentsSettingEditor | undefined;
     let saving = false;
     let confirmingDeleteAgent: string | undefined;
+    let pendingTaskAction: TaskListAction | undefined;
+    const selectedTaskIds = new Set<string>();
     let follow = requested.length > 0;
     let scroll = 0;
 
@@ -1125,10 +1134,20 @@ export class SubagentRuntime {
     const refreshTasks = (): void => {
       const selectedId = tasks[selectedTask]?.id;
       tasks = [...this.tasks.values()];
+      const visibleTaskIds = new Set(tasks.map((task) => task.id));
+      for (const taskId of selectedTaskIds) {
+        if (!visibleTaskIds.has(taskId)) selectedTaskIds.delete(taskId);
+      }
       const nextSelected = selectedId
         ? tasks.findIndex((task) => task.id === selectedId)
         : selectedTask;
       selectedTask = Math.max(0, Math.min(nextSelected < 0 ? 0 : nextSelected, tasks.length - 1));
+    };
+    const taskTargets = (): TaskRecord[] => {
+      const selected = tasks.filter((task) => selectedTaskIds.has(task.id));
+      if (selected.length > 0) return selected;
+      const task = tasks[selectedTask];
+      return task ? [task] : [];
     };
     const refreshAgentRuntime = async (name: string): Promise<void> => {
       reloadAgents();
@@ -1403,11 +1422,34 @@ export class SubagentRuntime {
               for (const [offset, task] of shown.entries()) {
                 const index = start + offset;
                 const cursor = index === selectedTask ? theme.fg('accent', '›') : ' ';
+                const selected = selectedTaskIds.has(task.id) ? theme.fg('accent', '✓') : ' ';
                 const indent = '  '.repeat(Math.max(0, task.depth - 1));
                 listLines.push(
-                  `${cursor} ${indent}${taskState(theme, task)} ${theme.fg('accent', `@${task.agent}`)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
+                  `${cursor} ${selected} ${indent}${taskState(theme, task)} ${theme.fg('accent', `@${task.agent}`)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
                 );
               }
+            }
+            const selectedCount = tasks.filter((task) => selectedTaskIds.has(task.id)).length;
+            if (selectedCount > 0) {
+              listLines.push('', theme.fg('dim', `${selectedCount} selected`));
+            }
+            listLines.push('');
+            if (pendingTaskAction) {
+              const count = pendingTaskAction.taskIds.length;
+              const label =
+                count === 1
+                  ? `Delete ${pendingTaskAction.taskIds[0]?.slice(0, 8) ?? 'task'}?`
+                  : `Delete ${count} selected task sessions?`;
+              listLines.push(
+                `${theme.fg('warning', label)} ${theme.fg('dim', 'enter confirm · esc cancel')}`,
+              );
+            } else {
+              listLines.push(
+                theme.fg(
+                  'dim',
+                  '↑↓ move · space select · enter inspect · ctrl+d delete · esc close',
+                ),
+              );
             }
             return box([tabs, '', ...listLines]);
           }
@@ -1752,10 +1794,43 @@ export class SubagentRuntime {
           }
 
           if (tab === 'tasks') {
+            if (pendingTaskAction) {
+              if (matchesKey(data, 'return')) {
+                const taskIds = pendingTaskAction.taskIds;
+                pendingTaskAction = undefined;
+                const deleted = this.deleteTasks(taskIds, ctx);
+                for (const taskId of taskIds) selectedTaskIds.delete(taskId);
+                refreshTasks();
+                if (deleted > 0) {
+                  ctx.ui.notify(
+                    `Deleted ${deleted} task session${deleted === 1 ? '' : 's'}`,
+                    'info',
+                  );
+                }
+                tui.requestRender();
+                return;
+              }
+              if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) {
+                pendingTaskAction = undefined;
+                tui.requestRender();
+              }
+              return;
+            }
             if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
             else if (matchesKey(data, 'up')) selectedTask = Math.max(0, selectedTask - 1);
             else if (matchesKey(data, 'down') && tasks.length > 0) {
               selectedTask = Math.min(tasks.length - 1, selectedTask + 1);
+            } else if (data === ' ') {
+              const task = tasks[selectedTask];
+              if (!task) return;
+              if (!selectedTaskIds.delete(task.id)) selectedTaskIds.add(task.id);
+            } else if (matchesKey(data, 'ctrl+d')) {
+              const targets = taskTargets();
+              if (targets.length === 0) return;
+              pendingTaskAction = {
+                type: 'delete',
+                taskIds: targets.map((task) => task.id),
+              };
             } else if (matchesKey(data, 'return') && tasks.length > 0) {
               tab = 'log';
               follow = true;
@@ -2728,12 +2803,34 @@ export class SubagentRuntime {
     }));
   }
 
+  private deleteTasks(taskIds: readonly string[], ctx: ExtensionContext): number {
+    let deleted = 0;
+    for (const taskId of taskIds) {
+      const task = this.tasks.get(taskId);
+      if (!task) continue;
+      task.deleted = true;
+      task.delivered = true;
+      this.controllers.get(taskId)?.abort();
+      this.tasks.delete(taskId);
+      this.pendingPrompts.delete(taskId);
+      this.foregroundClaims.delete(taskId);
+      this.persist(task);
+      deleted += 1;
+    }
+    if (deleted > 0) this.updateTaskWidget(ctx);
+    return deleted;
+  }
+
   private restore(ctx: ExtensionContext): void {
     this.tasks.clear();
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== 'custom' || entry.customType !== TASK_ENTRY) continue;
       const task = entry.data as TaskRecord | undefined;
       if (!task?.id || task.parentSessionId !== ctx.sessionManager.getSessionId()) continue;
+      if (task.deleted) {
+        this.tasks.delete(task.id);
+        continue;
+      }
       this.tasks.set(task.id, {
         ...task,
         usage: isTaskUsage(task.usage) ? { ...task.usage } : undefined,
