@@ -84,13 +84,11 @@ pub(crate) fn load_settings(
             let mut document = String::new();
             io::stdin()
                 .read_to_string(&mut document)
-                .map_err(|source| Error::PolicyIoFailed { source })
                 .context("policy stdin")?;
             (document, "policy stdin".to_owned())
         } else {
             log::debug!("config: {}", path.display());
             let document = fs::read_to_string(path)
-                .map_err(|source| Error::PolicyIoFailed { source })
                 .with_context(|| format!("policy file {}", path.display()))?;
             (document, format!("policy file {}", path.display()))
         };

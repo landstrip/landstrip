@@ -320,7 +320,7 @@ fn windows_command(args: WindowsArgs) -> WindowsCommand {
 
 #[cfg(target_os = "windows")]
 fn is_restricted_user_runner() -> Result<bool, Error> {
-    let executable = env::current_exe().map_err(|source| Error::PolicyIoFailed { source })?;
+    let executable = env::current_exe()?;
     Ok(executable
         .file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case(RESTRICTED_USER_RUNNER)))

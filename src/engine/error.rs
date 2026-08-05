@@ -237,6 +237,12 @@ impl StdError for Error {
     }
 }
 
+impl From<io::Error> for Error {
+    fn from(source: io::Error) -> Self {
+        Self::PolicyIoFailed { source }
+    }
+}
+
 impl Serialize for Error {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.code())

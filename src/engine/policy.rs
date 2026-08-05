@@ -207,9 +207,7 @@ pub(crate) fn resolve_policy(
     let policy_base = if policy_base.is_absolute() {
         policy_base.to_path_buf()
     } else {
-        env::current_dir()
-            .map_err(|source| Error::PolicyIoFailed { source })?
-            .join(policy_base)
+        env::current_dir()?.join(policy_base)
     };
     let policy_base = normalize_path_lexically(&policy_base);
 
