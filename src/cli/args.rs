@@ -391,21 +391,26 @@ fn parse_port(value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
-pub(super) fn policy_format(input: &PolicyInput) -> Result<PolicyFormat, Error> {
-    let stdin_count = input
-        .paths
-        .iter()
-        .filter(|path| path.as_path() == Path::new("-"))
-        .count();
-    if stdin_count > 1 {
-        return Err(Error::Usage {
-            message: "standard input may be specified as a policy only once".to_owned(),
-        });
+impl TryFrom<&PolicyInput> for PolicyFormat {
+    type Error = Error;
+
+    fn try_from(input: &PolicyInput) -> Result<Self, Self::Error> {
+        let stdin_count = input
+            .paths
+            .iter()
+            .filter(|path| path.as_path() == Path::new("-"))
+            .count();
+        if stdin_count > 1 {
+            return Err(Error::Usage {
+                message: "standard input may be specified as a policy only once".to_owned(),
+            });
+        }
+        if stdin_count == 1 && input.format.is_none() {
+            return Err(Error::Usage {
+                message: "--policy-format is required when --policy - is used".to_owned(),
+            });
+        }
+        Ok(input.format.map(PolicyFormat::from).unwrap_or_default())
     }
-    if stdin_count == 1 && input.format.is_none() {
-        return Err(Error::Usage {
-            message: "--policy-format is required when --policy - is used".to_owned(),
-        });
-    }
-    Ok(input.format.map(PolicyFormat::from).unwrap_or_default())
 }
+

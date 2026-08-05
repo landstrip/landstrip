@@ -5,9 +5,9 @@ mod args;
 
 use self::args::{
     Command, Invocation, ParseOutcome, PolicyCommand, PolicyInput, PolicyRequest, RunCommand,
-    parse_cli, policy_format,
+    parse_cli,
 };
-use crate::engine::config::load_settings;
+use crate::engine::config::{PolicyFormat, load_settings};
 use crate::engine::error::Error;
 use crate::engine::outcome::{CommandOutcome, PolicyValidationError, PolicyValidationReport};
 use crate::engine::platform;
@@ -147,7 +147,7 @@ fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport
 }
 
 fn load_policy(input: &PolicyInput, tool: Option<&std::ffi::OsStr>) -> Result<AccessPolicy> {
-    let format = policy_format(input)?;
+    let format = PolicyFormat::try_from(input)?;
     let cwd = std::env::current_dir()?;
     log::debug!("cli: cwd: {}", cwd.display());
     let settings = load_settings(&input.paths, format, tool)?;
