@@ -18,6 +18,38 @@ pub(crate) enum PolicyFormat {
     Yaml,
 }
 
+impl PolicyFormat {
+    pub(crate) fn parse_document(&self, document: &str) -> std::result::Result<Value, Error> {
+        match self {
+            Self::Json => serde_json::from_str(document).map_err(parse_failed),
+            Self::Yaml => serde_yml::from_str(document).map_err(parse_failed),
+        }
+    }
+}
+
+impl std::fmt::Display for PolicyFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Json => f.write_str("json"),
+            Self::Yaml => f.write_str("yaml"),
+        }
+    }
+}
+
+impl std::str::FromStr for PolicyFormat {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "json" => Ok(Self::Json),
+            "yaml" | "yml" => Ok(Self::Yaml),
+            _ => Err(Error::Usage {
+                message: format!("unsupported policy format: {s}"),
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct Settings {
@@ -92,7 +124,7 @@ pub(crate) fn load_settings(
                 .with_context(|| format!("policy file {}", path.display()))?;
             (document, format!("policy file {}", path.display()))
         };
-        let value = parse_policy_document(&document, format).with_context(|| source_name)?;
+        let value = format.parse_document(&document).with_context(|| source_name)?;
         merge_json(&mut merged, value);
     }
 
@@ -128,7 +160,7 @@ fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<V
     let document = String::from_utf8(bytes)
         .map_err(parse_failed)
         .with_context(|| format!("executable policy {}", exe.display()))?;
-    let value = parse_policy_document(&document, format)
+    let value = format.parse_document(&document)
         .with_context(|| format!("executable policy {}", exe.display()))?;
     Ok(Some(value))
 }
@@ -157,7 +189,7 @@ fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<V
     let document = String::from_utf8(bytes)
         .map_err(parse_failed)
         .with_context(|| format!("executable policy {}", exe.display()))?;
-    let value = parse_policy_document(&document, format)
+    let value = format.parse_document(&document)
         .with_context(|| format!("executable policy {}", exe.display()))?;
     Ok(Some(value))
 }
@@ -326,15 +358,6 @@ unsafe fn platform_getxattr(
     unsafe { libc::getxattr(path, name, value, size, 0, 0) }
 }
 
-fn parse_policy_document(
-    document: &str,
-    format: PolicyFormat,
-) -> std::result::Result<Value, Error> {
-    match format {
-        PolicyFormat::Json => serde_json::from_str(document).map_err(parse_failed),
-        PolicyFormat::Yaml => serde_yml::from_str(document).map_err(parse_failed),
-    }
-}
 
 fn parse_settings(document: Value) -> std::result::Result<Settings, Error> {
     serde_json::from_value(document).map_err(parse_failed)
