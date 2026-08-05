@@ -20,7 +20,7 @@ pub(crate) enum PolicyFormat {
 }
 
 impl PolicyFormat {
-    pub(crate) fn parse_document(&self, document: &str) -> std::result::Result<Value, Error> {
+    pub(crate) fn parse_document(self, document: &str) -> std::result::Result<Value, Error> {
         match self {
             Self::Json => serde_json::from_str(document).map_err(parse_failed),
             Self::Yaml => serde_yml::from_str(document).map_err(parse_failed),

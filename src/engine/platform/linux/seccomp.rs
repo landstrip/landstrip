@@ -225,10 +225,7 @@ pub(super) fn run_broker(
                 let trap = error
                     .chain()
                     .find_map(<dyn std::error::Error + 'static>::downcast_ref::<LandstripError>)
-                    .map_or_else(
-                        || Trap::internal(format!("{error:#}")),
-                        |err| Trap::from(err),
-                    );
+                    .map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from);
                 if handed_off || send_trap(&mut child_sock, &trap).is_err() {
                     trap_fd.write(&trap);
                     trap.emit();
