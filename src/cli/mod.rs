@@ -11,7 +11,7 @@ use crate::engine::config::load_settings;
 use crate::engine::error::Error;
 use crate::engine::outcome::{CommandOutcome, PolicyValidationError, PolicyValidationReport};
 use crate::engine::platform;
-use crate::engine::policy::{AccessPolicy, resolve_policy};
+use crate::engine::policy::AccessPolicy;
 use crate::engine::trap::Trap;
 #[cfg(unix)]
 use crate::engine::trap_fd::TrapFd;
@@ -148,15 +148,10 @@ fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport
 
 fn load_policy(input: &PolicyInput, tool: Option<&std::ffi::OsStr>) -> Result<AccessPolicy> {
     let format = policy_format(input)?;
-    let cwd = std::env::current_dir().map_err(|source| Error::PolicyIoFailed { source })?;
+    let cwd = std::env::current_dir()?;
     log::debug!("cli: cwd: {}", cwd.display());
     let settings = load_settings(&input.paths, format, tool)?;
-    resolve_policy(
-        &settings.filesystem,
-        &settings.network,
-        &settings.windows,
-        &cwd,
-    )
+    settings.resolve(&cwd)
 }
 
 fn render_display(text: &str) -> Result<()> {

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use crate::engine::error::Error;
+use crate::engine::policy::{AccessPolicy, resolve_policy};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -56,6 +57,12 @@ pub(crate) struct Settings {
     pub(crate) filesystem: SandboxFilesystem,
     pub(crate) network: SandboxNetwork,
     pub(crate) windows: SandboxWindows,
+}
+
+impl Settings {
+    pub(crate) fn resolve(&self, policy_base: &Path) -> Result<AccessPolicy> {
+        resolve_policy(&self.filesystem, &self.network, &self.windows, policy_base)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
