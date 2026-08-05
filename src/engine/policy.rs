@@ -169,6 +169,12 @@ pub(crate) struct NetworkAccess {
     pub(crate) unix_socket_access: UnixSocketAccess,
 }
 
+impl Default for NetworkAccess {
+    fn default() -> Self {
+        Self::unrestricted()
+    }
+}
+
 impl NetworkAccess {
     pub(crate) fn unrestricted() -> Self {
         Self {
