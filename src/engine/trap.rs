@@ -192,7 +192,6 @@ impl Trap {
         }))
     }
 
-
     /// The trap for a failure the landstrip code space does not name.
     pub(crate) fn internal(message: String) -> Self {
         Self::Internal(Box::new(InternalTrap {

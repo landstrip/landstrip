@@ -131,7 +131,9 @@ pub(crate) fn load_settings(
                 .with_context(|| format!("policy file {}", path.display()))?;
             (document, format!("policy file {}", path.display()))
         };
-        let value = format.parse_document(&document).with_context(|| source_name)?;
+        let value = format
+            .parse_document(&document)
+            .with_context(|| source_name)?;
         merge_json(&mut merged, value);
     }
 
@@ -167,7 +169,8 @@ fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<V
     let document = String::from_utf8(bytes)
         .map_err(parse_failed)
         .with_context(|| format!("executable policy {}", exe.display()))?;
-    let value = format.parse_document(&document)
+    let value = format
+        .parse_document(&document)
         .with_context(|| format!("executable policy {}", exe.display()))?;
     Ok(Some(value))
 }
@@ -196,7 +199,8 @@ fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<V
     let document = String::from_utf8(bytes)
         .map_err(parse_failed)
         .with_context(|| format!("executable policy {}", exe.display()))?;
-    let value = format.parse_document(&document)
+    let value = format
+        .parse_document(&document)
         .with_context(|| format!("executable policy {}", exe.display()))?;
     Ok(Some(value))
 }
@@ -364,7 +368,6 @@ unsafe fn platform_getxattr(
 ) -> libc::ssize_t {
     unsafe { libc::getxattr(path, name, value, size, 0, 0) }
 }
-
 
 fn parse_settings(document: Value) -> std::result::Result<Settings, Error> {
     serde_json::from_value(document).map_err(parse_failed)

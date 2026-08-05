@@ -179,7 +179,10 @@ fn exit_with_trap_fd(error: &anyhow::Error, trap_fd: &TrapFd) -> ! {
 
 fn error_trap(error: &anyhow::Error) -> (Trap, i32) {
     let engine_error = find_engine_error(error);
-    let trap = engine_error.map_or_else(|| Trap::internal(format!("{error:#}")), |err| Trap::from(err));
+    let trap = engine_error.map_or_else(
+        || Trap::internal(format!("{error:#}")),
+        |err| Trap::from(err),
+    );
     let exit_code = if matches!(engine_error, Some(Error::Usage { .. })) {
         2
     } else {
