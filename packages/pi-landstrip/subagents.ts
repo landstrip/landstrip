@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   readlinkSync,
   realpathSync,
   rmSync,
@@ -392,6 +393,108 @@ function formatTaskUsageSummary(usage: TaskUsage | undefined): string | undefine
   if (tokens) parts.push(`${formatTokens(tokens)} tok`);
   if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
   return parts.length > 0 ? parts.join(' ') : undefined;
+}
+
+function findFilesRecursively(dir: string): string[] {
+  const results: string[] = [];
+  try {
+    const entries = readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        results.push(...findFilesRecursively(fullPath));
+      } else if (entry.isFile()) {
+        results.push(fullPath);
+      }
+    }
+  } catch {
+    // Ignore read errors
+  }
+  return results;
+}
+
+function extractCwdFromSessionFile(filePath: string): string | undefined {
+  try {
+    const content = readFileSync(filePath, 'utf8');
+    const firstNewline = content.indexOf('\n');
+    const firstLine = firstNewline >= 0 ? content.slice(0, firstNewline) : content;
+    if (!firstLine.trim()) return undefined;
+    const header = JSON.parse(firstLine) as { cwd?: unknown };
+    if (typeof header.cwd === 'string') {
+      return header.cwd;
+    }
+  } catch {
+    // Ignore parse errors
+  }
+  return undefined;
+}
+
+function extractCwdFromTaskJsonFile(filePath: string): {
+  cwd?: string;
+  parentSessionFile?: string;
+} {
+  try {
+    const content = readFileSync(filePath, 'utf8');
+    const data = JSON.parse(content) as { cwd?: unknown; parentSessionFile?: unknown };
+    return {
+      cwd: typeof data.cwd === 'string' ? data.cwd : undefined,
+      parentSessionFile:
+        typeof data.parentSessionFile === 'string' ? data.parentSessionFile : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function defaultSessionDirForCwd(cwd: string, agentDir = getAgentDir()): string {
+  const resolvedCwd = resolve(cwd);
+  const safePath = `--${resolvedCwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+  return join(agentDir, 'sessions', safePath);
+}
+
+function isSubagentSessionDirForCwd(parentSessionDir: string, targetCwd: string): boolean {
+  const files = findFilesRecursively(parentSessionDir);
+  if (files.length === 0) {
+    return true;
+  }
+
+  const resolvedTarget = resolve(targetCwd);
+  const targetSessionDir = resolve(defaultSessionDirForCwd(targetCwd));
+  let hasTargetCwd = false;
+  let hasOtherCwd = false;
+
+  for (const file of files) {
+    if (file.endsWith('.jsonl')) {
+      const cwd = extractCwdFromSessionFile(file);
+      if (cwd) {
+        if (resolve(cwd) === resolvedTarget) {
+          hasTargetCwd = true;
+        } else {
+          hasOtherCwd = true;
+        }
+      }
+    } else if (file.endsWith('.json')) {
+      const { cwd, parentSessionFile } = extractCwdFromTaskJsonFile(file);
+      if (cwd) {
+        if (resolve(cwd) === resolvedTarget) {
+          hasTargetCwd = true;
+        } else {
+          hasOtherCwd = true;
+        }
+      } else if (parentSessionFile) {
+        const resolvedParent = resolve(parentSessionFile);
+        if (resolvedParent.startsWith(targetSessionDir)) {
+          hasTargetCwd = true;
+        } else {
+          hasOtherCwd = true;
+        }
+      }
+    }
+  }
+
+  if (hasOtherCwd) return false;
+  if (hasTargetCwd) return true;
+  return true;
 }
 
 function activeTaskRecords(tasks: readonly TaskRecord[]): TaskRecord[] {
@@ -980,6 +1083,7 @@ export class SubagentRuntime {
       this.broker.reset();
       this.restore(ctx);
       await this.restorePrimaryAgent(ctx);
+      await this.cleanupOrphanSubagentSessions(ctx);
       const activeTools = this.pi.getActiveTools();
       const withoutTask = activeTools.filter((tool) => tool !== 'task');
       const nextTools = this.maxSubagents > 0 ? [...withoutTask, 'task'] : withoutTask;
@@ -2708,6 +2812,9 @@ export class SubagentRuntime {
       task.deleted = true;
       task.delivered = true;
       this.controllers.get(taskId)?.abort();
+      if (task.sessionDir && existsSync(task.sessionDir)) {
+        rmSync(task.sessionDir, { recursive: true, force: true });
+      }
       this.tasks.delete(taskId);
       this.pendingPrompts.delete(taskId);
       this.foregroundClaims.delete(taskId);
@@ -2716,6 +2823,46 @@ export class SubagentRuntime {
     }
     if (deleted > 0) this.updateTaskWidget(ctx);
     return deleted;
+  }
+
+  private async cleanupOrphanSubagentSessions(ctx: ExtensionContext): Promise<void> {
+    try {
+      const subagentBaseDir = join(getAgentDir(), 'sessions', 'pi-landstrip');
+      if (!existsSync(subagentBaseDir)) return;
+
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      const sessionDir = sessionFile ? dirname(sessionFile) : undefined;
+      const cwdSessions = sessionDir
+        ? await SessionManager.list(ctx.cwd, sessionDir).catch(() => [])
+        : await SessionManager.list(ctx.cwd).catch(() => []);
+      const allSessions = await SessionManager.listAll().catch(() => []);
+
+      const existingParentSessionIds = new Set<string>();
+      for (const s of cwdSessions) {
+        if (s.id) existingParentSessionIds.add(s.id);
+      }
+      for (const s of allSessions) {
+        if (s.id) existingParentSessionIds.add(s.id);
+      }
+      const activeId = ctx.sessionManager.getSessionId();
+      if (activeId) existingParentSessionIds.add(activeId);
+
+      const entries = readdirSync(subagentBaseDir, { withFileTypes: true });
+      const targetCwd = ctx.cwd;
+
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const parentSessionId = entry.name;
+        if (existingParentSessionIds.has(parentSessionId)) continue;
+
+        const parentSessionDir = join(subagentBaseDir, parentSessionId);
+        if (isSubagentSessionDirForCwd(parentSessionDir, targetCwd)) {
+          rmSync(parentSessionDir, { recursive: true, force: true });
+        }
+      }
+    } catch {
+      // Ignore errors during orphan cleanup
+    }
   }
 
   private restore(ctx: ExtensionContext): void {

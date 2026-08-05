@@ -2222,3 +2222,72 @@ test('resolves the running Pi package from the extension location', () => {
   expect(isSupportedPiVersion(pkg.version)).toBe(true);
   expect(existsSync(pkg.cliEntry)).toBe(true);
 });
+
+test('cleans up orphan subagent session files for the current cwd at startup', async () => {
+  const cwd = temporaryDirectory();
+  const piAgentDir = temporaryDirectory();
+  process.env.PI_CODING_AGENT_DIR = piAgentDir;
+
+  const orphanDirCurrentCwd = join(
+    piAgentDir,
+    'sessions',
+    'pi-landstrip',
+    'orphan-parent-current',
+    'task-1',
+  );
+  mkdirSync(orphanDirCurrentCwd, { recursive: true });
+  writeFileSync(
+    join(orphanDirCurrentCwd, 'session.jsonl'),
+    JSON.stringify({ type: 'header', version: 1, cwd }) + '\n',
+  );
+
+  const orphanDirOtherCwd = join(
+    piAgentDir,
+    'sessions',
+    'pi-landstrip',
+    'orphan-parent-other',
+    'task-2',
+  );
+  mkdirSync(orphanDirOtherCwd, { recursive: true });
+  writeFileSync(
+    join(orphanDirOtherCwd, 'session.jsonl'),
+    JSON.stringify({ type: 'header', version: 1, cwd: '/some/other/cwd' }) + '\n',
+  );
+
+  let sessionStartHandler: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  const pi = {
+    registerTool() {},
+    registerCommand() {},
+    registerShortcut() {},
+    on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void>) {
+      if (event === 'session_start') sessionStartHandler = handler;
+    },
+    getActiveTools() {
+      return [];
+    },
+    setActiveTools() {},
+  } as unknown as ExtensionAPI;
+
+  const parentManager = SessionManager.create(cwd, join(cwd, 'sessions'));
+  const runtime = new SubagentRuntime(pi, {} as LandstripIntegration, undefined, (projectCwd) =>
+    loadAgentCatalog(projectCwd, piAgentDir),
+  );
+  runtime.register();
+
+  const ctx = {
+    cwd,
+    hasUI: false,
+    mode: 'tui',
+    isProjectTrusted: () => true,
+    sessionManager: parentManager,
+  };
+
+  await sessionStartHandler?.({ type: 'session_start' }, ctx);
+
+  expect(existsSync(join(piAgentDir, 'sessions', 'pi-landstrip', 'orphan-parent-current'))).toBe(
+    false,
+  );
+  expect(existsSync(join(piAgentDir, 'sessions', 'pi-landstrip', 'orphan-parent-other'))).toBe(
+    true,
+  );
+});
