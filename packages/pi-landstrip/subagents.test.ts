@@ -1350,7 +1350,6 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('\x1b[A');
   component?.handleInput('\x1b[A');
 
-
   component?.handleInput('\t');
   const tasks = component?.render(96).join('\n') ?? '';
   expect(tasks).toContain('[Tasks]');
@@ -1502,9 +1501,7 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   component?.handleInput('\t');
   const cycledAgents = component?.render(96).join('\n') ?? '';
-  expect(cycledAgents).toContain(
-    '[Primary]  Subagent  Tasks  Log  Settings  Help',
-  );
+  expect(cycledAgents).toContain('[Primary]  Subagent  Tasks  Log  Settings  Help');
   expect(cycledAgents).not.toContain('Tab next tab');
   finishCustom?.();
   await running;

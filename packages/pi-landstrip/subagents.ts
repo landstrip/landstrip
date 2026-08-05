@@ -63,11 +63,7 @@ import {
   setAgentDisabledForScope,
   setMaxSubagentsConfigForScope,
 } from './config.ts';
-import type {
-  LandstripIntegration,
-  LandstripRpcWorkerLaunch,
-  SandboxConfigScope,
-} from './index.ts';
+import type { LandstripIntegration, LandstripRpcWorkerLaunch } from './index.ts';
 import { type ExtensionUiRequest, type ExtensionUiResult, RpcProcess } from './rpc-process.ts';
 import { AsyncQueue, colorizeAgentText, formatError, isRecord } from './util.ts';
 
@@ -1146,8 +1142,6 @@ export class SubagentRuntime {
         this.pi.registerTool(this.createTaskTool(undefined, this.primaryRules, ctx));
       }
     };
-    const scopedAgent = (agent: AgentDefinition): AgentDefinition | undefined =>
-      scope === 'global' ? globalCatalog.agents.get(agent.name) : agent;
     const selectedMaxSubagents = (): number =>
       maxSubagentsSettings.project ?? maxSubagentsSettings.global;
 
@@ -1198,9 +1192,6 @@ export class SubagentRuntime {
               const index = start + offset;
               const selected = index === selectedAgent;
               const cursor = selected ? theme.fg('accent', '›') : ' ';
-              const current = agent;
-              const unavailable = false;
-              const scopedDisabled = agent.disabled;
               const disabled = agent.disabled;
               const deleting = confirmingDeleteAgent === agent.name;
               const inherited = !disabledOverrides.project.has(agent.name);
@@ -1222,7 +1213,7 @@ export class SubagentRuntime {
                 color,
                 pad(agent.source, sourceWidth),
               )} ${theme.fg(color, pad(agent.model ?? 'current model', modelWidth))} ${theme.fg(
-                deleting ? 'error' : unavailable ? 'muted' : scopedDisabled ? 'warning' : color,
+                deleting ? 'error' : disabled ? 'warning' : color,
                 pad(state, stateWidth),
               )}`;
               lines.push(agent.name === this.primaryAgent?.name ? theme.bold(line) : line);
