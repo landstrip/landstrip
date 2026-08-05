@@ -39,7 +39,7 @@ impl TrapFd {
     }
 
     pub(crate) fn write(&self, trap: &Trap) {
-        self.write_json(&trap.json_line());
+        self.write_json(&trap.to_string());
     }
 
     pub(crate) fn write_json(&self, json: &str) {

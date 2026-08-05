@@ -9,6 +9,9 @@ use serde::Serialize;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
+
+use std::fmt;
+use std::io::{self, Write};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
@@ -189,8 +192,23 @@ impl Trap {
         }))
     }
 
-    /// The trap that reports `error`, routed by the stage the code names.
-    pub(crate) fn from_error(error: &Error) -> Self {
+
+    /// The trap for a failure the landstrip code space does not name.
+    pub(crate) fn internal(message: String) -> Self {
+        Self::Internal(Box::new(InternalTrap {
+            code: INTERNAL_ERROR,
+            mechanism: None,
+            message,
+        }))
+    }
+
+    pub(crate) fn emit(&self) {
+        let _ = writeln!(io::stderr().lock(), "{self}");
+    }
+}
+
+impl From<&Error> for Trap {
+    fn from(error: &Error) -> Self {
         match error {
             Error::Usage { message } => Self::Usage(Box::new(UsageTrap {
                 code: error.code(),
@@ -214,33 +232,25 @@ impl Trap {
             })),
         }
     }
+}
 
-    /// The trap for a failure the landstrip code space does not name.
-    pub(crate) fn internal(message: String) -> Self {
-        Self::Internal(Box::new(InternalTrap {
-            code: INTERNAL_ERROR,
-            mechanism: None,
-            message,
-        }))
+impl From<Error> for Trap {
+    fn from(error: Error) -> Self {
+        Self::from(&error)
     }
+}
 
-    pub(crate) fn json_line(&self) -> String {
+impl fmt::Display for Trap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match serde_json::to_string(self) {
-            Ok(line) => line,
+            Ok(line) => f.write_str(&line),
             Err(error) => {
                 log::error!("trap: serialize: {error}");
-                r#"{"kind":"internal","code":"INTERNAL_ERROR","message":"failed to serialize trap"}"#
-                    .to_owned()
+                f.write_str(
+                    r#"{"kind":"internal","code":"INTERNAL_ERROR","message":"failed to serialize trap"}"#,
+                )
             }
         }
-    }
-
-    pub(crate) fn emit_json(line: &str) {
-        eprintln!("{line}");
-    }
-
-    pub(crate) fn emit(&self) {
-        Self::emit_json(&self.json_line());
     }
 }
 

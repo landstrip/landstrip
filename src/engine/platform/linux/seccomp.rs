@@ -225,7 +225,7 @@ pub(super) fn run_broker(
                 let trap = error
                     .chain()
                     .find_map(<dyn std::error::Error + 'static>::downcast_ref::<LandstripError>)
-                    .map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from_error);
+                    .map_or_else(|| Trap::internal(format!("{error:#}")), |err| Trap::from(err));
                 if handed_off || send_trap(&mut child_sock, &trap).is_err() {
                     trap_fd.write(&trap);
                     trap.emit();
@@ -254,7 +254,7 @@ pub(super) fn run_broker(
                 NotifyStartup::Trap(trap) => {
                     drop(parent);
                     trap_fd.write_json(&trap);
-                    Trap::emit_json(&trap);
+                    let _ = writeln!(io::stderr().lock(), "{trap}");
                     Ok(1)
                 }
             }
@@ -2356,7 +2356,7 @@ fn send_fd(socket: &UnixStream, fd: RawFd) -> Result<()> {
 }
 
 fn send_trap(socket: &mut UnixStream, trap: &Trap) -> Result<()> {
-    let payload = trap.json_line();
+    let payload = trap.to_string();
     let length =
         u32::try_from(payload.len()).map_err(|_| supervise_failed("notify: trap is too large"))?;
 
