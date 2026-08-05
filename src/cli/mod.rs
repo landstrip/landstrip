@@ -16,7 +16,6 @@ use crate::engine::trap::Trap;
 #[cfg(unix)]
 use crate::engine::trap_fd::TrapFd;
 use anyhow::Result;
-use serde::Serialize;
 use std::error::Error as StdError;
 use std::io::{self, Write};
 use std::process;
@@ -160,24 +159,7 @@ fn render_display(text: &str) -> Result<()> {
     Ok(())
 }
 fn render_outcome(outcome: &CommandOutcome) -> Result<()> {
-    let stdout = io::stdout();
-    render_outcome_to(&mut stdout.lock(), outcome)
-}
-
-fn render_outcome_to(output: &mut impl Write, outcome: &CommandOutcome) -> Result<()> {
-    match outcome {
-        CommandOutcome::Exit(_) => Ok(()),
-        CommandOutcome::PolicyValidated(report) => write_json(output, report),
-        CommandOutcome::PolicyResolved(policy) => write_json(output, policy),
-        CommandOutcome::Doctor(report) => write_json(output, report),
-        #[cfg(target_os = "windows")]
-        CommandOutcome::Windows(report) => write_json(output, report),
-    }
-}
-
-fn write_json(output: &mut impl Write, value: &impl Serialize) -> Result<()> {
-    serde_json::to_writer(&mut *output, value)?;
-    writeln!(output)?;
+    outcome.write_to(&mut io::stdout().lock())?;
     Ok(())
 }
 
