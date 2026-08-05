@@ -413,4 +413,3 @@ impl TryFrom<&PolicyInput> for PolicyFormat {
         Ok(input.format.map(PolicyFormat::from).unwrap_or_default())
     }
 }
-

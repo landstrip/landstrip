@@ -35,8 +35,8 @@ pub(crate) fn execute() {
 
     #[cfg(unix)]
     let trap_fd = match &invocation.command {
-        Command::Run(command) => TrapFd::from_fd(command.trap_fd),
-        _ => TrapFd::from_fd(None),
+        Command::Run(command) => TrapFd::from(command.trap_fd),
+        _ => TrapFd::from(None),
     };
     let outcome = match dispatch(&invocation) {
         Ok(outcome) => outcome,
@@ -86,7 +86,7 @@ fn run(command: &RunCommand) -> Result<CommandOutcome> {
 
 #[cfg(unix)]
 fn execute_run(policy: &AccessPolicy, command: &RunCommand) -> Result<i32> {
-    let trap_fd = TrapFd::from_fd(command.trap_fd);
+    let trap_fd = TrapFd::from(command.trap_fd);
     platform::execute(policy, &command.tool, &command.tool_args, &trap_fd)
 }
 

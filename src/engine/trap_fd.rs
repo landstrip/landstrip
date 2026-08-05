@@ -10,11 +10,20 @@ pub(crate) struct TrapFd {
     fd: Option<i32>,
 }
 
-impl TrapFd {
-    pub(crate) fn from_fd(fd: Option<i32>) -> Self {
+impl From<Option<i32>> for TrapFd {
+    fn from(fd: Option<i32>) -> Self {
         Self { fd }
     }
+}
 
+#[cfg(unix)]
+impl From<std::os::fd::RawFd> for TrapFd {
+    fn from(fd: std::os::fd::RawFd) -> Self {
+        Self { fd: Some(fd) }
+    }
+}
+
+impl TrapFd {
     #[cfg(target_os = "linux")]
     pub(crate) fn is_enabled(&self) -> bool {
         self.fd.is_some()
