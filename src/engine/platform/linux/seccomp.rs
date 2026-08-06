@@ -1329,6 +1329,16 @@ fn handle_openat(
         );
     }
 
+    // fget() rejects FMODE_PATH descriptors (fs/file.c), so
+    // SECCOMP_IOCTL_NOTIF_ADDFD fails with EBADF for an O_PATH fd and the
+    // child would see a spurious EACCES. An O_PATH handle grants no data
+    // access — every dereferencing operation goes through its own brokered
+    // syscall — and Landlock does not restrict O_PATH opens, so after the
+    // policy checks above let the child's syscall re-execute natively.
+    if (flags & libc::O_PATH) != 0 {
+        return Ok(NotificationResult::Continue);
+    }
+
     // Re-running openat in the child via CONTINUE would reopen the classic
     // seccomp-user-notification TOCTOU (a sibling can swap the path after the
     // broker's policy check). Landlock cannot express denyWrite holes under an
