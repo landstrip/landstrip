@@ -38,6 +38,11 @@ name=dev null read and write are permitted | os=linux,macos | policy={"network":
 name=inherited fd cannot bypass write policy | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}} | fd3=denied/preopened.txt | cmd=%SHELL% -c 'if test -e /dev/fd/3; then echo fd3-inherited >&2; fi; echo bypass >&3' | status=!0 | out!=fd3-inherited | trapfd_empty
 name=denyRead blocks subdirectory listing | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"]}} | cmd=/bin/ls /usr | status=!0
 
+# --- O_PATH handle opens through the ADDFD broker (Linux) ---
+
+name=opath open of allowed directory succeeds | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"],"allowWrite":["%TMP%/allowed"]}} | fs=opath:%TMP%/allowed:allowed
+name=opath open of denyRead directory is denied | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["%TMP%/denied"],"allowRead":["/"],"allowWrite":["%TMP%/allowed"]}} | fs=opath:%TMP%/denied:denied
+
 # --- structured denial reporting ---
 
 name=successful write denial is reported (linux) | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'cat /dev/null >/dev/null; true' | status=0 | out="kind":"filesystem" | out="write" | out=/dev/null

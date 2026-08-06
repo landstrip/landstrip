@@ -18,7 +18,14 @@ use std::time::{Duration, Instant};
 
 const DATA: &str = include_str!("data.txt");
 
+/// Re-exec argument marker for `fs=opath` probes (see [`opath_probe`]).
+const OPATH_PROBE_ARG: &str = "--test-opath";
+
 fn main() {
+    let mut args = std::env::args_os();
+    if args.nth(1).as_deref() == Some(std::ffi::OsStr::new(OPATH_PROBE_ARG)) {
+        std::process::exit(opath_probe(args.next()));
+    }
     let ctx = Context::new();
     let mut failed = 0u32;
     let mut ran = 0u32;
@@ -162,6 +169,12 @@ enum Net {
     UnixDenied,
 }
 
+/// Fs action driven natively by the harness (no shell/tool can O_PATH portably).
+enum Fs {
+    /// O_PATH directory open of `path`; `allowed` selects the expected result.
+    OPath { path: String, allowed: bool },
+}
+
 struct Case {
     name: String,
     os: Vec<String>,
@@ -174,6 +187,7 @@ struct Case {
     cwd: Option<String>,
     cmd: Option<String>,
     net: Option<Net>,
+    fs: Option<Fs>,
     unixsock: Option<String>,
     status: Status,
     checks: Vec<Check>,
@@ -194,6 +208,7 @@ impl Case {
             cwd: None,
             cmd: None,
             net: None,
+            fs: None,
             unixsock: None,
             status: Status::Zero,
             checks: Vec::new(),
@@ -213,6 +228,7 @@ impl Case {
                 "cwd" => case.cwd = Some(value.to_owned()),
                 "cmd" => case.cmd = Some(value.to_owned()),
                 "net" => case.net = Some(parse_net(value)),
+                "fs" => case.fs = Some(parse_fs(value)),
                 "unixsock" => case.unixsock = Some(value.to_owned()),
                 "status" => case.status = parse_status(value),
                 "out" | "out!" | "trapfd" | "trapfd!" => {
@@ -367,6 +383,10 @@ impl Case {
                 dir,
                 &self.unixsock,
             );
+        }
+
+        if let Some(fs) = &self.fs {
+            return run_fs(ctx, fs, self.format, &policies, resolver);
         }
 
         let mut command = Command::new(&ctx.bin);
@@ -532,6 +552,81 @@ fn parse_net(value: &str) -> Net {
         "unix-denied" => Net::UnixDenied,
         other => panic!("unknown net kind `{other}`"),
     }
+}
+
+/// `fs=opath:<path>:<allowed|denied>` — O_PATH directory open of <path>
+/// inside the sandbox; <allowed> selects the expected result.
+fn parse_fs(value: &str) -> Fs {
+    let Some(spec) = value.strip_prefix("opath:") else {
+        panic!("unknown fs kind `{value}`");
+    };
+    let (path, want) = spec
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("fs action `{value}` lacks a result marker"));
+    let allowed = match want {
+        "allowed" => true,
+        "denied" => false,
+        other => panic!("unknown fs result `{other}`"),
+    };
+    Fs::OPath {
+        path: path.to_owned(),
+        allowed,
+    }
+}
+
+/// Runs an fs action as a re-exec of this test binary under landstrip.
+fn run_fs(
+    ctx: &Context,
+    fs: &Fs,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+    resolver: &Resolver,
+) -> Result<(), String> {
+    match fs {
+        Fs::OPath { path, allowed } => {
+            let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
+            let output = landstrip_net(ctx, format, policies)
+                .arg(exe)
+                .arg(OPATH_PROBE_ARG)
+                .arg(resolver.subst(path))
+                .output()
+                .map_err(|e| format!("spawn opath probe: {e}"))?;
+            if output.status.success() != *allowed {
+                return Err(format!(
+                    "opath open of {path} {}denied; output={}",
+                    if *allowed { "" } else { "not " },
+                    merge(&output.stdout, &output.stderr).trim()
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Re-exec probe for `fs=opath` cases: performs an O_PATH directory open of
+/// the given path, exiting 0 on success and 1 on failure.
+#[cfg(unix)]
+fn opath_probe(path: Option<std::ffi::OsString>) -> i32 {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // Linux O_PATH | O_DIRECTORY.
+    const O_PATH_DIRECTORY: i32 = 0o10000000 | 0o200000;
+    let Some(path) = path else {
+        return 2;
+    };
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_PATH_DIRECTORY)
+        .open(path)
+    {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[cfg(not(unix))]
+fn opath_probe(_path: Option<std::ffi::OsString>) -> i32 {
+    2
 }
 
 fn parse_status(value: &str) -> Status {
