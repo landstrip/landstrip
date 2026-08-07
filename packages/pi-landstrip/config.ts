@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path';
 import { getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent';
 
 import { BUILT_IN_LANDSTRIP_CONFIG } from './built-in-agents.ts';
+import type { ReviewReasoningLevel } from './classifier.ts';
 import { expandFileReferences, formatError, isRecord } from './util.ts';
 
 export type ConfigObject = Record<string, unknown>;
@@ -15,16 +16,41 @@ export const MAX_SUBAGENTS = 16;
 
 export type AgentSource = 'built-in' | 'global' | 'local';
 
+export interface AutoReviewConfig {
+  enabled: boolean;
+  model?: string;
+  reasoning: ReviewReasoningLevel;
+  timeoutMs: number;
+  policy: string;
+  maxConsecutiveDenials: number;
+  maxDenialsInWindow: number;
+  denialWindowSize: number;
+}
+
+export interface GuardrailConfig {
+  allowInsideWorkingDirectory: boolean;
+  deniedPaths: string[];
+  protectedPaths: string[];
+  hardDenyRules: string;
+  autoReview: AutoReviewConfig;
+}
+
 export interface LandstripConfigFile {
   maxSubagents?: number;
   agent?: ConfigObject;
   permission?: unknown;
+  allowInsideWorkingDirectory?: boolean;
+  deniedPaths?: unknown;
+  protectedPaths?: unknown;
+  hardDenyRules?: string;
+  autoReview?: ConfigObject;
 }
 
 export interface LandstripConfig extends LandstripConfigFile {
   maxSubagents: number;
   agent: ConfigObject;
   agentSources: ReadonlyMap<string, AgentSource>;
+  guardrail: GuardrailConfig;
 }
 
 export interface MaxSubagentsSettings {
@@ -32,7 +58,16 @@ export interface MaxSubagentsSettings {
   readonly project?: number;
 }
 
-const LANDSTRIP_KEYS = new Set(['maxSubagents', 'agent', 'permission']);
+const LANDSTRIP_KEYS = new Set([
+  'maxSubagents',
+  'agent',
+  'permission',
+  'allowInsideWorkingDirectory',
+  'deniedPaths',
+  'protectedPaths',
+  'hardDenyRules',
+  'autoReview',
+]);
 
 function readJsonObject(path: string): ConfigObject {
   let value: unknown;
@@ -83,6 +118,38 @@ function readLandstripSettings(path: string): LandstripConfigFile {
     config.agent = settings.landstrip.agent;
   }
   if ('permission' in settings.landstrip) config.permission = settings.landstrip.permission;
+  if ('allowInsideWorkingDirectory' in settings.landstrip) {
+    if (typeof settings.landstrip.allowInsideWorkingDirectory !== 'boolean') {
+      throw new Error(`${path}: landstrip.allowInsideWorkingDirectory must be a boolean`);
+    }
+    config.allowInsideWorkingDirectory = settings.landstrip.allowInsideWorkingDirectory;
+  }
+  if ('deniedPaths' in settings.landstrip) {
+    const dp = settings.landstrip.deniedPaths;
+    if (!Array.isArray(dp) || dp.some((p) => typeof p !== 'string' || p.trim() === '')) {
+      throw new Error(`${path}: landstrip.deniedPaths must be an array of non-empty strings`);
+    }
+    config.deniedPaths = dp as string[];
+  }
+  if ('protectedPaths' in settings.landstrip) {
+    const pp = settings.landstrip.protectedPaths;
+    if (!Array.isArray(pp) || pp.some((p) => typeof p !== 'string' || p.trim() === '')) {
+      throw new Error(`${path}: landstrip.protectedPaths must be an array of non-empty strings`);
+    }
+    config.protectedPaths = pp as string[];
+  }
+  if ('hardDenyRules' in settings.landstrip) {
+    if (typeof settings.landstrip.hardDenyRules !== 'string') {
+      throw new Error(`${path}: landstrip.hardDenyRules must be a string`);
+    }
+    config.hardDenyRules = settings.landstrip.hardDenyRules;
+  }
+  if ('autoReview' in settings.landstrip) {
+    if (!isRecord(settings.landstrip.autoReview)) {
+      throw new Error(`${path}: landstrip.autoReview must be an object`);
+    }
+    config.autoReview = settings.landstrip.autoReview;
+  }
   expandAgentPromptReferences(config, path);
   return config;
 }
@@ -275,7 +342,96 @@ export function loadLandstripConfig(
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
   }
   if (!isRecord(config.agent)) throw new Error('landstrip.agent must be an object');
-  return { ...config, maxSubagents, agent: config.agent, agentSources };
+  const guardrail = buildGuardrailConfig(config);
+  return { ...config, maxSubagents, agent: config.agent, agentSources, guardrail };
+}
+
+function buildGuardrailConfig(config: LandstripConfigFile): GuardrailConfig {
+  const autoReviewRaw = isRecord(config.autoReview) ? config.autoReview : {};
+  return {
+    allowInsideWorkingDirectory: config.allowInsideWorkingDirectory ?? false,
+    deniedPaths: Array.isArray(config.deniedPaths)
+      ? (config.deniedPaths as string[])
+      : [],
+    protectedPaths: Array.isArray(config.protectedPaths)
+      ? (config.protectedPaths as string[])
+      : getDefaultProtectedPaths(),
+    hardDenyRules: typeof config.hardDenyRules === 'string' ? config.hardDenyRules : 'default',
+    autoReview: {
+      enabled: autoReviewRaw.enabled === true,
+      model: typeof autoReviewRaw.model === 'string' ? autoReviewRaw.model : undefined,
+      reasoning: (typeof autoReviewRaw.reasoning === 'string'
+        ? autoReviewRaw.reasoning
+        : 'low') as ReviewReasoningLevel,
+      timeoutMs: typeof autoReviewRaw.timeoutMs === 'number' ? autoReviewRaw.timeoutMs : 30000,
+      policy: typeof autoReviewRaw.policy === 'string' ? autoReviewRaw.policy : 'default',
+      maxConsecutiveDenials:
+        typeof autoReviewRaw.maxConsecutiveDenials === 'number'
+          ? autoReviewRaw.maxConsecutiveDenials
+          : 3,
+      maxDenialsInWindow:
+        typeof autoReviewRaw.maxDenialsInWindow === 'number'
+          ? autoReviewRaw.maxDenialsInWindow
+          : 10,
+      denialWindowSize:
+        typeof autoReviewRaw.denialWindowSize === 'number'
+          ? autoReviewRaw.denialWindowSize
+          : 50,
+    },
+  };
+}
+
+function getDefaultProtectedPaths(): string[] {
+  return [
+    '.git',
+    '.config/git',
+    '.vscode',
+    '.idea',
+    '.husky',
+    '.cargo',
+    '.devcontainer',
+    '.yarn',
+    '.mvn',
+    '.pi',
+    '.gitconfig',
+    '.gitmodules',
+    '.gitignore',
+    '.gitattributes',
+    '.bashrc',
+    '.bash_profile',
+    '.bash_login',
+    '.bash_aliases',
+    '.bash_logout',
+    '.zshrc',
+    '.zprofile',
+    '.zshenv',
+    '.zlogin',
+    '.zlogout',
+    '.profile',
+    '.envrc',
+    '.npmrc',
+    '.yarnrc',
+    '.yarnrc.yml',
+    '.pnp.cjs',
+    '.pnp.loader.mjs',
+    '.pnpmfile.cjs',
+    'bunfig.toml',
+    '.bunfig.toml',
+    '.bazelrc',
+    '.bazelversion',
+    '.bazeliskrc',
+    '.pre-commit-config.yaml',
+    'lefthook.yml',
+    'lefthook.yaml',
+    '.lefthook.yml',
+    '.lefthook.yaml',
+    'gradle-wrapper.properties',
+    'maven-wrapper.properties',
+    '.devcontainer.json',
+    '.ripgreprc',
+    'pyrightconfig.json',
+    '.mcp.json',
+  ];
 }
 
 export function loadMaxSubagentsSettings(

@@ -59,14 +59,27 @@ import {
   clearAgentDisabledForScope,
   clearMaxSubagentsConfigForScope,
   loadAgentDisabledOverrides,
+  loadLandstripConfig,
   loadMaxSubagentsSettings,
   MAX_SUBAGENTS,
   setAgentDisabledForScope,
   setMaxSubagentsConfigForScope,
+  type GuardrailConfig,
 } from './config.ts';
 import type { LandstripIntegration, LandstripRpcWorkerLaunch } from './index.ts';
 import { type ExtensionUiRequest, type ExtensionUiResult, RpcProcess } from './rpc-process.ts';
 import { AsyncQueue, colorizeAgentText, formatError, isRecord } from './util.ts';
+import { deterministicHardDeny } from './hard-deny.ts';
+import {
+  expandHomePattern,
+  isInside,
+  isPathBearingTool,
+  isProtectedPath,
+  matchesDeniedPath,
+  resolveInputPath,
+  resolvePathForPolicy,
+} from './paths.ts';
+import { defaultReviewAction, type ReviewAction, type ReviewConfig, type ReviewDecision } from './classifier.ts';
 
 const TASK_ENTRY = 'landstrip.task';
 const TASK_WIDGET = 'landstrip.subagents';
@@ -596,6 +609,7 @@ interface WorkerConfig {
   readonly task: Pick<TaskRecord, 'id' | 'description' | 'depth'>;
   readonly taskEnabled: boolean;
   readonly steps?: number;
+  readonly guardrail?: GuardrailConfig;
 }
 
 interface ControlRequest {
@@ -978,8 +992,44 @@ export function registerSubagentWorker(pi: ExtensionAPI, config: WorkerConfig): 
   pi.on('tool_call', async (event, ctx) => {
     // Nested task requests are validated by the root scheduler after transport.
     if (event.toolName === 'task') return;
-    const permission = permissionName(event.toolName);
     const input = isRecord(event.input) ? event.input : {};
+
+    // Guardrail tiers (same as primary agent).
+    const g = config.guardrail;
+    if (g) {
+      if (g.hardDenyRules !== 'none') {
+        const hardDenyReason = deterministicHardDeny(event.toolName, input, ctx.cwd);
+        if (hardDenyReason) {
+          return { block: true, reason: hardDenyReason };
+        }
+      }
+      if (isPathBearingTool(event.toolName)) {
+        const inputPath = resolveInputPath(ctx.cwd, (input as Record<string, unknown>).path);
+        if (inputPath) {
+          const expanded = expandHomePattern(inputPath);
+          const resolved = resolvePathForPolicy(expanded) ?? expanded;
+          const policyPath = resolvePathForPolicy(resolved) ?? resolved;
+          if (g.deniedPaths.length > 0 && matchesDeniedPath(policyPath, g.deniedPaths)) {
+            return { block: true, reason: `Path denied by policy: ${policyPath}` };
+          }
+          if (g.allowInsideWorkingDirectory) {
+            const policyCwd = resolvePathForPolicy(ctx.cwd) ?? ctx.cwd;
+            if (isInside(policyPath, policyCwd)) {
+              if (
+                (event.toolName === 'write' || event.toolName === 'edit') &&
+                isProtectedPath(policyPath, policyCwd, g.protectedPaths)
+              ) {
+                // Fall through to permission rules
+              } else {
+                return undefined;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const permission = permissionName(event.toolName);
     for (const resource of permissionResources(event.toolName, input, ctx.cwd)) {
       const decision = permissionDecision(config.rules, permission, resource);
       if (decision === 'deny') {
@@ -1057,13 +1107,20 @@ export class SubagentRuntime {
   private primaryAgentSwitching = false;
   private shuttingDown = false;
   private activeSessionId: string | undefined;
+  private guardrail: GuardrailConfig | undefined;
+  private readonly reviewAction: ReviewAction;
+  private consecutiveDenials = 0;
+  private readonly denialWindow: number[] = [];
 
   constructor(
     private readonly pi: ExtensionAPI,
     private readonly integration: LandstripIntegration,
     private readonly createWorker: WorkerFactory = (...args) => this.defaultWorker(...args),
     private readonly loadCatalog: CatalogLoader = loadAgentCatalog,
-  ) {}
+    reviewAction?: ReviewAction,
+  ) {
+    this.reviewAction = reviewAction ?? defaultReviewAction;
+  }
 
   register(): void {
     this.pi.registerTool(this.createTaskTool());
@@ -1082,8 +1139,11 @@ export class SubagentRuntime {
       this.activeSessionId = ctx.sessionManager.getSessionId();
       this.broker.reset();
       this.restore(ctx);
+      this.loadGuardrailConfig(ctx);
       await this.restorePrimaryAgent(ctx);
       await this.cleanupOrphanSubagentSessions(ctx);
+      this.consecutiveDenials = 0;
+      this.denialWindow.length = 0;
       const activeTools = this.pi.getActiveTools();
       const withoutTask = activeTools.filter((tool) => tool !== 'task');
       const nextTools = this.maxSubagents > 0 ? [...withoutTask, 'task'] : withoutTask;
@@ -1107,7 +1167,15 @@ export class SubagentRuntime {
       if (this.primaryConfigurationError) {
         return { block: true, reason: 'Invalid primary agent configuration' };
       }
-      if (!this.primaryAgent || !this.primaryRules || event.toolName === 'task') return;
+      if (event.toolName === 'task') return;
+
+      const g = this.guardrail;
+      if (g) {
+        const guardrailResult = await this.runGuardrailTiers(event, ctx, g);
+        if (guardrailResult) return guardrailResult;
+      }
+
+      if (!this.primaryAgent || !this.primaryRules) return;
       const permission = permissionName(event.toolName);
       for (const resource of permissionResources(event.toolName, event.input, ctx.cwd)) {
         const decision = permissionDecision(this.primaryRules, permission, resource);
@@ -1118,6 +1186,11 @@ export class SubagentRuntime {
           };
         }
         if (decision === 'ask') {
+          if (g?.autoReview.enabled) {
+            const reviewResult = await this.runAutoReview(event, ctx, g.autoReview);
+            if (reviewResult) return reviewResult;
+            continue;
+          }
           try {
             await this.broker.ask(
               ctx,
@@ -1132,6 +1205,89 @@ export class SubagentRuntime {
         }
       }
     });
+  }
+
+  private async runGuardrailTiers(
+    event: { toolName: string; input: Record<string, unknown> },
+    ctx: ExtensionContext,
+    g: GuardrailConfig,
+  ): Promise<{ block: true; reason: string } | undefined> {
+    const input = isRecord(event.input) ? event.input : {};
+
+    if (g.hardDenyRules !== 'none') {
+      const hardDenyReason = deterministicHardDeny(event.toolName, input, ctx.cwd);
+      if (hardDenyReason) {
+        return { block: true, reason: hardDenyReason };
+      }
+    }
+
+    if (isPathBearingTool(event.toolName)) {
+      const inputPath = resolveInputPath(ctx.cwd, input.path);
+      if (inputPath) {
+        const expanded = expandHomePattern(inputPath);
+        const resolved = resolvePathForPolicy(expanded) ?? expanded;
+        const policyPath = resolvePathForPolicy(resolved) ?? resolved;
+
+        if (g.deniedPaths.length > 0 && matchesDeniedPath(policyPath, g.deniedPaths)) {
+          return { block: true, reason: `Path denied by policy: ${policyPath}` };
+        }
+
+        if (g.allowInsideWorkingDirectory) {
+          const policyCwd = resolvePathForPolicy(ctx.cwd) ?? ctx.cwd;
+          if (isInside(policyPath, policyCwd)) {
+            if (
+              (event.toolName === 'write' || event.toolName === 'edit') &&
+              isProtectedPath(policyPath, policyCwd, g.protectedPaths)
+            ) {
+              // Fall through to permission rules / auto-review
+            } else {
+              return undefined;
+            }
+          }
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  private async runAutoReview(
+    event: { toolName: string; input: Record<string, unknown> },
+    ctx: ExtensionContext,
+    config: ReviewConfig,
+  ): Promise<{ block: true; reason: string } | undefined> {
+    const action = `${event.toolName} ${JSON.stringify(event.input).slice(0, 6000)}`;
+    let decision: ReviewDecision;
+    try {
+      decision = await this.reviewAction(ctx, config, action);
+    } catch (error) {
+      return { block: true, reason: `Review failed: ${formatError(error)}` };
+    }
+
+    if (decision.decision === 'allow') {
+      this.consecutiveDenials = 0;
+      return undefined;
+    }
+
+    this.consecutiveDenials += 1;
+    this.denialWindow.push(Date.now());
+    if (this.denialWindow.length > config.denialWindowSize) {
+      this.denialWindow.shift();
+    }
+
+    if (
+      this.consecutiveDenials >= config.maxConsecutiveDenials ||
+      this.denialWindow.length >= config.maxDenialsInWindow
+    ) {
+      this.consecutiveDenials = 0;
+      this.denialWindow.length = 0;
+      return {
+        block: true,
+        reason: `Review denied (circuit breaker tripped): ${decision.reason}`,
+      };
+    }
+
+    return { block: true, reason: `Review denied: ${decision.reason}` };
   }
 
   getAgentCatalog(ctx: ExtensionContext): AgentCatalog {
@@ -2446,7 +2602,7 @@ export class SubagentRuntime {
       '--tools',
       tools.join(','),
     ];
-    const config: WorkerConfig = { rules, task, taskEnabled, steps: agent.steps };
+    const config: WorkerConfig = { rules, task, taskEnabled, steps: agent.steps, guardrail: this.guardrail };
     const publicContext = this.taskContext(task, ctx);
     const temp = mkdtempSync(join(tmpdir(), `pi-landstrip-task-${task.id}-`));
     const agentDir = getAgentDir();
@@ -2900,6 +3056,15 @@ export class SubagentRuntime {
       this.persist(task);
     }
     this.updateTaskWidget(ctx);
+  }
+
+  private loadGuardrailConfig(ctx: ExtensionContext): void {
+    try {
+      const config = loadLandstripConfig(ctx.cwd, isProjectTrusted(ctx), getAgentDir());
+      this.guardrail = config.guardrail;
+    } catch {
+      this.guardrail = undefined;
+    }
   }
 
   private async restorePrimaryAgent(ctx: ExtensionContext): Promise<void> {

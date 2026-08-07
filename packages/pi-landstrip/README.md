@@ -76,8 +76,24 @@ read allowlist.
 
 | Layer            | Checked            | Controls                       |
 | ---------------- | ------------------ | ------------------------------ |
+| Denied paths     | Before a tool runs | Hard-deny secret/system paths  |
+| Hard-deny rules  | Before a tool runs | Block unsafe actions (TLS, profiles, persistence, destructive deletes) |
+| Inside-CWD allow | Before a tool runs | Silent allow for in-project file tools |
 | Agent permission | Before a tool runs | Which tools the agent may call |
+| Auto-review      | On "ask" decisions | LLM reviewer approves or denies boundary-crossing actions |
 | Sandbox policy   | During a command   | Filesystem and network access  |
+
+The first four layers are checked in order before agent permission rules. A
+matching denied path or hard-deny rule blocks immediately. When
+`allowInsideWorkingDirectory` is `true`, file tools inside the working directory
+are silently allowed (except protected paths like `.git/`, `.husky/`, `.pi/`,
+which still go through permission rules and auto-review).
+
+When auto-review is enabled, "ask" decisions from agent permission rules are
+routed to an LLM reviewer instead of prompting the user. The reviewer sees the
+planned action and returns an allow/deny decision with a rationale. A circuit
+breaker interrupts the turn after 3 consecutive denials or 10 denials within a
+rolling window of 50 reviews.
 
 An agent approval allows tool dispatch; the sandbox still applies to the
 resulting process.
@@ -149,6 +165,55 @@ projects, `.pi/settings.json`. Sandbox settings are read from
 the `task` tool. Agent definitions support `mode`, `prompt`, `model`, `variant`,
 `steps`, `color`, `hidden`, `disable`, `options`, and permission rules. Modes
 are `primary`, `subagent`, or `all`.
+
+### Guardrail configuration
+
+Guardrail tiers are configured under `landstrip` in `settings.json`. All keys
+are optional and default to current behavior (no guardrails beyond agent
+permissions and the sandbox).
+
+```json
+{
+  "landstrip": {
+    "allowInsideWorkingDirectory": true,
+    "deniedPaths": [
+      "*.env", "~/.ssh/*", "/etc/*", "**/id_rsa",
+      "~/.aws/*", "~/.kube/*", "~/.gnupg/*"
+    ],
+    "protectedPaths": [".git", ".husky", ".pi", ".gitignore"],
+    "hardDenyRules": "default",
+    "autoReview": {
+      "enabled": true,
+      "model": "ollama-cloud/gemma4:31b",
+      "reasoning": "low",
+      "timeoutMs": 30000,
+      "policy": "default",
+      "maxConsecutiveDenials": 3,
+      "maxDenialsInWindow": 10,
+      "denialWindowSize": 50
+    }
+  }
+}
+```
+
+| Key | Default | Effect |
+|-----|---------|--------|
+| `allowInsideWorkingDirectory` | `false` | When `true`, file tools inside the working directory are silently allowed without permission checks or auto-review. Protected paths (`.git/`, `.husky/`, `.pi/`, etc.) are still reviewed. |
+| `deniedPaths` | `[]` | Glob patterns hard-denied for file tools before any permission check or auto-review. Supports `~`, `$HOME`, `${HOME}`. `*` matches any characters including `/`. Checked on both the typed path and its symlink-resolved form. Applies to both the primary agent and subagents. |
+| `protectedPaths` | built-in list | In-CWD paths that always go through permission rules and auto-review even when `allowInsideWorkingDirectory` is `true`. Defaults include `.git`, `.husky`, `.pi`, `.gitignore`, `.npmrc`, and similar safety-sensitive files. |
+| `hardDenyRules` | `"default"` | Deterministic safety checks: shell profile writes, TLS weakening, SSH `authorized_keys`, cron/persistence, destructive deletes, safety-control file edits. Set to `"none"` to disable. |
+| `autoReview.enabled` | `false` | When `true`, "ask" decisions from agent permission rules are routed to an LLM reviewer instead of prompting the user. |
+| `autoReview.model` | session model | Classifier model in `provider/model-id` format. |
+| `autoReview.reasoning` | `"low"` | Reasoning level for the classifier: `"off"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. |
+| `autoReview.timeoutMs` | `30000` | Classifier call timeout. Fails closed (blocks) on timeout. |
+| `autoReview.policy` | `"default"` | Reviewer policy prompt. `"default"` uses the built-in Codex-style policy covering data exfiltration, credential probing, security weakening, and destructive actions. |
+| `autoReview.maxConsecutiveDenials` | `3` | Circuit breaker: consecutive denials before the turn is interrupted. |
+| `autoReview.maxDenialsInWindow` | `10` | Circuit breaker: denials within a rolling window before the turn is interrupted. |
+| `autoReview.denialWindowSize` | `50` | Rolling window size for the circuit breaker. |
+
+All guardrail tiers apply to both the primary agent and subagent workers. The
+denied-paths list, hard-deny rules, and inside-CWD allow are checked before
+agent permission rules in every `tool_call` handler.
 
 Pi Markdown agents are loaded from `~/.pi/agent/agents/` and `.pi/agents/`.
 `landstrip.agent` settings override Markdown agents with the same name.
