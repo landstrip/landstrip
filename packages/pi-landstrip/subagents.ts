@@ -59,7 +59,6 @@ import {
   clearAgentDisabledForScope,
   clearMaxSubagentsConfigForScope,
   loadAgentDisabledOverrides,
-  loadLandstripConfig,
   loadMaxSubagentsSettings,
   MAX_SUBAGENTS,
   setAgentDisabledForScope,
@@ -3060,8 +3059,8 @@ export class SubagentRuntime {
 
   private loadGuardrailConfig(ctx: ExtensionContext): void {
     try {
-      const config = loadLandstripConfig(ctx.cwd, isProjectTrusted(ctx), getAgentDir());
-      this.guardrail = config.guardrail;
+      const catalog = this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
+      this.guardrail = catalog.guardrail;
     } catch {
       this.guardrail = undefined;
     }

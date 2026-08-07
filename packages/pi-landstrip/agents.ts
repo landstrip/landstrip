@@ -53,6 +53,7 @@ export interface AgentCatalog {
   readonly permissions: PermissionRules;
   readonly diagnostics: readonly string[];
   readonly maxSubagents: number;
+  readonly guardrail?: import('./config.ts').GuardrailConfig;
 }
 
 const AGENT_FIELDS = new Set([
@@ -262,7 +263,14 @@ export function loadAgentCatalog(
   } catch (error) {
     diagnostics.push(formatError(error));
   }
-  return { agents: normalized, permissions, diagnostics, maxSubagents };
+  let guardrail: import('./config.ts').GuardrailConfig | undefined;
+  try {
+    const config = loadLandstripConfig(cwd, includeProject, piAgentDir);
+    guardrail = config.guardrail;
+  } catch {
+    // guardrail stays undefined; agent permissions and sandbox still apply
+  }
+  return { agents: normalized, permissions, diagnostics, maxSubagents, guardrail };
 }
 
 function permissionMatches(pattern: string, permission: string): boolean {

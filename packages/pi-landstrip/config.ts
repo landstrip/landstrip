@@ -39,6 +39,7 @@ export interface LandstripConfigFile {
   maxSubagents?: number;
   agent?: ConfigObject;
   permission?: unknown;
+  opencode?: ConfigObject;
   allowInsideWorkingDirectory?: boolean;
   deniedPaths?: unknown;
   protectedPaths?: unknown;
@@ -62,12 +63,37 @@ const LANDSTRIP_KEYS = new Set([
   'maxSubagents',
   'agent',
   'permission',
+  'opencode',
   'allowInsideWorkingDirectory',
   'deniedPaths',
   'protectedPaths',
   'hardDenyRules',
   'autoReview',
 ]);
+
+const OPENCODE_KEYS = new Set(['showGlobalAgents', 'showLocalAgents']);
+
+function normalizeOpenCode(value: unknown, path: string): ConfigObject {
+  if (value === undefined) return {};
+  if (!isRecord(value)) throw new Error(`${path} must be a JSON object`);
+  for (const key of Object.keys(value)) {
+    if (!OPENCODE_KEYS.has(key)) throw new Error(`${path}: unknown field ${key}`);
+  }
+  const result: ConfigObject = {};
+  if (value.showGlobalAgents !== undefined) {
+    if (typeof value.showGlobalAgents !== 'boolean') {
+      throw new Error(`${path}.showGlobalAgents must be a boolean`);
+    }
+    result.showGlobalAgents = value.showGlobalAgents;
+  }
+  if (value.showLocalAgents !== undefined) {
+    if (typeof value.showLocalAgents !== 'boolean') {
+      throw new Error(`${path}.showLocalAgents must be a boolean`);
+    }
+    result.showLocalAgents = value.showLocalAgents;
+  }
+  return result;
+}
 
 function readJsonObject(path: string): ConfigObject {
   let value: unknown;
@@ -118,6 +144,9 @@ function readLandstripSettings(path: string): LandstripConfigFile {
     config.agent = settings.landstrip.agent;
   }
   if ('permission' in settings.landstrip) config.permission = settings.landstrip.permission;
+  if ('opencode' in settings.landstrip) {
+    config.opencode = normalizeOpenCode(settings.landstrip.opencode, `${path}: landstrip.opencode`);
+  }
   if ('allowInsideWorkingDirectory' in settings.landstrip) {
     if (typeof settings.landstrip.allowInsideWorkingDirectory !== 'boolean') {
       throw new Error(`${path}: landstrip.allowInsideWorkingDirectory must be a boolean`);

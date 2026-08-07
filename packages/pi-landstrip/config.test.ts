@@ -30,7 +30,7 @@ describe('Landstrip settings', () => {
     );
   });
 
-  test('rejects the removed landstrip.opencode settings object', () => {
+  test('accepts landstrip.opencode settings object', () => {
     const agentDir = temporaryDirectory();
     write(join(agentDir, 'settings.json'), {
       landstrip: {
@@ -38,8 +38,7 @@ describe('Landstrip settings', () => {
       },
     });
 
-    expect(() => loadLandstripConfig(temporaryDirectory(), true, agentDir)).toThrow(
-      'landstrip has an unknown field opencode',
-    );
+    const config = loadLandstripConfig(temporaryDirectory(), true, agentDir);
+    expect(config.opencode).toEqual({ showGlobalAgents: false, showLocalAgents: false });
   });
 });
