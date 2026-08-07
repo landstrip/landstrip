@@ -6,9 +6,10 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
 export function expandHomePath(path: string): string {
-  if (path === '~' || path === '$HOME') return homedir();
+  if (path === '~' || path === '$HOME' || path === '${HOME}') return homedir();
   if (path.startsWith('~/')) return join(homedir(), path.slice(2));
   if (path.startsWith('$HOME/')) return join(homedir(), path.slice(6));
+  if (path.startsWith('${HOME}/')) return join(homedir(), path.slice(7));
   return path;
 }
 
