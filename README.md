@@ -288,6 +288,19 @@ from `Dockerfile.aarch64-apple-darwin-cross` / `Dockerfile.x86_64-apple-darwin-c
 `ls` the `artifacts/` directory after a run; `make publish` requires every
 platform binary staged in `npm/*/bin`.
 
+### Release
+
+After `scripts/release.sh <version>` and pushing the tag:
+
+```sh
+make ci
+PACKAGE_STRICT=1 make package
+make publish
+```
+
+`make publish` publishes crates.io and npm packages from the locally packaged
+binaries, then uploads GitHub release tarballs with `gh`.
+
 ## Licensing
 
 The JavaScript npm wrapper is licensed under `Apache-2.0`. The Rust source and

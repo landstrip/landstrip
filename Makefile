@@ -34,7 +34,8 @@ package:
 	CROSS="$(CROSS)" NODE="$(NODE)" ./scripts/package.sh $(PLATFORMS)
 
 publish:
-	$(CARGO) publish --package landstrip
+	CARGO="$(CARGO)" GH="$(GH)" NODE="$(NODE)" NPM="$(NPM)" \
+		./scripts/publish.sh "$(VERSION)"
 
 install:
 	$(INSTALL) -d $(DESTDIR)$(BINDIR)
