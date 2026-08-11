@@ -113,6 +113,9 @@ select `standard`, which is weaker because it can see resources granted to
 `ALL APPLICATION PACKAGES`. In AppContainer, `windows.allowLoopback` exposes
 every local loopback service; without it, proxy ports are blocked.
 
+Windows ACL allow roots must exist when the policy is resolved. Missing
+`allowRead` and `allowWrite` targets are omitted and remain inaccessible.
+
 Use `landstrip windows install` when software such as Git Bash cannot start in
 AppContainer. It provisions restricted local users and activates that mode.
 `windows uninstall` removes it and returns to AppContainer. An unhealthy
@@ -137,6 +140,78 @@ and static-profile denials do not always produce a per-access event.
 Trap kinds are `filesystem`, `network`, `launch`, `usage`, and `internal`.
 Filesystem and network records describe denied operations; the other kinds
 report failures in Landstrip itself.
+
+## Development
+
+### Check
+
+```sh
+make ci
+CI_MSRV=1 make ci  # optional MSRV check
+```
+
+`scripts/ci.sh` runs the Rust build, tests, clippy, and fmt, stages the host
+binary into `npm/<host>/bin`, smoke-tests the npm wrapper, and runs every
+agent-extension workspace's `ci:fmt`/`ci:lint`/`ci:check`/`ci:test` scripts
+via `scripts/test-extensions.sh --local-root`.
+
+### Package
+
+All cross targets use [`cross`](https://github.com/cross-rs/cross) and Docker.
+Linux x64/arm64 (musl) and Windows x64 (GNU) use official cross images.
+
+```sh
+make package
+make package PLATFORMS='linux-x64 win32-x64'
+PACKAGE_STRICT=1 make package
+```
+
+On a macOS host both `darwin-*` targets build natively with `cargo`; the
+`osxcross` images are only required when packaging from Linux. The
+`win32-arm64` target uses a local MSVC image because cross-rs cannot ship it:
+
+```sh
+git clone https://github.com/cross-rs/cross-toolchains.git
+cd cross-toolchains/docker
+cp /path/to/MacOSX*.sdk.tar.xz .  # only for darwin-* from Linux
+docker build -f Dockerfile.aarch64-pc-windows-msvc-cross \
+  -t ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local .
+```
+
+`darwin-arm64`/`darwin-x64` osxcross images follow the same `docker build` step
+from `Dockerfile.aarch64-apple-darwin-cross` / `Dockerfile.x86_64-apple-darwin-cross`
+(supplying a macOS SDK archive) when packaging from Linux.
+
+`ls` the `artifacts/` directory after a run; `make publish` requires every
+platform binary staged in `npm/*/bin`.
+
+### Release
+
+After `scripts/release.sh <version>` and pushing the tag:
+
+```sh
+make ci
+PACKAGE_STRICT=1 make package
+make publish
+```
+
+`make publish` publishes crates.io and npm packages from the locally packaged
+binaries, then uploads GitHub release tarballs with `gh`.
+
+
+## Development
+
+### Check
+
+```sh
+make ci
+CI_MSRV=1 make ci  # optional MSRV check
+```
+
+`scripts/ci.sh` runs the Rust build, tests, clippy, and fmt, stages the host
+binary into `npm/<host>/bin`, smoke-tests the npm wrapper, and runs every
+agent-extension workspace's `ci:fmt`/`ci:lint`/`ci:check`/`ci:test` scripts
+via `scripts/test-extensions.sh --local-root`.
 
 ## Licensing
 
