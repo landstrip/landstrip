@@ -4,6 +4,9 @@
 #
 # Publish crates.io + npm packages from locally packaged binaries.
 # Run `make package` (or PACKAGE_STRICT=1 make package) first.
+#
+# Defaults to the highest semver tag reachable from HEAD.
+# Tip may be ahead of the tag; cargo is published from the tagged tree.
 
 set -euo pipefail
 
@@ -27,6 +30,12 @@ license_files=(LICENSE-APACHE-2.0 LICENSE-LGPL-2.1)
 cleanup() {
   local status=$?
 
+  if [[ -n "${publish_worktree:-}" ]]; then
+    if ! git -C "${repo_root:-.}" worktree remove --force "$publish_worktree" 2>/dev/null; then
+      rm -rf "$publish_worktree"
+      git -C "${repo_root:-.}" worktree prune >/dev/null 2>&1 || true
+    fi
+  fi
   if [[ -n "${workdir:-}" ]]; then
     rm -rf "$workdir"
   fi
@@ -131,7 +140,7 @@ wait_for_npm_package() {
 }
 
 publish_cargo_package() {
-  local output
+  local output cargo_root="$1"
 
   if output="$($CARGO info --registry crates-io "landstrip@$version" 2>&1)"; then
     printf '%s\n' "landstrip@$version is already published"
@@ -141,7 +150,10 @@ publish_cargo_package() {
     printf '%s\n' "$output" >&2
     die "cannot query landstrip@$version from crates.io"
   fi
-  $CARGO publish --locked
+  (
+    cd "$cargo_root" || exit 1
+    $CARGO publish --locked
+  )
 }
 
 platform_binary() {
@@ -174,19 +186,61 @@ for extension_dir in "${extension_dirs[@]}"; do
   lock_files+=("$extension_dir/package-lock.json")
 done
 
-version="${1:-$($NODE -p 'require("./package.json").version')}"
+# Empty VERSION from make is still a set argv; treat blank as "latest tag".
+version="${1:-}"
+if [[ -z "$version" ]]; then
+  versions="$(git tag --merged HEAD --list '[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname)"
+  version="${versions%%$'\n'*}"
+  [[ -n "$version" ]] || die "no semver tag reachable from HEAD"
+fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid version: $version"
-package_version="$($NODE -p 'require("./package.json").version')"
-[[ "$version" == "$package_version" ]] \
-  || die "requested version $version does not match package.json $package_version"
+
+# npm packages are assembled from the tip tree; keep tip metadata on the tag.
+tip_version="$($NODE -p 'require("./package.json").version')"
+[[ "$version" == "$tip_version" ]] \
+  || die "tag $version does not match tip package.json $tip_version"
 
 tag_commit="$(git rev-parse "$version^{commit}" 2>/dev/null)" \
   || die "tag $version does not exist"
-[[ "$tag_commit" == "$(git rev-parse HEAD)" ]] \
-  || die "tag $version does not point to HEAD"
+head_commit="$(git rev-parse HEAD)"
+if ! git merge-base --is-ancestor "$tag_commit" "$head_commit"; then
+  die "tag $version is not an ancestor of HEAD"
+fi
+
+if [[ "$tag_commit" != "$head_commit" ]] \
+  && ! git diff --quiet "$tag_commit" "$head_commit" -- \
+    Cargo.toml Cargo.lock rust-toolchain.toml src; then
+  die "Rust package sources changed since tag $version"
+fi
 
 workdir="$(mktemp -d)"
 mkdir -p "$workdir/packages" "$workdir/release"
+publish_worktree=
+cargo_root="$repo_root"
+if [[ "$tag_commit" != "$head_commit" ]]; then
+  printf 'publishing tag %s (%s); HEAD is %s — cargo from tagged worktree\n' \
+    "$version" "${tag_commit:0:12}" "${head_commit:0:12}"
+  publish_worktree="$workdir/source"
+  git worktree add --detach "$publish_worktree" "$tag_commit" \
+    || die "cannot create worktree for tag $version"
+  [[ -f "$publish_worktree/Cargo.toml" ]] \
+    || die "worktree missing Cargo.toml: $publish_worktree"
+  cargo_root="$publish_worktree"
+else
+  printf 'publishing tag %s (matches HEAD)\n' "$version"
+fi
+
+package_version="$($NODE -p "require('$cargo_root/package.json').version")"
+[[ "$version" == "$package_version" ]] \
+  || die "tag $version package.json version is $package_version"
+
+cargo_version="$(
+  sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
+    "$cargo_root/Cargo.toml"
+)"
+cargo_version="${cargo_version%%$'\n'*}"
+[[ "$version" == "$cargo_version" ]] \
+  || die "tag $version Cargo.toml version is $cargo_version"
 
 printf '%s\n' "assembling platform packages from local npm/*/bin binaries"
 npm_package_dirs=()
@@ -231,7 +285,7 @@ for package_dir in "${npm_package_dirs[@]}"; do
   preflight_npm_package "$package_dir"
 done
 
-publish_cargo_package
+publish_cargo_package "$cargo_root"
 for package_dir in "${npm_package_dirs[@]}"; do
   publish_npm_package "$package_dir"
 done
