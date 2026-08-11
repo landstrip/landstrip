@@ -3,6 +3,7 @@
 
 export const BUILT_IN_LANDSTRIP_CONFIG = {
   maxSubagents: 1,
+  toolFilesystemPolicy: 'host',
   agent: {
     build: {
       description: 'Implement and test requested changes',

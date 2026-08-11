@@ -52,6 +52,55 @@ describe('project agent files', () => {
     expect(deleted.landstrip.maxSubagents).toBe(3);
   });
 
+  test('edits a built-in through a dedicated project configuration', async () => {
+    const cwd = temporaryDirectory('pi-landstrip-agent-edit-');
+    const agentDir = temporaryDirectory('pi-landstrip-agent-dir-');
+    const path = join(cwd, '.pi', 'landstrip.json');
+    write(path, `${JSON.stringify({ maxSubagents: 3 }, null, 2)}\n`);
+    const agent = loadAgentCatalog(cwd, agentDir).agents.get('build')!;
+
+    const document = prepareProjectAgentEditor(cwd, agent, agentDir);
+    const snippet = JSON.parse(document.content);
+    expect(Object.keys(snippet.agent)).toEqual(['build']);
+    snippet.agent.build.description = 'Dedicated build';
+    await document.save(`${JSON.stringify(snippet, null, 2)}\n`);
+
+    const config = JSON.parse(readFileSync(path, 'utf8'));
+    expect(config.maxSubagents).toBe(3);
+    expect(config.agent.build.description).toBe('Dedicated build');
+    const projectAgent = loadAgentCatalog(cwd, agentDir).agents.get('build')!;
+    expect(projectAgent).toMatchObject({ source: 'local', description: 'Dedicated build' });
+
+    expect(canDeleteProjectAgent(cwd, projectAgent, agentDir)).toBe(true);
+    await expect(deleteProjectAgent(cwd, projectAgent, agentDir)).resolves.toBe(true);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ maxSubagents: 3 });
+  });
+
+  test('removes an empty dedicated file after deleting its last agent', async () => {
+    const cwd = temporaryDirectory('pi-landstrip-agent-edit-');
+    const agentDir = temporaryDirectory('pi-landstrip-agent-dir-');
+    const path = join(cwd, '.pi', 'landstrip.json');
+    write(path, `${JSON.stringify({ agent: { build: { description: 'Project build' } } })}\n`);
+    const agent = loadAgentCatalog(cwd, agentDir).agents.get('build')!;
+
+    await expect(deleteProjectAgent(cwd, agent, agentDir)).resolves.toBe(true);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  test('rejects an editor save after the project configuration source changes', async () => {
+    const cwd = temporaryDirectory('pi-landstrip-agent-edit-');
+    const agentDir = temporaryDirectory('pi-landstrip-agent-dir-');
+    const dedicatedPath = join(cwd, '.pi', 'landstrip.json');
+    const agent = loadAgentCatalog(cwd, agentDir).agents.get('build')!;
+    const document = prepareProjectAgentEditor(cwd, agent, agentDir);
+    write(join(cwd, '.pi', 'settings.json'), `${JSON.stringify({ landstrip: {} }, null, 2)}\n`);
+
+    await expect(document.save(document.content)).rejects.toThrow(
+      'configuration source changed while updating it',
+    );
+    expect(existsSync(dedicatedPath)).toBe(false);
+  });
+
   test('copies a global Markdown agent to the project and deletes only the project copy', async () => {
     const cwd = temporaryDirectory('pi-landstrip-markdown-edit-');
     const agentDir = temporaryDirectory('pi-landstrip-markdown-dir-');

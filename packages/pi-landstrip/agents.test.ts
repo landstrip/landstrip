@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { describe, expect, test } from 'vitest';
@@ -164,14 +164,12 @@ describe('landstrip agent configuration', () => {
     expect(catalog.agents.get('local')?.source).toBe('local');
   });
 
-  test('ignores project landstrip settings when the project is untrusted', () => {
+  test('ignores a project landstrip.json when the project is untrusted', () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    write(join(cwd, '.pi', 'settings.json'), {
-      landstrip: {
-        maxSubagents: 8,
-        agent: { project: { mode: 'subagent' } },
-      },
+    write(join(cwd, '.pi', 'landstrip.json'), {
+      maxSubagents: 8,
+      agent: { project: { mode: 'subagent' } },
     });
 
     const catalog = loadAgentCatalog(cwd, agentDir, false);
@@ -254,11 +252,11 @@ describe('landstrip agent configuration', () => {
     });
   });
 
-  test('updates maxSubagents in trusted-project settings', async () => {
+  test('defaults maxSubagents mutations to dedicated files', async () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
-    const globalPath = join(agentDir, 'settings.json');
-    const projectPath = join(cwd, '.pi', 'settings.json');
+    const globalPath = join(agentDir, 'landstrip.json');
+    const projectPath = join(cwd, '.pi', 'landstrip.json');
 
     await setMaxSubagentsConfigForScope(cwd, 3, 'global', agentDir);
     expect(loadMaxSubagentsSettings(cwd, true, agentDir)).toEqual({
@@ -268,8 +266,8 @@ describe('landstrip agent configuration', () => {
     await setMaxSubagentsConfigForScope(cwd, 5, 'project', agentDir);
     expect(loadMaxSubagentsSettings(cwd, true, agentDir)).toEqual({ global: 3, project: 5 });
 
-    expect(JSON.parse(readFileSync(globalPath, 'utf8')).landstrip.maxSubagents).toBe(3);
-    expect(JSON.parse(readFileSync(projectPath, 'utf8')).landstrip.maxSubagents).toBe(5);
+    expect(JSON.parse(readFileSync(globalPath, 'utf8')).maxSubagents).toBe(3);
+    expect(JSON.parse(readFileSync(projectPath, 'utf8')).maxSubagents).toBe(5);
     expect(loadAgentCatalog(cwd, agentDir).maxSubagents).toBe(5);
 
     await clearMaxSubagentsConfigForScope(cwd, 'project', agentDir);
@@ -277,7 +275,7 @@ describe('landstrip agent configuration', () => {
       global: 3,
       project: undefined,
     });
-    expect(JSON.parse(readFileSync(projectPath, 'utf8')).landstrip).toBeUndefined();
+    expect(existsSync(projectPath)).toBe(false);
   });
 
   test('reports malformed agent permissions', () => {

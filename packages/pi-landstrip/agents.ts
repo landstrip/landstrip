@@ -6,10 +6,10 @@ import { minimatch } from 'minimatch';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
 
 import {
-  getPiConfigPaths,
   loadLandstripConfig,
   type AgentSource,
   type ConfigObject,
+  type ToolFilesystemPolicy,
 } from './config.ts';
 import { loadPiMarkdownAgents } from './opencode-agents.ts';
 import { expandHomePath, formatError, isAgentColor, isRecord } from './util.ts';
@@ -25,7 +25,7 @@ export interface PermissionRule {
 export type PermissionRules = readonly PermissionRule[];
 
 export interface AgentOrigin {
-  readonly kind: 'built-in' | 'settings' | 'pi-markdown';
+  readonly kind: 'built-in' | 'config' | 'pi-markdown';
   readonly source: AgentSource;
   readonly path?: string;
 }
@@ -53,6 +53,7 @@ export interface AgentCatalog {
   readonly permissions: PermissionRules;
   readonly diagnostics: readonly string[];
   readonly maxSubagents: number;
+  readonly toolFilesystemPolicy: ToolFilesystemPolicy;
 }
 
 const AGENT_FIELDS = new Set([
@@ -172,7 +173,7 @@ function normalizeAgent(
 }
 
 export function validateAgentRaw(name: string, raw: ConfigObject): void {
-  normalizeAgent(name, raw, 'local', { kind: 'settings', source: 'local' });
+  normalizeAgent(name, raw, 'local', { kind: 'config', source: 'local' });
 }
 
 export function loadAgentCatalog(
@@ -182,15 +183,19 @@ export function loadAgentCatalog(
 ): AgentCatalog {
   const diagnostics: string[] = [];
   let maxSubagents = 0;
+  let toolFilesystemPolicy: ToolFilesystemPolicy = 'host';
   let configuredAgents: ConfigObject = {};
   let configuredPermission: unknown;
   let agentSources = new Map<string, AgentSource>();
+  let agentPaths = new Map<string, string>();
   try {
     const config = loadLandstripConfig(cwd, includeProject, piAgentDir);
     maxSubagents = config.maxSubagents;
+    toolFilesystemPolicy = config.toolFilesystemPolicy;
     configuredAgents = config.agent;
     configuredPermission = config.permission;
     agentSources = new Map(config.agentSources);
+    agentPaths = new Map(config.agentPaths);
   } catch (error) {
     diagnostics.push(formatError(error));
   }
@@ -237,18 +242,12 @@ export function loadAgentCatalog(
     }
     try {
       const source = agentSources.get(name) ?? 'built-in';
-      const paths = getPiConfigPaths(cwd, 'settings.json', piAgentDir);
       normalized.set(
         name,
         normalizeAgent(name, value, source, {
-          kind: source === 'built-in' ? 'built-in' : 'settings',
+          kind: source === 'built-in' ? 'built-in' : 'config',
           source,
-          path:
-            source === 'local'
-              ? paths.projectPath
-              : source === 'global'
-                ? paths.globalPath
-                : undefined,
+          path: agentPaths.get(name),
         }),
       );
     } catch (error) {
@@ -262,7 +261,7 @@ export function loadAgentCatalog(
   } catch (error) {
     diagnostics.push(formatError(error));
   }
-  return { agents: normalized, permissions, diagnostics, maxSubagents };
+  return { agents: normalized, permissions, diagnostics, maxSubagents, toolFilesystemPolicy };
 }
 
 function permissionMatches(pattern: string, permission: string): boolean {

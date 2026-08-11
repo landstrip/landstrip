@@ -2,7 +2,7 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative, sep } from 'node:path';
+import { basename, dirname, join, relative, sep } from 'node:path';
 
 import { getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent';
 import {
@@ -14,7 +14,12 @@ import {
 } from 'jsonc-parser';
 
 import { type AgentDefinition, validateAgentRaw } from './agents.ts';
-import { type ConfigObject, getPiConfigPaths } from './config.ts';
+import {
+  type ConfigObject,
+  getLandstripConfigTarget,
+  type LandstripConfigKind,
+  type LandstripConfigTarget,
+} from './config.ts';
 import { parseMarkdownAgentRaw } from './opencode-agents.ts';
 import { expandFileReferences, isRecord } from './util.ts';
 
@@ -50,21 +55,32 @@ function valueAtPath(root: unknown, path: JsonPath): unknown {
   return value;
 }
 
-function agentJsonPath(name: string): JsonPath {
-  return ['landstrip', 'agent', name];
+function configKindForPath(path: string): LandstripConfigKind {
+  return basename(path) === 'landstrip.json' ? 'dedicated' : 'settings';
 }
 
-function editorSnippet(name: string, raw: ConfigObject): string {
-  return `${JSON.stringify({ landstrip: { agent: { [name]: raw } } }, null, 2)}\n`;
+function agentJsonPath(kind: LandstripConfigKind, name: string): JsonPath {
+  return kind === 'settings' ? ['landstrip', 'agent', name] : ['agent', name];
 }
 
-function parseEditorSnippet(content: string, name: string): ConfigObject {
+function editorSnippet(name: string, raw: ConfigObject, kind: LandstripConfigKind): string {
+  const agent = { agent: { [name]: raw } };
+  return `${JSON.stringify(kind === 'settings' ? { landstrip: agent } : agent, null, 2)}\n`;
+}
+
+function parseEditorSnippet(
+  content: string,
+  name: string,
+  kind: LandstripConfigKind,
+): ConfigObject {
   const root = parseJsonDocument(content, 'Edited agent');
-  const parent = valueAtPath(root, ['landstrip']);
-  const container = valueAtPath(root, ['landstrip', 'agent']);
+  const parentPath = kind === 'settings' ? ['landstrip'] : [];
+  const parent = valueAtPath(root, parentPath);
+  const container = valueAtPath(root, [...parentPath, 'agent']);
+  const expectedRootKey = kind === 'settings' ? 'landstrip' : 'agent';
   if (
     Object.keys(root).length !== 1 ||
-    root.landstrip === undefined ||
+    root[expectedRootKey] === undefined ||
     !isRecord(parent) ||
     Object.keys(parent).length !== 1 ||
     parent.agent === undefined ||
@@ -81,8 +97,14 @@ function ensureFinalNewline(content: string): string {
   return content.endsWith('\n') ? content : `${content}\n`;
 }
 
-async function writeJsonNode(path: string, nodePath: JsonPath, value: ConfigObject): Promise<void> {
+async function writeJsonNode(
+  path: string,
+  nodePath: JsonPath,
+  value: ConfigObject,
+  validate?: () => void,
+): Promise<void> {
   await withFileMutationQueue(path, async () => {
+    validate?.();
     const content = existsSync(path) ? readFileSync(path, 'utf8') : '{}\n';
     parseJsonDocument(content, path);
     const edited = applyEdits(content, modify(content, nodePath, value, JSON_FORMAT));
@@ -95,10 +117,13 @@ async function deleteJsonNode(
   path: string,
   nodePath: JsonPath,
   containerPaths: readonly JsonPath[],
+  validate?: () => void,
+  removeEmptyFile = false,
 ): Promise<boolean> {
   if (!existsSync(path)) return false;
   let deleted = false;
   await withFileMutationQueue(path, async () => {
+    validate?.();
     let content = readFileSync(path, 'utf8');
     const root = parseJsonDocument(content, path);
     if (valueAtPath(root, nodePath) === undefined) return;
@@ -110,16 +135,25 @@ async function deleteJsonNode(
         content = applyEdits(content, modify(content, containerPath, undefined, JSON_FORMAT));
       }
     }
+    if (removeEmptyFile && Object.keys(parseJsonDocument(content, path)).length === 0) {
+      unlinkSync(path);
+      deleted = true;
+      return;
+    }
     writeFileSync(path, ensureFinalNewline(content), { mode: 0o600 });
     deleted = true;
   });
   return deleted;
 }
 
-function readAgentNode(path: string, name: string): ConfigObject | undefined {
+function readAgentNode(
+  path: string,
+  kind: LandstripConfigKind,
+  name: string,
+): ConfigObject | undefined {
   if (!existsSync(path)) return undefined;
   const root = parseJsonDocument(readFileSync(path, 'utf8'), path);
-  const value = valueAtPath(root, agentJsonPath(name));
+  const value = valueAtPath(root, agentJsonPath(kind, name));
   return isRecord(value) ? { ...value } : undefined;
 }
 
@@ -178,12 +212,24 @@ function projectMarkdownPath(cwd: string, agentDir: string, agent: AgentDefiniti
   throw new Error(`Agent ${agent.name} has no Markdown source`);
 }
 
-function projectSettingsPath(cwd: string, agentDir: string): string {
-  return getPiConfigPaths(cwd, 'settings.json', agentDir).projectPath;
+function projectConfigTarget(cwd: string, agentDir: string): LandstripConfigTarget {
+  return getLandstripConfigTarget(cwd, 'project', agentDir);
 }
 
-function projectSettingsHasAgent(cwd: string, name: string, agentDir: string): boolean {
-  return readAgentNode(projectSettingsPath(cwd, agentDir), name) !== undefined;
+function assertProjectConfigTarget(
+  cwd: string,
+  agentDir: string,
+  target: LandstripConfigTarget,
+): void {
+  const current = projectConfigTarget(cwd, agentDir);
+  if (current.path !== target.path || current.kind !== target.kind) {
+    throw new Error('Landstrip project configuration source changed while updating it');
+  }
+}
+
+function projectConfigHasAgent(cwd: string, name: string, agentDir: string): boolean {
+  const target = projectConfigTarget(cwd, agentDir);
+  return readAgentNode(target.path, target.kind, name) !== undefined;
 }
 
 export function canDeleteProjectAgent(
@@ -192,7 +238,7 @@ export function canDeleteProjectAgent(
   agentDir = getAgentDir(),
 ): boolean {
   try {
-    if (projectSettingsHasAgent(cwd, agent.name, agentDir)) return true;
+    if (projectConfigHasAgent(cwd, agent.name, agentDir)) return true;
   } catch {
     return false;
   }
@@ -205,11 +251,16 @@ export async function deleteProjectAgent(
   agent: AgentDefinition,
   agentDir = getAgentDir(),
 ): Promise<boolean> {
-  const settingsPath = projectSettingsPath(cwd, agentDir);
-  const deletedOverride = await deleteJsonNode(settingsPath, agentJsonPath(agent.name), [
-    ['landstrip', 'agent'],
-    ['landstrip'],
-  ]);
+  const target = projectConfigTarget(cwd, agentDir);
+  const containers: readonly JsonPath[] =
+    target.kind === 'settings' ? [['landstrip', 'agent'], ['landstrip']] : [['agent']];
+  const deletedOverride = await deleteJsonNode(
+    target.path,
+    agentJsonPath(target.kind, agent.name),
+    containers,
+    () => assertProjectConfigTarget(cwd, agentDir, target),
+    target.kind === 'dedicated',
+  );
 
   const origin = agent.origin;
   if (origin?.source !== 'local' || !origin.path || origin.kind !== 'pi-markdown') {
@@ -242,20 +293,24 @@ export function prepareProjectAgentEditor(
   }
   const sourcePath = origin?.path;
   const sourceRaw =
-    origin?.kind === 'settings' && sourcePath ? readAgentNode(sourcePath, agent.name) : undefined;
+    origin?.kind === 'config' && sourcePath
+      ? readAgentNode(sourcePath, configKindForPath(sourcePath), agent.name)
+      : undefined;
   const raw = relocateGlobalPrompt(
     sourceRaw ? sourceRaw : agent.raw ? { ...agent.raw } : normalizedAgentRaw(agent),
     agent,
   );
-  const target = projectSettingsPath(cwd, agentDir);
+  const target = projectConfigTarget(cwd, agentDir);
 
   return {
     title: `Edit @${agent.name}`,
-    content: editorSnippet(agent.name, raw),
+    content: editorSnippet(agent.name, raw, target.kind),
     async save(content) {
-      const edited = parseEditorSnippet(content, agent.name);
+      const edited = parseEditorSnippet(content, agent.name, target.kind);
       validateAgentRaw(agent.name, edited);
-      await writeJsonNode(target, agentJsonPath(agent.name), edited);
+      await writeJsonNode(target.path, agentJsonPath(target.kind, agent.name), edited, () =>
+        assertProjectConfigTarget(cwd, agentDir, target),
+      );
     },
   };
 }

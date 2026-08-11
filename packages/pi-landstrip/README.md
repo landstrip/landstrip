@@ -31,10 +31,12 @@ Landstrip. Subagents run as separate Pi RPC processes and are sandboxed unless
 the sandbox is explicitly disabled.
 
 The root Pi process is trusted. Pi filesystem tools and plugin callbacks run
-outside the OS sandbox. Agent permissions still control tool dispatch, but they
-are not an OS isolation boundary. On Linux and macOS, primary Bash reads therefore
-use the same host view by default; writes remain sandboxed. Subagent processes
-retain the configured read and write policy.
+outside the OS sandbox. By default, agent permissions alone control filesystem
+tool dispatch. Set `toolFilesystemPolicy` to `"sandbox"` to preflight primary
+`read`, `write`, `edit`, and `apply_patch` calls against the sandbox filesystem
+rules. This path check is not an OS isolation boundary. On Linux and macOS,
+primary Bash reads use the same host view by default; writes remain sandboxed.
+Subagent processes retain the configured read and write policy.
 
 The default [sandbox policy](./sandbox.json) limits writes to the project and
 restricts worker reads within the user's home to the project and a few bootstrap
@@ -74,13 +76,16 @@ read allowlist.
 
 ### Permission layers
 
-| Layer            | Checked            | Controls                       |
-| ---------------- | ------------------ | ------------------------------ |
-| Agent permission | Before a tool runs | Which tools the agent may call |
-| Sandbox policy   | During a command   | Filesystem and network access  |
+| Layer                  | Checked            | Controls                              |
+| ---------------------- | ------------------ | ------------------------------------- |
+| Agent permission       | Before a tool runs | Which tools the agent may call        |
+| Filesystem tool policy | Before a file tool | Paths primary file tools may access   |
+| OS sandbox policy      | During a process   | Process filesystem and network access |
 
-An agent approval allows tool dispatch; the sandbox still applies to the
-resulting process.
+When a file-tool path requires sandbox approval and agent permission also asks,
+Pi composes both decisions into one prompt. The existing once, session, project,
+and global sandbox approval scopes apply. Subagents continue to rely on OS
+sandbox enforcement.
 
 ## Agents
 
@@ -116,133 +121,41 @@ that access, so install only trusted plugins and use suitable credentials.
 
 ## Configuration
 
-Agent settings are read from `~/.pi/agent/settings.json` and, for trusted
-projects, `.pi/settings.json`. Sandbox settings are read from
-`~/.pi/agent/sandbox.json` and `.pi/sandbox.json`.
+Landstrip settings are read from `~/.pi/agent/landstrip.json` and, for trusted
+projects, `.pi/landstrip.json`. The same object may instead be placed under
+`landstrip` in the matching `settings.json`. Use only one form at each scope.
+Sandbox settings remain in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`.
 
 ```json
 {
-  "landstrip": {
-    "maxSubagents": 2,
-    "agent": {
-      "review": {
-        "description": "Review code without modifying it",
-        "mode": "subagent",
-        "prompt": "Report concrete findings.",
-        "permission": {
-          "edit": "deny",
-          "bash": "ask"
-        }
+  "maxSubagents": 2,
+  "agent": {
+    "review": {
+      "description": "Review code without modifying it",
+      "mode": "subagent",
+      "prompt": "Report concrete findings.",
+      "permission": {
+        "edit": "deny",
+        "bash": "ask"
       }
-    },
-    "permission": {
-      "task": {
-        "*": "deny",
-        "review": "allow"
-      }
+    }
+  },
+  "permission": {
+    "task": {
+      "*": "deny",
+      "review": "allow"
     }
   }
 }
 ```
 
-`landstrip.maxSubagents` is the concurrency limit, from 0 to 16. Zero disables
+`maxSubagents` is the concurrency limit, from 0 to 16. Zero disables
 the `task` tool. Agent definitions support `mode`, `prompt`, `model`, `variant`,
 `steps`, `color`, `hidden`, `disable`, `options`, and permission rules. Modes
 are `primary`, `subagent`, or `all`.
 
 Pi Markdown agents are loaded from `~/.pi/agent/agents/` and `.pi/agents/`.
-`landstrip.agent` settings override Markdown agents with the same name.
+Configured `agent` entries override Markdown agents with the same name.
 Project definitions override global definitions.
 
 For example, save this advisor subagent as `~/.pi/agent/agents/advisor.md`:
-
-```markdown
----
-description: Escalate to a stronger reviewer for a plan, correction, or stop signal
-mode: subagent
-hidden: false
-variant: high
-permission:
-  '*': deny
-  read: allow
-  grep: allow
-  glob: allow
-  list: allow
----
-
-You are an advisor model in an advisor-strategy pattern. An executor model is running a task end-to-end — calling tools, reading results, iterating toward a solution. When the executor hits a decision it cannot reasonably solve alone, it consults you for guidance via the `task` tool with `subagent_type: "advisor"`.
-
-The executor should put the full situation in the task prompt: the goal, what it has tried, tool results that matter, current hypothesis, and the decision it needs. You may use read-only tools to verify claims against the repository when file paths are given; do not modify anything.
-
-Return ONE of:
-
-- a **plan** (concrete next steps the executor should take),
-- a **correction** (the executor is going down a wrong path — redirect it),
-- a **stop signal** (the executor should halt and escalate to the user).
-
-Be concise, directive, and grounded in the shared context. Name files, functions, and line numbers where possible. No preamble, no apologies, no meta-commentary about being an advisor — just the guidance the executor needs.
-
-Give advice serious weight for the executor: prefer primary-source evidence and root causes over temporary fixes. If requirements are ambiguous or contradictory, stop and say what the user must decide.
-```
-
-See the main [Landstrip documentation](https://github.com/landstrip/landstrip#readme)
-for `sandbox.json` fields and platform policy semantics.
-
-### Platform notes
-
-- **Linux:** blocked operations can be approved while the command is running.
-- **macOS:** a worker's Seatbelt policy is fixed at startup; restart the task to
-  apply new filesystem access.
-- **Windows:** the bundled policy uses standard AppContainer because Pi's Git
-  Bash cannot start in LPAC. Standard mode is weaker than LPAC.
-  `windows.allowLoopback` enables the domain proxy but exposes every local
-  loopback service. Restricted-user mode avoids that broad exemption.
-
-Install restricted-user mode from the intended Windows host account, then
-restart Pi:
-
-```powershell
-npx @landstrip/landstrip windows install
-npx @landstrip/landstrip windows status
-```
-
-Remove it with `npx @landstrip/landstrip windows uninstall`.
-
-## Plugin API
-
-Other Pi extensions can discover the v2 runtime with `useLandstrip` from
-`pi-landstrip/api`. The runtime provides:
-
-- `getContext()` for sandbox and task context.
-- `registerShellProvider()` for replacing POSIX shell invocation preparation.
-- `prepareProcess()` for one policy-aware process launch.
-- `registerWorkerExtension()` for trusted worker extensions.
-- `on()` for sandbox and subagent lifecycle events.
-
-A shell provider receives the command, working directory, composed command
-environment, and abort signal. It returns an executable, arguments, minimal
-launcher environment, required read paths, and optional cleanup. Landstrip adds
-platform variables required by its launcher, such as Windows `ProgramData`.
-Providers should pass the composed environment through a private temporary file,
-include that file in `readPaths`, and remove it in `dispose()`; do not copy secrets
-into `launcherEnv`. Landstrip remains responsible for starting the process, applying
-policy, proxying network access, handling traps, and prompting for additional
-access. Only one external provider can be active; disposing it restores the
-built-in POSIX provider.
-
-Use `provideLandstripShell()` to register a provider independently of extension
-load order. Shell providers and worker extensions are trusted code. Workers also
-receive an informational `LANDSTRIP_CONTEXT` environment value; it is not proof
-of authorization.
-
-## Limits
-
-At most `maxSubagents` tasks run concurrently. Nested task depth is capped at
-3, and a nested `task` tool is available only when the parent agent has explicit
-permission. Session switching and shutdown stop live workers.
-
-## License
-
-`pi-landstrip` is licensed under `Apache-2.0`. See [LICENSE](LICENSE). The
-bundled `@landstrip/landstrip` package is licensed separately as
-`Apache-2.0 AND LGPL-2.1-or-later`.
