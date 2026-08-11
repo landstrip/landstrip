@@ -195,7 +195,10 @@ test('external landstrip binary is refused', async () => {
         },
       };
 
-      await hooks['tool.execute.before']({ callID: 'external-binary-call', tool: 'bash' }, output);
+      await assert.rejects(
+        hooks['tool.execute.before']({ callID: 'external-binary-call', tool: 'bash' }, output),
+        /Broken @landstrip\/landstrip installation: Refusing to use landstrip binary/,
+      );
 
       assert.equal(output.args.command, 'git status --short');
       assert.match(
@@ -204,6 +207,54 @@ test('external landstrip binary is refused', async () => {
       );
     },
     { externalBinary: true },
+  );
+});
+
+test('headless filesystem denials do not become session allowances', async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      network: { allowedDomains: ['*'], deniedDomains: [] },
+    },
+    async ({ hooks, messages, tempDir }) => {
+      const blockedPath = `${tempDir}-blocked`;
+      const shared = await import(pathToFileURL(join(tempDir, 'shared.js')).href);
+      const leakedScope = shared.sessionScopeFor(blockedPath, tempDir);
+      const firstInput = { callID: 'headless-first', tool: 'bash' };
+      const firstOutput = { args: { command: `cat ${blockedPath}`, description: 'read blocked' } };
+
+      await hooks['tool.execute.before'](firstInput, firstOutput);
+      await hooks['tool.execute.after'](firstInput, {
+        title: '',
+        output:
+          JSON.stringify({
+            kind: 'filesystem',
+            operation: 'read',
+            path: blockedPath,
+            state: 'query',
+            query_id: 'headless-query',
+          }) + `\ncat: ${blockedPath}: Permission denied`,
+        metadata: {},
+      });
+
+      assert.match(
+        messages.join('\n'),
+        /No live TUI presenter was available, so access remains denied/,
+      );
+
+      const retryInput = { callID: 'headless-retry', tool: 'bash' };
+      const retryOutput = { args: { command: `cat ${blockedPath}`, description: 'retry blocked' } };
+      try {
+        await hooks['tool.execute.before'](retryInput, retryOutput);
+        const policyMatch = retryOutput.args.command.match(/\s'-p'\s+'([^']+)'/);
+        assert.ok(policyMatch, 'wrapped command includes a policy path');
+        const policy = JSON.parse(await readFile(policyMatch[1], 'utf8'));
+        assert.ok(!policy.filesystem.allowRead.includes(leakedScope));
+      } finally {
+        await hooks['tool.execute.after'](retryInput, { title: '', output: '', metadata: {} });
+      }
+    },
   );
 });
 
@@ -630,7 +681,7 @@ test('query-response: bash wrapping injects fd 3 and stays idempotent', linuxOnl
     },
     async ({ hooks, tempDir }) => {
       await withQueryServer(tempDir, async ({ port }) => {
-        const input = { callID: 'query-a', tool: 'bash' };
+        const input = { callID: 'query-a', sessionID: 'session-query-a', tool: 'bash' };
         const output = { args: { command: 'git status --short', description: 'status' } };
         try {
           await hooks['tool.execute.before'](input, output);
@@ -640,6 +691,8 @@ test('query-response: bash wrapping injects fd 3 and stays idempotent', linuxOnl
           // endpoint so held filesystem operations can be approved interactively.
           assert.match(wrapped, new RegExp(`/dev/tcp/127\\.0\\.0\\.1/${port}\\b`));
           assert.match(wrapped, /'--trap-fd' '3'/);
+          assert.match(wrapped, /opencode-landstrip-session/);
+          assert.match(wrapped, /session-query-a/);
           assert.equal(wrapped.includes(' || '), false, 'has no command retry branch');
           assert.equal(wrapped.match(/'--trap-fd'/g)?.length, 1);
           assert.equal(wrapped.match(/'-p'/g)?.length, 1);
@@ -651,14 +704,51 @@ test('query-response: bash wrapping injects fd 3 and stays idempotent', linuxOnl
           assert.equal(output.args.command, wrapped);
           assert.equal(wrapped.match(/\/dev\/tcp/g)?.length, 1);
 
-          // A fresh call receiving the wrapped command (policy dir still present)
-          // is recognized as already-generated and left intact.
+          // A fresh call rewraps the original command with its own session identity.
+          const reuseInput = {
+            callID: 'query-b',
+            sessionID: 'session-query-b',
+            tool: 'bash',
+          };
           const reuse = {
             args: { command: wrapped, description: 'status again' },
           };
-          await hooks['tool.execute.before']({ callID: 'query-b', tool: 'bash' }, reuse);
-          assert.equal(reuse.args.command, wrapped);
-          assert.equal(reuse.args.description, 'status again (landstrip)');
+          try {
+            await hooks['tool.execute.before'](reuseInput, reuse);
+            assert.notEqual(reuse.args.command, wrapped);
+            assert.match(reuse.args.command, /session-query-b/);
+            assert.doesNotMatch(reuse.args.command, /session-query-a/);
+            assert.equal(reuse.args.command.match(/\/dev\/tcp/g)?.length, 1);
+            assert.equal(reuse.args.description, 'status again (landstrip)');
+          } finally {
+            await hooks['tool.execute.after'](reuseInput, { title: '', output: '', metadata: {} });
+          }
+        } finally {
+          await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+        }
+      });
+    },
+  );
+});
+
+test('query-response: missing session identity ignores the TUI endpoint', linuxOnly, async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      network: { allowedDomains: ['*'], deniedDomains: [] },
+    },
+    async ({ hooks, tempDir }) => {
+      await withQueryServer(tempDir, async ({ port }) => {
+        const input = { callID: 'query-headless', tool: 'bash' };
+        const output = { args: { command: 'git status --short', description: 'status' } };
+        try {
+          await hooks['tool.execute.before'](input, output);
+          assert.doesNotMatch(
+            output.args.command,
+            new RegExp(`/dev/tcp/127\\.0\\.0\\.1/${port}\\b`),
+          );
+          assert.doesNotMatch(output.args.command, /opencode-landstrip-session/);
         } finally {
           await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
         }
@@ -685,7 +775,11 @@ test(
         shared.writeDiscoveryPort(tempDir, stalePort);
         await new Promise((res) => staleServer.close(res));
 
-        const input = { callID: 'stale-discovery', tool: 'bash' };
+        const input = {
+          callID: 'stale-discovery',
+          sessionID: 'session-stale-discovery',
+          tool: 'bash',
+        };
         const output = { args: { command: 'git status --short', description: 'status' } };
         try {
           await hooks['tool.execute.before'](input, output);
@@ -714,12 +808,20 @@ test('query-response: a failing command executes only once', linuxOnly, async ()
         await hooks.config({ shell: '/bin/sh' });
         const counter = join(tempDir, 'attempts');
         const command = `printf 'attempt\\n' >> ${JSON.stringify(counter)}; exit 17`;
-        const input = { callID: 'single-execution', tool: 'bash' };
+        const input = {
+          callID: 'single-execution',
+          sessionID: 'session-single-execution',
+          tool: 'bash',
+        };
         const output = { args: { command, description: 'write once before failure' } };
 
         try {
           await hooks['tool.execute.before'](input, output);
-          const setup = output.args.command.match(/^bash -c '([^']+)' bash /)?.[1];
+          const { stdout: setup } = await execFileAsync(
+            '/bin/bash',
+            ['-c', 'eval "set -- $1"; printf %s "$3"', 'bash', output.args.command],
+            { cwd: tempDir },
+          );
           assert.ok(setup, 'uses a single fd-setup wrapper');
           const offlineSetup = setup.replace(/\/dev\/tcp\/127\.0\.0\.1\/\d+/, '/dev/null');
           await assert.rejects(
@@ -746,14 +848,14 @@ test('query-response: recovery re-extracts the original command', linuxOnly, asy
     },
     async ({ hooks, tempDir }) => {
       await withQueryServer(tempDir, async () => {
-        const inputA = { callID: 'recover-a', tool: 'bash' };
+        const inputA = { callID: 'recover-a', sessionID: 'session-recover', tool: 'bash' };
         const outputA = { args: { command: 'git status --short', description: 'status' } };
         await hooks['tool.execute.before'](inputA, outputA);
         const wrapped = outputA.args.command;
         // Drop the policy dir so the next pass must re-extract and re-wrap.
         await hooks['tool.execute.after'](inputA, { title: '', output: '', metadata: {} });
 
-        const inputB = { callID: 'recover-b', tool: 'bash' };
+        const inputB = { callID: 'recover-b', sessionID: 'session-recover', tool: 'bash' };
         const outputB = { args: { command: wrapped, description: 'status' } };
         try {
           await hooks['tool.execute.before'](inputB, outputB);
@@ -792,72 +894,64 @@ function readLine(socket) {
   });
 }
 
-test(
-  'query-response: startTrapServer answers filesystem and network queries',
-  linuxOnly,
-  async () => {
-    await withPlugin(
-      {
-        enabled: true,
-        filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
-        network: { allowedDomains: ['*'], deniedDomains: [] },
-      },
-      async ({ hooks }) => {
-        const input = { callID: 'trap-server', tool: 'bash' };
-        const output = { args: { command: 'git status --short', description: 'status' } };
+test('query-response: headless trap handling fails closed without hanging', linuxOnly, async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      network: { allowedDomains: ['*'], deniedDomains: [] },
+    },
+    async ({ hooks }) => {
+      const input = { callID: 'trap-server', tool: 'bash' };
+      const output = { args: { command: 'git status --short', description: 'status' } };
+      try {
+        await hooks['tool.execute.before'](input, output);
+        const portMatch = output.args.command.match(/\/dev\/tcp\/127\.0\.0\.1\/(\d+)\b/);
+        assert.ok(portMatch, 'wrapped command carries the trap-server port');
+        const port = Number(portMatch[1]);
+
+        const socket = connect(port, '127.0.0.1');
+        await new Promise((res, rej) => {
+          socket.once('connect', res);
+          socket.once('error', rej);
+        });
         try {
-          await hooks['tool.execute.before'](input, output);
-          const portMatch = output.args.command.match(/\/dev\/tcp\/127\.0\.0\.1\/(\d+)\b/);
-          assert.ok(portMatch, 'wrapped command carries the trap-server port');
-          const port = Number(portMatch[1]);
-
-          const socket = connect(port, '127.0.0.1');
-          await new Promise((res, rej) => {
-            socket.once('connect', res);
-            socket.once('error', rej);
-          });
-          try {
-            // A path outside allowRead/allowWrite is remembered for subsequent
-            // commands but denied now. The query_id must round-trip as the same
-            // string, or landstrip's deserializer would reject the answer and
-            // leave the syscall suspended.
-            socket.write(
-              JSON.stringify({
-                kind: 'filesystem',
-                operation: 'read',
-                path: '/etc/hostname',
-                state: 'query',
-                query_id: '42',
-              }) + '\n',
-            );
-            assert.deepEqual(JSON.parse(await readLine(socket)), {
+          // A path outside allowRead/allowWrite is denied. The query_id must
+          // round-trip unchanged so landstrip can release the held syscall.
+          socket.write(
+            JSON.stringify({
+              kind: 'filesystem',
+              operation: 'read',
+              path: '/etc/hostname',
+              state: 'query',
               query_id: '42',
-              action: 'deny',
-            });
+            }) + '\n',
+          );
+          assert.deepEqual(JSON.parse(await readLine(socket)), {
+            query_id: '42',
+            action: 'deny',
+          });
 
-            // Network connect/bind queries were previously unhandled entirely
-            // (no response sent at all, so the syscall hung forever) — this is
-            // the regression guard for that hang.
-            socket.write(
-              JSON.stringify({
-                kind: 'network',
-                operation: 'connect',
-                target: '93.184.216.34:443',
-                state: 'query',
-                query_id: '43',
-              }) + '\n',
-            );
-            assert.deepEqual(JSON.parse(await readLine(socket)), {
+          // Network queries are denied rather than left suspended.
+          socket.write(
+            JSON.stringify({
+              kind: 'network',
+              operation: 'connect',
+              target: '93.184.216.34:443',
+              state: 'query',
               query_id: '43',
-              action: 'allow',
-            });
-          } finally {
-            socket.destroy();
-          }
+            }) + '\n',
+          );
+          assert.deepEqual(JSON.parse(await readLine(socket)), {
+            query_id: '43',
+            action: 'deny',
+          });
         } finally {
-          await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+          socket.destroy();
         }
-      },
-    );
-  },
-);
+      } finally {
+        await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+      }
+    },
+  );
+});

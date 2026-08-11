@@ -185,25 +185,59 @@ export class AsyncQueue {
   }
 }
 
+export function combineAbortSignals(...sources: Array<AbortSignal | undefined>): {
+  signal: AbortSignal;
+  dispose: () => void;
+} {
+  const signals = sources.filter((source): source is AbortSignal => source !== undefined);
+  const only = signals[0];
+  if (signals.length === 1 && only) return { signal: only, dispose: () => undefined };
+
+  const controller = new AbortController();
+  const abort = (): void => controller.abort();
+  for (const signal of signals) signal.addEventListener('abort', abort, { once: true });
+  if (signals.some((signal) => signal.aborted)) controller.abort();
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const signal of signals) signal.removeEventListener('abort', abort);
+    },
+  };
+}
+
 export class PermissionPromptCoordinator {
   private readonly queue = new AsyncQueue();
+  private resetController = new AbortController();
 
   async resolve<T>(
     current: () => T | undefined,
-    request: () => Promise<T>,
+    request: (signal: AbortSignal) => Promise<T>,
     signal?: AbortSignal,
   ): Promise<T> {
     const immediate = current();
     if (immediate !== undefined) return immediate;
 
-    const release = await this.queue.acquire(signal, 'Permission request cancelled');
+    const combined = combineAbortSignals(signal, this.resetController.signal);
+    let release: (() => void) | undefined;
     try {
+      release = await this.queue.acquire(combined.signal, 'Permission request cancelled');
       const resolved = current();
       if (resolved !== undefined) return resolved;
-      if (signal?.aborted) throw new Error('Permission request cancelled');
-      return await request();
+      if (combined.signal.aborted) throw new Error('Permission request cancelled');
+      const result = await request(combined.signal);
+      if (combined.signal.aborted) throw new Error('Permission request cancelled');
+      return result;
     } finally {
-      release();
+      release?.();
+      combined.dispose();
     }
+  }
+
+  reset(): void {
+    const controller = this.resetController;
+    this.resetController = new AbortController();
+    this.queue.reset();
+    controller.abort();
   }
 }

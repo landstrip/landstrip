@@ -78,6 +78,110 @@ test('path scopes use platform-native containment semantics', async () => {
   }
 });
 
+test('trap session handshake rejects missing or malformed identities', async () => {
+  const { mod, cleanup } = await loadShared();
+  try {
+    const line = mod.trapSessionHelloLine('  session-child  ');
+    assert.deepEqual(mod.decodeTrapSessionHello(line), {
+      kind: 'opencode-landstrip-session',
+      sessionID: 'session-child',
+    });
+    assert.equal(mod.decodeTrapSessionHello('{}'), null);
+    assert.equal(mod.decodeTrapSessionHello('{not-json'), null);
+    assert.throws(() => mod.trapSessionHelloLine('  '), /must not be empty/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('session allowances do not leak between root sessions', async () => {
+  const { mod, cleanup } = await loadShared();
+  try {
+    const sessions = new Map();
+    const first = mod.sessionAllowancesFor(sessions, 'root-a');
+    const second = mod.sessionAllowancesFor(sessions, 'root-b');
+    first.readPaths.add('/private/a');
+    first.targets.add('127.0.0.1:8080');
+
+    assert.strictEqual(mod.sessionAllowancesFor(sessions, 'root-a'), first);
+    assert.notStrictEqual(first, second);
+    assert.equal(second.readPaths.has('/private/a'), false);
+    assert.equal(second.targets.has('127.0.0.1:8080'), false);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('subagent queries route to their root session', async () => {
+  const { mod, cleanup } = await loadShared();
+  try {
+    const sessions = new Map([
+      ['root', {}],
+      ['child', { parentID: 'root' }],
+      ['grandchild', { parentID: 'child' }],
+      ['orphan', { parentID: 'missing' }],
+      ['cycle-a', { parentID: 'cycle-b' }],
+      ['cycle-b', { parentID: 'cycle-a' }],
+    ]);
+    assert.equal(
+      mod.rootSessionIDFor('grandchild', (id) => sessions.get(id)),
+      'root',
+    );
+    assert.equal(
+      mod.rootSessionIDFor('missing', (id) => sessions.get(id)),
+      undefined,
+    );
+    assert.equal(
+      mod.rootSessionIDFor('orphan', (id) => sessions.get(id)),
+      undefined,
+    );
+    assert.equal(
+      mod.rootSessionIDFor('cycle-a', (id) => sessions.get(id)),
+      undefined,
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test('sandbox prompt scheduling preserves priority, route isolation, and FIFO', async () => {
+  const { mod, cleanup } = await loadShared();
+  try {
+    assert.equal(mod.shouldRenderSandboxPermission('root-a', 'root-a', false), true);
+    assert.equal(mod.shouldRenderSandboxPermission('root-a', 'root-b', false), false);
+    assert.equal(mod.shouldRenderSandboxPermission('root-a', 'root-a', true), false);
+
+    const queue = [
+      { id: 'a-1', sessionID: 'root-a' },
+      { id: 'b-1', sessionID: 'root-b' },
+      { id: 'a-2', sessionID: 'root-a' },
+    ];
+    assert.equal(
+      mod.nextSandboxPermissionIndex(queue, 'root-a', () => false),
+      0,
+    );
+    assert.equal(
+      mod.nextSandboxPermissionIndex(queue, 'root-b', () => false),
+      -1,
+    );
+    assert.equal(
+      mod.nextSandboxPermissionIndex(queue, 'root-a', () => true),
+      -1,
+    );
+    assert.equal(
+      mod.nextSandboxPermissionIndex(queue, 'root-a', () => false),
+      0,
+    );
+    queue.shift();
+    assert.equal(
+      mod.nextSandboxPermissionIndex(queue, 'root-b', () => false),
+      0,
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
 test('sandbox summary reports an unavailable landstrip binary', async () => {
   const { mod, cleanup } = await loadShared();
   try {

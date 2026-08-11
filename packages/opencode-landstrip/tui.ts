@@ -14,19 +14,25 @@ import type {
 import { RGBA } from '@opentui/core';
 import { useTerminalDimensions } from '@opentui/solid';
 import { Fragment, jsx, jsxs } from '@opentui/solid/jsx-runtime';
-import { createSignal, onCleanup } from 'solid-js';
+import { createSignal, onCleanup, onMount } from 'solid-js';
 
 import {
   controlResponseLine,
+  decodeTrapSessionHello,
   getConfigPaths,
   loadConfig,
   normalizeOptions,
+  nextSandboxPermissionIndex,
   parseLandstripTraps,
   removeDiscoveryFile,
   sessionAllows,
+  sessionAllowancesFor,
   sandboxSummary,
   sessionScopeFor,
+  rootSessionIDFor,
   setSandboxConfigEnabled,
+  shouldRenderSandboxPermission,
+  type SessionAllowances,
   updateForPermission,
   writeConfigFile,
   writeDiscoveryPort,
@@ -49,6 +55,7 @@ interface PermissionPromptProps<Value extends string> {
   options: readonly PromptOption<Value>[];
   onSelect: (value: Value) => void;
   onCancel: () => void;
+  onShow: () => void;
 }
 
 const promptBorderChars = {
@@ -74,6 +81,9 @@ interface FsQueryEntry {
   socket: NetSocket;
   queryId: string;
   operation: 'read' | 'write';
+  sessionID: string;
+  sourceSessionID: string;
+  directory: string;
   path: string;
 }
 
@@ -87,6 +97,9 @@ interface NetworkQueryEntry {
   socket: NetSocket;
   queryId: string;
   operation: string;
+  sessionID: string;
+  sourceSessionID: string;
+  directory: string;
   target: string;
 }
 
@@ -125,6 +138,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     const theme = api.theme.current;
     const dimensions = useTerminalDimensions();
     const [selected, setSelected] = createSignal(0);
+    onMount(props.onShow);
 
     function move(direction: number): void {
       setSelected((index) => (index + direction + props.options.length) % props.options.length);
@@ -273,28 +287,51 @@ const tui: TuiPlugin = async (api, options, meta) => {
   const resolved = new Set<string>();
   const queue: QueueEntry[] = [];
   const [activeEntry, setActiveEntry] = createSignal<QueueEntry>();
+  const [permissionRevision, setPermissionRevision] = createSignal(0);
   let activeId: string | undefined;
   let refreshSandboxStatus: (() => void) | undefined;
 
-  // Paths the user approved "for session": later queries for the same path are
-  // auto-allowed without a dialog. This lives only in the TUI process — the
-  // server regenerates the policy from on-disk config each run — so it affects
-  // only live socket decisions, not the static policy.
-  const sessionAllowedWritePaths = new Set<string>();
-  const sessionAllowedReadPaths = new Set<string>();
-
-  // Targets the user approved "for session": address:port, since the broker
-  // knows nothing more specific than that at connect/bind time.
-  const sessionAllowedTargets = new Set<string>();
+  const sessionAllowances = new Map<string, SessionAllowances>();
+  const notified = new Set<string>();
 
   // Filesystem and network queries still awaiting a response, so cleanup can
   // release held syscalls instead of letting the child hang.
   const liveQueries = new Set<FsQueryEntry | NetworkQueryEntry>();
 
+  function nativePermissionPending(entry: QueueEntry): boolean {
+    if (api.state.session.permission(entry.sessionID).length > 0) return true;
+    return (
+      entry.sourceSessionID !== entry.sessionID &&
+      api.state.session.permission(entry.sourceSessionID).length > 0
+    );
+  }
+
+  function currentRouteSessionID(): string | undefined {
+    const route = api.route.current;
+    if (route.name !== 'session' || !route.params) return undefined;
+    return typeof route.params.sessionID === 'string' ? route.params.sessionID : undefined;
+  }
+
   function pump(): void {
-    if (activeId !== undefined) return;
-    let next = queue.shift();
-    while (next && resolved.has(next.id)) next = queue.shift();
+    const routeSessionID = currentRouteSessionID();
+    if (!routeSessionID) return;
+
+    const active = activeEntry();
+    if (activeId !== undefined) {
+      if (active?.sessionID === routeSessionID) return;
+      if (active && !resolved.has(active.id)) queue.unshift(active);
+      activeId = undefined;
+      setActiveEntry(undefined);
+    }
+
+    for (let index = queue.length - 1; index >= 0; index -= 1) {
+      const entry = queue[index];
+      if (entry && resolved.has(entry.id)) queue.splice(index, 1);
+    }
+
+    const index = nextSandboxPermissionIndex(queue, routeSessionID, nativePermissionPending);
+    if (index === -1) return;
+    const [next] = queue.splice(index, 1);
     if (!next) return;
     if (next.kind === 'fs-query') showFsQuery(next);
     else showNetworkQuery(next);
@@ -310,6 +347,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
 
   function finishActive(id: string): void {
     resolved.add(id);
+    notified.delete(id);
     if (activeId === id) {
       activeId = undefined;
       setActiveEntry(undefined);
@@ -317,19 +355,39 @@ const tui: TuiPlugin = async (api, options, meta) => {
     queueMicrotask(pump);
   }
 
+  function notifyQuery(entry: QueueEntry): void {
+    if (notified.has(entry.id)) return;
+    notified.add(entry.id);
+    void api.attention
+      .notify({
+        title: `Sandbox ${entry.operation} blocked`,
+        message: entry.kind === 'fs-query' ? entry.path : entry.target,
+        sound: { name: 'permission' },
+        notification: true,
+      })
+      .catch(() => undefined);
+  }
+
   function renderSessionPrompt(props: TuiHostSlotMap['session_prompt']) {
     return jsx(Fragment, {
       get children() {
+        permissionRevision();
+        queueMicrotask(pump);
         const entry = activeEntry();
-        const directory =
-          api.state.session.get(props.session_id)?.directory ||
-          api.state.path.directory ||
-          process.cwd();
-        if (entry?.kind === 'fs-query') {
+        const hostPromptActive =
+          props.visible === false ||
+          Boolean(props.disabled) ||
+          Boolean(entry && nativePermissionPending(entry));
+        const showEntry = Boolean(
+          entry &&
+          shouldRenderSandboxPermission(entry.sessionID, props.session_id, hostPromptActive),
+        );
+
+        if (showEntry && entry?.kind === 'fs-query') {
           const verb = entry.operation === 'read' ? 'Read' : 'Write';
           return jsx(LandstripPermissionPrompt, {
             icon: '→',
-            title: `${verb} ${formatPath(entry.path, directory)}`,
+            title: `${verb} ${formatPath(entry.path, entry.directory)}`,
             options: [
               { label: 'Allow once', value: 'once' },
               { label: 'Allow for session', value: 'session' },
@@ -339,9 +397,10 @@ const tui: TuiPlugin = async (api, options, meta) => {
             ],
             onSelect: (choice: QueryChoice) => resolveFsQuery(entry, choice),
             onCancel: () => resolveFsQuery(entry, 'deny'),
+            onShow: () => notifyQuery(entry),
           });
         }
-        if (entry?.kind === 'net-query') {
+        if (showEntry && entry?.kind === 'net-query') {
           const verb = entry.operation
             ? entry.operation[0]?.toUpperCase() + entry.operation.slice(1)
             : 'Network';
@@ -355,6 +414,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
             ],
             onSelect: (choice: NetworkQueryChoice) => resolveNetworkQuery(entry, choice),
             onCancel: () => resolveNetworkQuery(entry, 'deny'),
+            onShow: () => notifyQuery(entry),
           });
         }
         return api.ui.Prompt({
@@ -380,18 +440,14 @@ const tui: TuiPlugin = async (api, options, meta) => {
     if (resolved.has(entry.id)) return;
     const action = choice === 'deny' ? 'deny' : 'allow';
     const verb = entry.operation === 'read' ? 'Read' : 'Write';
-    const directory = api.state.path.directory || process.cwd();
+    const directory = entry.directory;
     const scope = sessionScopeFor(entry.path, directory);
-    const sessionPaths =
-      entry.operation === 'read' ? sessionAllowedReadPaths : sessionAllowedWritePaths;
+    const allowances = sessionAllowancesFor(sessionAllowances, entry.sessionID);
+    const sessionPaths = entry.operation === 'read' ? allowances.readPaths : allowances.writePaths;
 
+    let responseAction: 'allow' | 'deny' = action;
     try {
       if (action === 'allow') {
-        // Breadth-first: seed the session set with the broadest reasonable
-        // ancestor so the still-running command stops prompting for sibling
-        // files under the same tree. 'once' intentionally stays exact-path.
-        if (choice !== 'once') sessionPaths.add(scope);
-
         if (choice === 'project' || choice === 'global') {
           const { globalPath, projectPath } = getConfigPaths(directory);
           const update = updateForPermission({
@@ -400,20 +456,22 @@ const tui: TuiPlugin = async (api, options, meta) => {
           });
           if (update) writeConfigFile(choice === 'project' ? projectPath : globalPath, update);
         }
+        if (choice !== 'once') sessionPaths.add(scope);
       }
+    } catch {
+      responseAction = 'deny';
+    }
 
-      respondQuery(entry.socket, entry.queryId, action);
+    try {
+      respondQuery(entry.socket, entry.queryId, responseAction);
       api.ui.toast({
         title: 'Sandbox',
         message:
-          action === 'deny'
+          responseAction === 'deny'
             ? `${verb} denied: ${entry.path}`
             : `${verb} allowed (${choice}) under ${scope}`,
-        variant: action === 'deny' ? 'warning' : 'success',
+        variant: responseAction === 'deny' ? 'warning' : 'success',
       });
-    } catch {
-      // Persisting failed — still release the held syscall by denying it.
-      respondQuery(entry.socket, entry.queryId, 'deny');
     } finally {
       liveQueries.delete(entry);
       finishActive(entry.id);
@@ -423,20 +481,15 @@ const tui: TuiPlugin = async (api, options, meta) => {
   function showFsQuery(entry: FsQueryEntry): void {
     activeId = entry.id;
     setActiveEntry(entry);
-
-    void api.attention.notify({
-      title: `Sandbox ${entry.operation} blocked`,
-      message: entry.path,
-      sound: { name: 'permission' },
-      notification: true,
-    });
   }
   function resolveNetworkQuery(entry: NetworkQueryEntry, choice: NetworkQueryChoice): void {
     if (resolved.has(entry.id)) return;
     const action = choice === 'deny' ? 'deny' : 'allow';
 
     try {
-      if (action === 'allow' && choice === 'session') sessionAllowedTargets.add(entry.target);
+      if (action === 'allow' && choice === 'session') {
+        sessionAllowancesFor(sessionAllowances, entry.sessionID).targets.add(entry.target);
+      }
 
       respondQuery(entry.socket, entry.queryId, action);
       api.ui.toast({
@@ -456,13 +509,6 @@ const tui: TuiPlugin = async (api, options, meta) => {
   function showNetworkQuery(entry: NetworkQueryEntry): void {
     activeId = entry.id;
     setActiveEntry(entry);
-
-    void api.attention.notify({
-      title: `Sandbox ${entry.operation} blocked`,
-      message: entry.target,
-      sound: { name: 'permission' },
-      notification: true,
-    });
   }
 
   // Query-response socket server (Linux-only — landstrip's socket protocol lives
@@ -481,6 +527,9 @@ const tui: TuiPlugin = async (api, options, meta) => {
       const socketId = ++socketSeq;
       const seen = new Set<string>();
       let buffer = '';
+      let sourceSessionID: string | undefined;
+      let routeSessionID: string | undefined;
+      let sessionDirectory: string | undefined;
 
       socket.on('data', (chunk: string | Buffer) => {
         buffer += chunk.toString();
@@ -494,21 +543,37 @@ const tui: TuiPlugin = async (api, options, meta) => {
           const line = buffer.slice(0, newline);
           buffer = buffer.slice(newline + 1);
 
+          if (!sourceSessionID || !routeSessionID || !sessionDirectory) {
+            const hello = decodeTrapSessionHello(line);
+            const sourceSession = hello ? api.state.session.get(hello.sessionID) : undefined;
+            const rootSession = hello
+              ? rootSessionIDFor(hello.sessionID, (sessionID) => api.state.session.get(sessionID))
+              : undefined;
+            if (!hello || !sourceSession || !rootSession) {
+              socket.destroy();
+              return;
+            }
+            sourceSessionID = hello.sessionID;
+            routeSessionID = rootSession;
+            sessionDirectory = sourceSession.directory || baseDirectory;
+            continue;
+          }
+
+          const allowances = sessionAllowancesFor(sessionAllowances, routeSessionID);
           for (const trap of parseLandstripTraps(line)) {
-            const directory = api.state.path.directory || process.cwd();
             if (trap.kind !== 'filesystem' && trap.kind !== 'network') continue;
             if (trap.state !== 'query') continue;
             if (seen.has(trap.query_id)) continue;
             seen.add(trap.query_id);
 
-            if (!loadConfig(directory, optionOverrides).enabled) {
+            if (!loadConfig(sessionDirectory, optionOverrides).enabled) {
               respondQuery(socket, trap.query_id, 'allow');
               continue;
             }
 
             if (trap.kind === 'filesystem') {
               const sessionPaths =
-                trap.operation === 'read' ? sessionAllowedReadPaths : sessionAllowedWritePaths;
+                trap.operation === 'read' ? allowances.readPaths : allowances.writePaths;
               if (sessionAllows(sessionPaths, trap.path)) {
                 respondQuery(socket, trap.query_id, 'allow');
                 continue;
@@ -521,11 +586,14 @@ const tui: TuiPlugin = async (api, options, meta) => {
                 queryId: trap.query_id,
                 operation: trap.operation,
                 path: trap.path,
+                sessionID: routeSessionID,
+                sourceSessionID,
+                directory: sessionDirectory,
               };
               liveQueries.add(entry);
               enqueueEntry(entry);
             } else {
-              if (sessionAllowedTargets.has(trap.target)) {
+              if (allowances.targets.has(trap.target)) {
                 respondQuery(socket, trap.query_id, 'allow');
                 continue;
               }
@@ -537,6 +605,9 @@ const tui: TuiPlugin = async (api, options, meta) => {
                 queryId: trap.query_id,
                 operation: trap.operation,
                 target: trap.target,
+                sessionID: routeSessionID,
+                sourceSessionID,
+                directory: sessionDirectory,
               };
               liveQueries.add(entry);
               enqueueEntry(entry);
@@ -578,6 +649,18 @@ const tui: TuiPlugin = async (api, options, meta) => {
       }
     });
   }
+
+  const refreshPermissionPresentation = (): void => {
+    queueMicrotask(() => {
+      setPermissionRevision((revision) => revision + 1);
+      pump();
+    });
+  };
+  const unregisterPermissionAsked = api.event.on('permission.asked', refreshPermissionPresentation);
+  const unregisterPermissionReplied = api.event.on(
+    'permission.replied',
+    refreshPermissionPresentation,
+  );
 
   // /sandbox shows the config and toggles the persisted `enabled` flag. The
   // server reads sandbox.json on every tool call, so the toggle takes effect on
@@ -683,11 +766,15 @@ const tui: TuiPlugin = async (api, options, meta) => {
   }
 
   api.lifecycle.onDispose(() => {
+    unregisterPermissionAsked();
+    unregisterPermissionReplied();
+    sessionAllowances.clear();
     // Deny any still-held queries so the sandboxed children don't hang, then
     // tear down the socket server and drop the discovery file.
     for (const entry of liveQueries) {
       respondQuery(entry.socket, entry.queryId, 'deny');
       liveQueries.delete(entry);
+      finishActive(entry.id);
     }
     for (const socket of sockets) socket.destroy();
     if (socketServer) {

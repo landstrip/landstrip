@@ -37,7 +37,7 @@ import {
   permissionType,
   sandboxSummary,
   readDiscoveryPort,
-  sessionScopeFor,
+  trapSessionHelloLine,
 } from './shared.js';
 
 type LandstripPolicy = {
@@ -50,6 +50,7 @@ type LandstripPolicy = {
 interface BashSandboxState {
   originalCommand: string;
   wrappedCommand: string;
+  sessionID: string | undefined;
   policyDir: string;
   port: number | null;
   proxyToken: string | null;
@@ -794,9 +795,6 @@ function startTrapServer(
   denyRead: string[],
   denyWrite: string[],
   baseDirectory: string,
-  sessionAllowedReadPaths: Set<string>,
-  sessionAllowedWritePaths: Set<string>,
-  sessionAllowedTargets: Set<string>,
 ): Promise<{ server: ReturnType<typeof createServer>; port: number; trapLines: string[] }> {
   const trapLines: string[] = [];
   const server = createServer((trapSocket) => {
@@ -831,11 +829,6 @@ function startTrapServer(
             if (allowed) {
               trapSocket.write(controlResponseLine(queryId, 'allow'));
             } else {
-              // Remember the scope for later commands, but deny this syscall so
-              // a command that may already have side effects is never retried.
-              const scope = sessionScopeFor(path, baseDirectory);
-              if (operation === 'read') sessionAllowedReadPaths.add(scope);
-              else sessionAllowedWritePaths.add(scope);
               trapSocket.write(controlResponseLine(queryId, 'deny'));
               trapLines.push(line);
             }
@@ -843,17 +836,8 @@ function startTrapServer(
             trap.kind === 'network' &&
             (trap.operation === 'connect' || trap.operation === 'bind')
           ) {
-            // No policy field expresses "allow this address:port" (allowedDomains
-            // is hostname-based and enforced by the HTTP(S) proxy, not the broker),
-            // so — matching the filesystem branch above — auto-grant, remember it
-            // for the rest of the session, and surface it afterward rather than
-            // hanging or hard-denying an already-approved command.
-            const target = trap.target;
-            if (!sessionAllowedTargets.has(target)) {
-              sessionAllowedTargets.add(target);
-              trapLines.push(line);
-            }
-            trapSocket.write(controlResponseLine(queryId, 'allow'));
+            trapSocket.write(controlResponseLine(queryId, 'deny'));
+            trapLines.push(line);
           } else {
             trapLines.push(line);
           }
@@ -905,6 +889,7 @@ function buildWrappedCommand(
   shell: string,
   command: string,
   trapPort: number | null,
+  sessionID?: string,
 ): string {
   const baseArgs = ['run', '-p', policyPath, '--', ...shellArgs(shell, command)];
   const plain = [landstripBinaryPath(), ...baseArgs].map(shellQuote).join(' ');
@@ -926,7 +911,10 @@ function buildWrappedCommand(
   ]
     .map(shellQuote)
     .join(' ');
-  const openTrap = `exec 3<>/dev/tcp/127.0.0.1/${trapPort} && exec "$@"`;
+  const identifySession = sessionID
+    ? ` && printf '%s' ${shellQuote(trapSessionHelloLine(sessionID))} >&3`
+    : '';
+  const openTrap = `exec 3<>/dev/tcp/127.0.0.1/${trapPort}${identifySession} && exec "$@"`;
   return `bash -c ${shellQuote(openTrap)} bash ${trapped}`;
 }
 
@@ -1065,21 +1053,6 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
   const activeBash = new Map<string, BashSandboxState>();
   const notified = new Set<string>();
   const callAllowances = new Set<string>();
-  const sessionAllowedReadPaths = new Set<string>();
-  const sessionAllowedWritePaths = new Set<string>();
-  const sessionAllowedTargets = new Set<string>();
-
-  function mergeAllowances(configured: string[], session: Set<string>): string[] {
-    return [...configured, ...session];
-  }
-
-  function getEffectiveAllowRead(config: SandboxConfig): string[] {
-    return mergeAllowances(config.filesystem.allowRead, sessionAllowedReadPaths);
-  }
-
-  function getEffectiveAllowWrite(config: SandboxConfig): string[] {
-    return mergeAllowances(config.filesystem.allowWrite, sessionAllowedWritePaths);
-  }
   let enabledNotified = false;
   let configuredShell: string | undefined;
   let landstripCheck: { ok: true; version: string } | { ok: false; reason: string } | undefined;
@@ -1250,12 +1223,9 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
     const check = checkLandstrip();
     if (!check?.ok) {
-      await notifyOnce(
-        `disabled:${check?.reason ?? 'unknown'}`,
-        check?.reason ?? 'Sandbox disabled',
-        'error',
-      );
-      return null;
+      const reason = check?.reason ?? 'Unknown Landstrip installation error';
+      await notifyOnce(`broken-installation:${reason}`, reason, 'error');
+      throw new Error(`Broken @landstrip/landstrip installation: ${reason}`);
     }
 
     if (!enabledNotified) {
@@ -1308,10 +1278,12 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
   async function prepareBash(
     callID: string,
+    sessionID: string | undefined,
     args: Record<string, unknown>,
     config: SandboxConfig,
   ): Promise<void> {
     if (typeof args.command !== 'string') return;
+    const normalizedSessionID = sessionID?.trim() || undefined;
 
     const rewriteDescription = (): void => {
       if (typeof args.description === 'string')
@@ -1320,7 +1292,10 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
     const existing = activeBash.get(callID);
     if (existing) {
-      if (args.command === existing.originalCommand || args.command === existing.wrappedCommand) {
+      if (
+        existing.sessionID === normalizedSessionID &&
+        (args.command === existing.originalCommand || args.command === existing.wrappedCommand)
+      ) {
         args.command = existing.wrappedCommand;
         rewriteDescription();
         return;
@@ -1330,16 +1305,9 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     }
 
     if (isGeneratedWrappedCommand(args.command as string)) {
-      const policyMatch = (args.command as string).match(/\s'-p'\s+'([^']+)'/);
-      if (policyMatch?.[1] && existsSync(policyMatch[1])) {
-        rewriteDescription();
-        return;
-      }
       if (activeBash.has(callID)) await cleanupBash(callID);
       const original = extractOriginalCommand(args.command as string);
-      if (original) {
-        args.command = original;
-      }
+      if (original) args.command = original;
     }
 
     const allowNetwork = config.network.allowNetwork;
@@ -1347,11 +1315,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     const effectiveConfig = {
       ...config,
       network: { ...config.network },
-      filesystem: {
-        ...config.filesystem,
-        allowRead: getEffectiveAllowRead(config),
-        allowWrite: getEffectiveAllowWrite(config),
-      },
+      filesystem: config.filesystem,
     };
 
     if (!allowNetwork) {
@@ -1391,9 +1355,12 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     const originalCommand = args.command as string;
 
     // The TUI owns interactive query handling. Fall back to an in-process
-    // broker when no TUI endpoint is available (for example, in headless mode).
+    // broker when no TUI endpoint or session identity is available.
+    const interactiveSessionID = normalizedSessionID ?? '';
     const tuiTrapPort =
-      process.platform === 'linux' ? await readLiveDiscoveryPort(directory) : null;
+      process.platform === 'linux' && interactiveSessionID
+        ? await readLiveDiscoveryPort(directory)
+        : null;
     const trapServer =
       tuiTrapPort === null
         ? await startTrapServer(
@@ -1402,9 +1369,6 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
             effectiveConfig.filesystem.denyRead,
             effectiveConfig.filesystem.denyWrite,
             directory,
-            sessionAllowedReadPaths,
-            sessionAllowedWritePaths,
-            sessionAllowedTargets,
           )
         : null;
     const trapPort = tuiTrapPort ?? trapServer?.port ?? null;
@@ -1414,11 +1378,13 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       configuredShell ?? process.env.SHELL ?? '/bin/sh',
       originalCommand,
       trapPort,
+      tuiTrapPort === null ? undefined : interactiveSessionID,
     );
 
     activeBash.set(callID, {
       originalCommand,
       wrappedCommand,
+      sessionID: normalizedSessionID,
       policyDir: policy.dir,
       port: proxyPort,
       proxyToken,
@@ -1456,8 +1422,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
             : undefined;
       const patterns = permissionPatterns(request);
 
-      const effectiveAllowRead = getEffectiveAllowRead(config);
-      const effectiveAllowWrite = getEffectiveAllowWrite(config);
+      const effectiveAllowRead = config.filesystem.allowRead;
+      const effectiveAllowWrite = config.filesystem.allowWrite;
       const args: Record<string, unknown> = { ...metadata };
       if (permission === 'read') args.paths = patterns;
       if (permission === 'edit') {
@@ -1489,7 +1455,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       if (!config) return;
 
       if (input.tool === 'bash') {
-        await prepareBash(input.callID, output.args, config);
+        await prepareBash(input.callID, input.sessionID, output.args, config);
         return;
       }
 
@@ -1498,8 +1464,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
         output.args,
         config,
         directory,
-        getEffectiveAllowRead(config),
-        getEffectiveAllowWrite(config),
+        config.filesystem.allowRead,
+        config.filesystem.allowWrite,
       );
       for (const decision of decisions) {
         enforcePermission(input.callID, decision);
@@ -1530,7 +1496,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       // the after-the-fact toast.
       const serverTrapOutput = state.trapLines.join('\n');
       const combinedOutput = serverTrapOutput ? outputText + '\n' + serverTrapOutput : outputText;
-      const errors = parseLandstripTraps(combinedOutput).filter(
+      const traps = parseLandstripTraps(combinedOutput);
+      const errors = traps.filter(
         (trap: LandstripTrap) => !(trap.kind === 'filesystem' && trap.state === 'query'),
       );
       if (errors.length > 0) {
@@ -1553,21 +1520,18 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
           ?.catch?.(() => undefined);
       }
 
-      const blockedPath = extractBlockedPath(outputText, directory, state.originalCommand);
+      const blockedTrap = traps.find(
+        (trap): trap is Extract<LandstripTrap, { kind: 'filesystem' }> =>
+          trap.kind === 'filesystem' && trap.state === 'query',
+      );
+      const blockedPath = blockedTrap
+        ? canonicalizePath(blockedTrap.path, directory)
+        : extractBlockedPath(outputText, directory, state.originalCommand);
       if (blockedPath) {
-        let blockedOperation: 'read' | 'write' = 'read';
-        for (const trap of errors) {
-          if (trap.kind === 'filesystem') {
-            blockedOperation = trap.operation;
-            break;
-          }
-        }
-        const scope = sessionScopeFor(blockedPath, directory);
-        if (blockedOperation === 'read') sessionAllowedReadPaths.add(scope);
-        else sessionAllowedWritePaths.add(scope);
+        const blockedOperation = blockedTrap?.operation ?? 'read';
         await notifyOnce(
           `blocked:${blockedPath}`,
-          `Sandbox blocked ${blockedOperation} to "${blockedPath}". Added "${scope}" to session allowlist; retry the command.`,
+          `Sandbox blocked ${blockedOperation} to "${blockedPath}". No live TUI presenter was available, so access remains denied.`,
           'warning',
         );
       }
@@ -1597,8 +1561,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
         const config = await activeConfig();
         if (!config) return;
 
-        const effectiveAllowRead = getEffectiveAllowRead(config);
-        const effectiveAllowWrite = getEffectiveAllowWrite(config);
+        const effectiveAllowRead = config.filesystem.allowRead;
+        const effectiveAllowWrite = config.filesystem.allowWrite;
 
         for (const path of extractCandidatePaths(shellCommand)) {
           const readDecision = evaluateReadPermission(path, config, directory, effectiveAllowRead);

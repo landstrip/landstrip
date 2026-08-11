@@ -517,6 +517,85 @@ export function controlResponseLine(
   return JSON.stringify(response) + '\n';
 }
 
+export interface TrapSessionHello {
+  kind: 'opencode-landstrip-session';
+  sessionID: string;
+}
+
+export interface SessionAllowances {
+  readPaths: Set<string>;
+  writePaths: Set<string>;
+  targets: Set<string>;
+}
+
+export function trapSessionHelloLine(sessionID: string): string {
+  const normalized = sessionID.trim();
+  if (!normalized) throw new Error('OpenCode session ID must not be empty');
+  const hello: TrapSessionHello = { kind: 'opencode-landstrip-session', sessionID: normalized };
+  return JSON.stringify(hello) + '\n';
+}
+
+export function decodeTrapSessionHello(line: string): TrapSessionHello | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (!isRecord(value) || value.kind !== 'opencode-landstrip-session') return null;
+  if (typeof value.sessionID !== 'string') return null;
+  const sessionID = value.sessionID.trim();
+  return sessionID ? { kind: 'opencode-landstrip-session', sessionID } : null;
+}
+
+export function sessionAllowancesFor(
+  sessions: Map<string, SessionAllowances>,
+  sessionID: string,
+): SessionAllowances {
+  const existing = sessions.get(sessionID);
+  if (existing) return existing;
+  const created: SessionAllowances = {
+    readPaths: new Set(),
+    writePaths: new Set(),
+    targets: new Set(),
+  };
+  sessions.set(sessionID, created);
+  return created;
+}
+
+export function rootSessionIDFor(
+  sourceSessionID: string,
+  session: (sessionID: string) => { parentID?: string } | undefined,
+): string | undefined {
+  let current = sourceSessionID;
+  const seen = new Set<string>();
+  while (!seen.has(current)) {
+    seen.add(current);
+    const value = session(current);
+    if (!value) return undefined;
+    if (!value.parentID) return current;
+    current = value.parentID;
+  }
+  return undefined;
+}
+
+export function nextSandboxPermissionIndex<T extends { sessionID: string }>(
+  queue: readonly T[],
+  routeSessionID: string,
+  blocked: (entry: T) => boolean,
+): number {
+  const entry = queue[0];
+  return entry && entry.sessionID === routeSessionID && !blocked(entry) ? 0 : -1;
+}
+
+export function shouldRenderSandboxPermission(
+  requestSessionID: string,
+  routeSessionID: string,
+  hostPromptActive: boolean,
+): boolean {
+  return requestSessionID === routeSessionID && !hostPromptActive;
+}
+
 // The TUI plugin runs the query-response socket server and publishes its port
 // to a per-directory discovery file; the server plugin reads it to inject the
 // fd-3 redirect. Namespacing by a hash of the realpath keeps concurrent

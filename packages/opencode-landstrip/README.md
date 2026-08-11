@@ -46,10 +46,13 @@ default; the plugin's local HTTP and HTTPS proxy enforces `allowedDomains` and
 `deniedDomains`.
 The domain lists are plugin policy fields, not core Landstrip fields.
 
-OpenCode handles normal tool permissions before dispatch. On Linux, Landstrip
-can also pause a blocked filesystem or network operation and show an inline
-approval prompt. Filesystem approvals may be saved to
-`.opencode/sandbox.json` or `~/.config/opencode/sandbox.json`.
+OpenCode agent permissions authorize a tool before dispatch. Landstrip sandbox
+permissions authorize a blocked filesystem or network operation during the
+command. The TUI shows one permission at a time, with OpenCode's prompt first;
+subagent sandbox prompts are routed to the root session. Filesystem approvals
+may be saved to `.opencode/sandbox.json` or
+`~/.config/opencode/sandbox.json`.
+Without a live TUI presenter, blocked operations are denied.
 
 Shell-mode commands typed by the user are not process-sandboxed because
 OpenCode's plugin API cannot replace their execution. They may inherit proxy
