@@ -28,10 +28,11 @@ use windows_sys::Win32::Security::{
     SUB_CONTAINERS_AND_OBJECTS_INHERIT, SetFileSecurityW, SetSecurityDescriptorDacl,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
 
 const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+type Win32CallResult<T> = std::result::Result<T, (&'static str, io::Error)>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,14 +67,18 @@ impl GrantPlan {
         for path in &policy.write_roots {
             plan.add_root(
                 path,
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
                 GRANT_ACCESS,
             );
         }
         // Placed after grant entries so the resulting DACL has DENY before
         // GRANT in access-evaluation order.
         for path in &policy.write_denied_roots {
-            plan.add_subtree_deny(path, FILE_GENERIC_WRITE | FILE_DELETE_CHILD, DENY_ACCESS);
+            plan.add_subtree_deny(
+                path,
+                FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE,
+                DENY_ACCESS,
+            );
         }
         for path in &policy.read_denied_roots {
             plan.add_subtree_deny(path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, DENY_ACCESS);
@@ -132,11 +137,13 @@ impl GrantPlan {
         });
     }
 
-    pub(super) fn apply(&self, sid: &str) -> Result<()> {
+    pub(super) fn apply(&self, sid: &str) -> Result<Self> {
         let sid = OwnedSid::parse(sid)?;
-        let mut applied: Vec<&GrantEntry> = Vec::with_capacity(self.entries.len());
+        let mut applied = Self {
+            entries: Vec::with_capacity(self.entries.len()),
+        };
         for entry in &self.entries {
-            if let Err(error) = set_path_access(
+            match set_path_access(
                 &entry.path,
                 sid.0,
                 entry.access,
@@ -145,22 +152,25 @@ impl GrantPlan {
                 entry.propagate,
                 false,
             ) {
-                for applied_entry in applied.iter().rev() {
-                    let _ = set_path_access(
-                        &applied_entry.path,
-                        sid.0,
-                        0,
-                        REVOKE_ACCESS,
-                        false,
-                        applied_entry.propagate,
-                        true,
-                    );
+                Ok(true) => applied.entries.push(entry.clone()),
+                Ok(false) => {}
+                Err(error) => {
+                    for applied_entry in applied.entries.iter().rev() {
+                        let _ = set_path_access(
+                            &applied_entry.path,
+                            sid.0,
+                            0,
+                            REVOKE_ACCESS,
+                            false,
+                            applied_entry.propagate,
+                            true,
+                        );
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
-            applied.push(entry);
         }
-        Ok(())
+        Ok(applied)
     }
 
     pub(super) fn revoke(&self, sid: &str) -> Result<()> {
@@ -219,8 +229,8 @@ fn set_path_access(
     inherit: bool,
     propagate: bool,
     ignore_missing: bool,
-) -> Result<()> {
-    let path = path
+) -> Result<bool> {
+    let path_wide = path
         .as_os_str()
         .encode_wide()
         .chain(iter::once(0))
@@ -229,7 +239,7 @@ fn set_path_access(
     let mut security_descriptor = ptr::null_mut();
     let status = unsafe {
         GetNamedSecurityInfoW(
-            path.as_ptr(),
+            path_wide.as_ptr(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
@@ -240,13 +250,12 @@ fn set_path_access(
         )
     };
     if status != 0 {
-        if ignore_missing && is_missing_status(status) {
-            return Ok(());
+        if should_skip_before_apply(mode, status, ignore_missing) {
+            return Ok(false);
         }
-        if (mode == GRANT_ACCESS || mode == REVOKE_ACCESS) && is_locked_status(status) {
-            return Ok(());
-        }
-        return Err(setup_failed(win32_error(status)).into());
+        return Err(
+            path_access_failed(path, mode, "GetNamedSecurityInfoW", &win32_error(status)).into(),
+        );
     }
 
     let explicit_access = EXPLICIT_ACCESS_W {
@@ -270,27 +279,32 @@ fn set_path_access(
         unsafe { SetEntriesInAclW(1, &raw const explicit_access, old_dacl, &raw mut new_dacl) };
     if status != 0 {
         unsafe { LocalFree(security_descriptor) };
-        return Err(setup_failed(win32_error(status)).into());
+        return Err(
+            path_access_failed(path, mode, "SetEntriesInAclW", &win32_error(status)).into(),
+        );
     }
 
-    let result = apply_path_dacl(&path, new_dacl, propagate);
+    let result = apply_path_dacl(&path_wide, new_dacl, propagate);
     unsafe {
         LocalFree(new_dacl.cast());
         LocalFree(security_descriptor);
     }
-    if let Err(error) = result {
+    if let Err((api, error)) = result {
         if ignore_missing && is_missing_error(&error) {
-            return Ok(());
+            return Ok(false);
         }
-        if (mode == GRANT_ACCESS || mode == REVOKE_ACCESS) && is_locked_error(&error) {
-            return Ok(());
+        // A failed non-propagating grant did not alter descendants and leaves
+        // the target inaccessible. Propagating failures may be partial, so they
+        // remain hard errors and the full journal is retained for recovery.
+        if mode == GRANT_ACCESS && !propagate && is_locked_error(&error) {
+            return Ok(false);
         }
-        return Err(setup_failed(format!("apply_path_dacl: {error}")).into());
+        return Err(path_access_failed(path, mode, api, &error).into());
     }
-    Ok(())
+    Ok(true)
 }
 
-fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> io::Result<()> {
+fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> Win32CallResult<()> {
     if propagate {
         let status = unsafe {
             SetNamedSecurityInfoW(
@@ -304,7 +318,7 @@ fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> io::Result<
             )
         };
         if status != 0 {
-            return Err(win32_error(status));
+            return Err(("SetNamedSecurityInfoW", win32_error(status)));
         }
         return Ok(());
     }
@@ -314,10 +328,10 @@ fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> io::Result<
         InitializeSecurityDescriptor((&raw mut descriptor).cast(), SECURITY_DESCRIPTOR_REVISION)
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(("InitializeSecurityDescriptor", io::Error::last_os_error()));
     }
     if unsafe { SetSecurityDescriptorDacl((&raw mut descriptor).cast(), 1, dacl, 0) } == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(("SetSecurityDescriptorDacl", io::Error::last_os_error()));
     }
     if unsafe {
         SetFileSecurityW(
@@ -327,9 +341,31 @@ fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> io::Result<
         )
     } == 0
     {
-        return Err(io::Error::last_os_error());
+        return Err(("SetFileSecurityW", io::Error::last_os_error()));
     }
     Ok(())
+}
+
+fn path_access_failed(
+    path: &Path,
+    mode: ACCESS_MODE,
+    api: &str,
+    source: &io::Error,
+) -> LandstripError {
+    setup_failed(format!(
+        "{api} failed to {} ACL for {}: {source}",
+        acl_action(mode),
+        path.display()
+    ))
+}
+
+fn acl_action(mode: ACCESS_MODE) -> &'static str {
+    match mode {
+        GRANT_ACCESS => "grant",
+        DENY_ACCESS => "deny",
+        REVOKE_ACCESS => "revoke",
+        _ => "update",
+    }
 }
 
 fn setup_failed(source: impl Into<Cause>) -> LandstripError {
@@ -354,8 +390,6 @@ fn is_missing_error(error: &io::Error) -> bool {
 }
 
 /// Return whether an ACL target is inaccessible.
-///
-/// Grants remain fail-closed; revokes may leave a stale ACE. Denials fail.
 fn is_locked_status(status: u32) -> bool {
     status == ERROR_SHARING_VIOLATION || status == ERROR_ACCESS_DENIED
 }
@@ -364,6 +398,11 @@ fn is_locked_error(error: &io::Error) -> bool {
     error
         .raw_os_error()
         .is_some_and(|status| is_locked_status(u32::from_ne_bytes(status.to_ne_bytes())))
+}
+
+fn should_skip_before_apply(mode: ACCESS_MODE, status: u32, ignore_missing: bool) -> bool {
+    (ignore_missing && is_missing_status(status))
+        || (mode == GRANT_ACCESS && is_locked_status(status))
 }
 
 fn wide(value: &str) -> Vec<u16> {

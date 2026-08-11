@@ -51,17 +51,39 @@ pub(super) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
         return Err(setup_failed(error).into());
     }
 
+    let applied_grants;
     let launch_result = match grants.apply(&lease.account().sid) {
-        Ok(()) => broker::launch(lease.account(), &installation.runner_path, &request_path),
-        Err(error) => Err(error),
+        Ok(applied) => {
+            // Replace the crash-recovery plan with only entries that reached the
+            // DACL update. Pre-update locked grants need no later revocation.
+            if let Err(error) = lease.write_journal(&applied) {
+                let revoke_result = applied.revoke(&lease.account().sid);
+                if revoke_result.is_ok() {
+                    let _ = lease.clear_journal();
+                }
+                let _ = fs::remove_file(&request_path);
+                return Err(setup_failed(error).into());
+            }
+            applied_grants = applied;
+            broker::launch(lease.account(), &installation.runner_path, &request_path)
+        }
+        Err(error) => {
+            // A propagating update can fail after partial mutation. Keep and
+            // revoke the full pre-apply journal rather than narrowing it.
+            applied_grants = grants.clone();
+            Err(error)
+        }
     };
-    let revoke_result = grants.revoke(&lease.account().sid);
-    if revoke_result.is_ok() {
-        lease.clear_journal().map_err(setup_failed)?;
-    }
+    let revoke_result = applied_grants.revoke(&lease.account().sid);
+    let clear_result = if revoke_result.is_ok() {
+        lease.clear_journal().map_err(setup_failed)
+    } else {
+        Ok(())
+    };
     let _ = fs::remove_file(&request_path);
     let exit_code = launch_result?;
     revoke_result?;
+    clear_result?;
     Ok(i32::from_ne_bytes(exit_code.to_ne_bytes()))
 }
 

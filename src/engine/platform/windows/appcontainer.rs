@@ -46,9 +46,9 @@ use windows_sys::Win32::Security::{
     WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType,
-    OPEN_EXISTING,
+    CreateFileW, DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK,
+    FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -76,6 +76,7 @@ const FACILITY_WIN32: u32 = 7;
 const LOOPBACK_MUTEX_NAME: &str = "Global\\landstrip-loopback-config";
 const LOOPBACK_PROFILE_PREFIX: &str = "landstrip.loopback.";
 static NEXT_PROFILE_ID: AtomicU64 = AtomicU64::new(0);
+type Win32CallResult<T> = std::result::Result<T, (&'static str, io::Error)>;
 
 const NETWORK_CAPABILITY_SIDS: [WELL_KNOWN_SID_TYPE; 3] = [
     WinCapabilityInternetClientSid,
@@ -95,6 +96,28 @@ fn setup_failed(source: impl Into<Cause>) -> LandstripError {
 /// setting the last error.
 fn win32_error(status: u32) -> io::Error {
     io::Error::from_raw_os_error(i32::from_ne_bytes(status.to_ne_bytes()))
+}
+
+fn path_access_failed(
+    path: &Path,
+    mode: ACCESS_MODE,
+    api: &str,
+    source: &io::Error,
+) -> LandstripError {
+    setup_failed(format!(
+        "{api} failed to {} ACL for {}: {source}",
+        acl_action(mode),
+        path.display()
+    ))
+}
+
+fn acl_action(mode: ACCESS_MODE) -> &'static str {
+    match mode {
+        GRANT_ACCESS => "grant",
+        DENY_ACCESS => "deny",
+        REVOKE_ACCESS => "revoke",
+        _ => "update",
+    }
 }
 
 /// The Win32 error an `HRESULT` carries, when it carries one at all.
@@ -526,7 +549,7 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess
         grant_root_access(
             &mut granted,
             path,
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
         )?;
     }
 
@@ -534,7 +557,11 @@ fn grant_policy_access(policy: &AccessPolicy, sid: PSID) -> Result<GrantedAccess
     // allow roots. Patterns are not expressible as static ACLs on AppContainer;
     // restricted_user has the same root-only limitation today.
     for path in &policy.write_denied_roots {
-        deny_subtree_access(&mut granted, path, FILE_GENERIC_WRITE | FILE_DELETE_CHILD)?;
+        deny_subtree_access(
+            &mut granted,
+            path,
+            FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE,
+        )?;
     }
     for path in &policy.read_denied_roots {
         deny_subtree_access(&mut granted, path, FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)?;
@@ -612,7 +639,7 @@ fn set_path_access(
     inherit: bool,
     propagate: bool,
 ) -> Result<()> {
-    let path = path
+    let path_wide = path
         .as_os_str()
         .encode_wide()
         .chain(iter::once(0))
@@ -622,7 +649,7 @@ fn set_path_access(
 
     let status = unsafe {
         GetNamedSecurityInfoW(
-            path.as_ptr(),
+            path_wide.as_ptr(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
@@ -638,7 +665,9 @@ fn set_path_access(
         if mode == GRANT_ACCESS && is_grant_locked_status(status) {
             return Ok(());
         }
-        return Err(setup_failed(win32_error(status)).into());
+        return Err(
+            path_access_failed(path, mode, "GetNamedSecurityInfoW", &win32_error(status)).into(),
+        );
     }
 
     let explicit_access = EXPLICIT_ACCESS_W {
@@ -663,19 +692,28 @@ fn set_path_access(
         unsafe { SetEntriesInAclW(1, &raw const explicit_access, old_dacl, &raw mut new_dacl) };
     if status != 0 {
         unsafe { LocalFree(security_descriptor) };
-        return Err(setup_failed(win32_error(status)).into());
+        return Err(
+            path_access_failed(path, mode, "SetEntriesInAclW", &win32_error(status)).into(),
+        );
     }
 
-    let result = apply_path_dacl(&path, new_dacl, propagate);
+    let result = apply_path_dacl(&path_wide, new_dacl, propagate);
     unsafe {
         LocalFree(new_dacl.cast());
         LocalFree(security_descriptor);
     }
     // A descendant skipped during propagation remains inaccessible.
-    if mode == GRANT_ACCESS && result.as_ref().err().is_some_and(is_grant_locked_error) {
+    if mode == GRANT_ACCESS
+        && result
+            .as_ref()
+            .err()
+            .is_some_and(|(_, error)| is_grant_locked_error(error))
+    {
         return Ok(());
     }
-    result.map_err(setup_failed)?;
+    if let Err((api, error)) = result {
+        return Err(path_access_failed(path, mode, api, &error).into());
+    }
 
     Ok(())
 }
@@ -694,7 +732,7 @@ fn is_grant_locked_error(error: &io::Error) -> bool {
         .is_some_and(is_grant_locked_status)
 }
 
-fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> io::Result<()> {
+fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> Win32CallResult<()> {
     if propagate {
         let status = unsafe {
             SetNamedSecurityInfoW(
@@ -708,7 +746,7 @@ fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> io::Result<
             )
         };
         if status != 0 {
-            return Err(win32_error(status));
+            return Err(("SetNamedSecurityInfoW", win32_error(status)));
         }
         return Ok(());
     }
@@ -718,11 +756,11 @@ fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> io::Result<
         InitializeSecurityDescriptor((&raw mut descriptor).cast(), SECURITY_DESCRIPTOR_REVISION)
     };
     if initialized == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(("InitializeSecurityDescriptor", io::Error::last_os_error()));
     }
     let dacl_set = unsafe { SetSecurityDescriptorDacl((&raw mut descriptor).cast(), 1, dacl, 0) };
     if dacl_set == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(("SetSecurityDescriptorDacl", io::Error::last_os_error()));
     }
     let applied = unsafe {
         SetFileSecurityW(
@@ -732,7 +770,7 @@ fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> io::Result<
         )
     };
     if applied == 0 {
-        return Err(io::Error::last_os_error());
+        return Err(("SetFileSecurityW", io::Error::last_os_error()));
     }
 
     Ok(())

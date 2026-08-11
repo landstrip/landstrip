@@ -218,13 +218,18 @@ pub(crate) fn resolve_policy(
     let policy_base = normalize_path_lexically(&policy_base);
 
     let write_allow = resolve_paths(&filesystem.allow_write, &policy_base, home)?;
+    // Missing Windows allow roots cannot receive ACL entries. Dropping them is
+    // fail-closed because sandbox SIDs receive no access to those paths.
+    #[cfg(target_os = "windows")]
+    let write_allow = write_allow
+        .into_iter()
+        .filter(|path| path.try_exists().unwrap_or(false))
+        .collect::<Vec<_>>();
     let (write_deny, write_denied_patterns) =
         resolve_deny_paths(&filesystem.deny_write, &policy_base, home)?;
     let write_denied_links = collect_symlink_ancestors(&filesystem.deny_write, &policy_base, home)?;
 
     let read_allow = resolve_paths(&filesystem.allow_read, &policy_base, home)?;
-    // Missing Windows allow roots need no ACL entry; skipping them is
-    // fail-closed because sandbox SIDs have no access by default.
     #[cfg(target_os = "windows")]
     let read_allow = read_allow
         .into_iter()
