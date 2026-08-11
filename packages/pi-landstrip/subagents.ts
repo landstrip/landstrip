@@ -63,10 +63,17 @@ import {
   MAX_SUBAGENTS,
   setAgentDisabledForScope,
   setMaxSubagentsConfigForScope,
+  type ToolFilesystemPolicy,
 } from './config.ts';
 import type { LandstripIntegration, LandstripRpcWorkerLaunch } from './index.ts';
 import { type ExtensionUiRequest, type ExtensionUiResult, RpcProcess } from './rpc-process.ts';
-import { AsyncQueue, colorizeAgentText, formatError, isRecord } from './util.ts';
+import {
+  colorizeAgentText,
+  combineAbortSignals,
+  formatError,
+  isRecord,
+  PermissionPromptCoordinator,
+} from './util.ts';
 
 const TASK_ENTRY = 'landstrip.task';
 const TASK_WIDGET = 'landstrip.subagents';
@@ -641,6 +648,7 @@ function dependencyRoot(path: string): string | undefined {
 function agentBootstrapPaths(agentDir: string): string[] {
   return [
     'settings.json',
+    'landstrip.json',
     'models.json',
     'auth.json',
     'trust.json',
@@ -710,8 +718,10 @@ class Semaphore {
 }
 
 class PermissionBroker {
-  private readonly queue = new AsyncQueue();
   private readonly grants = new Set<string>();
+  private resetController = new AbortController();
+
+  constructor(private readonly prompts: PermissionPromptCoordinator) {}
 
   async ask(
     ctx: ExtensionContext,
@@ -720,30 +730,67 @@ class PermissionBroker {
     resource: string,
     signal?: AbortSignal,
   ): Promise<void> {
-    const key = `${permission}\u0000${resource}`;
-    if (this.grants.has(key)) return;
-    if (!ctx.hasUI) throw new Error(`Permission required: ${permission} ${resource}`);
-    const release = await this.queue.acquire(signal, 'Permission request cancelled');
-    try {
-      if (this.grants.has(key)) return;
-      if (signal?.aborted) throw new Error('Permission request cancelled');
-      const choice = await ctx.ui.select(
-        `${task}: permission required\n${permission}: ${resource}`,
-        ['Allow once', 'Allow for this session', 'Keep blocked'],
-        { signal },
+    await this.askMany(ctx, task, [{ permission, resource }], signal);
+  }
+
+  async askMany(
+    ctx: ExtensionContext,
+    task: string,
+    requests: readonly { permission: string; resource: string }[],
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const unique = [
+      ...new Map(
+        requests.map((request) => [`${request.permission}\u0000${request.resource}`, request]),
+      ).values(),
+    ];
+    const pending = (): typeof unique =>
+      unique.filter(
+        ({ permission, resource }) => !this.grants.has(`${permission}\u0000${resource}`),
       );
-      if (choice === 'Allow for this session') this.grants.add(key);
-      if (choice !== 'Allow once' && choice !== 'Allow for this session') {
-        throw new Error(`Permission denied: ${permission} ${resource}`);
-      }
+    if (pending().length === 0) return;
+    if (!ctx.hasUI) {
+      const request = pending()[0]!;
+      throw new Error(`Permission required: ${request.permission} ${request.resource}`);
+    }
+
+    const combined = combineAbortSignals(signal, this.resetController.signal);
+    try {
+      await this.prompts.resolve(
+        () => (pending().length === 0 ? true : undefined),
+        async (promptSignal) => {
+          const requested = pending();
+          const choice = await ctx.ui.select(
+            `${task}: permission required\n${requested
+              .map(({ permission, resource }) => `${permission}: ${resource}`)
+              .join('\n')}`,
+            ['Allow once', 'Allow for this session', 'Keep blocked'],
+            { signal: promptSignal },
+          );
+          if (promptSignal.aborted) throw new Error('Permission request cancelled');
+          if (choice === 'Allow for this session') {
+            for (const { permission, resource } of requested) {
+              this.grants.add(`${permission}\u0000${resource}`);
+            }
+          }
+          if (choice !== 'Allow once' && choice !== 'Allow for this session') {
+            const request = requested[0]!;
+            throw new Error(`Permission denied: ${request.permission} ${request.resource}`);
+          }
+          return true;
+        },
+        combined.signal,
+      );
     } finally {
-      release();
+      combined.dispose();
     }
   }
 
   reset(): void {
+    const controller = this.resetController;
+    this.resetController = new AbortController();
     this.grants.clear();
-    this.queue.reset();
+    controller.abort();
   }
 }
 
@@ -925,6 +972,24 @@ function permissionResources(tool: string, input: Record<string, unknown>, cwd: 
     : ['*'];
 }
 
+function filesystemToolAccesses(
+  tool: string,
+  input: Record<string, unknown>,
+  cwd: string,
+): { accesses: Array<{ operation: 'read' | 'write'; path: string }>; valid: boolean } | undefined {
+  if (!['read', 'write', 'edit', 'apply_patch'].includes(tool)) return undefined;
+  const paths = permissionResources(tool, input, cwd);
+  return {
+    accesses: paths
+      .filter((path) => path !== '*')
+      .map((path) => ({
+        operation: tool === 'read' ? 'read' : 'write',
+        path,
+      })),
+    valid: paths.length > 0 && paths.every((path) => path !== '*'),
+  };
+}
+
 function parseWorkerConfig(): WorkerConfig | undefined {
   const encoded = process.env[WORKER_ENV];
   if (!encoded) return undefined;
@@ -1042,7 +1107,7 @@ export function workerConfigFromEnvironment(): WorkerConfig | undefined {
 
 export class SubagentRuntime {
   private semaphore = new Semaphore(1);
-  private readonly broker = new PermissionBroker();
+  private readonly broker: PermissionBroker;
   private readonly tasks = new Map<string, TaskRecord>();
   private readonly running = new Map<string, RunningTask>();
   private readonly runPromises = new Map<string, Promise<string>>();
@@ -1054,6 +1119,7 @@ export class SubagentRuntime {
   private primaryRules: PermissionRules | undefined;
   private primaryConfigurationError = false;
   private maxSubagents = 0;
+  private toolFilesystemPolicy: ToolFilesystemPolicy = 'host';
   private primaryAgentSwitching = false;
   private shuttingDown = false;
   private activeSessionId: string | undefined;
@@ -1063,7 +1129,10 @@ export class SubagentRuntime {
     private readonly integration: LandstripIntegration,
     private readonly createWorker: WorkerFactory = (...args) => this.defaultWorker(...args),
     private readonly loadCatalog: CatalogLoader = loadAgentCatalog,
-  ) {}
+    permissionPrompts = new PermissionPromptCoordinator(),
+  ) {
+    this.broker = new PermissionBroker(permissionPrompts);
+  }
 
   register(): void {
     this.pi.registerTool(this.createTaskTool());
@@ -1107,28 +1176,56 @@ export class SubagentRuntime {
       if (this.primaryConfigurationError) {
         return { block: true, reason: 'Invalid primary agent configuration' };
       }
-      if (!this.primaryAgent || !this.primaryRules || event.toolName === 'task') return;
+      if (event.toolName === 'task') return;
+
+      const input = isRecord(event.input) ? event.input : {};
       const permission = permissionName(event.toolName);
-      for (const resource of permissionResources(event.toolName, event.input, ctx.cwd)) {
-        const decision = permissionDecision(this.primaryRules, permission, resource);
-        if (decision === 'deny') {
-          return {
-            block: true,
-            reason: `Permission denied by @${this.primaryAgent.name}: ${permission} ${resource}`,
-          };
-        }
-        if (decision === 'ask') {
-          try {
-            await this.broker.ask(
-              ctx,
-              `@${this.primaryAgent.name}`,
-              permission,
-              resource,
-              ctx.signal,
-            );
-          } catch (error) {
-            return { block: true, reason: formatError(error) };
+      const resources = permissionResources(event.toolName, input, ctx.cwd);
+      const requests: Array<{ permission: string; resource: string }> = [];
+      if (this.primaryAgent && this.primaryRules) {
+        for (const resource of resources) {
+          const decision = permissionDecision(this.primaryRules, permission, resource);
+          if (decision === 'deny') {
+            return {
+              block: true,
+              reason: `Permission denied by @${this.primaryAgent.name}: ${permission} ${resource}`,
+            };
           }
+          if (decision === 'ask') requests.push({ permission, resource });
+        }
+      }
+
+      const filesystem = filesystemToolAccesses(event.toolName, input, ctx.cwd);
+      if (this.toolFilesystemPolicy === 'sandbox' && filesystem) {
+        if (!filesystem.valid) {
+          return { block: true, reason: `Filesystem path unavailable for ${event.toolName}` };
+        }
+        try {
+          const authorization = await this.integration.authorizeFilesystemToolAccess(
+            ctx,
+            filesystem.accesses,
+            {
+              signal: ctx.signal,
+              authorizationNote:
+                requests.length > 0 && this.primaryAgent
+                  ? `Approval also authorizes @${this.primaryAgent.name} tool dispatch for this call.`
+                  : undefined,
+            },
+          );
+          if (!authorization.allowed) {
+            return { block: true, reason: authorization.reason ?? 'Filesystem access denied' };
+          }
+          if (authorization.prompted) return;
+        } catch (error) {
+          return { block: true, reason: `Filesystem policy error: ${formatError(error)}` };
+        }
+      }
+
+      if (requests.length > 0 && this.primaryAgent) {
+        try {
+          await this.broker.askMany(ctx, `@${this.primaryAgent.name}`, requests, ctx.signal);
+        } catch (error) {
+          return { block: true, reason: formatError(error) };
         }
       }
     });
@@ -2908,6 +3005,7 @@ export class SubagentRuntime {
     this.primaryConfigurationError = false;
     const catalog = this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
     this.maxSubagents = catalog.maxSubagents;
+    this.toolFilesystemPolicy = catalog.toolFilesystemPolicy;
     this.semaphore = new Semaphore(Math.max(1, this.maxSubagents));
     if (catalog.diagnostics.length > 0) {
       this.invalidatePrimaryAgent(catalog, ctx);
@@ -2993,6 +3091,7 @@ export class SubagentRuntime {
     if (!(await this.applyPrimaryAgentRuntime(agent, ctx))) return false;
     this.primaryAgent = agent;
     this.primaryRules = mergePermissionRules(catalog.permissions, agent.permissions);
+    this.toolFilesystemPolicy = catalog.toolFilesystemPolicy;
     this.primaryConfigurationError = false;
     this.broker.reset();
     this.pi.registerTool(this.createTaskTool(undefined, this.primaryRules, ctx));
@@ -3006,6 +3105,7 @@ export class SubagentRuntime {
 
   private async dispose(): Promise<void> {
     this.shuttingDown = true;
+    this.broker.reset();
     for (const controller of this.controllers.values()) controller.abort();
     await Promise.allSettled([...this.running.values()].map(({ rpc }) => rpc.stop()));
     await Promise.allSettled(this.runPromises.values());
@@ -3053,8 +3153,9 @@ export class SubagentRuntime {
 export function registerSubagents(
   pi: ExtensionAPI,
   integration: LandstripIntegration,
+  permissionPrompts = new PermissionPromptCoordinator(),
 ): SubagentRuntime {
-  const runtime = new SubagentRuntime(pi, integration);
+  const runtime = new SubagentRuntime(pi, integration, undefined, undefined, permissionPrompts);
   runtime.register();
   return runtime;
 }

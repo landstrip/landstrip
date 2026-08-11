@@ -27,6 +27,7 @@ import {
   SubagentRuntime,
 } from './subagents.ts';
 import { temporaryDirectory as makeTemporaryDirectory } from './test-util.ts';
+import { PermissionPromptCoordinator } from './util.ts';
 
 function temporaryDirectory(): string {
   return makeTemporaryDirectory('pi-landstrip-tasks-');
@@ -122,6 +123,7 @@ test('propagates registered extensions and public context to workers', async () 
   expect(prepared?.args).toContain(extensionEntry);
   expect(prepared?.readPaths).toContain(extensionEntry);
   expect(prepared?.readPaths).toContain(cwd);
+  expect(prepared?.readPaths.some((path) => path.endsWith('landstrip.json'))).toBe(true);
   const toolsIndex = prepared?.args.indexOf('--tools') ?? -1;
   expect(prepared?.args[toolsIndex + 1]).toBe('read');
   const context = contextFromEnvironment({
@@ -340,6 +342,53 @@ test('renders active task progress without completed siblings', () => {
   expect(cleared).toBe(true);
 });
 
+test('serializes agent and sandbox prompts through one presenter', async () => {
+  const prompts = new PermissionPromptCoordinator();
+  const runtime = new SubagentRuntime(
+    {} as ExtensionAPI,
+    {} as LandstripIntegration,
+    undefined,
+    undefined,
+    prompts,
+  );
+  const broker = (
+    runtime as unknown as {
+      broker: {
+        ask(
+          ctx: ExtensionContext,
+          task: string,
+          permission: string,
+          resource: string,
+        ): Promise<void>;
+      };
+    }
+  ).broker;
+  const select = vi.fn(async () => 'Allow once');
+  const ctx = { hasUI: true, ui: { select } } as unknown as ExtensionContext;
+  const sandboxStarted = vi.fn();
+  let finishSandbox = (): void => {};
+  const sandboxPending = new Promise<void>((resolve) => {
+    finishSandbox = resolve;
+  });
+  const sandbox = prompts.resolve(
+    () => undefined,
+    async () => {
+      sandboxStarted();
+      await sandboxPending;
+      return true;
+    },
+  );
+  await vi.waitFor(() => expect(sandboxStarted).toHaveBeenCalledOnce());
+
+  const agent = broker.ask(ctx, '@build', 'bash', 'git status');
+  await Promise.resolve();
+  expect(select).not.toHaveBeenCalled();
+
+  finishSandbox();
+  await expect(Promise.all([sandbox, agent])).resolves.toEqual([true, undefined]);
+  expect(select).toHaveBeenCalledOnce();
+});
+
 test('selects a primary agent and applies its prompt', async () => {
   let sessionStart:
     | ((event: { type: 'session_start' }, ctx: ExtensionContext) => Promise<void> | void)
@@ -426,17 +475,27 @@ test('selects a primary agent and applies its prompt', async () => {
       getSessionId: () => 'parent',
     },
   } as unknown as ExtensionContext;
-  const integration = { createTools: () => [] } as unknown as LandstripIntegration;
+  const authorizeFilesystemToolAccess = vi.fn(
+    async (..._args: Parameters<LandstripIntegration['authorizeFilesystemToolAccess']>) => ({
+      allowed: true,
+      prompted: true,
+    }),
+  );
+  const integration = {
+    createTools: () => [],
+    authorizeFilesystemToolAccess,
+  } as unknown as LandstripIntegration;
   const piAgentDir = temporaryDirectory();
   writeFileSync(
     join(piAgentDir, 'settings.json'),
     JSON.stringify({
       landstrip: {
+        toolFilesystemPolicy: 'sandbox',
         agent: {
           plan: {
             model: 'anthropic/claude-plan',
             variant: 'high',
-            permission: { edit: { '*': 'allow', 'secrets/**': 'deny' } },
+            permission: { edit: { '*': 'ask', 'secrets/**': 'deny' } },
           },
         },
       },
@@ -465,6 +524,34 @@ test('selects a primary agent and applies its prompt', async () => {
     toolCall?.({ toolName: 'bash', input: { command: 'git status' } }, ctx),
   ).resolves.toBe(undefined);
   expect(selections).toEqual(['@plan: permission required\nbash: git status']);
+  await expect(
+    toolCall?.(
+      {
+        toolName: 'apply_patch',
+        input: {
+          patchText:
+            '*** Begin Patch\n*** Update File: src/one.ts\n*** Move to: src/two.ts\n*** End Patch',
+        },
+      },
+      ctx,
+    ),
+  ).resolves.toBe(undefined);
+  expect(authorizeFilesystemToolAccess).toHaveBeenCalledOnce();
+  expect(authorizeFilesystemToolAccess.mock.calls[0]?.[1]).toEqual([
+    { operation: 'write', path: 'src/one.ts' },
+    { operation: 'write', path: 'src/two.ts' },
+  ]);
+  expect(authorizeFilesystemToolAccess.mock.calls[0]?.[2]).toMatchObject({
+    authorizationNote: 'Approval also authorizes @plan tool dispatch for this call.',
+  });
+  expect(selections).toHaveLength(1);
+  authorizeFilesystemToolAccess.mockRejectedValueOnce(new Error('corrupt sandbox policy'));
+  await expect(
+    toolCall?.({ toolName: 'write', input: { path: 'src/error.ts' } }, ctx),
+  ).resolves.toEqual({
+    block: true,
+    reason: 'Filesystem policy error: corrupt sandbox policy',
+  });
   await expect(
     toolCall?.(
       {
@@ -725,6 +812,7 @@ test('lists hidden agents in the task tool description', () => {
   } as unknown as ExtensionAPI;
   new SubagentRuntime(pi, {} as LandstripIntegration, undefined, () => ({
     maxSubagents: 1,
+    toolFilesystemPolicy: 'host',
     agents: new Map([
       [
         'visible',

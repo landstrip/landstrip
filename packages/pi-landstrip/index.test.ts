@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, parse } from 'node:path';
 
 import type {
   ExtensionAPI,
@@ -93,6 +102,78 @@ describe('process read policy', () => {
     expect(enforcesShellReadPolicy('policy', 'darwin')).toBe(true);
     expect(enforcesShellReadPolicy('host', 'win32')).toBe(true);
     expect(enforcesShellReadPolicy('invalid', 'darwin')).toBe(true);
+  });
+});
+
+describe('filesystem tool policy authorization', () => {
+  it('allows configured paths, hard-denies denyWrite, and prompts once for multiple paths', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-file-tool-'));
+    const outside = mkdtempSync(join(tmpdir(), 'pi-landstrip-file-tool-outside-'));
+    const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-file-tool-agent-'));
+    const canonicalOutside = realpathSync(outside);
+    symlinkSync(outside, join(cwd, 'outside-link'), 'junction');
+    const danglingTarget = join(outside, 'future-directory');
+    symlinkSync(danglingTarget, join(cwd, 'dangling-link'), 'junction');
+    vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+    writeFileSync(
+      join(agentDir, 'sandbox.json'),
+      JSON.stringify({
+        filesystem: { allowRead: ['.'], allowWrite: ['.'], denyWrite: ['**/.env'] },
+      }),
+    );
+    const prompts: string[] = [];
+    const ctx = {
+      cwd,
+      hasUI: true,
+      ui: {
+        select: async (title: string) => {
+          prompts.push(title);
+          return 'Allow once';
+        },
+        notify() {},
+      },
+    } as unknown as ExtensionContext;
+    const integration = createLandstripIntegration({ registerBashTool: false });
+
+    await expect(
+      integration.authorizeFilesystemToolAccess(ctx, [{ operation: 'read', path: 'source.ts' }]),
+    ).resolves.toEqual({ allowed: true, prompted: false });
+    await expect(
+      integration.authorizeFilesystemToolAccess(ctx, [{ operation: 'write', path: '.env' }]),
+    ).resolves.toMatchObject({ allowed: false, prompted: false });
+    await expect(
+      integration.authorizeFilesystemToolAccess(ctx, [
+        { operation: 'write', path: join(outside, 'one.ts') },
+        { operation: 'write', path: join(outside, 'two.ts') },
+        { operation: 'write', path: 'outside-link/future.ts' },
+        { operation: 'write', path: 'dangling-link/future.ts' },
+      ]),
+    ).resolves.toEqual({ allowed: true, prompted: true });
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain(`write: ${join(canonicalOutside, 'one.ts')}`);
+    expect(prompts[0]).toContain(`write: ${join(canonicalOutside, 'two.ts')}`);
+    expect(prompts[0]).toContain(`write: ${join(canonicalOutside, 'future.ts')}`);
+    expect(prompts[0]).toContain(
+      `write: ${join(canonicalOutside, 'future-directory', 'future.ts')}`,
+    );
+    vi.unstubAllEnvs();
+  });
+
+  it('fails closed without a UI when approval is required', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-file-tool-headless-'));
+    const outside = mkdtempSync(join(tmpdir(), 'pi-landstrip-file-tool-headless-outside-'));
+    const ctx = { cwd, hasUI: false } as ExtensionContext;
+
+    await expect(
+      createLandstripIntegration({ registerBashTool: false }).authorizeFilesystemToolAccess(ctx, [
+        { operation: 'write', path: join(outside, 'file.ts') },
+      ]),
+    ).resolves.toEqual({
+      allowed: false,
+      prompted: false,
+      reason: 'Filesystem access requires approval',
+    });
   });
 });
 
@@ -280,6 +361,59 @@ it('uses the active shell provider when sandboxing is disabled', async () => {
   }
 });
 
+it('does not route around an unavailable sandbox through a shell provider', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-unavailable-shell-'));
+  const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-unavailable-shell-agent-'));
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  const platform = vi.spyOn(process, 'platform', 'get').mockReturnValue('aix');
+  const handlers = new Map<string, unknown>();
+  let bashTool: ToolDefinition | undefined;
+  const pi = {
+    registerTool(tool: ToolDefinition) {
+      if (tool.name === 'bash') bashTool = tool;
+    },
+    registerFlag() {},
+    registerCommand() {},
+    getFlag() {
+      return false;
+    },
+    on(event: string, handler: unknown) {
+      handlers.set(event, handler);
+    },
+  } as unknown as ExtensionAPI;
+  const ctx = {
+    cwd,
+    hasUI: true,
+    mode: 'interactive',
+    isProjectTrusted: () => true,
+    sessionManager: { getSessionId: () => 'unavailable-session', getSessionFile: () => undefined },
+    ui: { notify() {}, setStatus() {} },
+  } as unknown as ExtensionContext;
+  const prepare = vi.fn();
+  const integration = createLandstripIntegration();
+  integration.registerShellProvider({ id: 'external-shell', prepare });
+  integration.register(pi);
+
+  try {
+    expect(bashTool).toBeDefined();
+    await expect(
+      bashTool!.execute('tool-call', { command: 'echo unsafe' }, undefined, undefined, ctx),
+    ).rejects.toThrow('Sandbox is unavailable; refusing command');
+
+    const userBash = handlers.get('user_bash') as (
+      event: unknown,
+      context: ExtensionContext,
+    ) => Promise<unknown>;
+    await expect(userBash({}, ctx)).rejects.toThrow('Sandbox is unavailable; refusing command');
+    expect(prepare).not.toHaveBeenCalled();
+  } finally {
+    platform.mockRestore();
+    vi.unstubAllEnvs();
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+});
+
 it('skips a queued permission prompt after a concurrent session grant', async () => {
   const coordinator = new PermissionPromptCoordinator();
   const path = join(homedir(), '.cargo');
@@ -391,6 +525,56 @@ it('releases an active permission prompt after cancellation', async () => {
   await activeResult;
   await expect(successor).resolves.toBe(true);
   expect(successorPrompt).toHaveBeenCalledOnce();
+});
+
+it('rejects a prompt result that settles after cancellation', async () => {
+  const coordinator = new PermissionPromptCoordinator();
+  const controller = new AbortController();
+  let finishPrompt = (): void => {};
+  const promptPending = new Promise<void>((resolve) => {
+    finishPrompt = resolve;
+  });
+  const activePrompt = vi.fn(async () => {
+    await promptPending;
+    return true;
+  });
+  const successorPrompt = vi.fn(async () => true);
+
+  const active = coordinator.resolve(() => undefined, activePrompt, controller.signal);
+  await vi.waitFor(() => expect(activePrompt).toHaveBeenCalledOnce());
+  const activeResult = expect(active).rejects.toThrow('Permission request cancelled');
+  const successor = coordinator.resolve(() => undefined, successorPrompt);
+  controller.abort();
+  finishPrompt();
+
+  await activeResult;
+  await expect(successor).resolves.toBe(true);
+  expect(successorPrompt).toHaveBeenCalledOnce();
+});
+
+it('cancels an active permission prompt when the coordinator resets', async () => {
+  const coordinator = new PermissionPromptCoordinator();
+  const activePrompt = vi.fn(
+    (signal: AbortSignal) =>
+      new Promise<boolean>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('Permission prompt cancelled')), {
+          once: true,
+        });
+      }),
+  );
+
+  const active = coordinator.resolve(() => undefined, activePrompt);
+  await vi.waitFor(() => expect(activePrompt).toHaveBeenCalledOnce());
+  const activeResult = expect(active).rejects.toThrow('Permission prompt cancelled');
+  coordinator.reset();
+
+  await activeResult;
+  await expect(
+    coordinator.resolve(
+      () => undefined,
+      async () => true,
+    ),
+  ).resolves.toBe(true);
 });
 
 it('registers the sandbox dashboard independently from agent supervision', async () => {
@@ -686,6 +870,13 @@ describe('matchesPattern other entry shapes', () => {
     expect(matchesPattern(`${PROJECT}/a/b/.env`, ['**/.env'], PROJECT)).toBe(true);
     expect(matchesPattern(`${PROJECT}/a/b/key.pem`, ['**/*.pem'], PROJECT)).toBe(true);
     expect(matchesPattern(`${PROJECT}/a/b/file.ts`, ['**/.env'], PROJECT)).toBe(false);
+  });
+
+  it('matches a glob rooted at the filesystem root', () => {
+    const root = parse(PROJECT).root;
+    expect(
+      matchesPattern(join(root, 'landstrip-root-test', 'file.ts'), [`${root}**`], PROJECT),
+    ).toBe(true);
   });
 
   // A single '*' must stop at '/', like landstrip's own matcher, so an

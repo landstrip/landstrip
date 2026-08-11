@@ -8,8 +8,10 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  lstatSync,
   readFileSync,
   realpathSync,
+  readlinkSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -23,7 +25,7 @@ import {
   Socket as NetSocket,
 } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, parse, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath, URL } from 'node:url';
 
@@ -550,28 +552,49 @@ function expandPath(filePath: string, cwd: string): string {
   return resolve(cwd, expandHomePath(filePath));
 }
 
-function canonicalizePath(filePath: string, cwd: string): string {
+function canonicalizePath(filePath: string, cwd: string, seen = new Set<string>()): string {
   const abs = expandPath(filePath, cwd);
+  const missing: string[] = [];
+  let existing = abs;
 
-  try {
-    return realpathSync.native(abs);
-  } catch {
-    const tail: string[] = [];
-    let probe = abs;
-
-    while (!existsSync(probe)) {
-      const parent = dirname(probe);
-      if (parent === probe) return abs;
-      tail.unshift(basename(probe));
-      probe = parent;
-    }
-
+  for (;;) {
     try {
-      return resolve(realpathSync.native(probe), ...tail);
+      const stat = lstatSync(existing);
+      if (stat.isSymbolicLink()) {
+        if (seen.has(existing)) return abs;
+        seen.add(existing);
+        const target = resolve(dirname(existing), readlinkSync(existing), ...missing);
+        return canonicalizePath(target, cwd, seen);
+      }
+      break;
     } catch {
-      return abs;
+      const parent = dirname(existing);
+      if (parent === existing) return abs;
+      missing.unshift(basename(existing));
+      existing = parent;
     }
   }
+
+  try {
+    return resolve(realpathSync.native(existing), ...missing);
+  } catch {
+    return abs;
+  }
+}
+
+function canonicalizePattern(pattern: string, cwd: string): string {
+  const expanded = expandPath(pattern, cwd);
+  const wildcard = expanded.indexOf('*');
+  if (wildcard < 0) return canonicalizePath(expanded, cwd);
+
+  const prefix = expanded.slice(0, wildcard);
+  const base = prefix.endsWith(sep) ? prefix : dirname(prefix);
+  const suffixOffset = base.endsWith(sep) ? base.length - 1 : base.length;
+  const canonicalBase = canonicalizePath(base, cwd);
+  const suffix = expanded.slice(suffixOffset);
+  return canonicalBase.endsWith(sep) && suffix.startsWith(sep)
+    ? `${canonicalBase}${suffix.slice(1)}`
+    : `${canonicalBase}${suffix}`;
 }
 
 function normalizePathSeparators(path: string): string {
@@ -582,9 +605,7 @@ export function matchesPattern(filePath: string, patterns: string[], cwd: string
   const abs = normalizePathSeparators(canonicalizePath(filePath, cwd));
 
   return patterns.some((pattern) => {
-    const absPattern = normalizePathSeparators(
-      pattern.includes('*') ? expandPath(pattern, cwd) : canonicalizePath(pattern, cwd),
-    );
+    const absPattern = normalizePathSeparators(canonicalizePattern(pattern, cwd));
 
     if (pattern.includes('*')) {
       // Mirror landstrip's matcher: `**/` spans directories, `**` spans any run,
@@ -981,6 +1002,7 @@ async function showPermissionPrompt(
     option.hint ? `${option.label} — ${option.hint}` : option.label,
   );
   const selected = await ctx.ui.select(title, labels, { signal });
+  if (signal?.aborted) return 'abort';
   const index = selected === undefined ? -1 : labels.indexOf(selected);
   const option = options[index];
   if (!option) return 'abort';
@@ -990,7 +1012,7 @@ async function showPermissionPrompt(
       `${title}\n\n${option.hint ?? 'This changes persisted sandbox policy.'}`,
       { signal },
     );
-    if (!confirmed) return 'abort';
+    if (!confirmed || signal?.aborted) return 'abort';
   }
   return option.action;
 }
@@ -1033,6 +1055,22 @@ function promptWriteBlock(
   );
 }
 
+function promptFilesystemToolBlock(
+  ctx: ExtensionContext,
+  accesses: readonly FilesystemToolAccess[],
+  authorizationNote: string | undefined,
+  signal?: AbortSignal,
+): Promise<PermissionChoice> {
+  const paths = accesses.map(({ operation, path }) => `${operation}: ${path}`).join('\n');
+  const note = authorizationNote ? `\n\n${authorizationNote}` : '';
+  return showPermissionPrompt(
+    ctx,
+    `Filesystem policy blocked this tool call:\n${paths}${note}`,
+    PERMISSION_OPTIONS,
+    signal,
+  );
+}
+
 // The broker knows only address:port, and no sandbox field can express a grant
 // for one non-loopback endpoint: allowedDomains is enforced by the proxy,
 // allowLocalBinding grants all loopback endpoints, and allowNetwork disables
@@ -1050,24 +1088,6 @@ function promptNetworkBlock(
     NETWORK_PERMISSION_OPTIONS,
     signal,
   );
-}
-
-// The binary is bundled and version-locked to @landstrip/landstrip via npm, so
-// compatibility is settled at install time; only confirm it is runnable here.
-function landstripAvailable(): boolean {
-  try {
-    return spawnSync(binaryPath(), ['--version']).status === 0;
-  } catch {
-    return false;
-  }
-}
-
-function landstripDisplayPath(): string {
-  try {
-    return binaryPath();
-  } catch {
-    return 'unavailable';
-  }
 }
 
 // Write the full environment to a temporary shell file.
@@ -1237,10 +1257,34 @@ export interface LandstripIntegrationOptions {
   readonly cwd?: string;
 }
 
+/** Filesystem access requested by a primary Pi file tool. */
+export interface FilesystemToolAccess {
+  readonly operation: 'read' | 'write';
+  readonly path: string;
+}
+
+/** Result of applying sandbox filesystem policy before a Pi file tool runs. */
+export interface FilesystemToolAuthorization {
+  readonly allowed: boolean;
+  readonly prompted: boolean;
+  readonly reason?: string;
+}
+
+export interface FilesystemToolAuthorizationOptions {
+  readonly signal?: AbortSignal;
+  readonly authorizationNote?: string;
+}
+
 /** Landstrip sandbox integration hooks for Pi. */
 export interface LandstripIntegration extends PiLandstripRuntimeV2 {
   /** Prepare a full Pi RPC process constrained by the effective sandbox policy. */
   prepareRpcWorker(options: LandstripRpcWorkerOptions): Promise<LandstripRpcWorkerLaunch>;
+  /** Apply sandbox filesystem rules before a primary Pi file tool runs. */
+  authorizeFilesystemToolAccess(
+    ctx: ExtensionContext,
+    accesses: readonly FilesystemToolAccess[],
+    options?: FilesystemToolAuthorizationOptions,
+  ): Promise<FilesystemToolAuthorization>;
   /** Register the integration's tools, events, flags, and commands with Pi. */
   register(pi: ExtensionAPI): void;
   /** Publish an integration lifecycle event from an embedded runtime. */
@@ -1286,14 +1330,22 @@ export default function (pi: ExtensionAPI) {
     registerSubagentWorker(pi, workerConfig);
     return;
   }
-  const integration = createLandstripIntegration();
-  registerSubagents(pi, integration);
+  const permissionPrompts = new PermissionPromptCoordinator();
+  const integration = createLandstripIntegrationWithPrompts({}, permissionPrompts);
+  registerSubagents(pi, integration, permissionPrompts);
   integration.register(pi);
 }
 
 /** Create a landstrip integration for registration or custom embedding. */
 export function createLandstripIntegration(
   options: LandstripIntegrationOptions = {},
+): LandstripIntegration {
+  return createLandstripIntegrationWithPrompts(options, new PermissionPromptCoordinator());
+}
+
+function createLandstripIntegrationWithPrompts(
+  options: LandstripIntegrationOptions,
+  permissionPrompts: PermissionPromptCoordinator,
 ): LandstripIntegration {
   const shouldRegisterBashTool = options.registerBashTool ?? true;
   const localCwd = options.cwd ?? process.cwd();
@@ -1323,7 +1375,6 @@ export function createLandstripIntegration(
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
   const sessionAllowedTargets: string[] = [];
-  const permissionPrompts = new PermissionPromptCoordinator();
 
   function getContext(ctx = activeContext): LandstripContextV2 {
     return {
@@ -1579,6 +1630,90 @@ export function createLandstripIntegration(
     noteScope(ctx, 'Write', choice, filePath, scope);
   }
 
+  async function authorizeFilesystemToolAccess(
+    ctx: ExtensionContext,
+    accesses: readonly FilesystemToolAccess[],
+    options: FilesystemToolAuthorizationOptions = {},
+  ): Promise<FilesystemToolAuthorization> {
+    const normalized = [
+      ...new Map(
+        accesses.map((access) => {
+          const path = normalizeBlockedPath(access.path, ctx.cwd);
+          return [`${access.operation}\u0000${path}`, { ...access, path }] as const;
+        }),
+      ).values(),
+    ];
+
+    const current = (): FilesystemToolAuthorization | undefined => {
+      const config = loadConfig(ctx.cwd);
+      for (const access of normalized) {
+        if (
+          access.operation === 'write' &&
+          matchesPattern(access.path, config.filesystem.denyWrite, ctx.cwd)
+        ) {
+          return {
+            allowed: false,
+            prompted: false,
+            reason: `Write denied by sandbox policy: ${access.path}`,
+          };
+        }
+      }
+
+      const blocked = normalized.filter((access) =>
+        access.operation === 'read'
+          ? !readAllowed(
+              access.path,
+              getEffectiveAllowRead(config, ctx.cwd),
+              getEffectiveDenyRead(config, ctx.cwd),
+              ctx.cwd,
+            )
+          : shouldPromptForWrite(access.path, getEffectiveAllowWrite(config), ctx.cwd),
+      );
+      return blocked.length === 0 ? { allowed: true, prompted: false } : undefined;
+    };
+
+    const existing = current();
+    if (existing) return existing;
+    if (!ctx.hasUI) {
+      return { allowed: false, prompted: false, reason: 'Filesystem access requires approval' };
+    }
+
+    return permissionPrompts.resolve(
+      current,
+      async (promptSignal) => {
+        const config = loadConfig(ctx.cwd);
+        const blocked = normalized.filter((access) =>
+          access.operation === 'read'
+            ? !readAllowed(
+                access.path,
+                getEffectiveAllowRead(config, ctx.cwd),
+                getEffectiveDenyRead(config, ctx.cwd),
+                ctx.cwd,
+              )
+            : shouldPromptForWrite(access.path, getEffectiveAllowWrite(config), ctx.cwd),
+        );
+        const choice = await promptFilesystemToolBlock(
+          ctx,
+          blocked,
+          options.authorizationNote,
+          promptSignal,
+        );
+        if (choice === 'abort' || promptSignal.aborted) {
+          return { allowed: false, prompted: true, reason: 'Filesystem access denied' };
+        }
+        for (const access of blocked) {
+          if (access.operation === 'read') {
+            await applyReadChoice(ctx, choice, access.path, ctx.cwd);
+          } else {
+            await applyWriteChoice(ctx, choice, access.path, ctx.cwd);
+          }
+        }
+        return { allowed: true, prompted: true };
+      },
+      options.signal,
+    );
+  }
+
   async function ensureDomainAllowed(
     ctx: ExtensionContext,
     domain: string,
@@ -1596,9 +1731,9 @@ export function createLandstripIntegration(
 
     return permissionPrompts.resolve(
       current,
-      async () => {
-        const choice = await promptDomainBlock(ctx, domain, signal);
-        if (choice === 'abort') return false;
+      async (promptSignal) => {
+        const choice = await promptDomainBlock(ctx, domain, promptSignal);
+        if (choice === 'abort' || promptSignal.aborted) return false;
         await applyDomainChoice(choice, domain, cwd, allowances);
         return true;
       },
@@ -1902,9 +2037,10 @@ export function createLandstripIntegration(
 
       return permissionPrompts.resolve(
         current,
-        async () => {
-          const choice = await promptNetworkBlock(ctx, trap.operation, trap.target, signal);
-          if (choice === 'abort') return { action: 'deny', reason: 'rejected' };
+        async (promptSignal) => {
+          const choice = await promptNetworkBlock(ctx, trap.operation, trap.target, promptSignal);
+          if (choice === 'abort' || promptSignal.aborted)
+            return { action: 'deny', reason: 'rejected' };
           const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
           if (!targets.includes(key)) targets.push(key);
           return { action: 'allow' };
@@ -1936,7 +2072,7 @@ export function createLandstripIntegration(
 
     return permissionPrompts.resolve(
       current,
-      async () => {
+      async (promptSignal) => {
         const config = loadConfig(cwd);
         const choice =
           trap.operation === 'read'
@@ -1946,10 +2082,11 @@ export function createLandstripIntegration(
                 matchesPattern(path, config.filesystem.denyRead, cwd)
                   ? 'granting allowRead will override it'
                   : undefined,
-                signal,
+                promptSignal,
               )
-            : await promptWriteBlock(ctx, path, signal);
-        if (choice === 'abort') return { action: 'deny', reason: 'rejected' };
+            : await promptWriteBlock(ctx, path, promptSignal);
+        if (choice === 'abort' || promptSignal.aborted)
+          return { action: 'deny', reason: 'rejected' };
         if (trap.operation === 'read') {
           await applyReadChoice(ctx, choice, path, cwd, allowances);
         } else {
@@ -2680,7 +2817,7 @@ export function createLandstripIntegration(
       };
       const access = await permissionPrompts.resolve(
         current,
-        async () => {
+        async (promptSignal) => {
           const config = loadConfig(ctx.cwd);
           const choice =
             operation === 'read'
@@ -2690,10 +2827,10 @@ export function createLandstripIntegration(
                   matchesPattern(blockedPath, config.filesystem.denyRead, ctx.cwd)
                     ? 'granting allowRead will override it'
                     : undefined,
-                  signal,
+                  promptSignal,
                 )
-              : await promptWriteBlock(ctx, blockedPath, signal);
-          if (choice === 'abort') return false;
+              : await promptWriteBlock(ctx, blockedPath, promptSignal);
+          if (choice === 'abort' || promptSignal.aborted) return false;
           if (operation === 'read') {
             await applyReadChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
           } else {
@@ -2898,17 +3035,10 @@ export function createLandstripIntegration(
       return false;
     }
 
-    if (!landstripAvailable()) {
-      sandboxEnabled = false;
-      sandboxReady = false;
-      setSandboxState('unavailable', ctx);
-      warnUnsandboxed(
-        ctx,
-        `landstrip was not found. Reinstall with: npm install @landstrip/landstrip`,
-        'error',
-      );
-      return false;
-    }
+    // Resolve through the plugin dependency. A missing platform package is a
+    // broken installation and must abort enablement instead of selecting an
+    // unsandboxed execution route.
+    binaryPath();
 
     sandboxEnabled = true;
     sandboxReady = true;
@@ -2953,7 +3083,7 @@ export function createLandstripIntegration(
       async execute(id, params, signal, onUpdate, ctx) {
         if (!ctx) throw new Error('Sandbox context is unavailable');
         if (!ensureSandboxState(ctx)) {
-          if (sandboxState === 'unavailable' && externalShellProvider === undefined) {
+          if (sandboxState === 'unavailable') {
             throw new Error('Sandbox is unavailable; refusing command');
           }
           if (externalShellProvider !== undefined) {
@@ -2991,7 +3121,7 @@ export function createLandstripIntegration(
 
     pi.on('user_bash', async (_event, ctx) => {
       if (!ensureSandboxState(ctx)) {
-        if (sandboxState === 'unavailable' && externalShellProvider === undefined) {
+        if (sandboxState === 'unavailable') {
           throw new Error('Sandbox is unavailable; refusing command');
         }
         if (externalShellProvider !== undefined) {
@@ -3005,6 +3135,7 @@ export function createLandstripIntegration(
 
     pi.on('session_start', async (_event, ctx) => {
       activeContext = ctx;
+      permissionPrompts.reset();
       resetSessionAllowances();
       const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
       projectConfigTrusted = trustContext.isProjectTrusted?.() ?? false;
@@ -3029,6 +3160,7 @@ export function createLandstripIntegration(
       if (!unpublishRuntime) unpublishRuntime = publishLandstripRuntime(pi, integration);
     });
     pi.on('session_shutdown', () => {
+      permissionPrompts.reset();
       activeContext = undefined;
       unpublishRuntime?.();
       unpublishRuntime = undefined;
@@ -3146,7 +3278,7 @@ export function createLandstripIntegration(
                     ),
                     item(
                       'Landstrip binary',
-                      text(truncateToWidth(landstripDisplayPath(), Math.max(10, innerWidth - 20))),
+                      text(truncateToWidth(binaryPath(), Math.max(10, innerWidth - 20))),
                     ),
                   );
                   if (windowsImplementation !== undefined) {
@@ -3272,6 +3404,7 @@ export function createLandstripIntegration(
     registerShellProvider,
     prepareProcess,
     prepareRpcWorker,
+    authorizeFilesystemToolAccess,
     registerWorkerExtension,
     getWorkerExtensions,
     on,

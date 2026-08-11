@@ -129,6 +129,7 @@ Sandbox settings remain in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`.
 ```json
 {
   "maxSubagents": 2,
+  "toolFilesystemPolicy": "sandbox",
   "agent": {
     "review": {
       "description": "Review code without modifying it",
@@ -153,6 +154,11 @@ Sandbox settings remain in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`.
 the `task` tool. Agent definitions support `mode`, `prompt`, `model`, `variant`,
 `steps`, `color`, `hidden`, `disable`, `options`, and permission rules. Modes
 are `primary`, `subagent`, or `all`.
+
+`toolFilesystemPolicy` defaults to "host", preserving Pi's normal filesystem
+tool behavior. Set it to "sandbox" to apply `sandbox.json` path rules before
+primary file tools run. `denyWrite` is a hard denial; other blocked paths use the
+standard sandbox approval scopes.
 
 Pi Markdown agents are loaded from `~/.pi/agent/agents/` and `.pi/agents/`.
 Configured `agent` entries override Markdown agents with the same name.
