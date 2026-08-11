@@ -1,18 +1,16 @@
 # pi-landstrip
 
 `pi-landstrip` adds sandboxed Bash, primary agents, and process-backed subagents
-to [Pi](https://pi.dev/). OS isolation is provided by
-[`landstrip`](https://github.com/landstrip/landstrip).
+to [Pi](https://pi.dev/). It requires Pi 0.82.0 or later and Node.js 22.19.0 or
+later.
 
-Requires Pi 0.82.0 or later and Node.js 22.19.0 or later.
-
-## Installation
+## Install
 
 ```sh
 pi install npm:pi-landstrip
 ```
 
-For a manual install, add the package to global or trusted project
+For a manual global or trusted-project install, add the package to Pi's
 `settings.json`:
 
 ```json
@@ -21,110 +19,88 @@ For a manual install, add the package to global or trusted project
 }
 ```
 
-The package includes native Linux, macOS, and Windows binaries for x64 and
-Arm64. On unsupported platforms, the extension loads with sandboxing disabled.
+The package includes Landstrip binaries for Linux, macOS, and Windows on x64 and
+Arm64. If sandboxing is enabled but the binary or platform is unusable, Bash,
+shell commands, and sandboxed workers fail closed. Only `--no-sandbox` or
+`"enabled": false` permits execution without OS isolation.
 
-## Behavior
+## Permissions
 
-AI Bash calls and shell commands entered with `!` or `!!` run through
-Landstrip. Subagents run as separate Pi RPC processes and are sandboxed unless
-the sandbox is explicitly disabled.
+Pi evaluates two permission categories:
 
-The root Pi process is trusted. Pi filesystem tools and plugin callbacks run
-outside the OS sandbox. By default, agent permissions alone control filesystem
-tool dispatch. Set `toolFilesystemPolicy` to `"sandbox"` to preflight primary
-`read`, `write`, `edit`, and `apply_patch` calls against the sandbox filesystem
-rules. This path check is not an OS isolation boundary. On Linux and macOS,
-primary Bash reads use the same host view by default; writes remain sandboxed.
-Subagent processes retain the configured read and write policy.
+| Category | Checked                                 | Controls                         |
+| -------- | --------------------------------------- | -------------------------------- |
+| Agent    | Before dispatch                         | Whether an agent may call a tool |
+| Sandbox  | Before file access and during processes | Filesystem and network resources |
 
-The default [sandbox policy](./sandbox.json) limits writes to the project and
-restricts worker reads within the user's home to the project and a few bootstrap
-files. Direct network access is blocked. When the platform permits loopback, the
-extension's proxy filters allowed HTTP and HTTPS domains.
+Agent rules return `deny`, `ask`, or `allow`. An agent approval authorizes only
+tool dispatch and cannot bypass a sandbox hard denial.
 
-When a command needs more access, Pi can allow it once, for the session, or in
-the project or global policy. Project approvals go to `.pi/sandbox.json` and
-global approvals to `~/.pi/agent/sandbox.json`.
+By default, primary `read`, `write`, `edit`, and `apply_patch` tools run in the
+trusted Pi process and only agent permissions apply. Set
+`toolFilesystemPolicy` to `"sandbox"` to preflight their paths against
+`sandbox.json`. `denyWrite` remains a hard denial. If both agent and sandbox
+approval are needed, Pi presents one prompt for the call.
 
-- `/sandbox` inspects and toggles the sandbox.
-- `/agents` selects agents, edits agent settings, and shows task sessions.
-- `Ctrl+Shift+A` cycles visible primary agents while Pi is idle.
+AI Bash, `!`, `!!`, and subagent processes use OS isolation. Subagents rely on
+that isolation instead of repeating file-tool preflight. Pi presents all agent
+and sandbox requests through one FIFO prompt queue.
 
-### Disabling the sandbox
+Sandbox approvals may apply once, for the session, to the project, or globally.
+Persistent approvals update `.pi/sandbox.json` or
+`~/.pi/agent/sandbox.json`. Headless requests that require approval are denied.
 
-Use `--no-sandbox` or set `enabled` to `false` in `sandbox.json`:
+## Sandbox configuration
 
-```json
-{
-  "enabled": false
-}
-```
+Sandbox policy merges in this order:
 
-Subagents remain separate processes but lose Landstrip OS isolation. Pi warns
-once per session. Trusted project config overrides global config; `/sandbox`
-updates a project sandbox file when present, otherwise the global file.
+1. bundled [`sandbox.json`](./sandbox.json);
+2. `~/.pi/agent/sandbox.json`;
+3. `.pi/sandbox.json` for a trusted project.
 
-### Shell read access
+Objects merge recursively, arrays combine, and later scalar values replace
+earlier values. `/sandbox` displays or toggles the policy. It writes the project
+policy in a trusted project and the global policy otherwise.
 
-`"shell": { "readAccess": "host" }` keeps primary Bash and `!`/`!!` reads
-consistent with trusted Pi filesystem tools. Set `readAccess` to `"policy"` to
-apply `filesystem.denyRead` and `filesystem.allowRead` to shell commands as an
-intentional stricter boundary. Worker processes always use the filesystem read
-policy. Windows always uses policy reads because its sandbox requires an explicit
-read allowlist.
+| Field                         | Bundled default                                                                                    |
+| ----------------------------- | -------------------------------------------------------------------------------------------------- |
+| `enabled`                     | `true`                                                                                             |
+| `shell.readAccess`            | `"host"`                                                                                           |
+| `filesystem.denyRead`         | `["/Users", "/home"]`                                                                              |
+| `filesystem.allowRead`        | `[".", "~/.gitconfig", "~/.config/git/config", "/dev/null"]`                                       |
+| `filesystem.allowWrite`       | `[".", "/dev/null"]`                                                                               |
+| `filesystem.denyWrite`        | `["**/.env", "**/.env.*", "**/*.pem", "**/*.key", ".pi/sandbox.json", "~/.pi/agent/sandbox.json"]` |
+| `network.allowNetwork`        | `false`                                                                                            |
+| `network.allowLocalBinding`   | `false`                                                                                            |
+| `network.allowAllUnixSockets` | `false`                                                                                            |
+| `network.allowUnixSockets`    | `[]`                                                                                               |
+| `network.allowedDomains`      | `[]`                                                                                               |
+| `network.deniedDomains`       | `[]`                                                                                               |
+| `windows.appContainerMode`    | `"standard"`                                                                                       |
+| `windows.allowLoopback`       | `false`                                                                                            |
 
-### Permission layers
+Filesystem and core network semantics follow the main
+[Landstrip policy](https://github.com/landstrip/landstrip#policy). `allowedDomains`
+and `deniedDomains` are plugin fields enforced by the local HTTP/HTTPS proxy.
 
-| Layer                  | Checked            | Controls                              |
-| ---------------------- | ------------------ | ------------------------------------- |
-| Agent permission       | Before a tool runs | Which tools the agent may call        |
-| Filesystem tool policy | Before a file tool | Paths primary file tools may access   |
-| OS sandbox policy      | During a process   | Process filesystem and network access |
+`shell.readAccess: "host"` gives primary Bash and `!`/`!!` the trusted host read
+view on Linux and macOS while retaining sandboxed writes. `"policy"` applies
+`denyRead` and `allowRead`. Workers always use policy reads. Windows always uses
+policy reads because it requires an explicit read allowlist.
 
-When a file-tool path requires sandbox approval and agent permission also asks,
-Pi composes both decisions into one prompt. The existing once, session, project,
-and global sandbox approval scopes apply. Subagents continue to rely on OS
-sandbox enforcement.
+With `enabled: false`, subagents remain separate processes but lose Landstrip OS
+isolation; Pi warns once per session.
 
-## Agents
+## Agent configuration
 
-The built-in primary agents are `build` and `plan`. The built-in subagents are
-`explore`, `general`, and `scout`. `/agents` can activate, edit, or disable
-configured agents.
+Agent configuration merges built-ins, global configuration, then trusted-project
+configuration. Use either dedicated files:
 
-The `task` tool starts a subagent. It accepts:
+- `~/.pi/agent/landstrip.json`
+- `.pi/landstrip.json`
 
-```json
-{
-  "description": "Review sandbox boundary",
-  "prompt": "Review the sandbox implementation and report concrete issues.",
-  "subagent_type": "explore",
-  "task_id": "optional-session-id",
-  "command": "optional-originating-command",
-  "background": false
-}
-```
-
-`description`, `prompt`, and `subagent_type` are required. Foreground tasks
-return their result directly. Background tasks return immediately and report
-completion later. Continue a saved task with `task_id`; inspect it with
-`/agents <id>`.
-
-Workers use normal Pi resource discovery and plugin loading. Each task starts a
-fresh process; continuing a task restores its saved session in a new process.
-Agent `deny`, `ask`, and `allow` rules are checked before tool dispatch.
-
-Model requests originate inside each worker. Workers can read Pi authentication
-and inherited credential environment variables. Loaded worker plugins share
-that access, so install only trusted plugins and use suitable credentials.
-
-## Configuration
-
-Landstrip settings are read from `~/.pi/agent/landstrip.json` and, for trusted
-projects, `.pi/landstrip.json`. The same object may instead be placed under
-`landstrip` in the matching `settings.json`. Use only one form at each scope.
-Sandbox settings remain in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`.
+or a top-level `landstrip` object in the matching `settings.json`. Using both
+forms at one scope is an error.
 
 ```json
 {
@@ -132,7 +108,7 @@ Sandbox settings remain in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`.
   "toolFilesystemPolicy": "sandbox",
   "agent": {
     "review": {
-      "description": "Review code without modifying it",
+      "description": "Review without modifying files",
       "mode": "subagent",
       "prompt": "Report concrete findings.",
       "permission": {
@@ -150,18 +126,41 @@ Sandbox settings remain in `~/.pi/agent/sandbox.json` and `.pi/sandbox.json`.
 }
 ```
 
-`maxSubagents` is the concurrency limit, from 0 to 16. Zero disables
-the `task` tool. Agent definitions support `mode`, `prompt`, `model`, `variant`,
-`steps`, `color`, `hidden`, `disable`, `options`, and permission rules. Modes
-are `primary`, `subagent`, or `all`.
+| Field                  | Default         | Values                                       |
+| ---------------------- | --------------- | -------------------------------------------- |
+| `maxSubagents`         | `1`             | integer from 0 through 16; 0 disables `task` |
+| `toolFilesystemPolicy` | `"host"`        | `"host"` or `"sandbox"`                      |
+| `agent`                | built-in agents | named agent definitions                      |
+| `permission`           | built-in rules  | global tool/resource rules                   |
 
-`toolFilesystemPolicy` defaults to "host", preserving Pi's normal filesystem
-tool behavior. Set it to "sandbox" to apply `sandbox.json` path rules before
-primary file tools run. `denyWrite` is a hard denial; other blocked paths use the
-standard sandbox approval scopes.
+Agent definitions accept `name`, `description`, `prompt`, `mode`, `model`,
+`variant`, `temperature`, `top_p`, `steps`, `color`, `hidden`, `disable`,
+`options`, and `permission`. `mode` is `primary`, `subagent`, or `all` and
+defaults to `all`.
 
-Pi Markdown agents are loaded from `~/.pi/agent/agents/` and `.pi/agents/`.
-Configured `agent` entries override Markdown agents with the same name.
-Project definitions override global definitions.
+The built-in primary agents are `build` and `plan`; built-in subagents are
+`general`, `scout`, and `explore`. Pi also loads Markdown agents from
+`~/.pi/agent/agents/` and `.pi/agents/`. Project definitions override global
+definitions, and configured agents override Markdown agents with the same name.
 
-For example, save this advisor subagent as `~/.pi/agent/agents/advisor.md`:
+## Commands and tasks
+
+- `/sandbox` inspects and toggles sandboxing.
+- `/agents` selects or edits agents and lists task sessions.
+- `Ctrl+Shift+A` cycles visible primary agents while Pi is idle.
+
+The `task` tool requires `description`, `prompt`, and `subagent_type`. Optional
+`task_id` continues a saved task, `command` records the originating command, and
+`background: true` returns immediately. `/agents <task-id>` inspects a task.
+Each invocation starts a fresh Pi RPC process; continuation restores its saved
+session in a new process.
+
+Workers use normal Pi resource and plugin discovery. Their model requests can
+read Pi authentication and inherited credential environment variables. Install
+only trusted worker plugins and use credentials appropriate for the sandboxed
+task.
+
+## License
+
+`pi-landstrip` is licensed under `Apache-2.0`. The bundled Landstrip package is
+licensed separately as `Apache-2.0 AND LGPL-2.1-or-later`.

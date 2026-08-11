@@ -1,13 +1,9 @@
 # opencode-landstrip
 
-`opencode-landstrip` sandboxes OpenCode AI `bash` calls with
-[`landstrip`](https://github.com/landstrip/landstrip) and the supported Anthropic
-Sandbox Runtime policy fields.
+`opencode-landstrip` runs OpenCode AI `bash` calls through
+[`landstrip`](https://github.com/landstrip/landstrip).
 
-The bundled [policy](./sandbox.json) is merged with global, project, and plugin
-options in that order.
-
-## Installation
+## Install
 
 ```sh
 # Current project
@@ -17,7 +13,8 @@ opencode plugin install opencode-landstrip
 opencode plugin install opencode-landstrip --global
 ```
 
-For a manual install, add the server plugin to `opencode.json`:
+A manual installation needs both plugins. Add the server plugin to
+`opencode.json`:
 
 ```json
 {
@@ -26,7 +23,7 @@ For a manual install, add the server plugin to `opencode.json`:
 }
 ```
 
-Add the TUI plugin to `tui.json`:
+Add the presenter to `tui.json`:
 
 ```json
 {
@@ -35,34 +32,66 @@ Add the TUI plugin to `tui.json`:
 }
 ```
 
-Run `/sandbox` to inspect or toggle the sandbox. The toggle writes to the
-project config if it already defines `enabled`; otherwise it writes to the
-global config.
+## Permissions
 
-## Behavior
+OpenCode agent permissions authorize tool dispatch. Landstrip sandbox
+permissions authorize filesystem and network access before a tool or while its
+process runs. Agent approval never bypasses a sandbox hard denial.
 
-AI `bash` calls run through Landstrip. Direct network access is blocked by
-default; the plugin's local HTTP and HTTPS proxy enforces `allowedDomains` and
-`deniedDomains`.
-The domain lists are plugin policy fields, not core Landstrip fields.
+The TUI presents one request at a time. OpenCode's native agent prompt has
+priority; Landstrip requests retain FIFO order and are routed to the originating
+root session. Without a live presenter, blocked sandbox requests are denied.
 
-OpenCode agent permissions authorize a tool before dispatch. Landstrip sandbox
-permissions authorize a blocked filesystem or network operation during the
-command. The TUI shows one permission at a time, with OpenCode's prompt first;
-subagent sandbox prompts are routed to the root session. Filesystem approvals
-may be saved to `.opencode/sandbox.json` or
-`~/.config/opencode/sandbox.json`.
-Without a live TUI presenter, blocked operations are denied.
+Filesystem approvals may be stored in `.opencode/sandbox.json` for the project
+or `~/.config/opencode/sandbox.json` globally. `/sandbox` displays or toggles the
+policy. It updates the project file when that file defines `enabled`, otherwise
+the global file.
 
-Shell-mode commands typed by the user are not process-sandboxed because
-OpenCode's plugin API cannot replace their execution. They may inherit proxy
-settings and receive policy checks, but they do not have an OS sandbox.
+## Configuration
 
-See the main [Landstrip documentation](https://github.com/landstrip/landstrip#readme)
-for policy semantics and platform limits.
+Policy merges in this order:
+
+1. bundled [`sandbox.json`](./sandbox.json);
+2. `~/.config/opencode/sandbox.json`;
+3. `.opencode/sandbox.json`;
+4. plugin options.
+
+Objects merge recursively, arrays combine, and later scalar values replace
+earlier values. The global file is initialized from the bundled policy when it
+does not exist. Programmatic plugin options may be the policy object directly or
+`{ "config": { ... } }`.
+
+| Field                         | Bundled default                                                                                                 |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `enabled`                     | `true`                                                                                                          |
+| `filesystem.denyRead`         | `["/Users", "/home"]`                                                                                           |
+| `filesystem.allowRead`        | `[".", "~/.gitconfig", "~/.config/git/config", "/dev/null"]`                                                    |
+| `filesystem.allowWrite`       | `[".", "/dev/null"]`                                                                                            |
+| `filesystem.denyWrite`        | `["**/.env", "**/.env.*", "**/*.pem", "**/*.key", ".opencode/sandbox.json", "~/.config/opencode/sandbox.json"]` |
+| `network.allowNetwork`        | `false`                                                                                                         |
+| `network.allowLocalBinding`   | `false`                                                                                                         |
+| `network.allowAllUnixSockets` | `false`                                                                                                         |
+| `network.allowUnixSockets`    | `[]`                                                                                                            |
+| `network.allowedDomains`      | `[]`                                                                                                            |
+| `network.deniedDomains`       | `[]`                                                                                                            |
+
+Filesystem and core network semantics follow the main
+[Landstrip policy](https://github.com/landstrip/landstrip#policy). `allowedDomains`
+and `deniedDomains` are plugin-only fields enforced by its local HTTP/HTTPS proxy.
+
+If `enabled` is true but the Landstrip binary, version, or platform is unusable,
+AI Bash fails closed rather than running without isolation. Set `enabled` to
+false explicitly to allow unsandboxed AI Bash.
+
+## Limits
+
+Only AI `bash` calls are process-sandboxed. Shell-mode commands entered directly
+by the user cannot be replaced through OpenCode's plugin API. They may inherit
+proxy settings and receive policy checks, but they do not have OS isolation.
+
+See the main [Landstrip documentation](https://github.com/landstrip/landstrip#readme) for platform limits.
 
 ## License
 
-`opencode-landstrip` is licensed under `Apache-2.0`. See [LICENSE](LICENSE).
-The bundled `@landstrip/landstrip` package is licensed separately as
-`Apache-2.0 AND LGPL-2.1-or-later`.
+`opencode-landstrip` is licensed under `Apache-2.0`. The bundled Landstrip
+package is licensed separately as `Apache-2.0 AND LGPL-2.1-or-later`.

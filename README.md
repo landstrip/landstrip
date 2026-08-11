@@ -3,21 +3,20 @@
 
 # landstrip
 
-`landstrip` runs commands in an OS-level sandbox using Landlock on Linux,
-Seatbelt on macOS, and AppContainer or restricted users on Windows. Policies use
+`landstrip` runs a command inside an OS sandbox: Landlock on Linux, Seatbelt on
+macOS, and AppContainer or a restricted user on Windows. Its policy format is
 the supported subset of the Anthropic Sandbox Runtime format.
 
-## Installation
+## Install
 
 ```sh
 npm install --save-dev @landstrip/landstrip
 npx landstrip run -p policy.json -- cargo test
 ```
 
-The npm package installs a Node.js wrapper and a native binary for the current
-platform.
+The npm package selects the native binary for the current platform.
 
-## Command line
+## Commands
 
 ```text
 landstrip run [OPTIONS] -- <PROGRAM> [ARGS...]
@@ -29,33 +28,21 @@ landstrip windows status
 landstrip windows uninstall
 ```
 
-The `windows` commands exist only in Windows builds.
+The `windows` commands are available only in Windows builds. `doctor` checks
+whether the platform sandbox is usable. Inspection commands print one JSON
+document. `run` returns the program's exit status; usage errors return 2 and
+other Landstrip failures return 1.
 
-Pass policies with `-p, --policy <FILE>`. The option may be repeated; objects
-merge recursively, later scalar values replace earlier ones, and arrays combine.
-JSON is the default. Use `--policy-format yaml` for YAML and always specify the
-format with `-p -`.
+Pass a policy with `-p, --policy <FILE>`. Repeat the option to merge policies
+from left to right: objects merge recursively, arrays combine without duplicate
+entries, and later scalar values replace earlier values. JSON is the default;
+use `--policy-format yaml` for YAML and always specify a format with `-p -`.
 
-`run` also merges policy attached to the program executable. `policy validate`
-checks parsing, resolution, and platform support. `policy resolve` prints the
-normalized policy; add `--tool <PROGRAM>` to include executable policy.
-`doctor` checks that the platform sandbox is usable.
-
-Inspection and management commands print one JSON document. `run` returns the
-program's exit status. Usage errors return 2; other Landstrip failures return 1.
-
-### Agent extensions
-
-Companion extensions integrate Landstrip with Pi and OpenCode. The Pi extension
-also provides primary agents and process-backed subagents.
-
-```sh
-pi install npm:pi-landstrip
-opencode plugin install opencode-landstrip
-```
-
-See [pi-landstrip](packages/pi-landstrip/README.md) and
-[opencode-landstrip](packages/opencode-landstrip/README.md).
+`policy validate` parses and resolves the policy and checks platform support.
+`policy resolve` prints the normalized result; `--tool <PROGRAM>` also merges
+policy attached to that executable. Executable policy is applied last from the
+`user.landstrip.policy` extended attribute on Unix or the `landstrip.policy`
+NTFS alternate data stream on Windows.
 
 ## Policy
 
@@ -70,36 +57,69 @@ See [pi-landstrip](packages/pi-landstrip/README.md) and
   "network": {
     "allowNetwork": false,
     "httpProxyPort": 8080,
+    "socksProxyPort": 1080,
     "allowLocalBinding": false,
+    "allowAllUnixSockets": false,
     "allowUnixSockets": []
+  },
+  "windows": {
+    "appContainerMode": "lpac",
+    "allowLoopback": false
   }
 }
 ```
 
-Paths may be absolute, relative to the starting directory, or prefixed with
-`~`. Path lists also accept `*`, `**`, `?`, and character-class globs.
+Paths may be absolute, relative to the command's starting directory, or start
+with `~`. Path fields accept arrays or newline-separated strings. Entries accept
+`*`, `**`, `?`, and character-class globs.
 
-Writes are denied by default. `allowWrite` grants writable roots; `denyWrite`
-always takes precedence. Reads are unrestricted until `denyRead` is non-empty;
-`allowRead` then adds exceptions, with the most specific read rule winning.
+### Filesystem
 
-Concrete `denyWrite` paths work on every platform. Glob denies are evaluated at
-access time on Linux and macOS, including for newly created files. Windows does
-not enforce glob `denyWrite` entries.
+| Field | Default | Effect |
+| --- | --- | --- |
+| `allowWrite` | `[]` | Writable roots |
+| `denyWrite` | `[]` | Hard write denials; takes precedence over `allowWrite` |
+| `denyRead` | `[]` | Read restrictions; empty means unrestricted reads |
+| `allowRead` | `[]` | Exceptions to `denyRead` |
 
-Direct TCP and new Unix sockets are denied by default. Proxy ports allow
-loopback connections only to those ports; Landstrip does not start a proxy or
-filter domains. `allowLocalBinding` permits local TCP binding and loopback
-connections. `allowUnixSockets` grants pathname sockets, and
-`allowAllUnixSockets` allows all Unix sockets. Set `allowNetwork` to `true` to
-disable network enforcement while keeping filesystem restrictions.
+When read rules overlap, the most specific rule wins. Concrete `denyWrite` paths
+work on every platform. Linux and macOS also enforce glob denials at access time,
+including for newly created files; Windows does not enforce glob `denyWrite`.
 
-On Unix, supplementary executable policy is read from the
-`user.landstrip.policy` extended attribute. On Windows it is read from the
-`landstrip.policy` NTFS alternate data stream. Executable policy is merged
-after `--policy` files.
+### Network
 
-## Platforms
+| Field | Default | Effect |
+| --- | --- | --- |
+| `allowNetwork` | `false` | Disables network enforcement when `true` |
+| `httpProxyPort` | unset | Allows loopback connection to this port |
+| `socksProxyPort` | unset | Allows loopback connection to this port |
+| `allowLocalBinding` | `false` | Allows local TCP binding and loopback connections |
+| `allowAllUnixSockets` | `false` | Allows every Unix socket |
+| `allowUnixSockets` | `[]` | Allows listed pathname Unix sockets |
+
+Landstrip does not start a proxy or filter domains. Direct TCP and new Unix
+sockets are denied unless allowed by these fields.
+
+### Windows
+
+`windows.appContainerMode` is `"lpac"` by default; `"standard"` is weaker
+because it can read resources granted to `ALL APPLICATION PACKAGES`.
+`windows.allowLoopback` exposes every local loopback service in AppContainer;
+without it, proxy ports are blocked. The removed `windows.backend` field is an
+error.
+
+Windows requires explicit read roots. ACL allow roots must exist when policy is
+resolved; missing `allowRead` and `allowWrite` targets are omitted and remain
+inaccessible. Windows does not support `allowLocalBinding` or Unix socket
+policy.
+
+Use `landstrip windows install` when software such as Git Bash cannot start in
+AppContainer. It provisions restricted local users and activates that mode.
+`windows uninstall` removes it. An unhealthy installation fails closed; inspect
+it with `windows status`. Restricted-user mode permits proxy ports only from the
+range selected at installation and does not support `windows.allowLoopback`.
+
+## Platform enforcement
 
 | Platform | Filesystem | Network |
 | --- | --- | --- |
@@ -107,85 +127,50 @@ after `--policy` files.
 | macOS | Seatbelt | TCP and Unix socket rules |
 | Windows | AppContainer or restricted user | AppContainer capabilities or account-scoped WFP |
 
-Windows requires an explicit read allowlist. AppContainer is used without
-installation; core Landstrip defaults to LPAC. `windows.appContainerMode` may
-select `standard`, which is weaker because it can see resources granted to
-`ALL APPLICATION PACKAGES`. In AppContainer, `windows.allowLoopback` exposes
-every local loopback service; without it, proxy ports are blocked.
+## Agent extensions
 
-Windows ACL allow roots must exist when the policy is resolved. Missing
-`allowRead` and `allowWrite` targets are omitted and remain inaccessible.
+[pi-landstrip](packages/pi-landstrip/README.md) and
+[opencode-landstrip](packages/opencode-landstrip/README.md) integrate Landstrip
+with coding agents.
 
-Use `landstrip windows install` when software such as Git Bash cannot start in
-AppContainer. It provisions restricted local users and activates that mode.
-`windows uninstall` removes it and returns to AppContainer. An unhealthy
-installation fails closed; inspect it with `windows status`.
+- **Agent permissions** authorize tool dispatch.
+- **Sandbox permissions** authorize filesystem and network access.
 
-Windows does not support `allowLocalBinding` or Unix socket policy.
-Restricted-user mode permits proxy ports only from the range chosen at install
-time and does not support `windows.allowLoopback`.
+An agent approval does not bypass the sandbox. Each plugin documents its prompt
+order, approval scopes, and configuration files.
+
+```sh
+pi install npm:pi-landstrip
+opencode plugin install opencode-landstrip
+```
 
 ## Traps
 
-Landstrip failures and broker-reported denials are JSON objects with a stable
-`kind` and `code`. Failures and completed denials go to standard error. The
-sandboxed program may also write to standard error.
+Landstrip failures and broker-reported denials are JSON objects with stable
+`kind` and `code` fields. Completed records go to standard error.
 
-On Unix, `--trap-fd FD` sends structured events to an already-open descriptor
-numbered 3 or higher. On Linux, a socket trap descriptor can carry a
-`state: "query"` filesystem or network event that pauses an operation for the
-integrating host to answer. Query events go only to that socket. Kernel-only
-and static-profile denials do not always produce a per-access event.
-
-Trap kinds are `filesystem`, `network`, `launch`, `usage`, and `internal`.
-Filesystem and network records describe denied operations; the other kinds
-report failures in Landstrip itself.
+On Unix, `--trap-fd FD` writes structured events to an already-open descriptor
+numbered 3 or higher. On Linux, a socket trap descriptor can receive a
+filesystem or network event with `state: "query"`; the operation waits for its
+host to answer. Kernel-only and static-profile denials do not always emit a
+per-access event. Trap kinds are `filesystem`, `network`, `launch`, `usage`, and
+`internal`.
 
 ## Development
 
-### Check
-
 ```sh
 make ci
-CI_MSRV=1 make ci  # optional MSRV check
-```
-
-`scripts/ci.sh` runs the Rust build, tests, clippy, and fmt, stages the host
-binary into `npm/<host>/bin`, smoke-tests the npm wrapper, and runs every
-agent-extension workspace's `ci:fmt`/`ci:lint`/`ci:check`/`ci:test` scripts
-via `scripts/test-extensions.sh --local-root`.
-
-### Package
-
-All cross targets use [`cross`](https://github.com/cross-rs/cross) and Docker.
-Linux x64/arm64 (musl) and Windows x64 (GNU) use official cross images.
-
-```sh
+CI_MSRV=1 make ci
 make package
 make package PLATFORMS='linux-x64 win32-x64'
 PACKAGE_STRICT=1 make package
 ```
 
-On a macOS host both `darwin-*` targets build natively with `cargo`; the
-`osxcross` images are only required when packaging from Linux. The
-`win32-arm64` target uses a local MSVC image because cross-rs cannot ship it:
-
-```sh
-git clone https://github.com/cross-rs/cross-toolchains.git
-cd cross-toolchains/docker
-cp /path/to/MacOSX*.sdk.tar.xz .  # only for darwin-* from Linux
-docker build -f Dockerfile.aarch64-pc-windows-msvc-cross \
-  -t ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local .
-```
-
-`darwin-arm64`/`darwin-x64` osxcross images follow the same `docker build` step
-from `Dockerfile.aarch64-apple-darwin-cross` / `Dockerfile.x86_64-apple-darwin-cross`
-(supplying a macOS SDK archive) when packaging from Linux.
-
-`ls` the `artifacts/` directory after a run; `make publish` requires every
-platform binary staged in `npm/*/bin`.
-
-### Release
+`scripts/ci.sh` checks Rust and every agent-extension workspace, stages the host
+binary, and smoke-tests the npm wrapper. Packaging uses `cross` and Docker for
+cross targets. macOS targets build natively on macOS; Linux hosts require local
+osxcross images. Windows Arm64 requires the local
+`ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local` image.
 
 After `scripts/release.sh <version>` and pushing the tag:
 
@@ -195,114 +180,10 @@ PACKAGE_STRICT=1 make package
 make publish
 ```
 
-`make publish` publishes crates.io and npm packages from the locally packaged
-binaries, then uploads GitHub release tarballs with `gh`.
-
-
-## Development
-
-### Check
-
-```sh
-make ci
-CI_MSRV=1 make ci  # optional MSRV check
-```
-
-`scripts/ci.sh` runs the Rust build, tests, clippy, and fmt, stages the host
-binary into `npm/<host>/bin`, smoke-tests the npm wrapper, and runs every
-agent-extension workspace's `ci:fmt`/`ci:lint`/`ci:check`/`ci:test` scripts
-via `scripts/test-extensions.sh --local-root`.
-
-
-### Package
-
-All cross targets use [`cross`](https://github.com/cross-rs/cross) and Docker.
-Linux x64/arm64 (musl) and Windows x64 (GNU) use official cross images.
-
-```sh
-make package
-make package PLATFORMS='linux-x64 win32-x64'
-PACKAGE_STRICT=1 make package
-```
-
-On a macOS host both `darwin-*` targets build natively with `cargo`; the
-`osxcross` images are only required when packaging from Linux. The
-`win32-arm64` target uses a local MSVC image because cross-rs cannot ship it:
-
-```sh
-git clone https://github.com/cross-rs/cross-toolchains.git
-cd cross-toolchains/docker
-cp /path/to/MacOSX*.sdk.tar.xz .  # only for darwin-* from Linux
-docker build -f Dockerfile.aarch64-pc-windows-msvc-cross \
-  -t ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local .
-```
-
-`darwin-arm64`/`darwin-x64` osxcross images follow the same `docker build` step
-from `Dockerfile.aarch64-apple-darwin-cross` / `Dockerfile.x86_64-apple-darwin-cross`
-(supplying a macOS SDK archive) when packaging from Linux.
-
-`ls` the `artifacts/` directory after a run; `make publish` requires every
-platform binary staged in `npm/*/bin`.
-
-
-### Release
-
-After `scripts/release.sh <version>` and pushing the tag:
-
-```sh
-make ci
-PACKAGE_STRICT=1 make package
-make publish
-```
-
-`make publish` publishes crates.io and npm packages from the locally packaged
-binaries, then uploads GitHub release tarballs with `gh`.
-
-### Package
-
-All cross targets use [`cross`](https://github.com/cross-rs/cross) and Docker.
-Linux x64/arm64 (musl) and Windows x64 (GNU) use official cross images.
-
-```sh
-make package
-make package PLATFORMS='linux-x64 win32-x64'
-PACKAGE_STRICT=1 make package
-```
-
-On a macOS host both `darwin-*` targets build natively with `cargo`; the
-`osxcross` images are only required when packaging from Linux. The
-`win32-arm64` target uses a local MSVC image because cross-rs cannot ship it:
-
-```sh
-git clone https://github.com/cross-rs/cross-toolchains.git
-cd cross-toolchains/docker
-cp /path/to/MacOSX*.sdk.tar.xz .  # only for darwin-* from Linux
-docker build -f Dockerfile.aarch64-pc-windows-msvc-cross \
-  -t ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local .
-```
-
-`darwin-arm64`/`darwin-x64` osxcross images follow the same `docker build` step
-from `Dockerfile.aarch64-apple-darwin-cross` / `Dockerfile.x86_64-apple-darwin-cross`
-(supplying a macOS SDK archive) when packaging from Linux.
-
-`ls` the `artifacts/` directory after a run; `make publish` requires every
-platform binary staged in `npm/*/bin`.
-
-### Release
-
-After `scripts/release.sh <version>` and pushing the tag:
-
-```sh
-make ci
-PACKAGE_STRICT=1 make package
-make publish
-```
-
-`make publish` publishes crates.io and npm packages from the locally packaged
-binaries, then uploads GitHub release tarballs with `gh`.
+`make publish` publishes the crates.io and npm packages and uploads release
+archives from locally packaged artifacts.
 
 ## Licensing
 
-The JavaScript npm wrapper is licensed under `Apache-2.0`. The Rust source and
-native binaries are licensed under `LGPL-2.1-or-later`. Corresponding source for
-each native package is available from the matching repository tag.
+The JavaScript wrapper is `Apache-2.0`. Rust source and native binaries are
+`LGPL-2.1-or-later`; corresponding source is available from the matching tag.
