@@ -213,6 +213,81 @@ binary into `npm/<host>/bin`, smoke-tests the npm wrapper, and runs every
 agent-extension workspace's `ci:fmt`/`ci:lint`/`ci:check`/`ci:test` scripts
 via `scripts/test-extensions.sh --local-root`.
 
+
+### Package
+
+All cross targets use [`cross`](https://github.com/cross-rs/cross) and Docker.
+Linux x64/arm64 (musl) and Windows x64 (GNU) use official cross images.
+
+```sh
+make package
+make package PLATFORMS='linux-x64 win32-x64'
+PACKAGE_STRICT=1 make package
+```
+
+On a macOS host both `darwin-*` targets build natively with `cargo`; the
+`osxcross` images are only required when packaging from Linux. The
+`win32-arm64` target uses a local MSVC image because cross-rs cannot ship it:
+
+```sh
+git clone https://github.com/cross-rs/cross-toolchains.git
+cd cross-toolchains/docker
+cp /path/to/MacOSX*.sdk.tar.xz .  # only for darwin-* from Linux
+docker build -f Dockerfile.aarch64-pc-windows-msvc-cross \
+  -t ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local .
+```
+
+`darwin-arm64`/`darwin-x64` osxcross images follow the same `docker build` step
+from `Dockerfile.aarch64-apple-darwin-cross` / `Dockerfile.x86_64-apple-darwin-cross`
+(supplying a macOS SDK archive) when packaging from Linux.
+
+`ls` the `artifacts/` directory after a run; `make publish` requires every
+platform binary staged in `npm/*/bin`.
+
+
+### Release
+
+After `scripts/release.sh <version>` and pushing the tag:
+
+```sh
+make ci
+PACKAGE_STRICT=1 make package
+make publish
+```
+
+`make publish` publishes crates.io and npm packages from the locally packaged
+binaries, then uploads GitHub release tarballs with `gh`.
+
+### Package
+
+All cross targets use [`cross`](https://github.com/cross-rs/cross) and Docker.
+Linux x64/arm64 (musl) and Windows x64 (GNU) use official cross images.
+
+```sh
+make package
+make package PLATFORMS='linux-x64 win32-x64'
+PACKAGE_STRICT=1 make package
+```
+
+On a macOS host both `darwin-*` targets build natively with `cargo`; the
+`osxcross` images are only required when packaging from Linux. The
+`win32-arm64` target uses a local MSVC image because cross-rs cannot ship it:
+
+```sh
+git clone https://github.com/cross-rs/cross-toolchains.git
+cd cross-toolchains/docker
+cp /path/to/MacOSX*.sdk.tar.xz .  # only for darwin-* from Linux
+docker build -f Dockerfile.aarch64-pc-windows-msvc-cross \
+  -t ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local .
+```
+
+`darwin-arm64`/`darwin-x64` osxcross images follow the same `docker build` step
+from `Dockerfile.aarch64-apple-darwin-cross` / `Dockerfile.x86_64-apple-darwin-cross`
+(supplying a macOS SDK archive) when packaging from Linux.
+
+`ls` the `artifacts/` directory after a run; `make publish` requires every
+platform binary staged in `npm/*/bin`.
+
 ## Licensing
 
 The JavaScript npm wrapper is licensed under `Apache-2.0`. The Rust source and

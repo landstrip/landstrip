@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) Jarkko Sakkinen 2026
+#
+# Packaging targets for `cross` (Docker). Used by scripts/package.sh.
+#
+# Linux x64/arm64 (musl) and Windows x64 (GNU) use official prebuilt cross
+# images. The MSVC and Apple SDK images below cannot be redistributed by
+# cross-rs; build them locally from cross-rs/cross-toolchains.
+
+[build.env]
+passthrough = [
+    "CARGO_BUILD_JOBS",
+    "RUSTFLAGS",
+]
+
+# Build from cross-rs/cross-toolchains Dockerfile.aarch64-pc-windows-msvc-cross
+# (uses xwin to fetch the Windows SDK):
+#   docker build -f Dockerfile.aarch64-pc-windows-msvc-cross \
+#     -t ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local .
+[target.aarch64-pc-windows-msvc]
+image = "ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local"
+
+# osxcross images (macOS SDK; not redistributable). On a darwin host these
+# targets are built natively by package.sh and the images are not required.
+[target.aarch64-apple-darwin]
+image = "ghcr.io/cross-rs/aarch64-apple-darwin-cross:local"
+
+[target.x86_64-apple-darwin]
+image = "ghcr.io/cross-rs/x86_64-apple-darwin-cross:local"

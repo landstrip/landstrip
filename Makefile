@@ -1,5 +1,5 @@
-# SPDX-License-Identifier: LGPL-2.1-or-later
-# Copyright (c) 2026 Jarkko Sakkinen
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) Landstrip Contributors
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
@@ -18,7 +18,6 @@ all:
 	$(CARGO) build
 
 check:
-	$(CARGO) build
 	$(CARGO) test
 	$(CARGO) clippy --all-targets
 
@@ -35,17 +34,14 @@ package:
 	CROSS="$(CROSS)" NODE="$(NODE)" ./scripts/package.sh $(PLATFORMS)
 
 publish:
-	CARGO="$(CARGO)" GH="$(GH)" NODE="$(NODE)" NPM="$(NPM)" \
-		./scripts/publish.sh "$(VERSION)"
+	$(CARGO) publish --package landstrip
 
 install:
-	$(CARGO) build --release
-	$(INSTALL) -d "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(MANDIR)/man1"
-	$(INSTALL) -m 755 target/release/landstrip "$(DESTDIR)$(BINDIR)/landstrip"
-	$(INSTALL) -m 644 man/man1/landstrip.1 "$(DESTDIR)$(MANDIR)/man1/landstrip.1"
+	$(INSTALL) -d $(DESTDIR)$(BINDIR)
+	$(INSTALL) -m 755 target/release/landstrip $(DESTDIR)$(BINDIR)/landstrip
 
 uninstall:
-	$(RM) "$(DESTDIR)$(BINDIR)/landstrip" "$(DESTDIR)$(MANDIR)/man1/landstrip.1"
+	$(RM) $(DESTDIR)$(BINDIR)/landstrip
 
 clean:
 	$(CARGO) clean
