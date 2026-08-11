@@ -45,7 +45,7 @@
     "yaml": "^2.9.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.82.0",
+    "@earendil-works/pi-coding-agent": "^0.84.1",
     "@earendil-works/pi-tui": "^0.82.1",
     "@types/node": "^24.0.0",
     "oxfmt": "^0.61.0",
