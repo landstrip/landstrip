@@ -27,7 +27,7 @@ pub(crate) enum TrapOperation {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum_macros::IntoStaticStr)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum NetworkOperation {
     Connect,

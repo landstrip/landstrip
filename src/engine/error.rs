@@ -16,7 +16,7 @@ pub(crate) type Cause = Box<dyn StdError + Send + Sync>;
 /// The OS enforcement layer an error or a denial is attributed to.
 ///
 /// `Display` and `Serialize` render the lowercase name used on the trap wire.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, strum_macros::Display)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, strum::Display)]
 #[strum(serialize_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Mechanism {
@@ -42,7 +42,7 @@ pub(crate) enum Mechanism {
 /// `Display` renders the `SCREAMING_SNAKE_CASE` code followed by the variant's
 /// discriminating data, and [`StdError::source`] exposes the underlying cause so
 /// `anyhow`'s alternate format appends it.
-#[derive(Debug, strum_macros::IntoStaticStr)]
+#[derive(Debug, strum::IntoStaticStr)]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum Error {
     /// A filesystem access the policy denies. Only the Linux broker mediates
