@@ -162,7 +162,7 @@ impl Trap {
             path,
             requested_path,
             syscall,
-            errno: denial_errno(),
+            errno: "EACCES",
             flags,
             reason,
             suggested_grant,
@@ -186,7 +186,7 @@ impl Trap {
             operation: syscall,
             target,
             syscall,
-            errno: denial_errno(),
+            errno: "EACCES",
             mechanism: Mechanism::Seccomp,
             process,
         }))
@@ -251,12 +251,6 @@ impl fmt::Display for Trap {
             }
         }
     }
-}
-
-/// The symbolic errno a denial surfaces in the sandboxed child.
-#[cfg(target_os = "linux")]
-fn denial_errno() -> &'static str {
-    errno_name(Error::DENIAL_ERRNO).unwrap_or("EACCES")
 }
 
 /// The detail behind the code: the variant's data and its causes as one line,
