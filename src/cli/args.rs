@@ -5,7 +5,7 @@ use crate::engine::config::PolicyFormat;
 use crate::engine::error::Error;
 #[cfg(target_os = "windows")]
 use crate::engine::platform::WindowsCommand;
-use clap::{Args, Parser, Subcommand, ValueEnum, error::ErrorKind};
+use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -62,25 +62,15 @@ pub(super) struct PolicyRequest {
     pub(super) tool: Option<OsString>,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum PolicyFormatArg {
-    Json,
-    Yaml,
-}
-
-impl From<PolicyFormatArg> for PolicyFormat {
-    fn from(format: PolicyFormatArg) -> Self {
-        match format {
-            PolicyFormatArg::Json => Self::Json,
-            PolicyFormatArg::Yaml => Self::Yaml,
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Args)]
 pub(super) struct PolicyInput {
+    /// Policy file; repeat to merge; use `-` for standard input.
+    #[arg(short = 'p', long = "policy", value_name = "FILE", value_parser = parse_policy_path)]
     pub(super) paths: Vec<PathBuf>,
-    format: Option<PolicyFormatArg>,
+
+    /// Policy format. Required when a policy is read from standard input.
+    #[arg(long = "policy-format", value_enum, value_name = "FORMAT")]
+    format: Option<PolicyFormat>,
 }
 
 #[derive(Debug, Parser)]
@@ -110,7 +100,7 @@ enum CliCommand {
 #[derive(Debug, Args)]
 struct RunArgs {
     #[command(flatten)]
-    policy: PolicyInputArgs,
+    policy: PolicyInput,
 
     #[cfg(unix)]
     /// Write traps to an already-open file descriptor.
@@ -120,17 +110,6 @@ struct RunArgs {
     /// Program and arguments. The `--` separator is required.
     #[arg(last = true, required = true, num_args = 1.., value_name = "PROGRAM [ARGS...]")]
     program: Vec<OsString>,
-}
-
-#[derive(Debug, Args)]
-struct PolicyInputArgs {
-    /// Policy file; repeat to merge; use `-` for standard input.
-    #[arg(short = 'p', long = "policy", value_name = "FILE", value_parser = parse_policy_path)]
-    policy: Vec<PathBuf>,
-
-    /// Policy format. Required when a policy is read from standard input.
-    #[arg(long = "policy-format", value_enum, value_name = "FORMAT")]
-    policy_format: Option<PolicyFormatArg>,
 }
 
 #[derive(Debug, Args)]
@@ -150,7 +129,7 @@ enum PolicyAction {
 #[derive(Debug, Args)]
 struct PolicyRequestArgs {
     #[command(flatten)]
-    policy: PolicyInputArgs,
+    policy: PolicyInput,
 
     /// Include policy attached to this executable.
     #[arg(long, value_name = "PROGRAM")]
@@ -275,7 +254,7 @@ fn run_command(args: RunArgs) -> Result<RunCommand, Error> {
         });
     };
     Ok(RunCommand {
-        policy: policy_input(args.policy),
+        policy: args.policy,
         #[cfg(unix)]
         trap_fd: args.trap_fd,
         tool,
@@ -292,15 +271,8 @@ fn policy_command(args: PolicyArgs) -> PolicyCommand {
 
 fn policy_request(args: PolicyRequestArgs) -> PolicyRequest {
     PolicyRequest {
-        policy: policy_input(args.policy),
+        policy: args.policy,
         tool: args.tool,
-    }
-}
-
-fn policy_input(args: PolicyInputArgs) -> PolicyInput {
-    PolicyInput {
-        paths: args.policy,
-        format: args.policy_format,
     }
 }
 
@@ -410,6 +382,6 @@ impl TryFrom<&PolicyInput> for PolicyFormat {
                 message: "--policy-format is required when --policy - is used".to_owned(),
             });
         }
-        Ok(input.format.map(PolicyFormat::from).unwrap_or_default())
+        Ok(input.format.unwrap_or_default())
     }
 }

@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub(crate) enum PolicyFormat {
     #[default]
     Json,
