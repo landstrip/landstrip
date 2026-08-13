@@ -60,8 +60,9 @@ cargo_version="$(
 [[ "$version" == "$cargo_version" ]] \
   || die "package.json version $version does not match Cargo.toml $cargo_version"
 
-# Share the caller's target dir so incremental cross/cargo caches still hit.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}"
+# Default to a packaging target root; keep host build scripts isolated from
+# cross images that may use different glibc versions.
+package_target_root="${CARGO_TARGET_DIR:-$repo_root/target/package}"
 
 # platform|rust-triple|binary-name|required-image
 platforms=(
@@ -70,7 +71,7 @@ platforms=(
   'win32-x64|x86_64-pc-windows-gnu|landstrip.exe|'
   'win32-arm64|aarch64-pc-windows-msvc|landstrip.exe|ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local'
   'darwin-arm64|aarch64-apple-darwin|landstrip|ghcr.io/cross-rs/aarch64-apple-darwin-cross:local'
-  'darwin-x64|x86_64-apple-darwin|landstrip|ghcr.io/cross-rs/x86_64-apple-darwin-cross:local'
+  'darwin-x64|x86_64-apple-darwin|landstrip|ghcr.io/cross-rs/aarch64-apple-darwin-cross:local'
 )
 
 requested=()
@@ -228,8 +229,8 @@ build_with_cross() {
     if [[ -n "$cargo_jobs" ]]; then
       export CARGO_BUILD_JOBS="$cargo_jobs"
     fi
-    # Use repo Cross.toml so packaging env passthrough applies without retagging.
-    CROSS_CONFIG="${CROSS_CONFIG:-$repo_root/Cross.toml}" \
+    # CROSS_TARGET lets shared osxcross images select the Apple toolchain.
+    CROSS_TARGET="$triple" CROSS_CONFIG="${CROSS_CONFIG:-$repo_root/Cross.toml}" \
       CARGO_HOME="$cargo_home" "$CROSS" build --release --target "$triple"
   ) &
   cross_pid=$!
@@ -318,6 +319,8 @@ for platform in "${requested[@]}"; do
   IFS='|' read -r _ triple binary required_image <<<"$entry"
   package_dir="npm/$platform"
   [[ -f "$package_dir/package.json" ]] || die "missing $package_dir/package.json"
+
+  export CARGO_TARGET_DIR="$package_target_root/$platform"
 
   # Host triple packages natively (no Docker). The osxcross :local images remain
   # for packaging darwin-* from Linux; the MSVC :local image for win32-arm64.
