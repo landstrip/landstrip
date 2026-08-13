@@ -24,8 +24,8 @@ pub(crate) fn execute() {
     let invocation = match parse_cli() {
         Ok(ParseOutcome::Invocation(invocation)) => invocation,
         Ok(ParseOutcome::Display(text)) => {
-            if let Err(error) = render_display(&text) {
-                exit_with_error(&error);
+            if let Err(error) = io::stdout().lock().write_all(text.as_bytes()) {
+                exit_with_error(&error.into());
             }
             return;
         }
@@ -47,7 +47,10 @@ pub(crate) fn execute() {
             exit_with_error(&error);
         }
     };
-    if let Err(error) = render_outcome(&outcome) {
+    if let Err(error) = outcome
+        .write_to(&mut io::stdout().lock())
+        .map_err(anyhow::Error::from)
+    {
         #[cfg(unix)]
         exit_with_trap_fd(&error, &trap_fd);
         #[cfg(not(unix))]
@@ -151,16 +154,6 @@ fn load_policy(input: &PolicyInput, tool: Option<&std::ffi::OsStr>) -> Result<Ac
     log::debug!("cli: cwd: {}", cwd.display());
     let settings = load_settings(&input.paths, format, tool)?;
     settings.resolve(&cwd)
-}
-
-fn render_display(text: &str) -> Result<()> {
-    let stdout = io::stdout();
-    stdout.lock().write_all(text.as_bytes())?;
-    Ok(())
-}
-fn render_outcome(outcome: &CommandOutcome) -> Result<()> {
-    outcome.write_to(&mut io::stdout().lock())?;
-    Ok(())
 }
 
 fn exit_with_error(error: &anyhow::Error) -> ! {

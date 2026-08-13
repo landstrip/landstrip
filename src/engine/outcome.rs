@@ -3,7 +3,6 @@
 
 use crate::engine::policy::AccessPolicy;
 use serde::Serialize;
-use std::fmt;
 use std::io::{self, Write};
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
@@ -118,32 +117,16 @@ impl CommandOutcome {
     pub(crate) fn write_to(&self, mut output: impl Write) -> io::Result<()> {
         match self {
             Self::Exit(_) => Ok(()),
-            _ => writeln!(output, "{self}"),
+            Self::PolicyValidated(report) => write_json(&mut output, report),
+            Self::PolicyResolved(policy) => write_json(&mut output, policy),
+            Self::Doctor(report) => write_json(&mut output, report),
+            #[cfg(target_os = "windows")]
+            Self::Windows(report) => write_json(&mut output, report),
         }
     }
 }
 
-impl fmt::Display for CommandOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Exit(_) => Ok(()),
-            Self::PolicyValidated(report) => match serde_json::to_string(report) {
-                Ok(json) => f.write_str(&json),
-                Err(_) => Err(fmt::Error),
-            },
-            Self::PolicyResolved(policy) => match serde_json::to_string(policy) {
-                Ok(json) => f.write_str(&json),
-                Err(_) => Err(fmt::Error),
-            },
-            Self::Doctor(report) => match serde_json::to_string(report) {
-                Ok(json) => f.write_str(&json),
-                Err(_) => Err(fmt::Error),
-            },
-            #[cfg(target_os = "windows")]
-            Self::Windows(report) => match serde_json::to_string(report) {
-                Ok(json) => f.write_str(&json),
-                Err(_) => Err(fmt::Error),
-            },
-        }
-    }
+fn write_json(output: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
+    serde_json::to_writer(&mut *output, value)?;
+    writeln!(output)
 }
