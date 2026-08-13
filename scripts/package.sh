@@ -268,9 +268,21 @@ build_with_cross() {
   return "$status"
 }
 
-has_required_image() {
-  local image="$1"
-  [[ -z "$image" ]] || docker image inspect "$image" >/dev/null 2>&1
+ensure_required_image() {
+  local image="$1" arch tagged
+
+  [[ -z "$image" ]] && return 0
+  docker image inspect "$image" >/dev/null 2>&1 && return 0
+
+  case "$(docker info --format '{{.Architecture}}')" in
+    amd64|x86_64) arch=amd64 ;;
+    arm64|aarch64) arch=arm64 ;;
+    *) return 1 ;;
+  esac
+
+  tagged="${image}-${arch}"
+  docker image inspect "$tagged" >/dev/null 2>&1 || return 1
+  docker image tag "$tagged" "$image"
 }
 
 build_native() {
@@ -319,7 +331,7 @@ for platform in "${requested[@]}"; do
   else
     printf '==> %s (%s via cross)\n' "$platform" "$triple"
 
-    if ! has_required_image "$required_image"; then
+    if ! ensure_required_image "$required_image"; then
       skipped+=("$platform: missing local cross image $required_image")
       printf 'skip: %s (build local cross image %s)\n' "$platform" "$required_image"
       continue
