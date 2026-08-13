@@ -90,7 +90,7 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
     let status = created.restrict_self().map_err(setup_failed)?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => {}
-        RulesetStatus::PartiallyEnforced => log::warn!(
+        RulesetStatus::PartiallyEnforced => log::debug!(
             "{}",
             partial_enforcement_warning(status.landlock, handled_access_fs, handled_access_net,)
         ),
