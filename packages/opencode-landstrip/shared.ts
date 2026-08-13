@@ -360,13 +360,6 @@ export function permissionPatterns(permission: Record<string, unknown>): string[
   return [];
 }
 
-export function permissionLabel(permission: Record<string, unknown>): string {
-  const type = permissionType(permission, 'permission');
-  const title = typeof permission.title === 'string' ? permission.title : type;
-  const pattern = permissionPattern(permission);
-  return pattern ? `${title}: ${pattern}` : title;
-}
-
 // The concrete resource a permission concerns (a path or a domain), used to show
 // the user exactly what they are approving and to persist the right allowlist.
 export function permissionResource(permission: Record<string, unknown>): string | undefined {
