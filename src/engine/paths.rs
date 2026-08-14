@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub(crate) fn normalize_roots(paths: &mut Vec<PathBuf>) {
     for path in paths.iter_mut() {
-        *path = normalize_path(path);
+        *path = normalize_path_lexically(path);
     }
 
     paths.sort_unstable();
