@@ -1003,31 +1003,54 @@ fn thread_group_leader(pid: Pid) -> SysResult<Pid> {
 }
 
 fn duplicate_target_fd(pid: Pid, fd: RawFd) -> SysResult<OwnedFd> {
-    // Seccomp reports the calling thread ID, but pidfd_open without
-    // PIDFD_THREAD accepts only a thread-group leader.
-    let process = thread_group_leader(pid)?;
-    // SAFETY: pidfd_open copies scalar arguments and returns a new fd on success.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.as_raw(), 0) };
-    if pidfd < 0 {
-        return Err(BrokerError::SystemCall {
-            errno: Errno::last() as i32,
-        });
-    }
-    // SAFETY: pidfd_open returned a new owned descriptor.
-    let pidfd = RawFd::try_from(pidfd).map_err(|_| BrokerError::BadFileDescriptor)?;
-    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+    // Linux 6.9 added PIDFD_THREAD. Older kernels reject the flag, and pidfd_open
+    // without it accepts only a thread-group leader, so use procfs only as the
+    // compatibility fallback for obtaining the TGID.
+    let pidfd = match open_pidfd(pid, libc::O_EXCL as libc::c_uint) {
+        Ok(pidfd) => pidfd,
+        Err(Errno::EINVAL | Errno::ENOSYS) => match open_pidfd(pid, 0) {
+            Ok(pidfd) => pidfd,
+            Err(Errno::EINVAL) => open_pidfd(thread_group_leader(pid)?, 0).map_err(|error| {
+                BrokerError::SystemCall {
+                    errno: error as i32,
+                }
+            })?,
+            Err(error) => {
+                return Err(BrokerError::SystemCall {
+                    errno: error as i32,
+                });
+            }
+        },
+        Err(error) => {
+            return Err(BrokerError::SystemCall {
+                errno: error as i32,
+            });
+        }
+    };
 
     // SAFETY: pidfd_getfd copies scalar arguments and returns a duplicated fd.
-    let sock = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
-    if sock < 0 {
+    let target = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+    if target < 0 {
         return Err(BrokerError::SystemCall {
             errno: Errno::last() as i32,
         });
     }
 
     // SAFETY: pidfd_getfd returned a new owned descriptor.
-    let sock = RawFd::try_from(sock).map_err(|_| BrokerError::BadFileDescriptor)?;
-    Ok(unsafe { OwnedFd::from_raw_fd(sock) })
+    let target = RawFd::try_from(target).map_err(|_| BrokerError::BadFileDescriptor)?;
+    Ok(unsafe { OwnedFd::from_raw_fd(target) })
+}
+
+fn open_pidfd(pid: Pid, flags: libc::c_uint) -> std::result::Result<OwnedFd, Errno> {
+    // SAFETY: pidfd_open copies scalar arguments and returns a new fd on success.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), flags) };
+    if pidfd < 0 {
+        return Err(Errno::last());
+    }
+
+    let pidfd = RawFd::try_from(pidfd).map_err(|_| Errno::EBADF)?;
+    // SAFETY: pidfd_open returned a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
 }
 
 fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> SysResult<i64> {
@@ -1725,12 +1748,7 @@ fn handle_fd_utimensat(
         return Err(BrokerError::BadFileDescriptor);
     }
 
-    let proc_path = Path::new("/proc")
-        .join(pid.as_raw().to_string())
-        .join("fd")
-        .join(child_fd.to_string());
-    let target = open_path(&proc_path, libc::O_PATH | libc::O_CLOEXEC)
-        .map_err(|errno| BrokerError::SystemCall { errno })?;
+    let target = duplicate_target_fd(pid, child_fd)?;
     let requested_path = fs::read_link(
         Path::new("/proc/self/fd").join(target.as_raw_fd().to_string()),
     )
@@ -2170,12 +2188,23 @@ fn grant_socket(notify_fd: RawFd, id: u64, grant: &SocketGrant) {
 
 fn run_mutation(grant: &MutationGrant) -> std::result::Result<(), i32> {
     if let MutationOp::UtimesFd { target, times } = &grant.op {
-        let ptr = times.as_ref().map_or(ptr::null(), |value| value.as_ptr());
-        // SAFETY: target is a pinned O_PATH descriptor and the empty pathname is
-        // NUL-terminated; AT_EMPTY_PATH applies the timestamps to that descriptor.
-        return check(unsafe {
-            libc::utimensat(target.as_raw_fd(), c"".as_ptr(), ptr, libc::AT_EMPTY_PATH)
-        });
+        let times = times.as_ref().map_or(ptr::null(), |value| value.as_ptr());
+        // SAFETY: target is a duplicated descriptor for the blocked task's open
+        // file description. A null pathname selects the fd-only utimensat form.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_utimensat,
+                target.as_raw_fd(),
+                ptr::null::<libc::c_char>(),
+                times,
+                0,
+            )
+        };
+        return if rc < 0 {
+            Err(Errno::last() as i32)
+        } else {
+            Ok(())
+        };
     }
 
     let at = grant.anchors.first().ok_or(libc::EINVAL)?;
@@ -2394,12 +2423,11 @@ fn resolve_child_path(pid: Pid, dirfd: i32, path: &Path) -> SysResult<PathBuf> {
         return Ok(cwd.join(path));
     }
 
-    // dirfd is a file descriptor; resolve relative to /proc/<pid>/fd/<dirfd>
-    let dir_path = fs::read_link(format!("/proc/{pid}/fd/{dirfd}")).map_err(|error| {
-        BrokerError::SystemCall {
+    let dir = duplicate_target_fd(pid, dirfd)?;
+    let dir_path = fs::read_link(Path::new("/proc/self/fd").join(dir.as_raw_fd().to_string()))
+        .map_err(|error| BrokerError::SystemCall {
             errno: error.raw_os_error().unwrap_or(libc::EBADF),
-        }
-    })?;
+        })?;
     Ok(dir_path.join(path))
 }
 
