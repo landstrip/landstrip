@@ -12,10 +12,11 @@ use crate::engine::error::Error;
 use crate::engine::policy::AccessPolicy;
 use crate::engine::trap_fd::TrapFd;
 use ::landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use fd::close_inherited_fds;
 use filter::NetworkFilter;
 use landlock::enforce_access_policy;
+use seccomp::ensure_notification_supported;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -29,14 +30,7 @@ pub(crate) fn doctor() -> Result<()> {
         .create()
         .context("create a Landlock ruleset")?;
 
-    let actions = std::fs::read_to_string("/proc/sys/kernel/seccomp/actions_avail")
-        .context("read seccomp capabilities")?;
-    if !actions
-        .split_ascii_whitespace()
-        .any(|action| action == "user_notif")
-    {
-        bail!("seccomp user notification is unavailable");
-    }
+    ensure_notification_supported()?;
     Ok(())
 }
 pub(crate) fn execute(

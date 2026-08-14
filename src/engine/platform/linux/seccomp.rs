@@ -596,7 +596,7 @@ fn notification_error(id: u64, error: i32) -> libc::seccomp_notif_resp {
     }
 }
 
-fn ensure_notification_supported() -> Result<()> {
+pub(super) fn ensure_notification_supported() -> Result<()> {
     let mut action = libc::SECCOMP_RET_USER_NOTIF;
     seccomp_probe(
         libc::SECCOMP_GET_ACTION_AVAIL,
