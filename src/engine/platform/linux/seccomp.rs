@@ -41,7 +41,7 @@ use std::fs;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
@@ -194,14 +194,12 @@ pub(super) fn run_broker(
                 {
                     let notify = filters.load_with_listener()?;
 
-                    // SAFETY: notify is borrowed only for the duration of fcntl(2).
-                    let notify_fd = unsafe { BorrowedFd::borrow_raw(notify.as_raw_fd()) };
-                    let notify =
-                        fcntl(notify_fd, FcntlArg::F_DUPFD_CLOEXEC(0)).map_err(supervise_errno)?;
+                    let notify = fcntl(notify.as_fd(), FcntlArg::F_DUPFD_CLOEXEC(0))
+                        .map_err(supervise_errno)?;
                     // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
                     let notify = unsafe { OwnedFd::from_raw_fd(notify) };
 
-                    send_fd(&child_sock, notify.as_raw_fd())?;
+                    send_fd(&child_sock, notify.as_fd())?;
                     handed_off = true;
                 }
 
@@ -243,12 +241,11 @@ pub(super) fn run_broker(
             match get_notify_fd(&parent)? {
                 NotifyStartup::Ready(notify) => {
                     drop(parent);
-                    let notify_fd = notify.as_raw_fd();
 
                     supervise_child(
                         policy,
                         child,
-                        notify_fd,
+                        notify.as_fd(),
                         &syscalls,
                         notify_filesystem,
                         trap_fd,
@@ -289,7 +286,7 @@ struct ControlResponse {
 fn supervise_child(
     policy: &AccessPolicy,
     child: Pid,
-    notify_fd: RawFd,
+    notify_fd: BorrowedFd<'_>,
     syscalls: &NotificationSyscalls,
     notify_filesystem: bool,
     trap_fd: Option<&TrapFd>,
@@ -307,13 +304,11 @@ fn supervise_child(
     };
     let mut trap_fd = trap_fd
         .filter(|trap_fd| trap_fd.is_socket())
-        .map(AsRawFd::as_raw_fd);
+        .map(AsFd::as_fd);
     let mut pending_queries: std::collections::HashMap<u64, PendingQuery> =
         std::collections::HashMap::new();
     let mut control_buffer: Vec<u8> = Vec::new();
     let mut next_query_id: u64 = 1;
-    // SAFETY: notify_fd is the live seccomp notification fd owned by the parent.
-    let notify = unsafe { BorrowedFd::borrow_raw(notify_fd) };
     loop {
         loop {
             match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -326,8 +321,7 @@ fn supervise_child(
             }
         }
 
-        let control = trap_fd.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
-        let revents = poll_broker_fds(notify, control)?;
+        let revents = poll_broker_fds(notify_fd, trap_fd)?;
 
         if revents.iter().all(PollFlags::is_empty) {
             continue;
@@ -412,7 +406,7 @@ fn supervise_child(
 }
 
 fn receive_handled_notification(
-    notify_fd: RawFd,
+    notify_fd: BorrowedFd<'_>,
     ctx: &NotificationContext,
     denials: &mut Denials<'_>,
     next_query_id: &mut u64,
@@ -690,12 +684,12 @@ fn seccomp_probe(operation: libc::c_uint, data: *mut libc::c_void) -> Result<()>
     Ok(())
 }
 
-fn receive_notification(fd: RawFd) -> Result<libc::seccomp_notif> {
+fn receive_notification(fd: BorrowedFd<'_>) -> Result<libc::seccomp_notif> {
     loop {
         // SAFETY: zero is a valid initial byte pattern for this plain kernel UAPI struct.
         let mut request = unsafe { mem::zeroed::<libc::seccomp_notif>() };
         // SAFETY: request points to writable storage for SECCOMP_IOCTL_NOTIF_RECV.
-        match unsafe { seccomp_notif_recv(fd, ptr::addr_of_mut!(request)) } {
+        match unsafe { seccomp_notif_recv(fd.as_raw_fd(), ptr::addr_of_mut!(request)) } {
             Ok(_) => return Ok(request),
             Err(Errno::EINTR) => {}
             Err(error) => {
@@ -705,10 +699,10 @@ fn receive_notification(fd: RawFd) -> Result<libc::seccomp_notif> {
     }
 }
 
-fn respond_notification(fd: RawFd, mut response: libc::seccomp_notif_resp) -> Result<()> {
+fn respond_notification(fd: BorrowedFd<'_>, mut response: libc::seccomp_notif_resp) -> Result<()> {
     loop {
         // SAFETY: response points to initialized storage for SECCOMP_IOCTL_NOTIF_SEND.
-        match unsafe { seccomp_notif_send(fd, ptr::addr_of_mut!(response)) } {
+        match unsafe { seccomp_notif_send(fd.as_raw_fd(), ptr::addr_of_mut!(response)) } {
             Ok(_) => return Ok(()),
             Err(Errno::EINTR) => {}
             Err(error) => {
@@ -718,10 +712,10 @@ fn respond_notification(fd: RawFd, mut response: libc::seccomp_notif_resp) -> Re
     }
 }
 
-fn validate_notification_id(fd: RawFd, id: u64) -> Result<bool> {
+fn validate_notification_id(fd: BorrowedFd<'_>, id: u64) -> Result<bool> {
     loop {
         // SAFETY: id points to initialized storage for SECCOMP_IOCTL_NOTIF_ID_VALID.
-        match unsafe { seccomp_notif_id_valid(fd, ptr::addr_of!(id)) } {
+        match unsafe { seccomp_notif_id_valid(fd.as_raw_fd(), ptr::addr_of!(id)) } {
             Ok(_) => return Ok(true),
             Err(Errno::EINTR) => {}
             Err(Errno::ENOENT) => return Ok(false),
@@ -2104,15 +2098,21 @@ fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>
 const CONTROL_BUFFER_MAX: usize = 64 * 1024;
 
 fn process_control_responses(
-    control_fd: i32,
+    control_fd: BorrowedFd<'_>,
     buffer: &mut Vec<u8>,
     pending_queries: &mut std::collections::HashMap<u64, PendingQuery>,
-    notify_fd: RawFd,
+    notify_fd: BorrowedFd<'_>,
 ) -> bool {
     let mut chunk = [0u8; 4096];
     // SAFETY: read(2) copies bytes from the live buffer.
     let n = loop {
-        let n = unsafe { libc::read(control_fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        let n = unsafe {
+            libc::read(
+                control_fd.as_raw_fd(),
+                chunk.as_mut_ptr().cast(),
+                chunk.len(),
+            )
+        };
         if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
             continue;
         }
@@ -2201,7 +2201,7 @@ fn process_control_responses(
 // notification ids are skipped, matching the per-response path.
 fn deny_all_pending(
     pending_queries: &mut std::collections::HashMap<u64, PendingQuery>,
-    notify_fd: RawFd,
+    notify_fd: BorrowedFd<'_>,
 ) {
     for (_id, pending) in pending_queries.drain() {
         let id = pending.request.id;
@@ -2214,7 +2214,7 @@ fn deny_all_pending(
     }
 }
 
-fn grant_open(notify_fd: RawFd, id: u64, grant: &OpenGrant) {
+fn grant_open(notify_fd: BorrowedFd<'_>, id: u64, grant: &OpenGrant) {
     let opened = match broker_open(grant) {
         Ok(fd) => fd,
         Err(errno) => {
@@ -2238,7 +2238,7 @@ fn grant_open(notify_fd: RawFd, id: u64, grant: &OpenGrant) {
 
     // SAFETY: addfd points to an initialized struct and opened is a live fd; the
     // SEND flag makes the ioctl complete the notification atomically.
-    if unsafe { seccomp_notif_addfd(notify_fd, ptr::addr_of!(addfd)) }.is_err() {
+    if unsafe { seccomp_notif_addfd(notify_fd.as_raw_fd(), ptr::addr_of!(addfd)) }.is_err() {
         let _ = respond_notification(
             notify_fd,
             notification_error(id, -LandstripError::DENIAL_ERRNO),
@@ -2246,7 +2246,7 @@ fn grant_open(notify_fd: RawFd, id: u64, grant: &OpenGrant) {
     }
 }
 
-fn grant_mutation(notify_fd: RawFd, id: u64, grant: &MutationGrant) {
+fn grant_mutation(notify_fd: BorrowedFd<'_>, id: u64, grant: &MutationGrant) {
     let rc = match run_mutation(grant) {
         Ok(()) => notification_value(id, 0),
         Err(errno) => notification_error(id, -errno.abs()),
@@ -2257,7 +2257,7 @@ fn grant_mutation(notify_fd: RawFd, id: u64, grant: &MutationGrant) {
 // The broker re-issues the approved connect or bind on the duplicated child
 // socket, which shares the child's open file description, so the call takes
 // effect on the child's socket while running outside its seccomp filter.
-fn grant_socket(notify_fd: RawFd, id: u64, grant: &SocketGrant) {
+fn grant_socket(notify_fd: BorrowedFd<'_>, id: u64, grant: &SocketGrant) {
     let rc = match broker_addr_call(grant.sock.as_raw_fd(), &grant.addr, grant.call) {
         Ok(value) => notification_value(id, value),
         Err(error) => notification_error(id, -error.errno().abs()),
@@ -2547,10 +2547,10 @@ fn sockopt(fd: RawFd, level: libc::c_int, name: libc::c_int) -> SysResult<i32> {
     })
 }
 
-fn send_fd(socket: &UnixStream, fd: RawFd) -> Result<()> {
+fn send_fd(socket: &UnixStream, fd: BorrowedFd<'_>) -> Result<()> {
     let byte = [0_u8];
     let iov = [IoSlice::new(&byte)];
-    let fds = [fd];
+    let fds = [fd.as_raw_fd()];
     loop {
         match sendmsg::<()>(
             socket.as_raw_fd(),
