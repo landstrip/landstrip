@@ -14,10 +14,10 @@ use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, LandlockStatus, NetPort, PathBeneath, Ruleset,
     RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
 };
-use std::ffi::CString;
+use nix::fcntl::{OFlag, open};
+use nix::sys::stat::{Mode, fstat};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 /// A Landlock ruleset landstrip could not build or enforce.
@@ -214,29 +214,20 @@ fn add_network_rules(mut ruleset: RulesetCreated, policy: &AccessPolicy) -> Resu
 }
 
 fn open_path(path: &Path) -> io::Result<OwnedFd> {
-    let path = CString::new(path.as_os_str().as_bytes())?;
-    // SAFETY: path is a valid NUL-terminated C string copied by open(2).
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SAFETY: open(2) returned a new owned file descriptor.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    open(path, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty()).map_err(io::Error::from)
 }
 
 fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {
-    // SAFETY: stat is initialized by fstat(2) on success.
-    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-    // SAFETY: fd is valid and stat points to writable storage.
-    let rc = unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) };
-    if rc != 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::EIO) || error.raw_os_error() == Some(libc::ENOTCONN) {
+    let stat = match fstat(fd).map_err(io::Error::from) {
+        Ok(stat) => stat,
+        Err(error)
+            if error.raw_os_error() == Some(libc::EIO)
+                || error.raw_os_error() == Some(libc::ENOTCONN) =>
+        {
             return Ok(false);
         }
-        return Err(setup_failed(error).into());
-    }
+        Err(error) => return Err(setup_failed(error).into()),
+    };
 
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFDIR)
 }
