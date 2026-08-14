@@ -132,6 +132,9 @@ name=follow chown still gated on in-tree link to out-of-root target | os=linux |
 
 name=glob permits write in matched dir | os=linux,macos | setup=mkdir:globdir/match1;mkdir:globdir/match2 | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/globdir/*"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ %TMP%/globdir/match1 | status=0
 name=glob denies write in unmatched dir | os=linux,macos | setup=mkdir:globdir/match1;mkdir:globdir/match2 | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/globdir/*"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/nope.txt"' _ %TMP%/globdir | status=!0
+name=question glob permits single-byte match | os=linux,macos | setup=mkdir:glob-question/match1 | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/glob-question/match?"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ %TMP%/glob-question/match1 | status=0
+name=class glob permits byte-range match | os=linux,macos | setup=mkdir:glob-class/release7 | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/glob-class/release[0-9]"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ %TMP%/glob-class/release7 | status=0
+name=globstar permits recursive match | os=linux,macos | setup=mkdir:globstar/deep/nested/target | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/globstar/**/target"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ %TMP%/globstar/deep/nested/target | status=0
 
 # --- home tilde expansion ---
 

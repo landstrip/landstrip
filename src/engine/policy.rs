@@ -694,7 +694,7 @@ fn path_matches_glob_str(path: &Path, pattern: &str) -> bool {
     let pattern_bytes = pattern.as_bytes();
     let path_len = path_bytes.len();
     let pattern_len = pattern_bytes.len();
-    let mut memo = vec![vec![None; path_len + 1]; pattern_len + 1];
+    let mut memo = vec![None; (pattern_len + 1) * (path_len + 1)];
     glob_matches_at(pattern_bytes, path_bytes.as_bytes(), 0, 0, &mut memo)
 }
 
@@ -754,7 +754,7 @@ fn collect_glob_matches(
     let candidate_text = candidate.to_string_lossy();
     let pattern_bytes = pattern.as_bytes();
     let candidate_bytes = candidate_text.as_bytes();
-    let mut memo = vec![vec![None; candidate_bytes.len() + 1]; pattern_bytes.len() + 1];
+    let mut memo = vec![None; (pattern_bytes.len() + 1) * (candidate_bytes.len() + 1)];
 
     if glob_matches_at(pattern_bytes, candidate_bytes, 0, 0, &mut memo) {
         matches.push(candidate.clone());
@@ -812,9 +812,10 @@ fn glob_matches_at(
     text: &[u8],
     pattern_at: usize,
     text_at: usize,
-    memo: &mut [Vec<Option<bool>>],
+    memo: &mut [Option<bool>],
 ) -> bool {
-    if let Some(result) = memo[pattern_at][text_at] {
+    let memo_at = pattern_at * (text.len() + 1) + text_at;
+    if let Some(result) = memo[memo_at] {
         return result;
     }
 
@@ -841,7 +842,7 @@ fn glob_matches_at(
         }
     };
 
-    memo[pattern_at][text_at] = Some(result);
+    memo[memo_at] = Some(result);
     result
 }
 
@@ -850,7 +851,7 @@ fn globstar_slash_matches(
     text: &[u8],
     pattern_at: usize,
     text_at: usize,
-    memo: &mut [Vec<Option<bool>>],
+    memo: &mut [Option<bool>],
 ) -> bool {
     if glob_matches_at(pattern, text, pattern_at + 3, text_at, memo) {
         return true;
@@ -870,7 +871,7 @@ fn globstar_matches(
     text: &[u8],
     pattern_at: usize,
     text_at: usize,
-    memo: &mut [Vec<Option<bool>>],
+    memo: &mut [Option<bool>],
 ) -> bool {
     for next in text_at..=text.len() {
         if glob_matches_at(pattern, text, pattern_at + 2, next, memo) {
@@ -886,7 +887,7 @@ fn star_matches(
     text: &[u8],
     pattern_at: usize,
     text_at: usize,
-    memo: &mut [Vec<Option<bool>>],
+    memo: &mut [Option<bool>],
 ) -> bool {
     let mut next = text_at;
     while next <= text.len() {
@@ -907,7 +908,7 @@ fn class_matches(
     text: &[u8],
     pattern_at: usize,
     text_at: usize,
-    memo: &mut [Vec<Option<bool>>],
+    memo: &mut [Option<bool>],
 ) -> bool {
     let Some(class_end) = pattern[pattern_at + 1..]
         .iter()
