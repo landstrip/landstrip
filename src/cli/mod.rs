@@ -35,14 +35,14 @@ pub(crate) fn execute() {
 
     #[cfg(unix)]
     let trap_fd = match &invocation.command {
-        Command::Run(command) => TrapFd::from(command.trap_fd),
-        _ => TrapFd::from(None),
+        Command::Run(command) => command.trap_fd.as_ref(),
+        _ => None,
     };
     let outcome = match dispatch(&invocation) {
         Ok(outcome) => outcome,
         Err(error) => {
             #[cfg(unix)]
-            exit_with_trap_fd(&error, &trap_fd);
+            exit_with_trap_fd(&error, trap_fd);
             #[cfg(not(unix))]
             exit_with_error(&error);
         }
@@ -52,7 +52,7 @@ pub(crate) fn execute() {
         .map_err(anyhow::Error::from)
     {
         #[cfg(unix)]
-        exit_with_trap_fd(&error, &trap_fd);
+        exit_with_trap_fd(&error, trap_fd);
         #[cfg(not(unix))]
         exit_with_error(&error);
     }
@@ -89,8 +89,12 @@ fn run(command: &RunCommand) -> Result<CommandOutcome> {
 
 #[cfg(unix)]
 fn execute_run(policy: &AccessPolicy, command: &RunCommand) -> Result<i32> {
-    let trap_fd = TrapFd::from(command.trap_fd);
-    platform::execute(policy, &command.tool, &command.tool_args, &trap_fd)
+    platform::execute(
+        policy,
+        &command.tool,
+        &command.tool_args,
+        command.trap_fd.as_ref(),
+    )
 }
 
 #[cfg(not(unix))]
@@ -163,9 +167,11 @@ fn exit_with_error(error: &anyhow::Error) -> ! {
 }
 
 #[cfg(unix)]
-fn exit_with_trap_fd(error: &anyhow::Error, trap_fd: &TrapFd) -> ! {
+fn exit_with_trap_fd(error: &anyhow::Error, trap_fd: Option<&TrapFd>) -> ! {
     let (trap, exit_code) = error_trap(error);
-    trap_fd.write(&trap);
+    if let Some(trap_fd) = trap_fd {
+        trap_fd.write(&trap);
+    }
     trap.emit();
     process::exit(exit_code)
 }

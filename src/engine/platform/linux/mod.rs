@@ -37,7 +37,7 @@ pub(crate) fn execute(
     policy: &AccessPolicy,
     tool: &OsStr,
     args: &[OsString],
-    trap_fd: &TrapFd,
+    trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
     let network = &policy.network_access;
     let unrestricted_network = network.is_unrestricted();
@@ -45,7 +45,7 @@ pub(crate) fn execute(
         log::debug!("linux: unix socket policy with seccomp enabled");
     }
 
-    let needs_fs_broker = filter::needs_filesystem_broker(policy) || trap_fd.is_enabled();
+    let needs_fs_broker = filter::needs_filesystem_broker(policy) || trap_fd.is_some();
     let needs_network_broker = !unrestricted_network
         && (network.local_tcp_bind
             || !network.connect_tcp_ports.is_empty()
@@ -60,7 +60,6 @@ pub(crate) fn execute(
             needs_fs_broker,
             trap_fd,
         )?;
-        trap_fd.close();
         return Ok(status);
     }
 

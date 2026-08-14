@@ -11,7 +11,7 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};
 use std::fs;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -26,11 +26,11 @@ pub(crate) fn execute(
     policy: &AccessPolicy,
     tool: &OsStr,
     args: &[OsString],
-    trap_fd: &TrapFd,
+    trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
     let profile = render_profile(policy).map_err(setup_failed)?;
     apply_profile(&profile)?;
-    close_inherited_fds(trap_fd.fd()).map_err(setup_failed)?;
+    close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd)).map_err(setup_failed)?;
     let error = Command::new(tool).args(args).exec();
     Err(Error::LaunchFailed {
         tool: PathBuf::from(tool),

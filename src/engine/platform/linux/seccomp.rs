@@ -145,7 +145,7 @@ pub(super) fn run_broker(
     args: &[OsString],
     needs_network: bool,
     needs_filesystem: bool,
-    trap_fd: &TrapFd,
+    trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
     let notify_unix_sockets = needs_unix_socket_broker(&policy.network_access.unix_socket_access);
     let notify_bind =
@@ -206,8 +206,8 @@ pub(super) fn run_broker(
                 }
 
                 let mut excluded = vec![child_sock.as_raw_fd()];
-                if let Some(fd) = trap_fd.fd() {
-                    excluded.push(fd);
+                if let Some(trap_fd) = trap_fd {
+                    excluded.push(trap_fd.as_raw_fd());
                 }
                 close_inherited_fds(&excluded).map_err(supervise_failed)?;
 
@@ -228,7 +228,9 @@ pub(super) fn run_broker(
                     .find_map(<dyn std::error::Error + 'static>::downcast_ref::<LandstripError>)
                     .map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from);
                 if handed_off || send_trap(&mut child_sock, &trap).is_err() {
-                    trap_fd.write(&trap);
+                    if let Some(trap_fd) = trap_fd {
+                        trap_fd.write(&trap);
+                    }
                     trap.emit();
                 }
             }
@@ -254,7 +256,9 @@ pub(super) fn run_broker(
                 }
                 NotifyStartup::Trap(trap) => {
                     drop(parent);
-                    trap_fd.write_json(&trap);
+                    if let Some(trap_fd) = trap_fd {
+                        trap_fd.write_json(&trap);
+                    }
                     let _ = writeln!(io::stderr().lock(), "{trap}");
                     Ok(1)
                 }
@@ -288,10 +292,10 @@ fn supervise_child(
     notify_fd: RawFd,
     syscalls: &NotificationSyscalls,
     notify_filesystem: bool,
-    trap_fd: &TrapFd,
+    trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
-    let mut denials = Denials::new(trap_fd.clone());
-    let query_enabled = trap_fd.is_socket();
+    let mut denials = Denials::new(trap_fd);
+    let query_enabled = trap_fd.is_some_and(TrapFd::is_socket);
     let mount_namespace =
         NamespaceId::try_from(Path::new("/proc/self/ns/mnt")).map_err(supervise_failed)?;
     let mut ctx = NotificationContext {
@@ -301,7 +305,9 @@ fn supervise_child(
         query_enabled,
         mount_namespace,
     };
-    let mut trap_fd = trap_fd.fd().filter(|_| query_enabled);
+    let mut trap_fd = trap_fd
+        .filter(|trap_fd| trap_fd.is_socket())
+        .map(AsRawFd::as_raw_fd);
     let mut pending_queries: std::collections::HashMap<u64, PendingQuery> =
         std::collections::HashMap::new();
     let mut control_buffer: Vec<u8> = Vec::new();
@@ -408,7 +414,7 @@ fn supervise_child(
 fn receive_handled_notification(
     notify_fd: RawFd,
     ctx: &NotificationContext,
-    denials: &mut Denials,
+    denials: &mut Denials<'_>,
     next_query_id: &mut u64,
 ) -> Result<Option<(libc::seccomp_notif, HandleResult)>> {
     let request = receive_notification(notify_fd)?;
@@ -474,17 +480,23 @@ impl Denial {
 }
 
 #[derive(Default)]
-struct Denials {
-    trap_fd: TrapFd,
+struct Denials<'a> {
+    trap_fd: Option<&'a TrapFd>,
     seen: HashSet<Denial>,
     pending: Vec<Denial>,
 }
 
-impl Denials {
-    fn new(trap_fd: TrapFd) -> Self {
+impl<'a> Denials<'a> {
+    fn new(trap_fd: Option<&'a TrapFd>) -> Self {
         Self {
             trap_fd,
             ..Self::default()
+        }
+    }
+
+    fn write(&self, trap: &Trap) {
+        if let Some(trap_fd) = self.trap_fd {
+            trap_fd.write(trap);
         }
     }
 
@@ -502,7 +514,7 @@ impl Denials {
             .filter(|denial| code != 0 || denial.report_on_success())
         {
             let trap = denial.clone().into_trap();
-            self.trap_fd.write(&trap);
+            self.write(&trap);
             trap.emit();
         }
         code
@@ -565,7 +577,7 @@ impl NamespaceId {
 fn handle_notification(
     ctx: &NotificationContext,
     request: &libc::seccomp_notif,
-    denials: &mut Denials,
+    denials: &mut Denials<'_>,
     next_query_id: &mut u64,
 ) -> HandleResult {
     let syscall = i64::from(request.data.nr);
@@ -616,7 +628,7 @@ fn handle_notification(
         Ok(NotificationResult::Open(grant)) => HandleResult::AddFd(grant),
         Ok(NotificationResult::Mutation(grant)) => HandleResult::RunMutation(grant),
         Ok(NotificationResult::Query(decision)) => {
-            denials.trap_fd.write(&decision.trap);
+            denials.write(&decision.trap);
             HandleResult::Pending(decision.query_id, decision.grant)
         }
         Err(error) => {
@@ -753,7 +765,7 @@ fn network_query(
 fn handle_bind(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
-    denials: &mut Denials,
+    denials: &mut Denials<'_>,
     query_enabled: bool,
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
@@ -815,7 +827,7 @@ fn handle_bind(
 fn handle_connect(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
-    denials: &mut Denials,
+    denials: &mut Denials<'_>,
     query_enabled: bool,
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
@@ -1257,7 +1269,7 @@ struct OpenDenial {
 
 fn deny_open(
     details: OpenDenial,
-    denials: &mut Denials,
+    denials: &mut Denials<'_>,
     query_enabled: bool,
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
@@ -1316,7 +1328,7 @@ fn deny_open(
 fn handle_openat(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
-    denials: &mut Denials,
+    denials: &mut Denials<'_>,
     query_enabled: bool,
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
@@ -1674,7 +1686,7 @@ const MUTATION_SYSCALLS: &[Syscall] = &[
 fn handle_mutation(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
-    denials: &mut Denials,
+    denials: &mut Denials<'_>,
     query_enabled: bool,
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
@@ -1798,7 +1810,7 @@ fn handle_mutation(
 fn handle_fd_utimensat(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
-    denials: &mut Denials,
+    denials: &mut Denials<'_>,
     query_enabled: bool,
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {

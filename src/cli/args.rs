@@ -5,9 +5,13 @@ use crate::engine::config::PolicyFormat;
 use crate::engine::error::Error;
 #[cfg(target_os = "windows")]
 use crate::engine::platform::WindowsCommand;
+#[cfg(unix)]
+use crate::engine::trap_fd::TrapFd;
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use std::env;
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::str::FromStr;
@@ -45,7 +49,7 @@ pub(super) enum Command {
 pub(super) struct RunCommand {
     pub(super) policy: PolicyInput,
     #[cfg(unix)]
-    pub(super) trap_fd: Option<i32>,
+    pub(super) trap_fd: Option<TrapFd>,
     pub(super) tool: OsString,
     pub(super) tool_args: Vec<OsString>,
 }
@@ -256,7 +260,11 @@ fn run_command(args: RunArgs) -> Result<RunCommand, Error> {
     Ok(RunCommand {
         policy: args.policy,
         #[cfg(unix)]
-        trap_fd: args.trap_fd,
+        trap_fd: args.trap_fd.map(|fd| {
+            // SAFETY: parse_trap_fd established that the inherited descriptor is open,
+            // and `--trap-fd` transfers its ownership to this process.
+            TrapFd::from(unsafe { OwnedFd::from_raw_fd(fd) })
+        }),
         tool,
         tool_args: program.collect(),
     })
@@ -328,6 +336,15 @@ fn parse_trap_fd(value: &str) -> Result<i32, String> {
     if fd < 3 {
         return Err("trap fd must be an integer greater than or equal to 3".to_owned());
     }
+
+    // SAFETY: F_GETFD only inspects the scalar descriptor number.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(format!(
+            "trap fd {fd} is not open: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
     Ok(fd)
 }
 

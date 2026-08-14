@@ -4,47 +4,38 @@
 //! Separate file descriptor for landstrip trap response blocks.
 
 use crate::engine::trap::Trap;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct TrapFd {
-    fd: Option<i32>,
-}
+#[derive(Debug)]
+pub(crate) struct TrapFd(OwnedFd);
 
-impl From<Option<i32>> for TrapFd {
-    fn from(fd: Option<i32>) -> Self {
-        Self { fd }
+impl From<OwnedFd> for TrapFd {
+    fn from(fd: OwnedFd) -> Self {
+        Self(fd)
     }
 }
 
-#[cfg(unix)]
-impl From<std::os::fd::RawFd> for TrapFd {
-    fn from(fd: std::os::fd::RawFd) -> Self {
-        Self { fd: Some(fd) }
+impl AsFd for TrapFd {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl AsRawFd for TrapFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
     }
 }
 
 impl TrapFd {
     #[cfg(target_os = "linux")]
-    pub(crate) fn is_enabled(&self) -> bool {
-        self.fd.is_some()
-    }
-
-    #[cfg(target_os = "linux")]
     pub(crate) fn is_socket(&self) -> bool {
-        self.fd.is_some_and(|fd| {
-            crate::engine::platform::fd::getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE).is_ok()
-        })
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn close(&self) {
-        if let Some(fd) = self.fd {
-            close_trap_fd(fd);
-        }
-    }
-
-    pub(crate) fn fd(&self) -> Option<i32> {
-        self.fd
+        crate::engine::platform::fd::getsockopt_int(
+            self.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+        )
+        .is_ok()
     }
 
     pub(crate) fn write(&self, trap: &Trap) {
@@ -55,15 +46,13 @@ impl TrapFd {
         let mut line = json.to_owned();
         line.push('\n');
 
-        if let Some(fd) = self.fd {
-            #[cfg(target_os = "linux")]
-            if self.is_socket() {
-                write_socket_trap_fd(fd, line.as_bytes());
-                return;
-            }
-
-            write_nonblocking_trap_fd(fd, line.as_bytes());
+        #[cfg(target_os = "linux")]
+        if self.is_socket() {
+            write_socket_trap_fd(self.as_raw_fd(), line.as_bytes());
+            return;
         }
+
+        write_nonblocking_trap_fd(self.as_raw_fd(), line.as_bytes());
     }
 }
 
@@ -171,17 +160,4 @@ fn log_fd_error(operation: &str, fd: i32) {
         "trap: {operation} fd={fd} errno={}",
         error.raw_os_error().unwrap_or(0)
     );
-}
-
-#[cfg(target_os = "linux")]
-fn close_trap_fd(fd: i32) {
-    // SAFETY: close(2) copies the scalar file descriptor argument.
-    let rc = unsafe { libc::close(fd) };
-    if rc != 0 {
-        let error = std::io::Error::last_os_error();
-        log::debug!(
-            "trap: close fd={fd} errno={}",
-            error.raw_os_error().unwrap_or(0)
-        );
-    }
 }

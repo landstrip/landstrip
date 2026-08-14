@@ -18,7 +18,7 @@ pub(crate) fn execute(
     _policy: &AccessPolicy,
     _tool: &OsStr,
     _args: &[OsString],
-    _trap_fd: &TrapFd,
+    _trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
     Err(Error::PlatformUnsupported.into())
 }
