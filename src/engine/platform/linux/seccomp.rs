@@ -43,6 +43,7 @@ use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -291,11 +292,14 @@ fn supervise_child(
 ) -> Result<i32> {
     let mut denials = Denials::new(trap_fd.clone());
     let query_enabled = trap_fd.is_socket();
+    let mount_namespace =
+        NamespaceId::try_from(Path::new("/proc/self/ns/mnt")).map_err(supervise_failed)?;
     let mut ctx = NotificationContext {
         policy,
         syscalls,
         notify_filesystem,
         query_enabled,
+        mount_namespace,
     };
     let mut trap_fd = trap_fd.fd().filter(|_| query_enabled);
     let mut pending_queries: std::collections::HashMap<u64, PendingQuery> =
@@ -411,7 +415,10 @@ fn receive_handled_notification(
     if !validate_notification_id(notify_fd, request.id)? {
         return Ok(None);
     }
-    let handle_result = handle_notification(ctx, &request, denials, next_query_id);
+    let handle_result = match ctx.mount_namespace.verify(request.pid) {
+        Ok(()) => handle_notification(ctx, &request, denials, next_query_id),
+        Err(error) => HandleResult::Respond(notification_error(request.id, -error.errno().abs())),
+    };
     if !validate_notification_id(notify_fd, request.id)? {
         return Ok(None);
     }
@@ -521,6 +528,38 @@ struct NotificationContext<'a> {
     syscalls: &'a NotificationSyscalls,
     notify_filesystem: bool,
     query_enabled: bool,
+    mount_namespace: NamespaceId,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct NamespaceId {
+    device: u64,
+    inode: u64,
+}
+
+impl TryFrom<&Path> for NamespaceId {
+    type Error = io::Error;
+
+    fn try_from(path: &Path) -> io::Result<Self> {
+        let metadata = fs::metadata(path)?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+impl NamespaceId {
+    fn verify(self, pid: u32) -> SysResult<()> {
+        let path = Path::new("/proc").join(pid.to_string()).join("ns/mnt");
+        let actual = Self::try_from(path.as_path()).map_err(|error| BrokerError::SystemCall {
+            errno: error.raw_os_error().unwrap_or(libc::EIO),
+        })?;
+        if actual != self {
+            return Err(BrokerError::PolicyDenied);
+        }
+        Ok(())
+    }
 }
 
 fn handle_notification(
