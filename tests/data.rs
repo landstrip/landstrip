@@ -21,6 +21,7 @@ const DATA: &str = include_str!("data.txt");
 /// Re-exec argument marker for `fs=opath` probes (see [`opath_probe`]).
 const OPATH_PROBE_ARG: &str = "--test-opath";
 const FUTIMENS_PROBE_ARG: &str = "--test-futimens";
+const TRUNCATE_PROBE_ARG: &str = "--test-truncate";
 
 fn main() {
     let mut args = std::env::args_os();
@@ -30,6 +31,9 @@ fn main() {
         }
         Some(value) if value == std::ffi::OsStr::new(FUTIMENS_PROBE_ARG) => {
             std::process::exit(futimens_probe(args.next()));
+        }
+        Some(value) if value == std::ffi::OsStr::new(TRUNCATE_PROBE_ARG) => {
+            std::process::exit(truncate_probe(args.next()));
         }
         _ => {}
     }
@@ -182,6 +186,8 @@ enum Fs {
     OPath { path: String, allowed: bool },
     /// fd-only utimensat of `path`; `allowed` selects the expected result.
     UtimensatFd { path: String, allowed: bool },
+    /// truncate(2) of `path`; `allowed` selects the expected result.
+    Truncate { path: String, allowed: bool },
 }
 
 struct Case {
@@ -563,13 +569,16 @@ fn parse_net(value: &str) -> Net {
     }
 }
 
-/// `fs=opath:<path>:<allowed|denied>` — O_PATH directory open of <path>, or
-/// `fs=utimensat-fd:<path>:<allowed|denied>` — fd-only timestamp update of <path>.
+/// `fs=opath:<path>:<allowed|denied>` — O_PATH directory open of <path>,
+/// `fs=utimensat-fd:<path>:<allowed|denied>` — fd-only timestamp update, or
+/// `fs=truncate:<path>:<allowed|denied>` — truncate(2) of <path>.
 fn parse_fs(value: &str) -> Fs {
-    let (spec, fd_only) = if let Some(spec) = value.strip_prefix("opath:") {
-        (spec, false)
+    let (spec, kind) = if let Some(spec) = value.strip_prefix("opath:") {
+        (spec, "opath")
     } else if let Some(spec) = value.strip_prefix("utimensat-fd:") {
-        (spec, true)
+        (spec, "utimensat-fd")
+    } else if let Some(spec) = value.strip_prefix("truncate:") {
+        (spec, "truncate")
     } else {
         panic!("unknown fs kind `{value}`");
     };
@@ -581,13 +590,18 @@ fn parse_fs(value: &str) -> Fs {
         "denied" => false,
         other => panic!("unknown fs result `{other}`"),
     };
-    if fd_only {
+    if kind == "opath" {
+        Fs::OPath {
+            path: path.to_owned(),
+            allowed,
+        }
+    } else if kind == "utimensat-fd" {
         Fs::UtimensatFd {
             path: path.to_owned(),
             allowed,
         }
     } else {
-        Fs::OPath {
+        Fs::Truncate {
             path: path.to_owned(),
             allowed,
         }
@@ -605,6 +619,7 @@ fn run_fs(
     let (marker, path, allowed) = match fs {
         Fs::OPath { path, allowed } => (OPATH_PROBE_ARG, path, allowed),
         Fs::UtimensatFd { path, allowed } => (FUTIMENS_PROBE_ARG, path, allowed),
+        Fs::Truncate { path, allowed } => (TRUNCATE_PROBE_ARG, path, allowed),
     };
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
     let output = landstrip_net(ctx, format, policies)
@@ -686,6 +701,29 @@ fn futimens_probe(path: Option<std::ffi::OsString>) -> i32 {
 
 #[cfg(not(target_os = "linux"))]
 fn futimens_probe(_path: Option<std::ffi::OsString>) -> i32 {
+    2
+}
+
+#[cfg(target_os = "linux")]
+fn truncate_probe(path: Option<std::ffi::OsString>) -> i32 {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(path) = path else {
+        return 2;
+    };
+    let Ok(path) = std::ffi::CString::new(path.as_bytes()) else {
+        return 2;
+    };
+    // SAFETY: path is NUL-terminated and length is nonnegative.
+    if unsafe { libc::truncate(path.as_ptr(), 1) } == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn truncate_probe(_path: Option<std::ffi::OsString>) -> i32 {
     2
 }
 

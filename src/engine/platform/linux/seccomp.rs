@@ -2284,9 +2284,17 @@ fn run_mutation(grant: &MutationGrant) -> std::result::Result<(), i32> {
         MutationOp::Unlink { flags } => unsafe { libc::unlinkat(dir, name, *flags) },
         MutationOp::Symlink { target } => unsafe { libc::symlinkat(target.as_ptr(), dir, name) },
         MutationOp::Truncate { length } => {
-            let (file, _path) = pin_target(at)?;
-            // SAFETY: ftruncate operates on the freshly opened owned fd.
-            return check(unsafe { libc::ftruncate(file.as_raw_fd(), *length) });
+            let (_target, path) = pin_target(at)?;
+            // Reopen the pinned O_PATH target with write access before ftruncate;
+            // ftruncate itself rejects O_PATH descriptors with EBADF.
+            // SAFETY: path is NUL-terminated and refers to the live pinned target.
+            let writable = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+            if writable < 0 {
+                return Err(Errno::last() as i32);
+            }
+            // SAFETY: open returned a new owned descriptor.
+            let writable = unsafe { OwnedFd::from_raw_fd(writable) };
+            return check(unsafe { libc::ftruncate(writable.as_raw_fd(), *length) });
         }
         MutationOp::Rename { flags } => {
             let to = grant.anchors.get(1).ok_or(libc::EINVAL)?;
