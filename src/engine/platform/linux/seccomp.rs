@@ -1592,6 +1592,10 @@ fn handle_mutation(
     let Some(spec) = MUTATION_SYSCALLS.iter().find(|s| s.nr == Some(syscall)) else {
         return Ok(NotificationResult::Continue);
     };
+    if spec.name == "utimensat" && request.data.args[1] == 0 {
+        return handle_fd_utimensat(policy, request, denials, query_enabled, next_query_id);
+    }
+
     let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
 
     let mut slots: Vec<Option<(PathBuf, PathBuf)>> = Vec::with_capacity(spec.paths.len());
@@ -1694,6 +1698,80 @@ fn handle_mutation(
             Some(qid),
         ),
         grant,
+    ))
+}
+
+/// Mediate the fd-only form used by `futimens(3)`, which glibc issues as
+/// `utimensat(fd, NULL, times, 0)`. Pin the child's descriptor before checking
+/// policy so another thread cannot swap its fd-table entry between the check
+/// and the brokered timestamp update.
+fn handle_fd_utimensat(
+    policy: &AccessPolicy,
+    request: &libc::seccomp_notif,
+    denials: &mut Denials,
+    query_enabled: bool,
+    next_query_id: &mut u64,
+) -> SysResult<NotificationResult> {
+    let args = &request.data.args;
+    let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
+    if syscall_i32(args[3]) != 0 {
+        return Err(BrokerError::SystemCall {
+            errno: libc::EINVAL,
+        });
+    }
+
+    let child_fd = syscall_i32(args[0]);
+    if child_fd < 0 {
+        return Err(BrokerError::BadFileDescriptor);
+    }
+
+    let proc_path = Path::new("/proc")
+        .join(pid.as_raw().to_string())
+        .join("fd")
+        .join(child_fd.to_string());
+    let target = open_path(&proc_path, libc::O_PATH | libc::O_CLOEXEC)
+        .map_err(|errno| BrokerError::SystemCall { errno })?;
+    let requested_path = fs::read_link(
+        Path::new("/proc/self/fd").join(target.as_raw_fd().to_string()),
+    )
+    .map_err(|error| BrokerError::SystemCall {
+        errno: error.raw_os_error().unwrap_or(libc::EIO),
+    })?;
+    let times = read_child_times(pid, args[2])?;
+    let resolved = normalize_path(&requested_path);
+    let lexical = normalize_path_lexically(&requested_path);
+    let reason = policy.to_reason(&resolved, &lexical, true);
+
+    let operation = MutationGrant {
+        op: MutationOp::UtimesFd { target, times },
+        anchors: Vec::new(),
+        no_follow: false,
+    };
+
+    let Some(reason) = reason else {
+        return Ok(NotificationResult::Mutation(operation));
+    };
+
+    let denial = FilesystemDenial {
+        operation: TrapOperation::Write,
+        path: resolved,
+        requested_path,
+        syscall: "utimensat",
+        flags: Vec::new(),
+        reason,
+        process: process_context(request.pid),
+    };
+    if !query_enabled {
+        denials.record(Denial::Filesystem(denial));
+        return Err(BrokerError::PolicyDenied);
+    }
+
+    let qid = *next_query_id;
+    *next_query_id += 1;
+    Ok(NotificationResult::query(
+        qid,
+        Trap::filesystem(denial, Some(qid)),
+        Some(Grant::Mutation(operation)),
     ))
 }
 
@@ -2091,10 +2169,18 @@ fn grant_socket(notify_fd: RawFd, id: u64, grant: &SocketGrant) {
 }
 
 fn run_mutation(grant: &MutationGrant) -> std::result::Result<(), i32> {
+    if let MutationOp::UtimesFd { target, times } = &grant.op {
+        let ptr = times.as_ref().map_or(ptr::null(), |value| value.as_ptr());
+        // SAFETY: target is a pinned O_PATH descriptor and the empty pathname is
+        // NUL-terminated; AT_EMPTY_PATH applies the timestamps to that descriptor.
+        return check(unsafe {
+            libc::utimensat(target.as_raw_fd(), c"".as_ptr(), ptr, libc::AT_EMPTY_PATH)
+        });
+    }
+
     let at = grant.anchors.first().ok_or(libc::EINVAL)?;
     let dir = at.dir.as_raw_fd();
     let name = at.name.as_ptr();
-
     let rc = match &grant.op {
         // Directory-entry operations act on a name within the pinned parent.
         MutationOp::Mkdir { mode } => unsafe { libc::mkdirat(dir, name, *mode) },
@@ -2155,6 +2241,7 @@ fn run_mutation(grant: &MutationGrant) -> std::result::Result<(), i32> {
                 unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), ptr, 0) }
             }
         }
+        MutationOp::UtimesFd { .. } => return Err(libc::EINVAL),
         MutationOp::SetXattr { name, value, flags } => {
             let (_fd, path) = pin_target(at)?;
             unsafe {
@@ -2605,6 +2692,10 @@ enum MutationOp {
         gid: u32,
     },
     Utimes {
+        times: Option<[libc::timespec; 2]>,
+    },
+    UtimesFd {
+        target: OwnedFd,
         times: Option<[libc::timespec; 2]>,
     },
     SetXattr {

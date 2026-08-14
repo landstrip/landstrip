@@ -20,11 +20,18 @@ const DATA: &str = include_str!("data.txt");
 
 /// Re-exec argument marker for `fs=opath` probes (see [`opath_probe`]).
 const OPATH_PROBE_ARG: &str = "--test-opath";
+const FUTIMENS_PROBE_ARG: &str = "--test-futimens";
 
 fn main() {
     let mut args = std::env::args_os();
-    if args.nth(1).as_deref() == Some(std::ffi::OsStr::new(OPATH_PROBE_ARG)) {
-        std::process::exit(opath_probe(args.next()));
+    match args.nth(1).as_deref() {
+        Some(value) if value == std::ffi::OsStr::new(OPATH_PROBE_ARG) => {
+            std::process::exit(opath_probe(args.next()));
+        }
+        Some(value) if value == std::ffi::OsStr::new(FUTIMENS_PROBE_ARG) => {
+            std::process::exit(futimens_probe(args.next()));
+        }
+        _ => {}
     }
     let ctx = Context::new();
     let mut failed = 0u32;
@@ -173,6 +180,8 @@ enum Net {
 enum Fs {
     /// O_PATH directory open of `path`; `allowed` selects the expected result.
     OPath { path: String, allowed: bool },
+    /// fd-only utimensat of `path`; `allowed` selects the expected result.
+    UtimensatFd { path: String, allowed: bool },
 }
 
 struct Case {
@@ -554,10 +563,14 @@ fn parse_net(value: &str) -> Net {
     }
 }
 
-/// `fs=opath:<path>:<allowed|denied>` — O_PATH directory open of <path>
-/// inside the sandbox; <allowed> selects the expected result.
+/// `fs=opath:<path>:<allowed|denied>` — O_PATH directory open of <path>, or
+/// `fs=utimensat-fd:<path>:<allowed|denied>` — fd-only timestamp update of <path>.
 fn parse_fs(value: &str) -> Fs {
-    let Some(spec) = value.strip_prefix("opath:") else {
+    let (spec, fd_only) = if let Some(spec) = value.strip_prefix("opath:") {
+        (spec, false)
+    } else if let Some(spec) = value.strip_prefix("utimensat-fd:") {
+        (spec, true)
+    } else {
         panic!("unknown fs kind `{value}`");
     };
     let (path, want) = spec
@@ -568,9 +581,16 @@ fn parse_fs(value: &str) -> Fs {
         "denied" => false,
         other => panic!("unknown fs result `{other}`"),
     };
-    Fs::OPath {
-        path: path.to_owned(),
-        allowed,
+    if fd_only {
+        Fs::UtimensatFd {
+            path: path.to_owned(),
+            allowed,
+        }
+    } else {
+        Fs::OPath {
+            path: path.to_owned(),
+            allowed,
+        }
     }
 }
 
@@ -582,25 +602,25 @@ fn run_fs(
     policies: &[PathBuf],
     resolver: &Resolver,
 ) -> Result<(), String> {
-    match fs {
-        Fs::OPath { path, allowed } => {
-            let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-            let output = landstrip_net(ctx, format, policies)
-                .arg(exe)
-                .arg(OPATH_PROBE_ARG)
-                .arg(resolver.subst(path))
-                .output()
-                .map_err(|e| format!("spawn opath probe: {e}"))?;
-            if output.status.success() != *allowed {
-                return Err(format!(
-                    "opath open of {path} {}denied; output={}",
-                    if *allowed { "" } else { "not " },
-                    merge(&output.stdout, &output.stderr).trim()
-                ));
-            }
-            Ok(())
-        }
+    let (marker, path, allowed) = match fs {
+        Fs::OPath { path, allowed } => (OPATH_PROBE_ARG, path, allowed),
+        Fs::UtimensatFd { path, allowed } => (FUTIMENS_PROBE_ARG, path, allowed),
+    };
+    let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
+    let output = landstrip_net(ctx, format, policies)
+        .arg(exe)
+        .arg(marker)
+        .arg(resolver.subst(path))
+        .output()
+        .map_err(|e| format!("spawn fs probe: {e}"))?;
+    if output.status.success() != *allowed {
+        return Err(format!(
+            "fs probe {marker} of {path} {}denied; output={}",
+            if *allowed { "" } else { "not " },
+            merge(&output.stdout, &output.stderr).trim()
+        ));
     }
+    Ok(())
 }
 
 /// Re-exec probe for `fs=opath` cases: performs an O_PATH directory open of
@@ -626,6 +646,46 @@ fn opath_probe(path: Option<std::ffi::OsString>) -> i32 {
 
 #[cfg(not(unix))]
 fn opath_probe(_path: Option<std::ffi::OsString>) -> i32 {
+    2
+}
+
+/// Re-exec probe for the fd-only form of utimensat used by futimens.
+#[cfg(target_os = "linux")]
+fn futimens_probe(path: Option<std::ffi::OsString>) -> i32 {
+    use std::os::fd::AsRawFd;
+
+    let Some(path) = path else {
+        return 2;
+    };
+    let Ok(file) = std::fs::File::open(path) else {
+        return 1;
+    };
+    let times = [
+        libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: 2,
+            tv_nsec: 0,
+        },
+    ];
+    // SAFETY: file is live, times points to two initialized timespecs, and a null
+    // pathname selects the fd-only Linux utimensat form used by glibc futimens.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_utimensat,
+            file.as_raw_fd(),
+            std::ptr::null::<libc::c_char>(),
+            times.as_ptr(),
+            0,
+        )
+    };
+    if rc == 0 { 0 } else { 1 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn futimens_probe(_path: Option<std::ffi::OsString>) -> i32 {
     2
 }
 
