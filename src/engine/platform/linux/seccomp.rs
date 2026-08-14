@@ -360,12 +360,11 @@ fn supervise_child(
             continue;
         }
 
-        let request = receive_notification(notify_fd)?;
-        let handle_result = handle_notification(&ctx, &request, &mut denials, &mut next_query_id);
-
-        if !validate_notification_id(notify_fd, request.id)? {
+        let Some((request, handle_result)) =
+            receive_handled_notification(notify_fd, &ctx, &mut denials, &mut next_query_id)?
+        else {
             continue;
-        }
+        };
         match handle_result {
             HandleResult::Respond(response) => {
                 if let Err(source) = respond_notification(notify_fd, response) {
@@ -395,8 +394,28 @@ fn supervise_child(
             HandleResult::RunMutation(grant) => {
                 grant_mutation(notify_fd, request.id, &grant);
             }
+            HandleResult::RunSocket(grant) => {
+                grant_socket(notify_fd, request.id, &grant);
+            }
         }
     }
+}
+
+fn receive_handled_notification(
+    notify_fd: RawFd,
+    ctx: &NotificationContext,
+    denials: &mut Denials,
+    next_query_id: &mut u64,
+) -> Result<Option<(libc::seccomp_notif, HandleResult)>> {
+    let request = receive_notification(notify_fd)?;
+    if !validate_notification_id(notify_fd, request.id)? {
+        return Ok(None);
+    }
+    let handle_result = handle_notification(ctx, &request, denials, next_query_id);
+    if !validate_notification_id(notify_fd, request.id)? {
+        return Ok(None);
+    }
+    Ok(Some((request, handle_result)))
 }
 
 fn poll_broker_fds(
@@ -489,9 +508,10 @@ enum HandleResult {
     // instead of letting the kernel re-run open in the child. Used for every
     // allowed open so CONTINUE cannot TOCTOU-bypass denyRead/denyWrite.
     AddFd(OpenGrant),
-    // Broker-mediated mutation: re-issue rename/unlink/chmod/etc outside the
-    // child so a path swap cannot race past a denyWrite check.
+    // Broker-mediated side effects are executed only after notification validity
+    // is checked immediately before dispatch.
     RunMutation(MutationGrant),
+    RunSocket(SocketGrant),
     Pending(u64, Option<Grant>),
 }
 
@@ -550,9 +570,7 @@ fn handle_notification(
     };
 
     match result {
-        Ok(NotificationResult::Value(value)) => {
-            HandleResult::Respond(notification_value(request.id, value))
-        }
+        Ok(NotificationResult::Socket(grant)) => HandleResult::RunSocket(grant),
         Ok(NotificationResult::Continue) => {
             HandleResult::Respond(notification_continue(request.id))
         }
@@ -700,7 +718,7 @@ fn handle_bind(
     query_enabled: bool,
     next_query_id: &mut u64,
 ) -> SysResult<NotificationResult> {
-    let mut socket = target_socket(request)?;
+    let socket = target_socket(request)?;
 
     match socket.info.kind() {
         SocketKind::Tcp => {
@@ -744,10 +762,12 @@ fn handle_bind(
                 return Err(BrokerError::PolicyDenied);
             }
 
-            broker_addr_call(socket.sock.as_raw_fd(), &socket.addr, libc::bind)
-                .map(NotificationResult::Value)
+            Ok(NotificationResult::Socket(SocketGrant::new(
+                socket,
+                libc::bind,
+            )))
         }
-        SocketKind::Unix => handle_unix_bind(policy, request.pid, &mut socket),
+        SocketKind::Unix => handle_unix_bind(policy, request.pid, socket),
         SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
         SocketKind::Other => Ok(NotificationResult::Continue),
     }
@@ -790,10 +810,12 @@ fn handle_connect(
                 return Err(BrokerError::PolicyDenied);
             }
 
-            broker_addr_call(socket.sock.as_raw_fd(), &socket.addr, libc::connect)
-                .map(NotificationResult::Value)
+            Ok(NotificationResult::Socket(SocketGrant::new(
+                socket,
+                libc::connect,
+            )))
         }
-        SocketKind::Unix => handle_unix_connect(policy, request.pid, &socket),
+        SocketKind::Unix => handle_unix_connect(policy, request.pid, socket),
         SocketKind::Other => Ok(NotificationResult::Continue),
         SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
     }
@@ -802,7 +824,7 @@ fn handle_connect(
 fn handle_unix_connect(
     policy: &AccessPolicy,
     pid: u32,
-    socket: &TargetSocket,
+    socket: TargetSocket,
 ) -> SysResult<NotificationResult> {
     let Some((target, relative)) = unix_path_target(pid, &socket.addr)? else {
         return Err(BrokerError::PolicyDenied);
@@ -814,13 +836,17 @@ fn handle_unix_connect(
         rewrite_unix_path(&mut addr, &target)?;
     }
 
-    broker_addr_call(socket.sock.as_raw_fd(), &addr, libc::connect).map(NotificationResult::Value)
+    Ok(NotificationResult::Socket(SocketGrant {
+        sock: socket.sock,
+        addr,
+        call: libc::connect,
+    }))
 }
 
 fn handle_unix_bind(
     policy: &AccessPolicy,
     pid: u32,
-    socket: &mut TargetSocket,
+    mut socket: TargetSocket,
 ) -> SysResult<NotificationResult> {
     let Some((target, relative)) = unix_path_target(pid, &socket.addr)? else {
         return Err(BrokerError::PolicyDenied);
@@ -839,8 +865,10 @@ fn handle_unix_bind(
         rewrite_unix_path(&mut socket.addr, &target)?;
     }
 
-    broker_addr_call(socket.sock.as_raw_fd(), &socket.addr, libc::bind)
-        .map(NotificationResult::Value)
+    Ok(NotificationResult::Socket(SocketGrant::new(
+        socket,
+        libc::bind,
+    )))
 }
 
 fn unix_path_target(pid: u32, addr: &[u8]) -> SysResult<Option<(PathBuf, bool)>> {
@@ -2610,7 +2638,7 @@ struct TcpEndpoint {
 }
 
 enum NotificationResult {
-    Value(i64),
+    Socket(SocketGrant),
     Continue,
     Query(QueryDecision),
     Open(OpenGrant),
@@ -2645,6 +2673,16 @@ struct SocketGrant {
     sock: OwnedFd,
     addr: Vec<u8>,
     call: SocketAddrCall,
+}
+
+impl SocketGrant {
+    fn new(socket: TargetSocket, call: SocketAddrCall) -> Self {
+        Self {
+            sock: socket.sock,
+            addr: socket.addr,
+            call,
+        }
+    }
 }
 
 struct Anchor {
