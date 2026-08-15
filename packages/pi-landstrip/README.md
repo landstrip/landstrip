@@ -160,6 +160,34 @@ read Pi authentication and inherited credential environment variables. Install
 only trusted worker plugins and use credentials appropriate for the sandboxed
 task.
 
+## Permission ask providers
+
+A separate Pi extension can resolve agent permission rules that return `ask` by
+registering one `LandstripPermissionAskProvider`:
+
+```ts
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { provideLandstripPermissionAsk } from 'pi-landstrip/api';
+
+export default function permissionReviewer(pi: ExtensionAPI): void {
+  provideLandstripPermissionAsk(pi, {
+    id: 'example-reviewer',
+    async decide(request) {
+      if (request.toolName === 'bash' && request.input.command === 'git status') {
+        return { decision: 'allow' };
+      }
+      return { decision: 'abstain' };
+    },
+  });
+}
+```
+
+The provider receives the tool name and input, pending permission/resource pairs,
+the primary or subagent context, and an abort signal. `allow` approves that call,
+`deny` blocks it, and `abstain` uses the normal UI prompt or headless denial.
+Provider errors also fall back safely. Only one provider may be registered at a
+time; the helper works regardless of extension load order and returns a disposer.
+
 ## License
 
 `pi-landstrip` is licensed under `Apache-2.0`. The bundled Landstrip package is
