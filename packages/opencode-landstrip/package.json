@@ -59,7 +59,7 @@
     "@types/node": "^26.1.1",
     "oxfmt": "^0.63.0",
     "oxlint": "^1.68.0",
-    "typescript": "^5.9.3"
+    "typescript": "^7.0.2"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.17.7"
