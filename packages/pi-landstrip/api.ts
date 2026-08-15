@@ -56,6 +56,33 @@ export interface LandstripShellProvider {
   ): LandstripShellInvocation | Promise<LandstripShellInvocation>;
 }
 
+export interface LandstripPermissionAsk {
+  readonly permission: string;
+  readonly resource: string;
+}
+
+export interface LandstripPermissionAskRequest {
+  readonly context: LandstripContextV2;
+  readonly toolName: string;
+  readonly input: Readonly<Record<string, unknown>>;
+  readonly permissions: readonly LandstripPermissionAsk[];
+  /** Description of the subagent task that originated the request, when applicable. */
+  readonly taskDescription?: string;
+  readonly signal?: AbortSignal;
+}
+
+export type LandstripPermissionAskDecision =
+  | { readonly decision: 'allow' }
+  | { readonly decision: 'deny'; readonly reason?: string }
+  | { readonly decision: 'abstain' };
+
+export interface LandstripPermissionAskProvider {
+  readonly id: string;
+  decide(
+    request: LandstripPermissionAskRequest,
+  ): LandstripPermissionAskDecision | Promise<LandstripPermissionAskDecision>;
+}
+
 export interface LandstripProcessOptions {
   readonly command: string;
   readonly args: readonly string[];
@@ -112,6 +139,7 @@ export interface PiLandstripRuntimeV2 {
   readonly version: 2;
   getContext(ctx?: ExtensionContext): LandstripContextV2;
   registerShellProvider(provider: LandstripShellProvider): () => void;
+  registerPermissionAskProvider(provider: LandstripPermissionAskProvider): () => void;
   prepareProcess(options: LandstripProcessOptions): Promise<LandstripPreparedProcess>;
   registerWorkerExtension(extension: LandstripWorkerExtension): () => void;
   getWorkerExtensions(): readonly LandstripWorkerExtension[];
@@ -150,6 +178,7 @@ function isRuntime(value: unknown): value is PiLandstripRuntimeV2 {
     value.version === LANDSTRIP_RUNTIME_VERSION &&
     typeof value.getContext === 'function' &&
     typeof value.registerShellProvider === 'function' &&
+    typeof value.registerPermissionAskProvider === 'function' &&
     typeof value.prepareProcess === 'function' &&
     typeof value.registerWorkerExtension === 'function' &&
     typeof value.getWorkerExtensions === 'function' &&
@@ -193,6 +222,22 @@ export function provideLandstripShell(
   let unregisterProvider: (() => void) | undefined;
   const stopDiscovery = useLandstrip(pi, (runtime) => {
     const unregisterNext = runtime.registerShellProvider(provider);
+    unregisterProvider?.();
+    unregisterProvider = unregisterNext;
+  });
+  return () => {
+    stopDiscovery();
+    unregisterProvider?.();
+  };
+}
+
+export function provideLandstripPermissionAsk(
+  pi: ExtensionAPI,
+  provider: LandstripPermissionAskProvider,
+): () => void {
+  let unregisterProvider: (() => void) | undefined;
+  const stopDiscovery = useLandstrip(pi, (runtime) => {
+    const unregisterNext = runtime.registerPermissionAskProvider(provider);
     unregisterProvider?.();
     unregisterProvider = unregisterNext;
   });

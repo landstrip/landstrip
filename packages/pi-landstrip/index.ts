@@ -58,6 +58,9 @@ import {
 import {
   type LandstripContextV2,
   type LandstripEvent,
+  type LandstripPermissionAskDecision,
+  type LandstripPermissionAskProvider,
+  type LandstripPermissionAskRequest,
   type LandstripPreparedProcess,
   type LandstripProcessOptions,
   type LandstripSandboxState,
@@ -1277,6 +1280,10 @@ export interface FilesystemToolAuthorizationOptions {
 
 /** Landstrip sandbox integration hooks for Pi. */
 export interface LandstripIntegration extends PiLandstripRuntimeV2 {
+  /** Resolve a permission ask through the registered external provider. */
+  resolvePermissionAsk(
+    request: LandstripPermissionAskRequest,
+  ): Promise<LandstripPermissionAskDecision>;
   /** Prepare a full Pi RPC process constrained by the effective sandbox policy. */
   prepareRpcWorker(options: LandstripRpcWorkerOptions): Promise<LandstripRpcWorkerLaunch>;
   /** Apply sandbox filesystem rules before a primary Pi file tool runs. */
@@ -1313,6 +1320,10 @@ export interface LandstripRpcWorkerLaunch extends LandstripPreparedProcess {
 export type {
   LandstripContextV2,
   LandstripEvent,
+  LandstripPermissionAsk,
+  LandstripPermissionAskDecision,
+  LandstripPermissionAskProvider,
+  LandstripPermissionAskRequest,
   LandstripPreparedProcess,
   LandstripProcessOptions,
   LandstripSandboxState,
@@ -1369,6 +1380,7 @@ function createLandstripIntegrationWithPrompts(
   let unpublishRuntime: (() => void) | undefined;
   const defaultShellProvider = createPosixShellProvider();
   let externalShellProvider: LandstripShellProvider | undefined;
+  let externalPermissionAskProvider: LandstripPermissionAskProvider | undefined;
   const eventHandlers = new Set<(event: LandstripEvent) => void>();
   const workerExtensions = new Map<string, { entry: string; registrations: number }>();
   const sessionAllowedDomains: string[] = [];
@@ -1434,6 +1446,43 @@ function createLandstripIntegrationWithPrompts(
       disposed = true;
       if (externalShellProvider === provider) externalShellProvider = undefined;
     };
+  }
+
+  function registerPermissionAskProvider(provider: LandstripPermissionAskProvider): () => void {
+    const id = provider.id.trim();
+    if (!id) throw new Error('Permission ask provider id must not be empty');
+    if (externalPermissionAskProvider) {
+      throw new Error(
+        `Permission ask provider "${externalPermissionAskProvider.id}" is already registered; cannot register "${id}"`,
+      );
+    }
+
+    externalPermissionAskProvider = provider;
+    let disposed = false;
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      if (externalPermissionAskProvider === provider) externalPermissionAskProvider = undefined;
+    };
+  }
+
+  async function resolvePermissionAsk(
+    request: LandstripPermissionAskRequest,
+  ): Promise<LandstripPermissionAskDecision> {
+    const provider = externalPermissionAskProvider;
+    if (!provider) return { decision: 'abstain' };
+
+    const result: unknown = await provider.decide(request);
+    if (
+      typeof result !== 'object' ||
+      result === null ||
+      !('decision' in result) ||
+      !['allow', 'deny', 'abstain'].includes(String(result.decision)) ||
+      ('reason' in result && result.reason !== undefined && typeof result.reason !== 'string')
+    ) {
+      throw new Error(`Permission ask provider "${provider.id}" returned an invalid decision`);
+    }
+    return result as LandstripPermissionAskDecision;
   }
 
   function activeShellProvider(): LandstripShellProvider {
@@ -3402,6 +3451,8 @@ function createLandstripIntegrationWithPrompts(
     version: LANDSTRIP_RUNTIME_VERSION,
     getContext,
     registerShellProvider,
+    registerPermissionAskProvider,
+    resolvePermissionAsk,
     prepareProcess,
     prepareRpcWorker,
     authorizeFilesystemToolAccess,

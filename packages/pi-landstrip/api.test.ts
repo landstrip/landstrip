@@ -12,6 +12,7 @@ import {
   contextFromEnvironment,
   encodeLandstripContext,
   LANDSTRIP_CONTEXT_ENV,
+  provideLandstripPermissionAsk,
   provideLandstripShell,
   publishLandstripRuntime,
   type PiLandstripRuntimeV2,
@@ -47,6 +48,29 @@ function shellProvider(id: string) {
     prepare() {
       return { executable: 'shell', args: [], launcherEnv: {} };
     },
+  };
+}
+
+function permissionAskProvider(id: string) {
+  return {
+    id,
+    decide: vi.fn(async () => ({ decision: 'allow' as const })),
+  };
+}
+
+function permissionAskRequest() {
+  return {
+    context: {
+      version: 2,
+      host: 'pi',
+      role: 'primary',
+      sandbox: 'enabled',
+      cwd: '/workspace',
+      depth: 0,
+    } as const,
+    toolName: 'bash',
+    input: { command: 'git status' },
+    permissions: [{ permission: 'bash', resource: 'git status' }],
   };
 }
 test('discovers the runtime regardless of extension load order', () => {
@@ -129,6 +153,45 @@ test('rejects invalid and conflicting shell provider registrations', () => {
   stop();
   const stopFish = landstrip.registerShellProvider(shellProvider('fish'));
   stopFish();
+});
+
+test('registers permission ask providers regardless of extension load order', async () => {
+  for (const providerFirst of [true, false]) {
+    const pi = extensionApi();
+    const landstrip = createLandstripIntegration({ registerBashTool: false });
+    const provider = permissionAskProvider(`review-${providerFirst}`);
+    let stopProvider: (() => void) | undefined;
+
+    if (providerFirst) stopProvider = provideLandstripPermissionAsk(pi, provider);
+    const stopRuntime = publishLandstripRuntime(pi, landstrip);
+    if (!providerFirst) stopProvider = provideLandstripPermissionAsk(pi, provider);
+
+    await expect(landstrip.resolvePermissionAsk(permissionAskRequest())).resolves.toEqual({
+      decision: 'allow',
+    });
+    expect(provider.decide).toHaveBeenCalledWith(permissionAskRequest());
+    stopProvider?.();
+    await expect(landstrip.resolvePermissionAsk(permissionAskRequest())).resolves.toEqual({
+      decision: 'abstain',
+    });
+    stopRuntime();
+  }
+});
+
+test('rejects invalid and conflicting permission ask providers', () => {
+  const landstrip = createLandstripIntegration({ registerBashTool: false });
+  expect(() => landstrip.registerPermissionAskProvider(permissionAskProvider(''))).toThrow(
+    'must not be empty',
+  );
+
+  const stop = landstrip.registerPermissionAskProvider(permissionAskProvider('review'));
+  expect(() => landstrip.registerPermissionAskProvider(permissionAskProvider('other'))).toThrow(
+    'Permission ask provider "review" is already registered',
+  );
+  stop();
+  stop();
+  const stopOther = landstrip.registerPermissionAskProvider(permissionAskProvider('other'));
+  stopOther();
 });
 
 test('republishes the runtime when a new session starts', async () => {
