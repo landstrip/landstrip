@@ -37,7 +37,13 @@ import {
 } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 
-import { encodeLandstripContext, type LandstripContextV2, LANDSTRIP_CONTEXT_ENV } from './api.ts';
+import {
+  encodeLandstripContext,
+  type LandstripContextV2,
+  LANDSTRIP_CONTEXT_ENV,
+  type LandstripPermissionAskDecision,
+  type LandstripPermissionAskRequest,
+} from './api.ts';
 import {
   type AgentCatalog,
   type AgentDefinition,
@@ -717,11 +723,20 @@ class Semaphore {
   }
 }
 
+type PermissionAskDetails = Omit<LandstripPermissionAskRequest, 'permissions' | 'signal'>;
+
+type PermissionAskResolver = (
+  request: LandstripPermissionAskRequest,
+) => Promise<LandstripPermissionAskDecision>;
+
 class PermissionBroker {
   private readonly grants = new Set<string>();
   private resetController = new AbortController();
 
-  constructor(private readonly prompts: PermissionPromptCoordinator) {}
+  constructor(
+    private readonly prompts: PermissionPromptCoordinator,
+    private readonly resolveAsk: PermissionAskResolver = async () => ({ decision: 'abstain' }),
+  ) {}
 
   async ask(
     ctx: ExtensionContext,
@@ -729,8 +744,9 @@ class PermissionBroker {
     permission: string,
     resource: string,
     signal?: AbortSignal,
+    details?: PermissionAskDetails,
   ): Promise<void> {
-    await this.askMany(ctx, task, [{ permission, resource }], signal);
+    await this.askMany(ctx, task, [{ permission, resource }], signal, details);
   }
 
   async askMany(
@@ -738,6 +754,7 @@ class PermissionBroker {
     task: string,
     requests: readonly { permission: string; resource: string }[],
     signal?: AbortSignal,
+    details?: PermissionAskDetails,
   ): Promise<void> {
     const unique = [
       ...new Map(
@@ -749,13 +766,35 @@ class PermissionBroker {
         ({ permission, resource }) => !this.grants.has(`${permission}\u0000${resource}`),
       );
     if (pending().length === 0) return;
-    if (!ctx.hasUI) {
-      const request = pending()[0]!;
-      throw new Error(`Permission required: ${request.permission} ${request.resource}`);
-    }
 
     const combined = combineAbortSignals(signal, this.resetController.signal);
     try {
+      if (details) {
+        let decision: LandstripPermissionAskDecision = { decision: 'abstain' };
+        try {
+          decision = await this.resolveWithSignal(
+            { ...details, permissions: pending(), signal: combined.signal },
+            combined.signal,
+          );
+        } catch (error) {
+          if (combined.signal.aborted) throw new Error('Permission request cancelled');
+          console.error(`pi-landstrip: permission ask provider failed: ${formatError(error)}`);
+        }
+        if (combined.signal.aborted) throw new Error('Permission request cancelled');
+        if (pending().length === 0) return;
+        if (decision.decision === 'allow') return;
+        if (decision.decision === 'deny') {
+          const request = pending()[0]!;
+          throw new Error(
+            decision.reason ?? `Permission denied: ${request.permission} ${request.resource}`,
+          );
+        }
+      }
+
+      if (!ctx.hasUI) {
+        const request = pending()[0]!;
+        throw new Error(`Permission required: ${request.permission} ${request.resource}`);
+      }
       await this.prompts.resolve(
         () => (pending().length === 0 ? true : undefined),
         async (promptSignal) => {
@@ -791,6 +830,25 @@ class PermissionBroker {
     this.resetController = new AbortController();
     this.grants.clear();
     controller.abort();
+  }
+
+  private async resolveWithSignal(
+    request: LandstripPermissionAskRequest,
+    signal: AbortSignal,
+  ): Promise<LandstripPermissionAskDecision> {
+    if (signal.aborted) throw new Error('Permission request cancelled');
+    let abort: (() => void) | undefined;
+    try {
+      return await Promise.race([
+        this.resolveAsk(request),
+        new Promise<never>((_resolve, reject) => {
+          abort = () => reject(new Error('Permission request cancelled'));
+          signal.addEventListener('abort', abort, { once: true });
+        }),
+      ]);
+    } finally {
+      if (abort) signal.removeEventListener('abort', abort);
+    }
   }
 }
 
@@ -1131,7 +1189,12 @@ export class SubagentRuntime {
     private readonly loadCatalog: CatalogLoader = loadAgentCatalog,
     permissionPrompts = new PermissionPromptCoordinator(),
   ) {
-    this.broker = new PermissionBroker(permissionPrompts);
+    this.broker = new PermissionBroker(permissionPrompts, (request) => {
+      const resolveAsk = this.integration.resolvePermissionAsk;
+      return typeof resolveAsk === 'function'
+        ? resolveAsk.call(this.integration, request)
+        : Promise.resolve({ decision: 'abstain' });
+    });
   }
 
   register(): void {
@@ -1223,7 +1286,11 @@ export class SubagentRuntime {
 
       if (requests.length > 0 && this.primaryAgent) {
         try {
-          await this.broker.askMany(ctx, `@${this.primaryAgent.name}`, requests, ctx.signal);
+          await this.broker.askMany(ctx, `@${this.primaryAgent.name}`, requests, ctx.signal, {
+            context: this.permissionContext(ctx),
+            toolName: event.toolName,
+            input,
+          });
         } catch (error) {
           return { block: true, reason: formatError(error) };
         }
@@ -2162,7 +2229,12 @@ export class SubagentRuntime {
     const taskPermission = permissionDecision(rules, 'task', agent.name);
     if (taskPermission === 'deny') throw new Error(`Task permission denied for ${agent.name}`);
     if (taskPermission === 'ask') {
-      await this.broker.ask(ctx, input.description, 'task', agent.name, signal);
+      await this.broker.ask(ctx, input.description, 'task', agent.name, signal, {
+        context: parentTask ? this.taskContext(parentTask, ctx) : this.permissionContext(ctx),
+        toolName: 'task',
+        input: { ...input },
+        taskDescription: parentTask?.description,
+      });
     }
 
     const depth = (parentTask?.depth ?? -1) + 1;
@@ -2654,6 +2726,19 @@ export class SubagentRuntime {
       agent: task.agent,
       depth: task.depth,
     };
+  }
+
+  private permissionContext(ctx: ExtensionContext): LandstripContextV2 {
+    const context = this.integration.getContext?.(ctx) ?? {
+      version: 2,
+      host: 'pi',
+      role: 'primary',
+      sandbox: 'unavailable',
+      cwd: ctx.cwd,
+      sessionId: ctx.sessionManager.getSessionId(),
+      depth: 0,
+    };
+    return { ...context, agent: this.primaryAgent?.name };
   }
 
   private piInvocation(): { command: string; args: string[] } {

@@ -389,6 +389,66 @@ test('serializes agent and sandbox prompts through one presenter', async () => {
   expect(select).toHaveBeenCalledOnce();
 });
 
+test('uses permission ask providers before headless fallback', async () => {
+  const resolvePermissionAsk = vi
+    .fn()
+    .mockResolvedValueOnce({ decision: 'allow' })
+    .mockRejectedValueOnce(new Error('review unavailable'))
+    .mockResolvedValueOnce({ decision: 'deny', reason: 'Unsafe command' });
+  const runtime = new SubagentRuntime(
+    {} as ExtensionAPI,
+    { resolvePermissionAsk } as unknown as LandstripIntegration,
+  );
+  const broker = (
+    runtime as unknown as {
+      broker: {
+        ask(
+          ctx: ExtensionContext,
+          task: string,
+          permission: string,
+          resource: string,
+          signal: AbortSignal | undefined,
+          details: Record<string, unknown>,
+        ): Promise<void>;
+      };
+    }
+  ).broker;
+  const ctx = { hasUI: false } as ExtensionContext;
+  const details = {
+    context: {
+      version: 2,
+      host: 'pi',
+      role: 'primary',
+      sandbox: 'enabled',
+      cwd: '/workspace',
+      depth: 0,
+    },
+    toolName: 'bash',
+    input: { command: 'git status' },
+  };
+
+  await expect(broker.ask(ctx, '@build', 'bash', 'git status', undefined, details)).resolves.toBe(
+    undefined,
+  );
+  expect(resolvePermissionAsk).toHaveBeenLastCalledWith({
+    ...details,
+    permissions: [{ permission: 'bash', resource: 'git status' }],
+    signal: expect.any(AbortSignal),
+  });
+
+  const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  await expect(broker.ask(ctx, '@build', 'bash', 'git status', undefined, details)).rejects.toThrow(
+    'Permission required: bash git status',
+  );
+  expect(error).toHaveBeenCalledWith(
+    'pi-landstrip: permission ask provider failed: review unavailable',
+  );
+  await expect(broker.ask(ctx, '@build', 'bash', 'git status', undefined, details)).rejects.toThrow(
+    'Unsafe command',
+  );
+  error.mockRestore();
+});
+
 test('selects a primary agent and applies its prompt', async () => {
   let sessionStart:
     | ((event: { type: 'session_start' }, ctx: ExtensionContext) => Promise<void> | void)
@@ -481,9 +541,11 @@ test('selects a primary agent and applies its prompt', async () => {
       prompted: true,
     }),
   );
+  const resolvePermissionAsk = vi.fn(async () => ({ decision: 'abstain' as const }));
   const integration = {
     createTools: () => [],
     authorizeFilesystemToolAccess,
+    resolvePermissionAsk,
   } as unknown as LandstripIntegration;
   const piAgentDir = temporaryDirectory();
   writeFileSync(
@@ -524,6 +586,14 @@ test('selects a primary agent and applies its prompt', async () => {
     toolCall?.({ toolName: 'bash', input: { command: 'git status' } }, ctx),
   ).resolves.toBe(undefined);
   expect(selections).toEqual(['@plan: permission required\nbash: git status']);
+  expect(resolvePermissionAsk).toHaveBeenCalledWith(
+    expect.objectContaining({
+      context: expect.objectContaining({ role: 'primary', agent: 'plan' }),
+      toolName: 'bash',
+      input: { command: 'git status' },
+      permissions: [{ permission: 'bash', resource: 'git status' }],
+    }),
+  );
   await expect(
     toolCall?.(
       {
