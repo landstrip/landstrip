@@ -615,6 +615,8 @@ interface ControlRequest {
   readonly type: 'permission' | 'task';
   readonly permission?: string;
   readonly resource?: string;
+  readonly toolName?: string;
+  readonly toolInput?: Record<string, unknown>;
   readonly input?: TaskInput;
 }
 
@@ -1111,7 +1113,13 @@ export function registerSubagentWorker(pi: ExtensionAPI, config: WorkerConfig): 
       if (decision !== 'ask') continue;
       const value = await ctx.ui.input(
         CONTROL_TITLE,
-        JSON.stringify({ type: 'permission', permission, resource } satisfies ControlRequest),
+        JSON.stringify({
+          type: 'permission',
+          permission,
+          resource,
+          toolName: event.toolName,
+          toolInput: input,
+        } satisfies ControlRequest),
         { signal: ctx.signal },
       );
       try {
@@ -2783,7 +2791,25 @@ export class SubagentRuntime {
           throw new Error('Invalid worker control request');
         }
         if (control.type === 'permission') {
-          if (typeof control.permission !== 'string' || typeof control.resource !== 'string') {
+          if (
+            typeof control.permission !== 'string' ||
+            typeof control.resource !== 'string' ||
+            typeof control.toolName !== 'string' ||
+            !isRecord(control.toolInput)
+          ) {
+            throw new Error('Invalid permission request');
+          }
+          const derivedPermission = permissionName(control.toolName);
+          const derivedResources = permissionResources(
+            control.toolName,
+            control.toolInput,
+            ctx.cwd,
+          );
+          if (
+            control.permission !== derivedPermission ||
+            !derivedResources.includes(control.resource) ||
+            permissionDecision(rules, control.permission, control.resource) !== 'ask'
+          ) {
             throw new Error('Invalid permission request');
           }
           await this.broker.ask(
@@ -2792,6 +2818,12 @@ export class SubagentRuntime {
             control.permission,
             control.resource,
             this.controllers.get(task.id)?.signal,
+            {
+              context: this.taskContext(task, ctx),
+              toolName: control.toolName,
+              input: control.toolInput,
+              taskDescription: task.description,
+            },
           );
           response = { ok: true };
         } else {

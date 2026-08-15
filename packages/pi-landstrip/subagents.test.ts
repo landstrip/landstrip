@@ -1010,6 +1010,7 @@ test('runs a foreground task in an injected RPC worker', async () => {
             description: 'Review code',
             mode: 'subagent',
             prompt: 'Review carefully.',
+            permission: { bash: 'ask' },
           },
         },
       },
@@ -1035,7 +1036,11 @@ test('runs a foreground task in an injected RPC worker', async () => {
       sentMessages.push(message);
     },
   } as unknown as ExtensionAPI;
-  const integration = { createTools: () => [] } as unknown as LandstripIntegration;
+  const resolvePermissionAsk = vi.fn(async () => ({ decision: 'allow' as const }));
+  const integration = {
+    createTools: () => [],
+    resolvePermissionAsk,
+  } as unknown as LandstripIntegration;
   let createdAgent: string | undefined;
   let emit: ((event: Record<string, unknown>) => void) | undefined;
   const onUpdate = vi.fn();
@@ -1095,6 +1100,32 @@ test('runs a foreground task in an injected RPC worker', async () => {
             cost: { total: 0.002 },
           },
         },
+      });
+      const invalidPermission = (await forwardRequest?.({
+        method: 'input',
+        title: 'pi-landstrip:control:v1',
+        placeholder: JSON.stringify({
+          type: 'permission',
+          permission: 'bash',
+          resource: 'git status',
+          toolName: 'bash',
+          toolInput: { command: 'git diff' },
+        }),
+      })) as { value: string };
+      expect(JSON.parse(invalidPermission.value)).toEqual({
+        ok: false,
+        error: 'Invalid permission request',
+      });
+      await forwardRequest?.({
+        method: 'input',
+        title: 'pi-landstrip:control:v1',
+        placeholder: JSON.stringify({
+          type: 'permission',
+          permission: 'bash',
+          resource: 'git status',
+          toolName: 'bash',
+          toolInput: { command: 'git status' },
+        }),
       });
       await forwardRequest?.({ method: 'select', title: 'Choose item', options: ['one'] });
       await forwardRequest?.({ method: 'confirm', title: 'Confirm action', message: 'Proceed?' });
@@ -1190,6 +1221,20 @@ test('runs a foreground task in an injected RPC worker', async () => {
       turns: 2,
     },
   });
+  expect(resolvePermissionAsk).toHaveBeenCalledWith(
+    expect.objectContaining({
+      context: expect.objectContaining({
+        role: 'subagent',
+        agent: 'review',
+        taskId: expect.any(String),
+      }),
+      taskDescription: 'Review implementation',
+      toolName: 'bash',
+      input: { command: 'git status' },
+      permissions: [{ permission: 'bash', resource: 'git status' }],
+    }),
+  );
+  expect(resolvePermissionAsk).toHaveBeenCalledOnce();
   initTheme('dark', false);
   const theme = {
     fg: (_color: string, value: string) => value,
