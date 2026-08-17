@@ -87,7 +87,7 @@ const NETWORK_CAPABILITY_SIDS: [WELL_KNOWN_SID_TYPE; 3] = [
 /// A Win32 status code, as reported by the ACL APIs that return one instead of
 /// setting the last error.
 fn win32_error(status: u32) -> io::Error {
-    io::Error::from_raw_os_error(i32::from_ne_bytes(status.to_ne_bytes()))
+    io::Error::from_raw_os_error(status.cast_signed())
 }
 
 fn path_access_failed(
@@ -166,7 +166,7 @@ pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
     drop(loopback);
     drop(profile);
 
-    Ok(i32::from_ne_bytes(exit_code?.to_ne_bytes()))
+    Ok(exit_code?.cast_signed())
 }
 
 fn appcontainer_moniker(tool: &OsStr, policy: &AccessPolicy, loopback: bool) -> String {
@@ -1327,5 +1327,5 @@ fn wide_string(value: &str) -> Vec<u16> {
 }
 
 fn hresult_value(hr: i32) -> u32 {
-    u32::from_ne_bytes(hr.to_ne_bytes())
+    hr.cast_unsigned()
 }

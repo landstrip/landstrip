@@ -94,7 +94,7 @@ pub(super) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
     let exit_code = launch_result?;
     revoke_result?;
     clear_result?;
-    Ok(i32::from_ne_bytes(exit_code.to_ne_bytes()))
+    Ok(exit_code.cast_signed())
 }
 
 pub(super) fn run_worker(request: &std::path::Path) -> Result<i32> {

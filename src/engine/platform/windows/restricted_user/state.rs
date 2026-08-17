@@ -340,9 +340,7 @@ pub(super) fn protect_path(path: &Path) -> Result<()> {
         LocalFree(security_descriptor.cast::<c_void>());
     }
     if status != 0 {
-        return Err(io::Error::from_raw_os_error(i32::from_ne_bytes(
-            status.to_ne_bytes(),
-        )))
+        return Err(io::Error::from_raw_os_error(status.cast_signed()))
         .context("protect restricted-user state DACL");
     }
     Ok(())
@@ -360,7 +358,7 @@ fn current_user_sid_string() -> Result<String> {
         GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &raw mut required);
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() != Some(i32::from_ne_bytes(ERROR_INSUFFICIENT_BUFFER.to_ne_bytes())) {
+    if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER.cast_signed()) {
         return Err(error).context("query current user SID size");
     }
     let word_size = std::mem::size_of::<usize>();

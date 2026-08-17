@@ -101,7 +101,7 @@ pub(super) fn run(path: &Path) -> Result<i32> {
         .collect::<Vec<_>>();
     let cwd = OsString::from_wide(&request.cwd);
     let exit_code = launch(&tool, &args, &cwd, &request.environment)?;
-    Ok(i32::from_ne_bytes(exit_code.to_ne_bytes()))
+    Ok(exit_code.cast_signed())
 }
 
 fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> Result<u32> {

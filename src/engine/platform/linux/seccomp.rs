@@ -122,12 +122,12 @@ fn syscall_u32(value: u64) -> u32 {
 /// Recover the low 32 bits of a syscall argument register as a signed C
 /// argument, preserving values such as `AT_FDCWD` that are sign-extended.
 fn syscall_i32(value: u64) -> i32 {
-    i32::from_ne_bytes(syscall_u32(value).to_ne_bytes())
+    syscall_u32(value).cast_signed()
 }
 
 /// Reinterpret a syscall argument register as its signed 64-bit C type.
 fn syscall_i64(value: u64) -> i64 {
-    i64::from_ne_bytes(value.to_ne_bytes())
+    value.cast_signed()
 }
 
 /// A syscall that failed while supervising the sandboxed child.

@@ -376,7 +376,7 @@ fn acl_action(mode: ACCESS_MODE) -> &'static str {
 }
 
 fn win32_error(status: u32) -> io::Error {
-    io::Error::from_raw_os_error(i32::from_ne_bytes(status.to_ne_bytes()))
+    io::Error::from_raw_os_error(status.cast_signed())
 }
 
 fn is_missing_status(status: u32) -> bool {
@@ -386,7 +386,7 @@ fn is_missing_status(status: u32) -> bool {
 fn is_missing_error(error: &io::Error) -> bool {
     error
         .raw_os_error()
-        .is_some_and(|status| is_missing_status(u32::from_ne_bytes(status.to_ne_bytes())))
+        .is_some_and(|status| is_missing_status(status.cast_unsigned()))
 }
 
 /// Return whether an ACL target is inaccessible.
@@ -397,7 +397,7 @@ fn is_locked_status(status: u32) -> bool {
 fn is_locked_error(error: &io::Error) -> bool {
     error
         .raw_os_error()
-        .is_some_and(|status| is_locked_status(u32::from_ne_bytes(status.to_ne_bytes())))
+        .is_some_and(|status| is_locked_status(status.cast_unsigned()))
 }
 
 fn should_skip_before_apply(mode: ACCESS_MODE, status: u32, ignore_missing: bool) -> bool {

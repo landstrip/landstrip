@@ -81,7 +81,7 @@ pub(super) fn lookup_sid(name: &str) -> Result<String> {
         );
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() != Some(i32::from_ne_bytes(ERROR_INSUFFICIENT_BUFFER.to_ne_bytes())) {
+    if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER.cast_signed()) {
         return Err(error).context("query sandbox account SID size");
     }
 
@@ -192,7 +192,7 @@ fn random_password() -> Result<String> {
 }
 
 fn net_error(status: u32) -> io::Error {
-    io::Error::from_raw_os_error(i32::from_ne_bytes(status.to_ne_bytes()))
+    io::Error::from_raw_os_error(status.cast_signed())
 }
 
 fn wide(value: &str) -> Vec<u16> {

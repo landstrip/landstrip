@@ -163,7 +163,7 @@ fn add_provider(engine: HANDLE, key: GUID) -> Result<()> {
     ensure_success_or(
         unsafe { FwpmProviderAdd0(engine, &raw const provider, ptr::null_mut()) },
         "FwpmProviderAdd0",
-        &[u32::from_ne_bytes(FWP_E_ALREADY_EXISTS.to_ne_bytes())],
+        &[FWP_E_ALREADY_EXISTS.cast_unsigned()],
     )
 }
 
@@ -181,7 +181,7 @@ fn add_sublayer(engine: HANDLE, provider: GUID, key: GUID) -> Result<()> {
     ensure_success_or(
         unsafe { FwpmSubLayerAdd0(engine, &raw const sublayer, ptr::null_mut()) },
         "FwpmSubLayerAdd0",
-        &[u32::from_ne_bytes(FWP_E_ALREADY_EXISTS.to_ne_bytes())],
+        &[FWP_E_ALREADY_EXISTS.cast_unsigned()],
     )
 }
 
@@ -409,7 +409,7 @@ impl Engine {
             unsafe {
                 FwpmEngineOpen0(
                     ptr::null(),
-                    u32::from_ne_bytes(RPC_C_AUTHN_DEFAULT.to_ne_bytes()),
+                    RPC_C_AUTHN_DEFAULT.cast_unsigned(),
                     ptr::null(),
                     &raw const session,
                     &raw mut handle,
@@ -477,8 +477,8 @@ fn allow_not_found(result: u32, operation: &str) -> Result<()> {
         result,
         operation,
         &[
-            u32::from_ne_bytes(FWP_E_FILTER_NOT_FOUND.to_ne_bytes()),
-            u32::from_ne_bytes(FWP_E_NOT_FOUND.to_ne_bytes()),
+            FWP_E_FILTER_NOT_FOUND.cast_unsigned(),
+            FWP_E_NOT_FOUND.cast_unsigned(),
         ],
     )
 }
