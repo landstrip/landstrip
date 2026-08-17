@@ -62,6 +62,26 @@ See [pi-landstrip](packages/pi-landstrip/README.md) and
 Pass policies with `-p, --policy <FILE>` (repeatable). Semantics, platform
 limits, traps, and exit status are in the manual page.
 
+## Development
+
+### Package
+
+Artifacts land in `npm/*/bin` and `artifacts/`.
+
+Non-host targets use [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)
+(Zig as linker). Requires `cargo-zigbuild`, `zig`, and the matching `rustup`
+targets (`x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
+`x86_64-pc-windows-gnu`, `aarch64-pc-windows-gnullvm`, `aarch64-apple-darwin`,
+`x86_64-apple-darwin`). Host-native triples use plain `cargo`. Darwin links
+`libsandbox`; from Linux set `SDKROOT` to a macOS SDK (Apple SDK; not
+redistributed).
+
+```sh
+make package
+make package PLATFORMS='linux-x64 win32-x64'
+PACKAGE_STRICT=1 make package
+```
+
 ## License
 
 `landstrip` is free software under the GNU Lesser General Public License

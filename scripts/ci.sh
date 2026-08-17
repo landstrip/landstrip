@@ -28,6 +28,9 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
   || die "not inside a Git repository"
 cd "$repo_root"
 
+printf '==> package target selection test\n'
+./scripts/package-target-test.sh
+
 host_platform="$(
   "$NODE" -e 'process.stdout.write(process.platform + "-" + process.arch)'
 )"

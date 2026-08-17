@@ -3,15 +3,14 @@
 # Copyright (C) Jarkko Sakkinen 2026
 #
 # Multi-platform release packaging.
-#   linux-*/win32-x64 — cross-rs (Docker)
-#   win32-arm64 — cross-rs + local MSVC image (cross-toolchains, xwin SDK)
-#   darwin-* — native cargo on Apple Silicon; cross + local osxcross image on Linux
+#   host-native triple — cargo
+#   other triples — cargo-zigbuild (Zig linker)
 #
 # Platforms:
-#   linux-x64, linux-arm64, win32-x64 — official cross images
-#   win32-arm64 — local cross-toolchains MSVC image (built from Dockerfile)
-#   darwin-arm64, darwin-x64 — host cargo when packaging on Intel/ARM macOS;
-#   else local cross-toolchains osxcross images (Apple SDK; required from Linux)
+#   linux-x64, linux-arm64 — x86_64/aarch64-unknown-linux-musl (static)
+#   darwin-arm64, darwin-x64 — aarch64/x86_64-apple-darwin
+#   win32-x64 — x86_64-pc-windows-gnu
+#   win32-arm64 — aarch64-pc-windows-gnullvm
 #
 # Exit 0 if every requested platform was packaged.
 # Exit 2 if a requested build fails while another succeeds.
@@ -20,11 +19,17 @@
 
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=package-target.sh
+source "$script_dir/package-target.sh"
+
 CARGO="${CARGO:-cargo}"
-CROSS="${CROSS:-cross}"
+RUSTC="${RUSTC:-rustc}"
+CARGO_ZIGBUILD="${CARGO_ZIGBUILD:-cargo-zigbuild}"
 NODE="${NODE:-node}"
 FILE="${FILE:-file}"
 READELF="${READELF:-readelf}"
+ZIG="${ZIG:-zig}"
 
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--no-deprecation"
 export PATH="${HOME}/.cargo/bin:${PATH}"
@@ -38,13 +43,9 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-for command in "$CARGO" "$CROSS" "$NODE" git tar "$FILE" docker; do
+for command in "$CARGO" "$RUSTC" "$NODE" git tar "$FILE"; do
   require_command "$command"
 done
-
-if ! docker info >/dev/null 2>&1; then
-  die "docker is not usable (is the daemon running?)"
-fi
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
   || die "not inside a Git repository"
@@ -59,27 +60,29 @@ cargo_version="$(
 )"
 [[ "$version" == "$cargo_version" ]] \
   || die "package.json version $version does not match Cargo.toml $cargo_version"
+rust_host_triple="$("$RUSTC" --print host-tuple)"
+[[ -n "$rust_host_triple" ]] || die "cannot determine rustc host triple"
 
-# Default to a packaging target root; keep host build scripts isolated from
-# cross images that may use different glibc versions.
+# Keep packaging builds out of the developer target tree.
 package_target_root="${CARGO_TARGET_DIR:-$repo_root/target/package}"
 
-# platform|rust-triple|binary-name|required-image
+# platform|rust-triple|binary-name
 platforms=(
-  'linux-x64|x86_64-unknown-linux-musl|landstrip|'
-  'linux-arm64|aarch64-unknown-linux-musl|landstrip|'
-  'win32-x64|x86_64-pc-windows-gnu|landstrip.exe|'
-  'win32-arm64|aarch64-pc-windows-msvc|landstrip.exe|ghcr.io/cross-rs/aarch64-pc-windows-msvc-cross:local'
-  'darwin-arm64|aarch64-apple-darwin|landstrip|ghcr.io/cross-rs/aarch64-apple-darwin-cross:local'
-  'darwin-x64|x86_64-apple-darwin|landstrip|ghcr.io/cross-rs/aarch64-apple-darwin-cross:local'
+  'linux-x64|x86_64-unknown-linux-musl|landstrip'
+  'linux-arm64|aarch64-unknown-linux-musl|landstrip'
+  'win32-x64|x86_64-pc-windows-gnu|landstrip.exe'
+  'win32-arm64|aarch64-pc-windows-gnullvm|landstrip.exe'
+  'darwin-arm64|aarch64-apple-darwin|landstrip'
+  'darwin-x64|x86_64-apple-darwin|landstrip'
 )
+supported_platforms='linux-x64 linux-arm64 win32-x64 win32-arm64 darwin-arm64 darwin-x64'
 
 requested=()
 if (($# > 0)); then
   requested=("$@")
 else
   for entry in "${platforms[@]}"; do
-    IFS='|' read -r platform _ _ _ <<<"$entry"
+    IFS='|' read -r platform _ _ <<<"$entry"
     requested+=("$platform")
   done
 fi
@@ -87,7 +90,7 @@ fi
 platform_entry() {
   local want="$1" entry platform
   for entry in "${platforms[@]}"; do
-    IFS='|' read -r platform _ _ _ <<<"$entry"
+    IFS='|' read -r platform _ _ <<<"$entry"
     if [[ "$platform" == "$want" ]]; then
       printf '%s\n' "$entry"
       return 0
@@ -136,168 +139,61 @@ smoke_host_binary() {
   fi
 }
 
-# Host ~/.cargo/config.toml (mold/clang for all Linux) breaks cross image
-# linkers. Use a dedicated CARGO_HOME under the user cache with no config.
-#
-# Dory (and similar FEX-backed Docker engines) leave the cross container
-# running after cargo exits: only FEXServer --wait_pipe remains, so `cross`
-# blocks forever after "Finished `release` profile". Reap that container;
-# the binary is already on the host volume.
-cross_container_ids() {
-  docker ps -q --filter "status=running" --filter "name=${1}" 2>/dev/null || true
-}
-
-reap_stuck_cross_containers() {
-  local ids
-
-  ids="$(cross_container_ids "$1")"
-  if [[ -n "$ids" ]]; then
-    # shellcheck disable=SC2086
-    docker kill $ids >/dev/null 2>&1 || true
-    # shellcheck disable=SC2086
-    docker rm -f $ids >/dev/null 2>&1 || true
-  fi
-}
-
-# True when cargo has finished inside a still-running FEX cross container.
-# Dory keeps FEXServer --wait_pipe alive after cargo exits; docker top still
-# shows the original `sh -c '... cargo build ...'` argv under FEX, so do not
-# treat the word "cargo" in that line as an active build.
-fex_zombie_cross_container() {
-  local triple="$1" id top logs
-  local ids
-
-  ids="$(cross_container_ids "$triple")"
-  [[ -n "$ids" ]] || return 1
-  for id in $ids; do
-    top="$(docker top "$id" 2>/dev/null || true)"
-    [[ -n "$top" ]] || continue
-    printf '%s\n' "$top" | grep -Eq 'FEXServer' || continue
-    # Active compile/link still running.
-    if printf '%s\n' "$top" | grep -Eq 'rustc|cc1|clang|collect2'; then
-      continue
-    fi
-    logs="$(docker logs "$id" 2>&1 || true)"
-    if printf '%s\n' "$logs" | grep -Fq 'Finished `release` profile'; then
-      return 0
-    fi
-  done
-  return 1
-}
-
-build_with_cross() {
+rustup_has_target() {
   local triple="$1"
-  local cargo_home cross_pid status=0 binary source_bin
-  local grace="${CROSS_FEX_GRACE_SECS:-5}"
-  # Cold FEX builds of large crates (tree-sitter/pdf) exceed 30m easily.
-  local timeout_secs="${CROSS_BUILD_TIMEOUT_SECS:-7200}"
-  local deadline=$((SECONDS + timeout_secs))
-  local cargo_jobs
+  command -v rustup >/dev/null 2>&1 || return 0
+  rustup target list --installed | grep -Fxq "$triple"
+}
 
-  cargo_home="${XDG_CACHE_HOME:-$HOME/.cache}/landstrip/cross-cargo"
+# Host ~/.cargo/config.toml (mold/clang for all Linux) sets -C linker and
+# opts cargo-zigbuild out of zig cc. Use a dedicated CARGO_HOME with no config.
+package_cargo_home() {
+  local cargo_home="${XDG_CACHE_HOME:-$HOME/.cache}/landstrip/package-cargo"
   mkdir -p "$cargo_home"
   rm -f "$cargo_home/config.toml" "$cargo_home/config"
-
-  case "$triple" in
-    *windows*) binary=landstrip.exe ;;
-    *) binary=landstrip ;;
-  esac
-  source_bin="$CARGO_TARGET_DIR/$triple/release/$binary"
-
-  # Dory FEX + parallel rustc often writes empty rlibs on the virtiofs mount
-  # ("memory map must have a non-zero length" / rustc SIGSEGV). Serialize by
-  # default on Darwin; override with CARGO_BUILD_JOBS.
-  if [[ -n "${CARGO_BUILD_JOBS:-}" ]]; then
-    cargo_jobs="$CARGO_BUILD_JOBS"
-  elif [[ "$(uname -s)" == Darwin ]]; then
-    cargo_jobs=1
-  else
-    cargo_jobs=
-  fi
-
-  # MSVC release must statically link the CRT (matching the previous
-  # GitHub Actions release.yml build), and Windows GNU builds stay dynamic.
-  if [[ "$triple" == *-msvc ]]; then
-    export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+crt-static"
-  fi
-
-  # Build from repo root; Cross.toml is read from CWD. Inherit stdout/stderr
-  # so cargo progress still streams to the terminal.
-  set +e
-  (
-    cd "$repo_root" || exit 1
-    if [[ -n "$cargo_jobs" ]]; then
-      export CARGO_BUILD_JOBS="$cargo_jobs"
-    fi
-    # CROSS_TARGET lets shared osxcross images select the Apple toolchain.
-    CROSS_TARGET="$triple" CROSS_CONFIG="${CROSS_CONFIG:-$repo_root/Cross.toml}" \
-      CARGO_HOME="$cargo_home" "$CROSS" build --release --target "$triple"
-  ) &
-  cross_pid=$!
-
-  while kill -0 "$cross_pid" 2>/dev/null; do
-    if (( SECONDS >= deadline )); then
-      printf 'cross build timed out for %s after %ss\n' \
-        "$triple" "$timeout_secs" >&2
-      reap_stuck_cross_containers "$triple"
-      kill "$cross_pid" 2>/dev/null || true
-      wait "$cross_pid" 2>/dev/null
-      set -e
-      return 1
-    fi
-
-    if fex_zombie_cross_container "$triple" && [[ -f "$source_bin" ]]; then
-      # Confirm it stays finished (not a brief gap between compile steps).
-      sleep "$grace"
-      if kill -0 "$cross_pid" 2>/dev/null \
-        && fex_zombie_cross_container "$triple" \
-        && [[ -f "$source_bin" ]]; then
-        printf 'warning: cross hung after cargo finished for %s (Dory FEX); killing container\n' \
-          "$triple" >&2
-        reap_stuck_cross_containers "$triple"
-        wait "$cross_pid" 2>/dev/null
-        set -e
-        return 0
-      fi
-    fi
-    sleep 2
-  done
-
-  wait "$cross_pid"
-  status=$?
-  set -e
-  return "$status"
+  printf '%s\n' "$cargo_home"
 }
 
-ensure_required_image() {
-  local image="$1" arch tagged
+build_with_zigbuild() {
+  local triple="$1"
+  local target_dir="$package_target_root/$triple"
+  local cargo_home zig_path
+  cargo_home="$(package_cargo_home)"
+  zig_path="$(command -v "$ZIG")"
 
-  [[ -z "$image" ]] && return 0
-  docker image inspect "$image" >/dev/null 2>&1 && return 0
-
-  case "$(docker info --format '{{.Architecture}}')" in
-    amd64|x86_64) arch=amd64 ;;
-    arm64|aarch64) arch=arm64 ;;
-    *) return 1 ;;
-  esac
-
-  tagged="${image}-${arch}"
-  docker image inspect "$tagged" >/dev/null 2>&1 || return 1
-  docker image tag "$tagged" "$image"
+  (
+    cd "$repo_root" || exit 1
+    export CARGO_HOME="$cargo_home"
+    export CARGO_TARGET_DIR="$target_dir"
+    export CARGO_ZIGBUILD_ZIG_PATH="$zig_path"
+    unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+    "$CARGO_ZIGBUILD" zigbuild --release --target "$triple"
+  )
 }
 
 build_native() {
   local triple="$1"
-
-  if command -v rustup >/dev/null 2>&1; then
-    rustup target add "$triple" >/dev/null
-  fi
+  local target_dir="$package_target_root/$triple"
 
   (
     cd "$repo_root" || exit 1
-    "$CARGO" build --release --target "$triple"
+    CARGO_TARGET_DIR="$target_dir" "$CARGO" build --release --target "$triple"
   )
 }
+
+needs_zigbuild=0
+for platform in "${requested[@]}"; do
+  entry="$(platform_entry "$platform")" \
+    || die "unknown platform: $platform (supported: $supported_platforms)"
+  IFS='|' read -r _ triple _ <<<"$entry"
+  if [[ "$(package_build_driver "$rust_host_triple" "$triple")" == zigbuild ]]; then
+    needs_zigbuild=1
+  fi
+done
+if ((needs_zigbuild)); then
+  require_command "$CARGO_ZIGBUILD"
+  require_command "$ZIG"
+fi
 
 built=()
 skipped=()
@@ -305,26 +201,17 @@ failed=()
 
 mkdir -p artifacts
 
-host="$(host_platform)"
-is_darwin_host=0
-if [[ "$host" == darwin-* ]]; then
-  # native cargo on either macOS arch covers both darwin triples
-  is_darwin_host=1
-fi
-
 for platform in "${requested[@]}"; do
   entry="$(platform_entry "$platform")" \
-    || die "unknown platform: $platform (supported: linux-x64 linux-arm64 win32-x64 win32-arm64 darwin-arm64 darwin-x64)"
+    || die "unknown platform: $platform (supported: $supported_platforms)"
 
-  IFS='|' read -r _ triple binary required_image <<<"$entry"
+  IFS='|' read -r _ triple binary <<<"$entry"
   package_dir="npm/$platform"
   [[ -f "$package_dir/package.json" ]] || die "missing $package_dir/package.json"
 
-  export CARGO_TARGET_DIR="$package_target_root/$platform"
-
-  # Host triple packages natively (no Docker). The osxcross :local images remain
-  # for packaging darwin-* from Linux; the MSVC :local image for win32-arm64.
-  if [[ "$platform" == "$(host_platform)" || ( "$is_darwin_host" == 1 && "$platform" == darwin-* ) ]]; then
+  # Compare Rust triples because Node's platform omits the libc/toolchain ABI
+  # (for example, linux-x64 can target x86_64-unknown-linux-musl).
+  if [[ "$(package_build_driver "$rust_host_triple" "$triple")" == cargo ]]; then
     printf '==> %s (%s via cargo)\n' "$platform" "$triple"
     if ! build_native "$triple"; then
       failed+=("$platform: cargo build failed")
@@ -332,22 +219,26 @@ for platform in "${requested[@]}"; do
       continue
     fi
   else
-    printf '==> %s (%s via cross)\n' "$platform" "$triple"
-
-    if ! ensure_required_image "$required_image"; then
-      skipped+=("$platform: missing local cross image $required_image")
-      printf 'skip: %s (build local cross image %s)\n' "$platform" "$required_image"
+    printf '==> %s (%s via cargo-zigbuild)\n' "$platform" "$triple"
+    if ! rustup_has_target "$triple"; then
+      failed+=("$platform: rustup target not installed: $triple")
+      printf 'fail: %s (rustup target add %s)\n' "$platform" "$triple" >&2
       continue
     fi
 
-    if ! build_with_cross "$triple"; then
-      failed+=("$platform: cross build failed")
-      printf 'fail: %s (cross build failed)\n' "$platform" >&2
+    if ! build_with_zigbuild "$triple"; then
+      if [[ "$triple" == *apple-darwin && -z "${SDKROOT:-}" ]]; then
+        failed+=("$platform: cargo zigbuild failed (Darwin system libraries need SDKROOT)")
+        printf 'fail: %s (set SDKROOT to a macOS SDK for Darwin system libraries)\n' "$platform" >&2
+      else
+        failed+=("$platform: cargo zigbuild failed")
+        printf 'fail: %s (cargo zigbuild failed)\n' "$platform" >&2
+      fi
       continue
     fi
   fi
 
-  source_bin="$CARGO_TARGET_DIR/$triple/release/$binary"
+  source_bin="$package_target_root/$triple/$triple/release/$binary"
   if [[ ! -f "$source_bin" ]]; then
     failed+=("$platform: missing $source_bin")
     printf 'fail: %s (missing %s)\n' "$platform" "$source_bin" >&2

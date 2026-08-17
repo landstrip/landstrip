@@ -5,7 +5,7 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 MANDIR ?= $(PREFIX)/share/man
 CARGO ?= cargo
-CROSS ?= cross
+CARGO_ZIGBUILD ?= cargo-zigbuild
 GH ?= gh
 NODE ?= node
 NPM ?= npm
@@ -31,7 +31,7 @@ clippy:
 	$(CARGO) clippy --all-targets
 
 package:
-	CROSS="$(CROSS)" NODE="$(NODE)" ./scripts/package.sh $(PLATFORMS)
+	CARGO_ZIGBUILD="$(CARGO_ZIGBUILD)" NODE="$(NODE)" ./scripts/package.sh $(PLATFORMS)
 
 publish:
 	CARGO="$(CARGO)" GH="$(GH)" NODE="$(NODE)" NPM="$(NPM)" \
