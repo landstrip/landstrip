@@ -47,14 +47,13 @@ impl<'a> Lease<'a> {
                 return Ok(lease);
             }
         }
-        Err(LandstripError::SandboxSetupFailed {
-            mechanism: Mechanism::Windowsuser,
-            source: io::Error::new(
+        Err(LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "all matching restricted-user accounts are busy",
-            )
-            .into(),
-        }
+            ),
+        )
         .into())
     }
 
@@ -153,10 +152,10 @@ impl<'a> Lease<'a> {
         let journal: Journal =
             serde_json::from_slice(&bytes).context("parse restricted-user lease journal")?;
         if !journal.account_sid.eq_ignore_ascii_case(&self.account.sid) {
-            return Err(LandstripError::SandboxSetupFailed {
-                mechanism: Mechanism::Windowsuser,
-                source: "lease journal account SID does not match installation state".into(),
-            }
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                "lease journal account SID does not match installation state",
+            )
             .into());
         }
         journal
@@ -171,14 +170,13 @@ pub(super) fn recover_all(installation: &Installation) -> Result<()> {
     let mut leases = Vec::with_capacity(installation.accounts.len());
     for account in &installation.accounts {
         let lease = Lease::try_account(installation, account)?.ok_or_else(|| {
-            LandstripError::SandboxSetupFailed {
-                mechanism: Mechanism::Windowsuser,
-                source: io::Error::new(
+            LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!("restricted-user account {} is busy", account.name),
-                )
-                .into(),
-            }
+                ),
+            )
         })?;
         lease.recover_stale()?;
         leases.push(lease);

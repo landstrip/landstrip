@@ -3,7 +3,7 @@
 
 //! macOS Seatbelt (SBPL) sandbox platform.
 
-use crate::engine::error::{Cause, Error, Mechanism};
+use crate::engine::error::{Error, Mechanism};
 use crate::engine::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use crate::engine::trap_fd::TrapFd;
 use anyhow::Result;
@@ -28,33 +28,24 @@ pub(crate) fn execute(
     args: &[OsString],
     trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
-    let profile = render_profile(policy).map_err(setup_failed)?;
+    let profile = render_profile(policy)
+        .map_err(|source| Error::sandbox_setup(Mechanism::Seatbelt, source))?;
     apply_profile(&profile)?;
-    close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd)).map_err(setup_failed)?;
+    close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd))
+        .map_err(|source| Error::sandbox_setup(Mechanism::Seatbelt, source))?;
     let error = Command::new(tool).args(args).exec();
-    Err(Error::LaunchFailed {
-        tool: PathBuf::from(tool),
-        source: error.into(),
-    }
-    .into())
+    Err(Error::launch(tool, error).into())
 }
 
 pub(crate) fn doctor() -> Result<()> {
-    let operation = CString::new("file-read-data").map_err(setup_failed)?;
+    let operation = CString::new("file-read-data")
+        .map_err(|source| Error::sandbox_setup(Mechanism::Seatbelt, source))?;
     let result =
         unsafe { ffi::sandbox_check(libc::getpid(), operation.as_ptr(), SANDBOX_FILTER_NONE) };
     if result < 0 {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(Error::sandbox_setup(Mechanism::Seatbelt, io::Error::last_os_error()).into());
     }
     Ok(())
-}
-
-/// A Seatbelt profile landstrip could not render or install.
-fn setup_failed(source: impl Into<Cause>) -> Error {
-    Error::SandboxSetupFailed {
-        mechanism: Mechanism::Seatbelt,
-        source: source.into(),
-    }
 }
 
 /// Close every descriptor the launcher left open so the tool cannot reach them:
@@ -134,10 +125,10 @@ fn close_fd(fd: RawFd, trap_fd: Option<RawFd>) {
 
 fn apply_profile(profile: &str) -> Result<()> {
     let profile = CString::new(profile).map_err(|source| {
-        setup_failed(format!(
-            "profile: interior nul at offset {}",
-            source.nul_position()
-        ))
+        Error::sandbox_setup(
+            Mechanism::Seatbelt,
+            format!("profile: interior nul at offset {}", source.nul_position()),
+        )
     })?;
     let mut errorbuf = ptr::null_mut();
 
@@ -147,7 +138,7 @@ fn apply_profile(profile: &str) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(setup_failed(take_sandbox_error(errorbuf)).into())
+        Err(Error::sandbox_setup(Mechanism::Seatbelt, take_sandbox_error(errorbuf)).into())
     }
 }
 

@@ -3,7 +3,7 @@
 
 //! Temporary filesystem grants for a leased sandbox account.
 
-use crate::engine::error::{Cause, Error as LandstripError, Mechanism};
+use crate::engine::error::{Error as LandstripError, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -205,7 +205,11 @@ impl OwnedSid {
         let value = wide(value);
         let mut sid = ptr::null_mut();
         if unsafe { ConvertStringSidToSidW(value.as_ptr(), &raw mut sid) } == 0 {
-            return Err(setup_failed(io::Error::last_os_error()).into());
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                io::Error::last_os_error(),
+            )
+            .into());
         }
         Ok(Self(sid))
     }
@@ -352,11 +356,14 @@ fn path_access_failed(
     api: &str,
     source: &io::Error,
 ) -> LandstripError {
-    setup_failed(format!(
-        "{api} failed to {} ACL for {}: {source}",
-        acl_action(mode),
-        path.display()
-    ))
+    LandstripError::sandbox_setup(
+        Mechanism::Windowsuser,
+        format!(
+            "{api} failed to {} ACL for {}: {source}",
+            acl_action(mode),
+            path.display()
+        ),
+    )
 }
 
 fn acl_action(mode: ACCESS_MODE) -> &'static str {
@@ -365,13 +372,6 @@ fn acl_action(mode: ACCESS_MODE) -> &'static str {
         DENY_ACCESS => "deny",
         REVOKE_ACCESS => "revoke",
         _ => "update",
-    }
-}
-
-fn setup_failed(source: impl Into<Cause>) -> LandstripError {
-    LandstripError::SandboxSetupFailed {
-        mechanism: Mechanism::Windowsuser,
-        source: source.into(),
     }
 }
 

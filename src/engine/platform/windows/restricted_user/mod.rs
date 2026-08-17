@@ -24,9 +24,14 @@ pub(super) fn is_installed() -> Result<bool> {
     Ok(state::load_optional()?.is_some())
 }
 pub(super) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<i32> {
-    let installation = state::load().map_err(setup_failed)?;
+    let installation =
+        state::load().map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     if !installation.complete {
-        return Err(setup_failed("restricted-user installation is incomplete").into());
+        return Err(Error::sandbox_setup(
+            Mechanism::Windowsuser,
+            "restricted-user installation is incomplete",
+        )
+        .into());
     }
     let network_mode = if policy.network_access.is_unrestricted() {
         state::NetworkMode::Unrestricted
@@ -35,20 +40,23 @@ pub(super) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
         state::NetworkMode::Restricted
     };
     let lease = lease::Lease::acquire(&installation, network_mode)?;
-    let state_path = state::state_path().map_err(setup_failed)?;
-    let request_id = account::random_identifier(16).map_err(setup_failed)?;
+    let state_path = state::state_path()
+        .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
+    let request_id = account::random_identifier(16)
+        .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     let request_path = state_path
         .parent()
         .context("restricted-user state path has no parent")?
         .join("runs")
         .join(format!("{request_id}.json"));
-    let cwd = std::env::current_dir().map_err(setup_failed)?;
+    let cwd = std::env::current_dir()
+        .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     let grants = access::GrantPlan::new(policy, &request_path)?;
     worker::write_request(&request_path, &lease.account().sid, tool, args, &cwd)
-        .map_err(setup_failed)?;
+        .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     if let Err(error) = lease.write_journal(&grants) {
         let _ = fs::remove_file(&request_path);
-        return Err(setup_failed(error).into());
+        return Err(Error::sandbox_setup(Mechanism::Windowsuser, error).into());
     }
 
     let applied_grants;
@@ -62,7 +70,7 @@ pub(super) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
                     let _ = lease.clear_journal();
                 }
                 let _ = fs::remove_file(&request_path);
-                return Err(setup_failed(error).into());
+                return Err(Error::sandbox_setup(Mechanism::Windowsuser, error).into());
             }
             applied_grants = applied;
             broker::launch(lease.account(), &installation.runner_path, &request_path)
@@ -76,7 +84,9 @@ pub(super) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
     };
     let revoke_result = applied_grants.revoke(&lease.account().sid);
     let clear_result = if revoke_result.is_ok() {
-        lease.clear_journal().map_err(setup_failed)
+        lease
+            .clear_journal()
+            .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))
     } else {
         Ok(())
     };
@@ -92,9 +102,14 @@ pub(super) fn run_worker(request: &std::path::Path) -> Result<i32> {
 }
 
 pub(super) fn validate(policy: &AccessPolicy) -> Result<()> {
-    let installation = state::load().map_err(setup_failed)?;
+    let installation =
+        state::load().map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     if !installation.complete {
-        return Err(setup_failed("restricted-user installation is incomplete").into());
+        return Err(Error::sandbox_setup(
+            Mechanism::Windowsuser,
+            "restricted-user installation is incomplete",
+        )
+        .into());
     }
     if !policy.network_access.is_unrestricted() {
         validate_restricted_network(policy, &installation)?;
@@ -107,13 +122,15 @@ fn validate_restricted_network(
     installation: &state::Installation,
 ) -> Result<()> {
     if policy.allow_windows_loopback {
-        return Err(setup_failed(
+        return Err(Error::sandbox_setup(
+            Mechanism::Windowsuser,
             "windows.allowLoopback is not supported by restricted-user isolation",
         )
         .into());
     }
     if policy.network_access.local_tcp_bind || !policy.network_access.restrict_bind_tcp {
-        return Err(setup_failed(
+        return Err(Error::sandbox_setup(
+            Mechanism::Windowsuser,
             "allowLocalBinding is not supported by restricted-user isolation",
         )
         .into());
@@ -124,17 +141,11 @@ fn validate_restricted_network(
         .iter()
         .any(|port| *port < installation.proxy_port_low || *port > installation.proxy_port_high)
     {
-        return Err(setup_failed(
+        return Err(Error::sandbox_setup(
+            Mechanism::Windowsuser,
             "restricted-user proxy port is outside the installed WFP allow range",
         )
         .into());
     }
     Ok(())
-}
-
-fn setup_failed(source: impl Into<crate::engine::error::Cause>) -> Error {
-    Error::SandboxSetupFailed {
-        mechanism: Mechanism::Windowsuser,
-        source: source.into(),
-    }
 }

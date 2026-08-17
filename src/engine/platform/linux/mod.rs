@@ -19,7 +19,6 @@ use landlock::enforce_access_policy;
 use seccomp::ensure_notification_supported;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
 use std::process::Command;
 
 pub(crate) fn doctor() -> Result<()> {
@@ -77,13 +76,7 @@ pub(crate) fn execute(
         )?;
         filters.load()?;
     }
-    close_inherited_fds(&[]).map_err(|source| Error::SuperviseFailed {
-        source: source.into(),
-    })?;
+    close_inherited_fds(&[]).map_err(Error::supervise)?;
     let error = Command::new(tool).args(args).exec();
-    Err(Error::LaunchFailed {
-        tool: PathBuf::from(tool),
-        source: error.into(),
-    }
-    .into())
+    Err(Error::launch(tool, error).into())
 }

@@ -120,6 +120,30 @@ impl Error {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) const DENIAL_ERRNO: i32 = libc::EACCES;
 
+    /// A sandbox mechanism landstrip could not install on the process.
+    pub(crate) fn sandbox_setup(mechanism: Mechanism, source: impl Into<Cause>) -> Self {
+        Self::SandboxSetupFailed {
+            mechanism,
+            source: source.into(),
+        }
+    }
+
+    /// Supervising the sandboxed child failed.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    pub(crate) fn supervise(source: impl Into<Cause>) -> Self {
+        Self::SuperviseFailed {
+            source: source.into(),
+        }
+    }
+
+    /// The sandbox was installed but the tool did not start.
+    pub(crate) fn launch(tool: impl Into<PathBuf>, source: impl Into<Cause>) -> Self {
+        Self::LaunchFailed {
+            tool: tool.into(),
+            source: source.into(),
+        }
+    }
+
     /// The stable, machine-routable code.
     pub(crate) fn code(&self) -> &'static str {
         self.into()

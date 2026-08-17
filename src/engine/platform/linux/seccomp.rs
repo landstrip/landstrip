@@ -16,10 +16,10 @@
 use super::fd::close_inherited_fds;
 use super::filter::{
     NetworkFilters, build_errno_filter, build_notify_filter, needs_unix_socket_broker,
-    setup_failed, unix_socket_filter,
+    unix_socket_filter,
 };
 use super::landlock::enforce_broker_access_policy;
-use crate::engine::error::{Cause, Error as LandstripError};
+use crate::engine::error::{Error as LandstripError, Mechanism};
 use crate::engine::paths::{
     PathCoverage, normalize_path, normalize_path_lexically, normalize_path_nofollow,
 };
@@ -132,13 +132,7 @@ fn syscall_i64(value: u64) -> i64 {
 
 /// A syscall that failed while supervising the sandboxed child.
 fn supervise_errno(errno: Errno) -> LandstripError {
-    supervise_failed(io::Error::from_raw_os_error(errno as i32))
-}
-
-fn supervise_failed(source: impl Into<Cause>) -> LandstripError {
-    LandstripError::SuperviseFailed {
-        source: source.into(),
-    }
+    LandstripError::supervise(io::Error::from_raw_os_error(errno as i32))
 }
 
 pub(super) fn run_broker(
@@ -181,7 +175,7 @@ pub(super) fn run_broker(
     };
 
     let filters = NetworkFilters::new(errno, notify);
-    let (parent, child_sock) = UnixStream::pair().map_err(supervise_failed)?;
+    let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::supervise)?;
 
     // SAFETY: landstrip forks before spawning threads; the child either execs the tool or exits.
     match unsafe { fork() }.map_err(supervise_errno)? {
@@ -209,17 +203,13 @@ pub(super) fn run_broker(
                 if let Some(trap_fd) = trap_fd {
                     excluded.push(trap_fd.as_raw_fd());
                 }
-                close_inherited_fds(&excluded).map_err(supervise_failed)?;
+                close_inherited_fds(&excluded).map_err(LandstripError::supervise)?;
 
                 let mut child_tool = Command::new(tool);
                 child_tool.args(args);
 
                 let error = child_tool.exec();
-                Err(LandstripError::LaunchFailed {
-                    tool: PathBuf::from(tool),
-                    source: error.into(),
-                }
-                .into())
+                Err(LandstripError::launch(tool, error).into())
             })();
 
             if let Err(error) = result {
@@ -296,7 +286,7 @@ fn supervise_child(
     let mut denials = Denials::new(trap_fd);
     let query_enabled = trap_fd.is_some_and(TrapFd::is_socket);
     let mount_namespace =
-        NamespaceId::try_from(Path::new("/proc/self/ns/mnt")).map_err(supervise_failed)?;
+        NamespaceId::try_from(Path::new("/proc/self/ns/mnt")).map_err(LandstripError::supervise)?;
     let mut ctx = NotificationContext {
         policy,
         syscalls,
@@ -680,7 +670,9 @@ fn seccomp_probe(operation: libc::c_uint, data: *mut libc::c_void) -> Result<()>
     // SAFETY: seccomp(2) copies the operation-specific data pointer before returning.
     let rc = unsafe { libc::syscall(libc::SYS_seccomp, operation, 0, data) };
     if rc < 0 {
-        return Err(setup_failed(io::Error::last_os_error()).into());
+        return Err(
+            LandstripError::sandbox_setup(Mechanism::Seccomp, io::Error::last_os_error()).into(),
+        );
     }
 
     Ok(())
@@ -2585,16 +2577,18 @@ fn send_fd(socket: &UnixStream, fd: BorrowedFd<'_>) -> Result<()> {
 
 fn send_trap(socket: &mut UnixStream, trap: &Trap) -> Result<()> {
     let payload = trap.to_string();
-    let length =
-        u32::try_from(payload.len()).map_err(|_| supervise_failed("notify: trap is too large"))?;
+    let length = u32::try_from(payload.len())
+        .map_err(|_| LandstripError::supervise("notify: trap is too large"))?;
 
-    socket.write_all(&[1_u8]).map_err(supervise_failed)?;
+    socket
+        .write_all(&[1_u8])
+        .map_err(LandstripError::supervise)?;
     socket
         .write_all(&length.to_be_bytes())
-        .map_err(supervise_failed)?;
+        .map_err(LandstripError::supervise)?;
     socket
         .write_all(payload.as_bytes())
-        .map_err(supervise_failed)?;
+        .map_err(LandstripError::supervise)?;
     Ok(())
 }
 
@@ -2624,12 +2618,12 @@ fn get_notify_fd(socket: &UnixStream) -> Result<NotifyStartup> {
     };
 
     if bytes == 0 {
-        return Err(supervise_failed("notify: unexpected eof").into());
+        return Err(LandstripError::supervise("notify: unexpected eof").into());
     }
 
     match byte[0] {
         0 => fd.map_or_else(
-            || Err(supervise_failed("notify: missing descriptor").into()),
+            || Err(LandstripError::supervise("notify: missing descriptor").into()),
             |fd| {
                 // SAFETY: SCM_RIGHTS transfers ownership of the received descriptor.
                 Ok(NotifyStartup::Ready(unsafe { OwnedFd::from_raw_fd(fd) }))
@@ -2638,21 +2632,26 @@ fn get_notify_fd(socket: &UnixStream) -> Result<NotifyStartup> {
         1 => {
             let mut length = [0_u8; 4];
             let mut socket = socket;
-            socket.read_exact(&mut length).map_err(supervise_failed)?;
+            socket
+                .read_exact(&mut length)
+                .map_err(LandstripError::supervise)?;
             let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
             if length > 1_048_576 {
-                return Err(supervise_failed("notify: trap is too large").into());
+                return Err(LandstripError::supervise("notify: trap is too large").into());
             }
             let mut payload = vec![0_u8; length];
-            socket.read_exact(&mut payload).map_err(supervise_failed)?;
-            let trap = String::from_utf8(payload)
-                .map_err(|error| supervise_failed(format!("notify: invalid trap: {error}")))?;
+            socket
+                .read_exact(&mut payload)
+                .map_err(LandstripError::supervise)?;
+            let trap = String::from_utf8(payload).map_err(|error| {
+                LandstripError::supervise(format!("notify: invalid trap: {error}"))
+            })?;
             if serde_json::from_str::<serde_json::Value>(&trap).is_err() {
-                return Err(supervise_failed("notify: invalid trap").into());
+                return Err(LandstripError::supervise("notify: invalid trap").into());
             }
             Ok(NotifyStartup::Trap(trap))
         }
-        _ => Err(supervise_failed("notify: invalid marker").into()),
+        _ => Err(LandstripError::supervise("notify: invalid marker").into()),
     }
 }
 

@@ -7,7 +7,7 @@
 //! This gives deny traversal snapshot semantics: a removed and recreated path is
 //! a new object unless an allowed ancestor covers it.
 
-use crate::engine::error::{Cause, Error, Mechanism, PathIo};
+use crate::engine::error::{Error, Mechanism, PathIo};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use landlock::{
@@ -19,14 +19,6 @@ use nix::sys::stat::{Mode, fstat};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-
-/// A Landlock ruleset landstrip could not build or enforce.
-fn setup_failed(source: impl Into<Cause>) -> Error {
-    Error::SandboxSetupFailed {
-        mechanism: Mechanism::Landlock,
-        source: source.into(),
-    }
-}
 
 /// Landlock features handled by this module, pinned to the highest ABI the
 /// `landlock` crate understands (audit-logging controls only past ABI 6).
@@ -64,13 +56,15 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
 
     let mut ruleset = Ruleset::default()
         .handle_access(handled_access_fs)
-        .map_err(setup_failed)?;
+        .map_err(|source| Error::sandbox_setup(Mechanism::Landlock, source))?;
     if !handled_access_net.is_empty() {
         ruleset = ruleset
             .handle_access(handled_access_net)
-            .map_err(setup_failed)?;
+            .map_err(|source| Error::sandbox_setup(Mechanism::Landlock, source))?;
     }
-    let mut created = ruleset.create().map_err(setup_failed)?;
+    let mut created = ruleset
+        .create()
+        .map_err(|source| Error::sandbox_setup(Mechanism::Landlock, source))?;
 
     created = add_path_rules(
         created,
@@ -87,7 +81,9 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
         created = add_network_rules(created, policy)?;
     }
 
-    let status = created.restrict_self().map_err(setup_failed)?;
+    let status = created
+        .restrict_self()
+        .map_err(|source| Error::sandbox_setup(Mechanism::Landlock, source))?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => {}
         RulesetStatus::PartiallyEnforced => log::debug!(
@@ -95,7 +91,8 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
             partial_enforcement_warning(status.landlock, handled_access_fs, handled_access_net,)
         ),
         RulesetStatus::NotEnforced => {
-            return Err(setup_failed(
+            return Err(Error::sandbox_setup(
+                Mechanism::Landlock,
                 "not enforced by the kernel (Linux 5.13+ with CONFIG_SECURITY_LANDLOCK required, \
                  and not disabled via the lsm= boot parameter)",
             )
@@ -174,7 +171,7 @@ fn add_path_rules(
                 );
                 continue;
             }
-            Err(error) => return Err(setup_failed(error).into()),
+            Err(error) => return Err(Error::sandbox_setup(Mechanism::Landlock, error).into()),
         };
 
         let path_access = if fd_is_dir(&fd)? {
@@ -188,7 +185,7 @@ fn add_path_rules(
 
         ruleset = ruleset
             .add_rule(PathBeneath::new(fd, path_access))
-            .map_err(setup_failed)?;
+            .map_err(|source| Error::sandbox_setup(Mechanism::Landlock, source))?;
     }
 
     Ok(ruleset)
@@ -202,7 +199,7 @@ fn add_network_rules(mut ruleset: RulesetCreated, policy: &AccessPolicy) -> Resu
     for port in &policy.network_access.connect_tcp_ports {
         ruleset = ruleset
             .add_rule(NetPort::new(*port, AccessNet::ConnectTcp))
-            .map_err(setup_failed)?;
+            .map_err(|source| Error::sandbox_setup(Mechanism::Landlock, source))?;
     }
 
     Ok(ruleset)
@@ -218,7 +215,7 @@ fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {
         Err(error) if error.is_transport_failed() => {
             return Ok(false);
         }
-        Err(error) => return Err(setup_failed(error).into()),
+        Err(error) => return Err(Error::sandbox_setup(Mechanism::Landlock, error).into()),
     };
 
     Ok((stat.st_mode & libc::S_IFMT) == libc::S_IFDIR)

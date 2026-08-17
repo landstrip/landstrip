@@ -135,30 +135,24 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
         )
     };
     if ok == 0 {
-        return Err(LandstripError::LaunchFailed {
-            tool: tool.into(),
-            source: io::Error::last_os_error().into(),
-        }
-        .into());
+        return Err(LandstripError::launch(tool, io::Error::last_os_error()).into());
     }
     let process = Handle(process_info.hProcess);
     let thread = Handle(process_info.hThread);
     if unsafe { ResumeThread(thread.0) } == u32::MAX {
-        return Err(setup_failed(format!("ResumeThread: {}", io::Error::last_os_error())).into());
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!("ResumeThread: {}", io::Error::last_os_error()),
+        )
+        .into());
     }
     let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
     if wait == WAIT_FAILED {
-        return Err(LandstripError::SuperviseFailed {
-            source: io::Error::last_os_error().into(),
-        }
-        .into());
+        return Err(LandstripError::supervise(io::Error::last_os_error()).into());
     }
     let mut exit_code = 0;
     if unsafe { GetExitCodeProcess(process.0, &raw mut exit_code) } == 0 {
-        return Err(LandstripError::SuperviseFailed {
-            source: io::Error::last_os_error().into(),
-        }
-        .into());
+        return Err(LandstripError::supervise(io::Error::last_os_error()).into());
     }
     Ok(exit_code)
 }
@@ -188,10 +182,10 @@ fn create_restricted_token() -> Result<Handle> {
         )
     };
     if ok == 0 {
-        return Err(setup_failed(format!(
-            "CreateRestrictedToken: {}",
-            io::Error::last_os_error()
-        ))
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!("CreateRestrictedToken: {}", io::Error::last_os_error()),
+        )
         .into());
     }
     Ok(Handle(restricted_token))
@@ -208,10 +202,13 @@ fn harden_worker_objects() -> Result<()> {
         )
     } == 0
     {
-        return Err(setup_failed(format!(
-            "ConvertStringSecurityDescriptorToSecurityDescriptorW: {}",
-            io::Error::last_os_error()
-        ))
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW: {}",
+                io::Error::last_os_error()
+            ),
+        )
         .into());
     }
 
@@ -228,10 +225,13 @@ fn harden_worker_objects() -> Result<()> {
                 )
             } == 0
             {
-                return Err(setup_failed(format!(
-                    "SetKernelObjectSecurity ({object}): {}",
-                    io::Error::last_os_error()
-                ))
+                return Err(LandstripError::sandbox_setup(
+                    Mechanism::Windowsuser,
+                    format!(
+                        "SetKernelObjectSecurity ({object}): {}",
+                        io::Error::last_os_error()
+                    ),
+                )
                 .into());
             }
         }
@@ -246,10 +246,10 @@ fn harden_worker_objects() -> Result<()> {
 fn current_environment() -> Result<Vec<u16>> {
     let environment = unsafe { GetEnvironmentStringsW() };
     if environment.is_null() {
-        return Err(setup_failed(format!(
-            "GetEnvironmentStringsW: {}",
-            io::Error::last_os_error()
-        ))
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!("GetEnvironmentStringsW: {}", io::Error::last_os_error()),
+        )
         .into());
     }
     let mut length = 0;
@@ -259,10 +259,10 @@ fn current_environment() -> Result<Vec<u16>> {
     length += 2;
     let result = unsafe { std::slice::from_raw_parts(environment, length) }.to_vec();
     if unsafe { FreeEnvironmentStringsW(environment) } == 0 {
-        return Err(setup_failed(format!(
-            "FreeEnvironmentStringsW: {}",
-            io::Error::last_os_error()
-        ))
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!("FreeEnvironmentStringsW: {}", io::Error::last_os_error()),
+        )
         .into());
     }
     Ok(result)
@@ -288,9 +288,11 @@ fn current_process_token() -> Result<Handle> {
         )
     } == 0
     {
-        return Err(
-            setup_failed(format!("OpenProcessToken: {}", io::Error::last_os_error())).into(),
-        );
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!("OpenProcessToken: {}", io::Error::last_os_error()),
+        )
+        .into());
     }
     Ok(Handle(token))
 }
@@ -301,10 +303,10 @@ fn token_user(token: HANDLE) -> Result<TokenUserBuffer> {
         GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &raw mut size);
     }
     if size == 0 {
-        return Err(setup_failed(format!(
-            "GetTokenInformation (probe): {}",
-            io::Error::last_os_error()
-        ))
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!("GetTokenInformation (probe): {}", io::Error::last_os_error()),
+        )
         .into());
     }
     let word_size = mem::size_of::<usize>();
@@ -320,10 +322,10 @@ fn token_user(token: HANDLE) -> Result<TokenUserBuffer> {
         )
     } == 0
     {
-        return Err(setup_failed(format!(
-            "GetTokenInformation: {}",
-            io::Error::last_os_error()
-        ))
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!("GetTokenInformation: {}", io::Error::last_os_error()),
+        )
         .into());
     }
     Ok(TokenUserBuffer { words })
@@ -346,10 +348,10 @@ fn verify_current_sid(expected: &str) -> Result<()> {
     let user = token_user(token.0)?;
     let mut sid_string = ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut sid_string) } == 0 {
-        return Err(setup_failed(format!(
-            "ConvertSidToStringSidW: {}",
-            io::Error::last_os_error()
-        ))
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!("ConvertSidToStringSidW: {}", io::Error::last_os_error()),
+        )
         .into());
     }
     let actual = wide_ptr_to_string(sid_string);
@@ -433,9 +435,3 @@ fn wide_ptr_to_string(value: *const u16) -> String {
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(value, length) })
 }
 
-fn setup_failed(source: impl Into<crate::engine::error::Cause>) -> LandstripError {
-    LandstripError::SandboxSetupFailed {
-        mechanism: Mechanism::Windowsuser,
-        source: source.into(),
-    }
-}
