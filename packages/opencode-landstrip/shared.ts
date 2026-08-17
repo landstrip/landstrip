@@ -7,6 +7,38 @@ import {
   type LandstripTrap,
 } from '@landstrip/landstrip';
 
+import {
+  allowsAllDomains,
+  controlResponseLine,
+  decodeLandstripTrap,
+  domainMatchesAny,
+  domainMatchesPattern,
+  expandHomePath,
+  formatLandstripTrap,
+  formatLandstripTraps,
+  isRecord,
+  parseLandstripTraps,
+  pathUnderDirectory,
+  sessionAllows,
+  sessionScopeFor,
+} from '@landstrip/landstrip/shared';
+
+export {
+  allowsAllDomains,
+  controlResponseLine,
+  decodeLandstripTrap,
+  domainMatchesAny,
+  domainMatchesPattern,
+  expandHomePath,
+  formatLandstripTrap,
+  formatLandstripTraps,
+  isRecord,
+  parseLandstripTraps,
+  pathUnderDirectory,
+  sessionAllows,
+  sessionScopeFor,
+};
+
 // Re-exported so index.ts/tui.ts can import the trap/response types from this
 // module alongside the parsing functions that produce/consume them.
 export type { LandstripControlResponse, LandstripTrap };
@@ -15,7 +47,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { dirname, join } from 'node:path';
 
 export interface SandboxFilesystemConfig {
   denyRead: string[];
@@ -56,62 +88,6 @@ const LANDSTRIP_PACKAGE_NAMES = new Set([
   '@landstrip/landstrip-win32-x64',
   '@landstrip/landstrip-win32-arm64',
 ]);
-
-// Breadth-first filesystem approval: a held read/write under a directory tree
-// is approved for the broadest reasonable ancestor (e.g. `~/.cargo`, not each
-// subcrate file), so a single approval covers sibling files under the same tree.
-export function pathUnderDirectory(filePath: string, dir: string): boolean {
-  const child = relative(dir, filePath);
-  return child === '' || (!isAbsolute(child) && child !== '..' && !child.startsWith(`..${sep}`));
-}
-
-export function sessionAllows(prefixes: Set<string>, filePath: string): boolean {
-  for (const prefix of prefixes) {
-    if (pathUnderDirectory(filePath, prefix)) return true;
-  }
-  return false;
-}
-
-// The broadest ancestor worth approving in one click: the immediate child of
-// `$HOME` (e.g. `~/.cargo`) for paths under the user's home, the project root
-// for paths under it, otherwise the containing directory. When the file sits
-// directly on a boundary (so the only ancestor is `$HOME` itself, which would
-// over-broaden), fall back to the exact file so nothing widens silently.
-export function sessionScopeFor(filePath: string, baseDirectory: string): string {
-  const dir = dirname(filePath);
-  const home = homedir();
-  const homeBoundaries = new Set<string>([home]);
-  try {
-    homeBoundaries.add(realpathSync.native(home));
-  } catch {
-    // $HOME not resolvable — fall back to the raw value only.
-  }
-
-  for (const boundary of homeBoundaries) {
-    if (pathUnderDirectory(dir, boundary)) {
-      const first = relative(boundary, dir).split(sep)[0];
-      if (!first) return filePath;
-      return join(boundary, first);
-    }
-  }
-
-  const projectBoundaries = new Set<string>([baseDirectory]);
-  try {
-    projectBoundaries.add(realpathSync.native(baseDirectory));
-  } catch {
-    // Project directory not resolvable — fall back to the raw value only.
-  }
-
-  for (const boundary of projectBoundaries) {
-    if (pathUnderDirectory(dir, boundary)) return boundary;
-  }
-
-  return dir;
-}
-
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 export function list(values: string[]): string {
   return values.join(', ') || '(none)';
@@ -402,112 +378,6 @@ export function updateForPermission(
   }
 
   return null;
-}
-
-// Landstrip emits one JSON trap per line on its trap fd/file. The `state` field
-// distinguishes a terminal `info` trap from a `query` trap that holds a syscall
-// pending until the host answers with the trap's `query_id`. Parsing lives here
-// so the server hook and the TUI socket handler decode identically.
-const LANDSTRIP_OPERATIONS = new Set<'read' | 'write'>(['read', 'write']);
-
-function isLandstripOperation(value: unknown): value is 'read' | 'write' {
-  return typeof value === 'string' && LANDSTRIP_OPERATIONS.has(value as 'read' | 'write');
-}
-
-// The declarations landstrip ships are compile-time only, so a runtime guard is
-// still required — but it only has to validate the fields actually read below.
-// Deliberately does not validate `state`: a missing or unknown state degrades to
-// "informational", the safe direction. `query_id` must be a string on both
-// filesystem and network traps — landstrip < 0.17 sent a number here, and a
-// numeric id fails landstrip's own deserializer when echoed back, so treating
-// it as undecodable (rather than coercing it) keeps a stale/mismatched trap
-// from ever being answered with a shape the broker would reject.
-function isLandstripTrap(value: unknown): value is LandstripTrap {
-  if (!isRecord(value)) return false;
-
-  switch (value.kind) {
-    case 'filesystem':
-      return (
-        isLandstripOperation(value.operation) &&
-        typeof value.path === 'string' &&
-        typeof value.query_id === 'string'
-      );
-    case 'network':
-      return (
-        typeof value.operation === 'string' &&
-        typeof value.target === 'string' &&
-        typeof value.query_id === 'string'
-      );
-    case 'launch':
-      return typeof value.program === 'string' && typeof value.message === 'string';
-    case 'usage':
-      return typeof value.message === 'string';
-    case 'internal':
-      return typeof value.code === 'string' && typeof value.message === 'string';
-    default:
-      return false;
-  }
-}
-
-export function decodeLandstripTrap(value: unknown): LandstripTrap | null {
-  return isLandstripTrap(value) ? value : null;
-}
-
-export function parseLandstripTraps(output: string): LandstripTrap[] {
-  const traps: LandstripTrap[] = [];
-
-  for (const line of output.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0 || trimmed[0] !== '{') continue;
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-
-    const trap = decodeLandstripTrap(parsed);
-    if (trap) traps.push(trap);
-  }
-
-  return traps;
-}
-
-export function formatLandstripTrap(trap: LandstripTrap): string {
-  switch (trap.kind) {
-    case 'filesystem':
-      return `landstrip: filesystem ${trap.operation} denied (${trap.path})${
-        trap.mechanism ? ` [${trap.mechanism}]` : ''
-      }`;
-    case 'network':
-      return `landstrip: network ${trap.operation} denied (${trap.target})${
-        trap.mechanism ? ` [${trap.mechanism}]` : ''
-      }`;
-    case 'launch':
-      return `landstrip: launch failed (${trap.program})${trap.message ? `: ${trap.message}` : ''}`;
-    case 'usage':
-      return `landstrip: usage error: ${trap.message}`;
-    case 'internal': {
-      const mechanism = trap.mechanism ? ` [${trap.mechanism}]` : '';
-      return `landstrip: ${trap.code}${mechanism}: ${trap.message}`;
-    }
-  }
-}
-
-export function formatLandstripTraps(traps: LandstripTrap[]): string {
-  return traps.map(formatLandstripTrap).join('\n');
-}
-
-// The broker matches an answer to its query by the exact decimal `query_id`
-// string the trap carried. A numeric id fails its deserializer, the line is
-// dropped, and the child's syscall stays suspended.
-export function controlResponseLine(
-  queryId: string,
-  action: LandstripControlResponse['action'],
-): string {
-  const response: LandstripControlResponse = { query_id: queryId, action };
-  return JSON.stringify(response) + '\n';
 }
 
 export interface TrapSessionHello {

@@ -15,7 +15,7 @@ import {
   isIP,
   type Socket,
 } from 'node:net';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 import { URL } from 'node:url';
 
@@ -23,8 +23,11 @@ import {
   type LandstripTrap,
   type SandboxConfig,
   type SandboxFilesystemConfig,
+  allowsAllDomains,
   controlResponseLine,
   decodeLandstripTrap,
+  domainMatchesAny,
+  expandHomePath,
   extractDomainsFromCommand,
   formatLandstripTraps,
   getConfigPaths,
@@ -104,7 +107,7 @@ for (const [network, prefix] of [
 }
 
 function expandPath(filePath: string, baseDirectory: string): string {
-  const expanded = filePath.replace(/^~(?=$|[/])/, homedir());
+  const expanded = expandHomePath(filePath);
   return resolve(isAbsolute(expanded) ? expanded : join(baseDirectory, expanded));
 }
 
@@ -240,27 +243,6 @@ function resolveFilesystemConfig(
     allowWrite: resolveFilesystemPatterns(config.allowWrite, baseDirectory),
     denyWrite: resolveFilesystemPatterns(config.denyWrite, baseDirectory),
   };
-}
-
-function domainMatchesPattern(domain: string, pattern: string): boolean {
-  const normalizedDomain = domain.toLowerCase();
-  const normalizedPattern = pattern.toLowerCase();
-
-  if (normalizedPattern === '*') return true;
-  if (normalizedPattern.startsWith('*.')) {
-    const base = normalizedPattern.slice(2);
-    return normalizedDomain === base || normalizedDomain.endsWith(`.${base}`);
-  }
-
-  return normalizedDomain === normalizedPattern;
-}
-
-function domainMatchesAny(domain: string, patterns: string[]): boolean {
-  return patterns.some((pattern) => domainMatchesPattern(domain, pattern));
-}
-
-function allowsAllDomains(allowedDomains: string[]): boolean {
-  return allowedDomains.includes('*');
 }
 
 function isDomainAllowed(domain: string, config: SandboxConfig): boolean {
