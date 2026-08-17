@@ -20,7 +20,9 @@ use super::filter::{
 };
 use super::landlock::enforce_broker_access_policy;
 use crate::engine::error::{Cause, Error as LandstripError};
-use crate::engine::paths::{normalize_path, normalize_path_lexically, normalize_path_nofollow};
+use crate::engine::paths::{
+    PathCoverage, normalize_path, normalize_path_lexically, normalize_path_nofollow,
+};
 use crate::engine::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
 use crate::engine::trap::{
     FilesystemDenial, NetworkOperation, ProcessContext, Trap, TrapOperation,
@@ -898,11 +900,7 @@ fn handle_unix_bind(
     };
     authorize_unix_path(policy, &target)?;
 
-    if !policy
-        .write_roots
-        .iter()
-        .any(|root| target == *root || target.starts_with(root))
-    {
+    if !target.is_under_any(&policy.write_roots) {
         return Err(BrokerError::PolicyDenied);
     }
 
@@ -947,9 +945,8 @@ fn unix_path_target(pid: u32, addr: &[u8]) -> SysResult<Option<(PathBuf, bool)>>
 fn authorize_unix_path(policy: &AccessPolicy, target: &Path) -> SysResult<()> {
     match &policy.network_access.unix_socket_access {
         UnixSocketAccess::Unrestricted => Ok(()),
-        UnixSocketAccess::AllowPaths(paths) => paths
-            .iter()
-            .any(|path| target == path || target.starts_with(path))
+        UnixSocketAccess::AllowPaths(paths) => target
+            .is_under_any(paths)
             .then_some(())
             .ok_or(BrokerError::PolicyDenied),
     }
@@ -1368,11 +1365,7 @@ fn handle_openat(
         let lexical = normalize_path_lexically(&raw);
         let reason = if policy.is_write_denied(&resolved, &lexical) {
             Some("deny_match")
-        } else if policy
-            .write_roots
-            .iter()
-            .any(|root| resolved == *root || resolved.starts_with(root))
-        {
+        } else if resolved.is_under_any(&policy.write_roots) {
             None
         } else {
             Some("allow_miss")
@@ -2552,17 +2545,10 @@ fn fs_read_denial_reason(policy: &AccessPolicy, path: &Path) -> Option<&'static 
     match &policy.read_access {
         ReadAccess::Unrestricted => None,
         ReadAccess::AllowRoots(roots) => {
-            if policy
-                .read_denied_roots
-                .iter()
-                .any(|root| path == root || path.starts_with(root))
-            {
+            if path.is_under_any(&policy.read_denied_roots) {
                 return Some("deny_match");
             }
-            if roots
-                .iter()
-                .any(|root| path == root || path.starts_with(root))
-            {
+            if path.is_under_any(roots) {
                 None
             } else {
                 Some("allow_miss")

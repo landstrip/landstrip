@@ -4,6 +4,29 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+pub(crate) trait PathCoverage {
+    fn is_under(&self, root: impl AsRef<Path>) -> bool;
+    fn is_strictly_under(&self, root: impl AsRef<Path>) -> bool;
+
+    fn is_under_any<I>(&self, roots: I) -> bool
+    where
+        I: IntoIterator,
+        I::Item: AsRef<Path>,
+    {
+        roots.into_iter().any(|root| self.is_under(root))
+    }
+}
+
+impl PathCoverage for Path {
+    fn is_under(&self, root: impl AsRef<Path>) -> bool {
+        self.starts_with(root)
+    }
+
+    fn is_strictly_under(&self, root: impl AsRef<Path>) -> bool {
+        let root = root.as_ref();
+        self.starts_with(root) && self != root
+    }
+}
 pub(crate) fn normalize_roots(paths: &mut Vec<PathBuf>) {
     for path in paths.iter_mut() {
         *path = normalize_path_lexically(path);

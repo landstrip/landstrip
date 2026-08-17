@@ -16,7 +16,9 @@
 
 use crate::engine::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows};
 use crate::engine::error::Error;
-use crate::engine::paths::{normalize_path, normalize_path_lexically, normalize_roots};
+use crate::engine::paths::{
+    PathCoverage, normalize_path, normalize_path_lexically, normalize_roots,
+};
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -53,13 +55,8 @@ impl AccessPolicy {
     /// patterns in `write_denied_patterns` are evaluated dynamically against the
     /// lexical path so files created after sandbox startup are also blocked.
     pub(crate) fn is_write_denied(&self, canonical: &Path, lexical: &Path) -> bool {
-        self.write_denied_roots
-            .iter()
-            .any(|root| canonical == root || canonical.starts_with(root))
-            || self
-                .write_denied_links
-                .iter()
-                .any(|root| lexical == root || lexical.starts_with(root))
+        canonical.is_under_any(&self.write_denied_roots)
+            || lexical.is_under_any(&self.write_denied_links)
             || self
                 .write_denied_patterns
                 .iter()
@@ -79,12 +76,7 @@ impl AccessPolicy {
     ) -> Option<&'static str> {
         if self.is_write_denied(canonical, lexical) {
             Some("deny_match")
-        } else if surface_allow_miss
-            && !self
-                .write_roots
-                .iter()
-                .any(|root| canonical == root || canonical.starts_with(root))
-        {
+        } else if surface_allow_miss && !canonical.is_under_any(&self.write_roots) {
             Some("allow_miss")
         } else {
             None
@@ -112,11 +104,10 @@ impl AccessPolicy {
             }
         }
 
-        let has_writable_symlink_ancestor = self.write_denied_links.iter().any(|link| {
-            self.write_roots
-                .iter()
-                .any(|root| link == root || link.starts_with(root))
-        });
+        let has_writable_symlink_ancestor = self
+            .write_denied_links
+            .iter()
+            .any(|link| link.is_under_any(&self.write_roots));
         if has_writable_symlink_ancestor {
             return Err(Error::PolicyDenyWriteSymlinkAncestor);
         }
@@ -294,14 +285,11 @@ fn lower_windows_write_access(
     for allow in write_allow {
         let needs_carve = carve_denials
             .iter()
-            .any(|deny| deny.starts_with(allow) && deny.as_path() != allow.as_path());
+            .any(|deny| deny.is_strictly_under(allow));
         if needs_carve {
             let scan = scan_allowed_root(allow, &carve_denials, true, 0)?;
             carved_writes.extend(scan.roots);
-        } else if write_deny
-            .iter()
-            .any(|deny| allow == deny || allow.starts_with(deny))
-        {
+        } else if allow.is_under_any(&write_deny) {
             // Fully covered by a write deny — omit.
         } else {
             carved_writes.push(allow.clone());
@@ -315,7 +303,7 @@ fn lower_windows_write_access(
         .filter(|deny| {
             !carved_writes
                 .iter()
-                .any(|allow| deny.starts_with(allow) && deny.as_path() != allow.as_path())
+                .any(|allow| deny.is_strictly_under(allow))
         })
         .collect();
     Ok((carved_writes, write_deny))
@@ -337,11 +325,9 @@ fn lower_read_access(
     if read_deny.is_empty() {
         Ok((ReadAccess::Unrestricted, Vec::new()))
     } else if read_allow.contains(&fs_root)
-        && !read_deny.iter().any(|deny| {
-            read_allow
-                .iter()
-                .any(|allow| allow.starts_with(deny) && allow.as_path() != deny.as_path())
-        })
+        && !read_deny
+            .iter()
+            .any(|deny| read_allow.iter().any(|allow| allow.is_strictly_under(deny)))
     {
         // Layer surviving denyRead roots over a full-tree allowRead grant.
         // Windows rejects the full-volume grant above.
@@ -364,9 +350,7 @@ fn lower_restricted_read_access(
     let mut roots = Vec::new();
     let mut symlinks = Vec::new();
     for allow in read_allow {
-        let needs_carve = denied
-            .iter()
-            .any(|deny| deny.starts_with(allow) && deny.as_path() != allow.as_path());
+        let needs_carve = denied.iter().any(|deny| deny.is_strictly_under(allow));
         if needs_carve {
             let scan = scan_allowed_root(allow, &denied, true, 0)?;
             roots.extend(scan.roots);
@@ -541,16 +525,13 @@ fn scan_allowed_root(
             return Err(Error::PolicyTraversalDepth.into());
         }
 
-        if denied
-            .iter()
-            .any(|denied_root| current == *denied_root || current.starts_with(denied_root))
-        {
+        if current.is_under_any(denied) {
             continue;
         }
 
         let has_denied_descendant = denied
             .iter()
-            .any(|denied_root| denied_root.starts_with(&current));
+            .any(|denied_root| denied_root.is_strictly_under(&current));
 
         // A transient EIO (e.g. an autofs automount such as macOS `/home`) is
         // treated as an opaque boundary alongside a missing or denied path: keep
@@ -623,11 +604,7 @@ fn scan_allowed_root(
 fn effective_denied_roots(read_deny: &[PathBuf], read_allow: &[PathBuf]) -> Vec<PathBuf> {
     read_deny
         .iter()
-        .filter(|deny| {
-            !read_allow
-                .iter()
-                .any(|allow| allow.as_path() == deny.as_path() || allow.starts_with(deny))
-        })
+        .filter(|deny| !read_allow.iter().any(|allow| allow.is_under(deny)))
         .cloned()
         .collect()
 }
