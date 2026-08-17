@@ -212,6 +212,24 @@ pub(crate) fn errno_name(errno: i32) -> Option<&'static str> {
     }
 }
 
+pub(crate) trait PathIo {
+    fn is_opaque(&self) -> bool;
+    fn is_transport_failed(&self) -> bool;
+}
+
+impl PathIo for io::Error {
+    fn is_transport_failed(&self) -> bool {
+        self.kind() == io::ErrorKind::NotConnected || self.raw_os_error() == Some(libc::EIO)
+    }
+
+    fn is_opaque(&self) -> bool {
+        matches!(
+            self.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        ) || self.is_transport_failed()
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.code())?;

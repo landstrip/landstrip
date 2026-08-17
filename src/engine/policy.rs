@@ -15,7 +15,7 @@
 //! while lowering the policy.
 
 use crate::engine::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows};
-use crate::engine::error::Error;
+use crate::engine::error::{Error, PathIo};
 use crate::engine::paths::{
     PathCoverage, normalize_path, normalize_path_lexically, normalize_roots,
 };
@@ -539,12 +539,7 @@ fn scan_allowed_root(
         // stat is also unreadable to the sandboxed child.
         let metadata = match fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.kind() == io::ErrorKind::PermissionDenied
-                    || error.raw_os_error() == Some(libc::EIO)
-                    || error.raw_os_error() == Some(libc::ENOTCONN) =>
-            {
+            Err(error) if error.is_opaque() => {
                 results.push(current);
                 continue;
             }
@@ -565,8 +560,7 @@ fn scan_allowed_root(
             Ok(entries) => entries,
             Err(error)
                 if error.kind() == io::ErrorKind::PermissionDenied
-                    || error.raw_os_error() == Some(libc::EIO)
-                    || error.raw_os_error() == Some(libc::ENOTCONN) =>
+                    || error.is_transport_failed() =>
             {
                 results.push(current);
                 continue;
@@ -576,10 +570,7 @@ fn scan_allowed_root(
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(error)
-                    if error.raw_os_error() == Some(libc::EIO)
-                        || error.raw_os_error() == Some(libc::ENOTCONN) =>
-                {
+                Err(error) if error.is_transport_failed() => {
                     continue;
                 }
                 Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
@@ -684,11 +675,7 @@ pub(crate) fn expand_glob_path(pattern: &Path) -> Result<Vec<PathBuf>> {
 
     match fs::symlink_metadata(&base) {
         Ok(_) => collect_glob_matches(&base, &pattern, &mut matches, 0)?,
-        Err(error)
-            if error.kind() == io::ErrorKind::NotFound
-                || error.kind() == io::ErrorKind::PermissionDenied
-                || error.raw_os_error() == Some(libc::EIO)
-                || error.raw_os_error() == Some(libc::ENOTCONN) => {}
+        Err(error) if error.is_opaque() => {}
         Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
     }
 
@@ -745,12 +732,7 @@ fn collect_glob_matches(
     // broker still enforces denied paths regardless of glob expansion.
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error)
-            if error.kind() == io::ErrorKind::NotFound
-                || error.kind() == io::ErrorKind::PermissionDenied
-                || error.raw_os_error() == Some(libc::EIO)
-                || error.raw_os_error() == Some(libc::ENOTCONN) =>
-        {
+        Err(error) if error.is_opaque() => {
             return Ok(());
         }
         Err(source) => return Err(Error::PolicyIoFailed { source }.into()),
@@ -762,9 +744,7 @@ fn collect_glob_matches(
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
         Err(error)
-            if error.kind() == io::ErrorKind::PermissionDenied
-                || error.raw_os_error() == Some(libc::EIO)
-                || error.raw_os_error() == Some(libc::ENOTCONN) =>
+            if error.kind() == io::ErrorKind::PermissionDenied || error.is_transport_failed() =>
         {
             return Ok(());
         }
@@ -773,10 +753,7 @@ fn collect_glob_matches(
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(error)
-                if error.raw_os_error() == Some(libc::EIO)
-                    || error.raw_os_error() == Some(libc::ENOTCONN) =>
-            {
+            Err(error) if error.is_transport_failed() => {
                 continue;
             }
             Err(source) => return Err(Error::PolicyIoFailed { source }.into()),

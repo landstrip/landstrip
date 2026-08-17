@@ -7,7 +7,7 @@
 //! This gives deny traversal snapshot semantics: a removed and recreated path is
 //! a new object unless an allowed ancestor covers it.
 
-use crate::engine::error::{Cause, Error, Mechanism};
+use crate::engine::error::{Cause, Error, Mechanism, PathIo};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use landlock::{
@@ -161,12 +161,7 @@ fn add_path_rules(
     for path in paths {
         let fd = match open_path(path) {
             Ok(fd) => fd,
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.kind() == io::ErrorKind::PermissionDenied
-                    || error.raw_os_error() == Some(libc::EIO)
-                    || error.raw_os_error() == Some(libc::ENOTCONN) =>
-            {
+            Err(error) if error.is_opaque() => {
                 // Missing / unreachable targets must not promote the parent
                 // directory into the ruleset. Granting from_write on that
                 // ancestor would let the sandboxed process create and mutate
@@ -220,10 +215,7 @@ fn open_path(path: &Path) -> io::Result<OwnedFd> {
 fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {
     let stat = match fstat(fd).map_err(io::Error::from) {
         Ok(stat) => stat,
-        Err(error)
-            if error.raw_os_error() == Some(libc::EIO)
-                || error.raw_os_error() == Some(libc::ENOTCONN) =>
-        {
+        Err(error) if error.is_transport_failed() => {
             return Ok(false);
         }
         Err(error) => return Err(setup_failed(error).into()),
