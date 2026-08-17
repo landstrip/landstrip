@@ -154,18 +154,25 @@ pub(crate) fn load_settings(
 /// search unless the name already names a location) and then canonicalized,
 /// so the attribute is always read from the real executable inode a `PATH`
 /// trick cannot relocate.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<Value>> {
     let Some(exe) = resolve_executable(tool) else {
         return Ok(None);
     };
 
-    let Some(bytes) = read_xattr(&exe, EXECUTABLE_POLICY_XATTR)
+    let Some(bytes) = HostStore::read_policy(&exe)
         .with_context(|| format!("executable policy {}", exe.display()))?
     else {
         return Ok(None);
     };
 
+    parse_attached_policy(bytes, format, &exe)
+}
+
+fn parse_attached_policy(
+    bytes: Vec<u8>,
+    format: PolicyFormat,
+    exe: &Path,
+) -> Result<Option<Value>> {
     let document = String::from_utf8(bytes)
         .map_err(parse_failed)
         .with_context(|| format!("executable policy {}", exe.display()))?;
@@ -175,40 +182,28 @@ fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<V
     Ok(Some(value))
 }
 
-/// Same policy, carried on Windows as a named alternate data stream rather
-/// than an extended attribute, which NTFS does not have.
-#[cfg(target_os = "windows")]
-fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<Value>> {
-    let Some(exe) = resolve_executable(tool) else {
-        return Ok(None);
+fn resolve_executable(tool: &OsStr) -> Option<PathBuf> {
+    let tool_path = Path::new(tool);
+    let has_location = tool_path
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+
+    let candidate = if has_location {
+        HostStore::locate(tool_path)?
+    } else {
+        let path_var = std::env::var_os("PATH")?;
+        std::env::split_paths(&path_var).find_map(|dir| HostStore::locate(&dir.join(tool_path)))?
     };
 
-    let mut stream = exe.clone().into_os_string();
-    stream.push(":");
-    stream.push(EXECUTABLE_POLICY_STREAM);
-
-    let bytes = match fs::read(PathBuf::from(stream)) {
-        Ok(bytes) => bytes,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(Error::PolicyIoFailed { source })
-                .with_context(|| format!("executable policy {}", exe.display()));
-        }
-    };
-
-    let document = String::from_utf8(bytes)
-        .map_err(parse_failed)
-        .with_context(|| format!("executable policy {}", exe.display()))?;
-    let value = format
-        .parse_document(&document)
-        .with_context(|| format!("executable policy {}", exe.display()))?;
-    Ok(Some(value))
+    candidate.canonicalize().ok()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn read_executable_policy(_tool: &OsStr, _format: PolicyFormat) -> Result<Option<Value>> {
-    Ok(None)
+trait ExecutableStore {
+    fn locate(path: &Path) -> Option<PathBuf>;
+    fn read_policy(exe: &Path) -> Result<Option<Vec<u8>>>;
 }
+
+struct HostStore;
 
 /// The extended attribute carrying a supplementary policy, in the
 /// unprivileged `user` namespace: unlike `trusted.*` or `security.*`, it
@@ -222,23 +217,43 @@ const EXECUTABLE_POLICY_XATTR: &str = "user.landstrip.policy";
 #[cfg(target_os = "windows")]
 const EXECUTABLE_POLICY_STREAM: &str = "landstrip.policy";
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn resolve_executable(tool: &OsStr) -> Option<PathBuf> {
-    let tool_path = Path::new(tool);
-    let has_location = tool_path
-        .parent()
-        .is_some_and(|parent| !parent.as_os_str().is_empty());
+impl ExecutableStore for HostStore {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn locate(path: &Path) -> Option<PathBuf> {
+        is_executable_file(path).then(|| path.to_path_buf())
+    }
 
-    let candidate = if has_location {
-        is_executable_file(tool_path).then(|| tool_path.to_path_buf())?
-    } else {
-        let path_var = std::env::var_os("PATH")?;
-        std::env::split_paths(&path_var)
-            .map(|dir| dir.join(tool_path))
-            .find(|candidate| is_executable_file(candidate))?
-    };
+    #[cfg(target_os = "windows")]
+    fn locate(path: &Path) -> Option<PathBuf> {
+        resolve_with_extensions(path)
+    }
 
-    candidate.canonicalize().ok()
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    fn locate(_path: &Path) -> Option<PathBuf> {
+        None
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn read_policy(exe: &Path) -> Result<Option<Vec<u8>>> {
+        Ok(read_xattr(exe, EXECUTABLE_POLICY_XATTR)?)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn read_policy(exe: &Path) -> Result<Option<Vec<u8>>> {
+        let mut stream = exe.as_os_str().to_os_string();
+        stream.push(":");
+        stream.push(EXECUTABLE_POLICY_STREAM);
+        match fs::read(PathBuf::from(stream)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(Error::PolicyIoFailed { source }.into()),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    fn read_policy(_exe: &Path) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -246,24 +261,6 @@ fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(target_os = "windows")]
-fn resolve_executable(tool: &OsStr) -> Option<PathBuf> {
-    let tool_path = Path::new(tool);
-    let has_location = tool_path
-        .parent()
-        .is_some_and(|parent| !parent.as_os_str().is_empty());
-
-    let candidate = if has_location {
-        resolve_with_extensions(tool_path)?
-    } else {
-        let path_var = std::env::var_os("PATH")?;
-        std::env::split_paths(&path_var)
-            .find_map(|dir| resolve_with_extensions(&dir.join(tool_path)))?
-    };
-
-    candidate.canonicalize().ok()
 }
 
 #[cfg(target_os = "windows")]
