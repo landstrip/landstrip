@@ -5,7 +5,8 @@
 
 use super::state;
 use super::{
-    OwnedSecurityDescriptor, ToWideNul, current_process_token, own_handle, sid_string, token_user,
+    OwnedSecurityDescriptor, ToWideNul, current_process_token, join_command_line, own_handle,
+    quote_command_text, sid_string, token_user,
 };
 use crate::engine::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result, bail};
@@ -13,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::iter;
 use std::mem;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
@@ -290,48 +290,11 @@ fn verify_current_sid(expected: &str) -> Result<()> {
 }
 
 fn command_line(tool: &OsStr, args: &[OsString]) -> Result<String> {
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(quote_command_arg(tool)?);
-    for arg in args {
-        parts.push(quote_command_arg(arg)?);
-    }
-    Ok(parts.join(" "))
-}
-
-fn quote_command_arg(arg: &OsStr) -> Result<String> {
-    let arg = arg
-        .to_str()
-        .context("restricted-user command line is not valid Unicode")?;
-    if arg.contains('\0') {
-        bail!("restricted-user command line contains an interior NUL");
-    }
-    if arg.is_empty() {
-        return Ok("\"\"".to_owned());
-    }
-    if !arg
-        .bytes()
-        .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\"'))
-    {
-        return Ok(arg.to_owned());
-    }
-    let mut quoted = String::from("\"");
-    let mut backslashes = 0;
-    for ch in arg.chars() {
-        match ch {
-            '\\' => backslashes += 1,
-            '"' => {
-                quoted.extend(iter::repeat_n('\\', backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                quoted.extend(iter::repeat_n('\\', backslashes));
-                quoted.push(ch);
-                backslashes = 0;
-            }
-        }
-    }
-    quoted.extend(iter::repeat_n('\\', backslashes * 2));
-    quoted.push('"');
-    Ok(quoted)
+    join_command_line(tool, args, |arg| {
+        let arg = arg
+            .to_str()
+            .context("restricted-user command line is not valid Unicode")?;
+        quote_command_text(arg)
+            .map_err(|_| anyhow::anyhow!("restricted-user command line contains an interior NUL"))
+    })
 }

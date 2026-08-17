@@ -27,6 +27,7 @@ impl PathCoverage for Path {
         self.starts_with(root) && self != root
     }
 }
+
 pub(crate) fn normalize_roots(paths: &mut Vec<PathBuf>) {
     for path in paths.iter_mut() {
         *path = normalize_path_lexically(path);

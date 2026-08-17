@@ -13,8 +13,9 @@ mod wfp;
 mod worker;
 
 pub(super) use super::{
-    OwnedLocal, OwnedSecurityDescriptor, ToWideNul, current_process_token, own_handle, sid_string,
-    token_user,
+    OwnedLocal, OwnedSecurityDescriptor, ToWideNul, current_process_token, decode_hex, encode_hex,
+    is_locked_error, is_missing_error, join_command_line, own_handle, path_access_failed,
+    quote_command_arg, quote_command_text, set_path_access, sid_string, token_user, win32_error,
 };
 
 use crate::engine::error::{Error, Mechanism};

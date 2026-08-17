@@ -8,6 +8,7 @@ use super::WindowsCommand;
 mod appcontainer;
 mod restricted_user;
 
+use crate::engine::error::{Error, Mechanism};
 use crate::engine::outcome::WindowsStatusReport;
 use crate::engine::policy::AccessPolicy;
 use anyhow::Result;
@@ -16,12 +17,22 @@ use std::io;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
+use std::path::Path;
 use std::ptr;
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE, LocalFree};
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+use windows_sys::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PATH_NOT_FOUND,
+    ERROR_SHARING_VIOLATION, HANDLE, LocalFree,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ACCESS_MODE, ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, REVOKE_ACCESS,
+    SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
+};
 use windows_sys::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, TOKEN_USER, TokenUser,
+    ACL, DACL_SECURITY_INFORMATION, GetTokenInformation, InitializeSecurityDescriptor,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    SetFileSecurityW, SetSecurityDescriptorDacl, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -168,7 +179,157 @@ impl OwnedSecurityDescriptor {
     }
 }
 
+/// Lowercase hexadecimal encoding of `bytes`.
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(char::from(HEX[(byte >> 4) as usize]));
+        output.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+    output
+}
+
+/// Decode lowercase or uppercase hexadecimal `value`.
+pub(crate) fn decode_hex(value: &str) -> Result<Vec<u8>, &'static str> {
+    if !value.len().is_multiple_of(2) {
+        return Err("hex string has an invalid length");
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_digit(pair[0])?;
+            let low = hex_digit(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_digit(value: u8) -> Result<u8, &'static str> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err("hex string contains non-hexadecimal data"),
+    }
+}
+
+/// Quote one argument for `CreateProcessW` / `CommandLineToArgvW`.
+///
+/// `arg` must not contain an interior NUL.
+pub(crate) fn quote_command_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_owned();
+    }
+    if !arg
+        .bytes()
+        .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\"'))
+    {
+        return arg.to_owned();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                quoted.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+/// Quote one already-decoded argument. `arg` must not contain an interior NUL.
+pub(crate) fn quote_command_text(arg: &str) -> Result<String, &'static str> {
+    if arg.contains('\0') {
+        return Err("command line contains an interior NUL byte");
+    }
+    Ok(quote_command_arg(arg))
+}
+
+/// Join a tool and arguments into a `CreateProcessW` command line.
+pub(crate) fn join_command_line<E>(
+    tool: &OsStr,
+    args: &[OsString],
+    mut quote: impl FnMut(&OsStr) -> Result<String, E>,
+) -> Result<String, E> {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(quote(tool)?);
+    for arg in args {
+        parts.push(quote(arg)?);
+    }
+    Ok(parts.join(" "))
+}
+
 pub(crate) const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+type Win32CallResult<T> = std::result::Result<T, (&'static str, io::Error)>;
+
+/// A Win32 or `NET_API` status code, as reported by APIs that return one
+/// instead of setting the last error.
+pub(crate) fn win32_error(status: u32) -> io::Error {
+    io::Error::from_raw_os_error(status.cast_signed())
+}
+
+/// The Win32 status carried by `error`, when it carries one.
+pub(crate) fn win32_status(error: &io::Error) -> Option<u32> {
+    error.raw_os_error().map(i32::cast_unsigned)
+}
+
+pub(crate) fn is_missing_status(status: u32) -> bool {
+    status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND
+}
+
+pub(crate) fn is_locked_status(status: u32) -> bool {
+    status == ERROR_SHARING_VIOLATION || status == ERROR_ACCESS_DENIED
+}
+
+pub(crate) fn is_missing_error(error: &io::Error) -> bool {
+    win32_status(error).is_some_and(is_missing_status)
+}
+
+pub(crate) fn is_locked_error(error: &io::Error) -> bool {
+    win32_status(error).is_some_and(is_locked_status)
+}
+
+/// Format an ACL apply failure for `path`.
+pub(crate) fn path_access_failed(
+    mechanism: Mechanism,
+    path: &Path,
+    mode: ACCESS_MODE,
+    api: &str,
+    source: &io::Error,
+) -> Error {
+    Error::sandbox_setup(
+        mechanism,
+        format!(
+            "{api} failed to {} ACL for {}: {source}",
+            acl_action(mode),
+            path.display()
+        ),
+    )
+}
+
+fn acl_action(mode: ACCESS_MODE) -> &'static str {
+    match mode {
+        GRANT_ACCESS => "grant",
+        DENY_ACCESS => "deny",
+        REVOKE_ACCESS => "revoke",
+        _ => "update",
+    }
+}
 
 /// A `LocalAlloc`'d buffer.
 pub(crate) struct OwnedLocal(*mut c_void);
@@ -195,6 +356,107 @@ impl Drop for OwnedLocal {
             }
         }
     }
+}
+
+/// Edit a path DACL for `sid`.
+pub(crate) fn set_path_access(
+    path: &Path,
+    sid: PSID,
+    access: u32,
+    mode: ACCESS_MODE,
+    inherit: bool,
+    propagate: bool,
+) -> Win32CallResult<()> {
+    let path_wide = path.to_wide_nul();
+    let mut old_dacl: *mut ACL = ptr::null_mut();
+    let mut security_descriptor = ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &raw mut old_dacl,
+            ptr::null_mut(),
+            &raw mut security_descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(("GetNamedSecurityInfoW", win32_error(status)));
+    }
+    let _security_descriptor = unsafe { OwnedLocal::from_raw(security_descriptor) };
+
+    let explicit_access = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: access,
+        grfAccessMode: mode,
+        grfInheritance: if inherit {
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        } else {
+            0
+        },
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid.cast(),
+        },
+    };
+    let mut new_dacl: *mut ACL = ptr::null_mut();
+    let status =
+        unsafe { SetEntriesInAclW(1, &raw const explicit_access, old_dacl, &raw mut new_dacl) };
+    if status != 0 {
+        return Err(("SetEntriesInAclW", win32_error(status)));
+    }
+    let _new_dacl = unsafe { OwnedLocal::from_raw(new_dacl) };
+    apply_path_dacl(&path_wide, new_dacl, propagate)
+}
+
+/// Apply a constructed DACL to a path.
+///
+/// Propagating updates use `SetNamedSecurityInfoW`. Non-propagating updates
+/// write the DACL with `SetFileSecurityW` so descendants stay unchanged.
+fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> Win32CallResult<()> {
+    if propagate {
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                path.as_ptr().cast_mut(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(("SetNamedSecurityInfoW", win32_error(status)));
+        }
+        return Ok(());
+    }
+
+    let mut descriptor = unsafe { mem::zeroed::<SECURITY_DESCRIPTOR>() };
+    if unsafe {
+        InitializeSecurityDescriptor((&raw mut descriptor).cast(), SECURITY_DESCRIPTOR_REVISION)
+    } == 0
+    {
+        return Err(("InitializeSecurityDescriptor", io::Error::last_os_error()));
+    }
+    if unsafe { SetSecurityDescriptorDacl((&raw mut descriptor).cast(), 1, dacl, 0) } == 0 {
+        return Err(("SetSecurityDescriptorDacl", io::Error::last_os_error()));
+    }
+    if unsafe {
+        SetFileSecurityW(
+            path.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            (&raw mut descriptor).cast(),
+        )
+    } == 0
+    {
+        return Err(("SetFileSecurityW", io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) -> Result<i32> {

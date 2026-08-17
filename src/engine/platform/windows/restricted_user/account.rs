@@ -4,7 +4,7 @@
 //! Local sandbox account provisioning.
 
 use super::state::{self, Account, NetworkMode};
-use super::{ToWideNul, sid_string};
+use super::{ToWideNul, encode_hex, sid_string, win32_error};
 use anyhow::{Context, Result, bail};
 use std::io;
 use std::ptr;
@@ -58,7 +58,7 @@ pub(super) fn remove(name: &str) -> Result<()> {
     if status == NERR_Success || status == 2221 {
         return Ok(());
     }
-    Err(net_error(status))
+    Err(win32_error(status))
         .with_context(|| format!("delete sandbox account {}", display_wide(&name)))
 }
 
@@ -105,19 +105,8 @@ pub(super) fn lookup_sid(name: &str) -> Result<String> {
 
 pub(super) fn random_identifier(bytes: usize) -> Result<String> {
     let mut random = vec![0_u8; bytes];
-    let length = u32::try_from(random.len()).context("random identifier is too long")?;
-    let status = unsafe {
-        BCryptGenRandom(
-            ptr::null_mut(),
-            random.as_mut_ptr(),
-            length,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status < 0 {
-        bail!("BCryptGenRandom failed with NTSTATUS 0x{status:08x}");
-    }
-    Ok(hex(&random))
+    fill_random(&mut random)?;
+    Ok(encode_hex(&random))
 }
 
 fn create(name: &str, password: &str) -> Result<()> {
@@ -145,7 +134,7 @@ fn create(name: &str, password: &str) -> Result<()> {
     };
     password_wide.zeroize();
     if status != NERR_Success {
-        return Err(net_error(status))
+        return Err(win32_error(status))
             .with_context(|| format!("create sandbox account (field {parameter_error})"));
     }
     Ok(())
@@ -154,20 +143,7 @@ fn create(name: &str, password: &str) -> Result<()> {
 fn random_password() -> Result<String> {
     const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*-_+";
     let mut random = vec![0_u8; PASSWORD_BYTES];
-    let length = u32::try_from(random.len()).context("password is too long")?;
-    let status = unsafe {
-        BCryptGenRandom(
-            ptr::null_mut(),
-            random.as_mut_ptr(),
-            length,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status < 0 {
-        return Err(anyhow::anyhow!(
-            "BCryptGenRandom failed with NTSTATUS 0x{status:08x}"
-        ));
-    }
+    fill_random(&mut random)?;
 
     let mut password = String::with_capacity(PASSWORD_BYTES + 4);
     password.push('a');
@@ -181,20 +157,22 @@ fn random_password() -> Result<String> {
     Ok(password)
 }
 
-fn net_error(status: u32) -> io::Error {
-    io::Error::from_raw_os_error(status.cast_signed())
+fn fill_random(buffer: &mut [u8]) -> Result<()> {
+    let length = u32::try_from(buffer.len()).context("random buffer is too long")?;
+    let status = unsafe {
+        BCryptGenRandom(
+            ptr::null_mut(),
+            buffer.as_mut_ptr(),
+            length,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        bail!("BCryptGenRandom failed with NTSTATUS 0x{status:08x}");
+    }
+    Ok(())
 }
 
 fn display_wide(value: &[u16]) -> String {
     String::from_utf16_lossy(&value[..value.len().saturating_sub(1)])
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[(byte >> 4) as usize]));
-        output.push(char::from(HEX[(byte & 0x0f) as usize]));
-    }
-    output
 }

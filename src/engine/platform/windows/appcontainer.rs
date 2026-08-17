@@ -3,9 +3,12 @@
 
 //! Windows sandbox platform using `AppContainer`.
 
-use super::{ToWideNul, own_handle};
+use super::{
+    ToWideNul, is_locked_error, join_command_line, own_handle, path_access_failed,
+    quote_command_text, set_path_access, win32_error, win32_status,
+};
 use crate::engine::config::AppContainerMode;
-use crate::engine::error::{Error as LandstripError, Mechanism};
+use crate::engine::error::{Cause, Error as LandstripError, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use std::collections::hash_map::DefaultHasher;
@@ -13,7 +16,6 @@ use std::ffi::{OsStr, OsString, c_void};
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::iter;
 use std::mem;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
@@ -22,27 +24,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, ERROR_SHARING_VIOLATION,
-    GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
-    WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, GENERIC_READ,
+    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
     NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-    REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_SID,
-    TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ACCESS_MODE, DENY_ACCESS, GRANT_ACCESS, REVOKE_ACCESS,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
-    ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, FreeSid,
-    InitializeSecurityDescriptor, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
-    SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT, SetFileSecurityW, SetSecurityDescriptorDacl,
-    WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
+    CreateWellKnownSid, EqualSid, FreeSid, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+    SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, WELL_KNOWN_SID_TYPE,
+    WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
     WinCapabilityPrivateNetworkClientServerSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -70,50 +68,16 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICA
 
 const INFINITE: u32 = 0xffff_ffff;
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
-const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 /// The `HRESULT` facility that wraps a Win32 error code.
 const FACILITY_WIN32: u32 = 7;
 const LOOPBACK_MUTEX_NAME: &str = "Global\\landstrip-loopback-config";
 const LOOPBACK_PROFILE_PREFIX: &str = "landstrip.loopback.";
 static NEXT_PROFILE_ID: AtomicU64 = AtomicU64::new(0);
-type Win32CallResult<T> = std::result::Result<T, (&'static str, io::Error)>;
-
 const NETWORK_CAPABILITY_SIDS: [WELL_KNOWN_SID_TYPE; 3] = [
     WinCapabilityInternetClientSid,
     WinCapabilityInternetClientServerSid,
     WinCapabilityPrivateNetworkClientServerSid,
 ];
-
-/// A Win32 status code, as reported by the ACL APIs that return one instead of
-/// setting the last error.
-fn win32_error(status: u32) -> io::Error {
-    io::Error::from_raw_os_error(status.cast_signed())
-}
-
-fn path_access_failed(
-    path: &Path,
-    mode: ACCESS_MODE,
-    api: &str,
-    source: &io::Error,
-) -> LandstripError {
-    LandstripError::sandbox_setup(
-        Mechanism::Appcontainer,
-        format!(
-            "{api} failed to {} ACL for {}: {source}",
-            acl_action(mode),
-            path.display()
-        ),
-    )
-}
-
-fn acl_action(mode: ACCESS_MODE) -> &'static str {
-    match mode {
-        GRANT_ACCESS => "grant",
-        DENY_ACCESS => "deny",
-        REVOKE_ACCESS => "revoke",
-        _ => "update",
-    }
-}
 
 /// The Win32 error an `HRESULT` carries, when it carries one at all.
 fn hresult_win32(hr: i32) -> Option<u16> {
@@ -645,11 +609,11 @@ fn grant_path_access(
     inherit: bool,
     propagate: bool,
 ) -> Result<()> {
-    set_path_access(path, sid, access, GRANT_ACCESS, inherit, propagate)
+    set_appcontainer_path_access(path, sid, access, GRANT_ACCESS, inherit, propagate)
 }
 
 fn deny_subtree_access(granted: &mut GrantedAccess, path: &Path, access: u32) -> Result<()> {
-    set_path_access(path, granted.sid, access, DENY_ACCESS, true, true)?;
+    set_appcontainer_path_access(path, granted.sid, access, DENY_ACCESS, true, true)?;
     granted.paths.push(GrantedPath {
         path: path.to_path_buf(),
         propagate: true,
@@ -658,10 +622,10 @@ fn deny_subtree_access(granted: &mut GrantedAccess, path: &Path, access: u32) ->
 }
 
 fn revoke_path_access(path: &Path, sid: PSID, propagate: bool) -> Result<()> {
-    set_path_access(path, sid, 0, REVOKE_ACCESS, false, propagate)
+    set_appcontainer_path_access(path, sid, 0, REVOKE_ACCESS, false, propagate)
 }
 
-fn set_path_access(
+fn set_appcontainer_path_access(
     path: &Path,
     sid: PSID,
     access: u32,
@@ -669,137 +633,31 @@ fn set_path_access(
     inherit: bool,
     propagate: bool,
 ) -> Result<()> {
-    let path_wide = path.to_wide_nul();
-    let mut old_dacl: *mut ACL = ptr::null_mut();
-    let mut security_descriptor = ptr::null_mut();
-
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            path_wide.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &raw mut old_dacl,
-            ptr::null_mut(),
-            &raw mut security_descriptor,
-        )
-    };
-    if status != 0 {
-        // Skipping an inaccessible grant is fail-closed because AppContainer
-        // SIDs have no access by default.
-        if mode == GRANT_ACCESS && is_grant_locked_status(status) {
-            return Ok(());
+    match set_path_access(path, sid, access, mode, inherit, propagate) {
+        Ok(()) => Ok(()),
+        Err(("GetNamedSecurityInfoW", error))
+            if mode == GRANT_ACCESS && is_locked_error(&error) =>
+        {
+            // Skipping an inaccessible grant is fail-closed because AppContainer
+            // SIDs have no access by default.
+            Ok(())
         }
-        return Err(
-            path_access_failed(path, mode, "GetNamedSecurityInfoW", &win32_error(status)).into(),
-        );
-    }
-
-    let explicit_access = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: access,
-        grfAccessMode: mode,
-        grfInheritance: if inherit {
-            SUB_CONTAINERS_AND_OBJECTS_INHERIT
-        } else {
-            0
-        },
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: ptr::null_mut(),
-            MultipleTrusteeOperation: 0,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.cast(),
-        },
-    };
-    let mut new_dacl: *mut ACL = ptr::null_mut();
-
-    let status =
-        unsafe { SetEntriesInAclW(1, &raw const explicit_access, old_dacl, &raw mut new_dacl) };
-    if status != 0 {
-        unsafe { LocalFree(security_descriptor) };
-        return Err(
-            path_access_failed(path, mode, "SetEntriesInAclW", &win32_error(status)).into(),
-        );
-    }
-
-    let result = apply_path_dacl(&path_wide, new_dacl, propagate);
-    unsafe {
-        LocalFree(new_dacl.cast());
-        LocalFree(security_descriptor);
-    }
-    // A descendant skipped during propagation remains inaccessible.
-    if mode == GRANT_ACCESS
-        && result
-            .as_ref()
-            .err()
-            .is_some_and(|(_, error)| is_grant_locked_error(error))
-    {
-        return Ok(());
-    }
-    if let Err((api, error)) = result {
-        return Err(path_access_failed(path, mode, api, &error).into());
-    }
-
-    Ok(())
-}
-
-/// Return whether an ACL grant failure leaves the path inaccessible.
-///
-/// Deny and revoke operations must still fail to avoid retaining access.
-fn is_grant_locked_status(status: u32) -> bool {
-    status == ERROR_SHARING_VIOLATION || status == ERROR_ACCESS_DENIED
-}
-
-fn is_grant_locked_error(error: &io::Error) -> bool {
-    error
-        .raw_os_error()
-        .and_then(|code| u32::try_from(code).ok())
-        .is_some_and(is_grant_locked_status)
-}
-
-fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> Win32CallResult<()> {
-    if propagate {
-        let status = unsafe {
-            SetNamedSecurityInfoW(
-                path.as_ptr().cast_mut(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                dacl,
-                ptr::null_mut(),
-            )
-        };
-        if status != 0 {
-            return Err(("SetNamedSecurityInfoW", win32_error(status)));
-        }
-        return Ok(());
-    }
-
-    let mut descriptor = unsafe { mem::zeroed::<SECURITY_DESCRIPTOR>() };
-    let initialized = unsafe {
-        InitializeSecurityDescriptor((&raw mut descriptor).cast(), SECURITY_DESCRIPTOR_REVISION)
-    };
-    if initialized == 0 {
-        return Err(("InitializeSecurityDescriptor", io::Error::last_os_error()));
-    }
-    let dacl_set = unsafe { SetSecurityDescriptorDacl((&raw mut descriptor).cast(), 1, dacl, 0) };
-    if dacl_set == 0 {
-        return Err(("SetSecurityDescriptorDacl", io::Error::last_os_error()));
-    }
-    let applied = unsafe {
-        SetFileSecurityW(
-            path.as_ptr(),
-            DACL_SECURITY_INFORMATION,
-            (&raw mut descriptor).cast(),
+        Err(("SetEntriesInAclW", error)) => Err(path_access_failed(
+            Mechanism::Appcontainer,
+            path,
+            mode,
+            "SetEntriesInAclW",
+            &error,
         )
-    };
-    if applied == 0 {
-        return Err(("SetFileSecurityW", io::Error::last_os_error()));
+        .into()),
+        Err((_, error)) if mode == GRANT_ACCESS && is_locked_error(&error) => {
+            // A descendant skipped during propagation remains inaccessible.
+            Ok(())
+        }
+        Err((api, error)) => {
+            Err(path_access_failed(Mechanism::Appcontainer, path, mode, api, &error).into())
+        }
     }
-
-    Ok(())
 }
 
 struct SandboxJob {
@@ -1140,10 +998,7 @@ fn create_process(
 }
 
 fn is_access_denied(error: &io::Error) -> bool {
-    error
-        .raw_os_error()
-        .and_then(|code| u32::try_from(code).ok())
-        == Some(ERROR_ACCESS_DENIED)
+    win32_status(error) == Some(ERROR_ACCESS_DENIED)
 }
 
 fn supervise_process(process_info: PROCESS_INFORMATION) -> Result<u32> {
@@ -1298,55 +1153,15 @@ impl NetworkCapabilities {
 }
 
 fn command_line(tool: &OsStr, args: &[OsString]) -> Result<String> {
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(quote_command_arg(tool).map_err(|message| tool_encoding_error(tool, message))?);
-    for arg in args {
-        parts.push(quote_command_arg(arg).map_err(|message| tool_encoding_error(tool, message))?);
-    }
-    Ok(parts.join(" "))
+    join_command_line(tool, args, |arg| {
+        quote_command_text(&arg.to_string_lossy())
+            .map_err(|message| tool_encoding_error(tool, message))
+    })
+    .map_err(Into::into)
 }
 
 fn tool_encoding_error(tool: &OsStr, message: &'static str) -> LandstripError {
     LandstripError::launch(tool, message)
-}
-
-fn quote_command_arg(arg: &OsStr) -> std::result::Result<String, &'static str> {
-    let arg = arg.to_string_lossy();
-    if arg.contains('\0') {
-        return Err("command line contains an interior NUL byte");
-    }
-
-    if arg.is_empty() {
-        return Ok("\"\"".to_owned());
-    }
-
-    if !arg
-        .bytes()
-        .any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\"'))
-    {
-        return Ok(arg.into_owned());
-    }
-
-    let mut quoted = String::from("\"");
-    let mut backslashes = 0;
-    for ch in arg.chars() {
-        match ch {
-            '\\' => backslashes += 1,
-            '"' => {
-                quoted.extend(iter::repeat_n('\\', backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                quoted.extend(iter::repeat_n('\\', backslashes));
-                quoted.push(ch);
-                backslashes = 0;
-            }
-        }
-    }
-    quoted.extend(iter::repeat_n('\\', backslashes * 2));
-    quoted.push('"');
-    Ok(quoted)
 }
 
 fn hresult_value(hr: i32) -> u32 {

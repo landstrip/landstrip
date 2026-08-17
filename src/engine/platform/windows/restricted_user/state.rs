@@ -4,7 +4,8 @@
 //! Persistent installation state and DPAPI-protected account credentials.
 
 use super::{
-    OwnedLocal, OwnedSecurityDescriptor, ToWideNul, current_process_token, sid_string, token_user,
+    OwnedLocal, OwnedSecurityDescriptor, ToWideNul, current_process_token, decode_hex, encode_hex,
+    sid_string, token_user, win32_error,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -248,7 +249,9 @@ pub(super) fn protect_password(password: &str) -> Result<String> {
 }
 
 pub(super) fn unprotect_password(protected: &str) -> Result<SecretWide> {
-    let mut protected = decode_hex(protected)?;
+    let mut protected = decode_hex(protected)
+        .map_err(anyhow::Error::msg)
+        .context("protected password is not valid hexadecimal")?;
     let protected_len = u32::try_from(protected.len()).context("protected password is too long")?;
     let input = CRYPT_INTEGER_BLOB {
         cbData: protected_len,
@@ -317,8 +320,7 @@ pub(super) fn protect_path(path: &Path) -> Result<()> {
         )
     };
     if status != 0 {
-        return Err(io::Error::from_raw_os_error(status.cast_signed()))
-            .context("protect restricted-user state DACL");
+        return Err(win32_error(status)).context("protect restricted-user state DACL");
     }
     Ok(())
 }
@@ -327,38 +329,4 @@ fn current_user_sid_string() -> Result<String> {
     let token = current_process_token(TOKEN_QUERY).context("open current process token")?;
     let user = token_user(token.as_raw_handle()).context("query current user SID")?;
     unsafe { sid_string(user.User.Sid) }.context("format current user SID")
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[(byte >> 4) as usize]));
-        output.push(char::from(HEX[(byte & 0x0f) as usize]));
-    }
-    output
-}
-
-fn decode_hex(value: &str) -> Result<Vec<u8>> {
-    if !value.len().is_multiple_of(2) {
-        bail!("protected password has an invalid length");
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = hex_digit(pair[0])?;
-            let low = hex_digit(pair[1])?;
-            Ok((high << 4) | low)
-        })
-        .collect()
-}
-
-fn hex_digit(value: u8) -> Result<u8> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => bail!("protected password contains non-hexadecimal data"),
-    }
 }

@@ -4,12 +4,11 @@
 //! Elevated broker that starts a worker under a leased local account.
 
 use super::state::{self, Account};
-use super::{ToWideNul, own_handle};
+use super::{ToWideNul, own_handle, quote_command_arg};
 use crate::engine::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result};
 use std::ffi::{OsStr, c_void};
 use std::io;
-use std::iter;
 use std::mem;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::Path;
@@ -151,24 +150,5 @@ fn quote(value: &OsStr) -> Result<String> {
         )
         .into());
     }
-    let mut quoted = String::from("\"");
-    let mut backslashes = 0;
-    for ch in value.chars() {
-        match ch {
-            '\\' => backslashes += 1,
-            '"' => {
-                quoted.extend(iter::repeat_n('\\', backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                quoted.extend(iter::repeat_n('\\', backslashes));
-                quoted.push(ch);
-                backslashes = 0;
-            }
-        }
-    }
-    quoted.extend(iter::repeat_n('\\', backslashes * 2));
-    quoted.push('"');
-    Ok(quoted)
+    Ok(quote_command_arg(value))
 }

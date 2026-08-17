@@ -3,34 +3,23 @@
 
 //! Temporary filesystem grants for a leased sandbox account.
 
-use super::{OwnedLocal, ToWideNul};
+use super::{
+    OwnedLocal, ToWideNul, is_locked_error, is_missing_error, path_access_failed, set_path_access,
+};
 use crate::engine::error::{Error as LandstripError, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::mem;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SHARING_VIOLATION,
-    LocalFree,
-};
 use windows_sys::Win32::Security::Authorization::{
-    ACCESS_MODE, ConvertStringSidToSidW, DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS,
-    GetNamedSecurityInfoW, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW,
-    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ACCESS_MODE, ConvertStringSidToSidW, DENY_ACCESS, GRANT_ACCESS, REVOKE_ACCESS,
 };
-use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, InitializeSecurityDescriptor, PSID, SECURITY_DESCRIPTOR,
-    SUB_CONTAINERS_AND_OBJECTS_INHERIT, SetFileSecurityW, SetSecurityDescriptorDacl,
-};
+use windows_sys::Win32::Security::PSID;
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
-
-const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
-type Win32CallResult<T> = std::result::Result<T, (&'static str, io::Error)>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,7 +130,7 @@ impl GrantPlan {
             entries: Vec::with_capacity(self.entries.len()),
         };
         for entry in &self.entries {
-            match set_path_access(
+            match set_restricted_path_access(
                 &entry.path,
                 sid.as_psid(),
                 entry.access,
@@ -154,7 +143,7 @@ impl GrantPlan {
                 Ok(false) => {}
                 Err(error) => {
                     for applied_entry in applied.entries.iter().rev() {
-                        let _ = set_path_access(
+                        let _ = set_restricted_path_access(
                             &applied_entry.path,
                             sid.as_psid(),
                             0,
@@ -175,7 +164,7 @@ impl GrantPlan {
         let sid = OwnedSid::parse(sid)?;
         let mut first_error = None;
         for entry in self.entries.iter().rev() {
-            let error = set_path_access(
+            let error = set_restricted_path_access(
                 &entry.path,
                 sid.as_psid(),
                 0,
@@ -217,7 +206,7 @@ impl OwnedSid {
     }
 }
 
-fn set_path_access(
+fn set_restricted_path_access(
     path: &Path,
     sid: PSID,
     access: u32,
@@ -226,169 +215,33 @@ fn set_path_access(
     propagate: bool,
     ignore_missing: bool,
 ) -> Result<bool> {
-    let path_wide = path.to_wide_nul();
-    let mut old_dacl: *mut ACL = ptr::null_mut();
-    let mut security_descriptor = ptr::null_mut();
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            path_wide.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &raw mut old_dacl,
-            ptr::null_mut(),
-            &raw mut security_descriptor,
+    match set_path_access(path, sid, access, mode, inherit, propagate) {
+        Ok(()) => Ok(true),
+        Err(("GetNamedSecurityInfoW", error))
+            if (ignore_missing && is_missing_error(&error))
+                || (mode == GRANT_ACCESS && is_locked_error(&error)) =>
+        {
+            Ok(false)
+        }
+        Err(("SetEntriesInAclW", error)) => Err(path_access_failed(
+            Mechanism::Windowsuser,
+            path,
+            mode,
+            "SetEntriesInAclW",
+            &error,
         )
-    };
-    if status != 0 {
-        if should_skip_before_apply(mode, status, ignore_missing) {
-            return Ok(false);
+        .into()),
+        Err((api, error)) => {
+            if ignore_missing && is_missing_error(&error) {
+                return Ok(false);
+            }
+            // A failed non-propagating grant did not alter descendants and leaves
+            // the target inaccessible. Propagating failures may be partial, so they
+            // remain hard errors and the full journal is retained for recovery.
+            if mode == GRANT_ACCESS && !propagate && is_locked_error(&error) {
+                return Ok(false);
+            }
+            Err(path_access_failed(Mechanism::Windowsuser, path, mode, api, &error).into())
         }
-        return Err(
-            path_access_failed(path, mode, "GetNamedSecurityInfoW", &win32_error(status)).into(),
-        );
     }
-
-    let explicit_access = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: access,
-        grfAccessMode: mode,
-        grfInheritance: if inherit {
-            SUB_CONTAINERS_AND_OBJECTS_INHERIT
-        } else {
-            0
-        },
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: ptr::null_mut(),
-            MultipleTrusteeOperation: 0,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.cast(),
-        },
-    };
-    let mut new_dacl: *mut ACL = ptr::null_mut();
-    let status =
-        unsafe { SetEntriesInAclW(1, &raw const explicit_access, old_dacl, &raw mut new_dacl) };
-    if status != 0 {
-        unsafe { LocalFree(security_descriptor) };
-        return Err(
-            path_access_failed(path, mode, "SetEntriesInAclW", &win32_error(status)).into(),
-        );
-    }
-
-    let result = apply_path_dacl(&path_wide, new_dacl, propagate);
-    unsafe {
-        LocalFree(new_dacl.cast());
-        LocalFree(security_descriptor);
-    }
-    if let Err((api, error)) = result {
-        if ignore_missing && is_missing_error(&error) {
-            return Ok(false);
-        }
-        // A failed non-propagating grant did not alter descendants and leaves
-        // the target inaccessible. Propagating failures may be partial, so they
-        // remain hard errors and the full journal is retained for recovery.
-        if mode == GRANT_ACCESS && !propagate && is_locked_error(&error) {
-            return Ok(false);
-        }
-        return Err(path_access_failed(path, mode, api, &error).into());
-    }
-    Ok(true)
-}
-
-fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> Win32CallResult<()> {
-    if propagate {
-        let status = unsafe {
-            SetNamedSecurityInfoW(
-                path.as_ptr().cast_mut(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                dacl,
-                ptr::null_mut(),
-            )
-        };
-        if status != 0 {
-            return Err(("SetNamedSecurityInfoW", win32_error(status)));
-        }
-        return Ok(());
-    }
-
-    let mut descriptor = unsafe { mem::zeroed::<SECURITY_DESCRIPTOR>() };
-    if unsafe {
-        InitializeSecurityDescriptor((&raw mut descriptor).cast(), SECURITY_DESCRIPTOR_REVISION)
-    } == 0
-    {
-        return Err(("InitializeSecurityDescriptor", io::Error::last_os_error()));
-    }
-    if unsafe { SetSecurityDescriptorDacl((&raw mut descriptor).cast(), 1, dacl, 0) } == 0 {
-        return Err(("SetSecurityDescriptorDacl", io::Error::last_os_error()));
-    }
-    if unsafe {
-        SetFileSecurityW(
-            path.as_ptr(),
-            DACL_SECURITY_INFORMATION,
-            (&raw mut descriptor).cast(),
-        )
-    } == 0
-    {
-        return Err(("SetFileSecurityW", io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-fn path_access_failed(
-    path: &Path,
-    mode: ACCESS_MODE,
-    api: &str,
-    source: &io::Error,
-) -> LandstripError {
-    LandstripError::sandbox_setup(
-        Mechanism::Windowsuser,
-        format!(
-            "{api} failed to {} ACL for {}: {source}",
-            acl_action(mode),
-            path.display()
-        ),
-    )
-}
-
-fn acl_action(mode: ACCESS_MODE) -> &'static str {
-    match mode {
-        GRANT_ACCESS => "grant",
-        DENY_ACCESS => "deny",
-        REVOKE_ACCESS => "revoke",
-        _ => "update",
-    }
-}
-
-fn win32_error(status: u32) -> io::Error {
-    io::Error::from_raw_os_error(status.cast_signed())
-}
-
-fn is_missing_status(status: u32) -> bool {
-    status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND
-}
-
-fn is_missing_error(error: &io::Error) -> bool {
-    error
-        .raw_os_error()
-        .is_some_and(|status| is_missing_status(status.cast_unsigned()))
-}
-
-/// Return whether an ACL target is inaccessible.
-fn is_locked_status(status: u32) -> bool {
-    status == ERROR_SHARING_VIOLATION || status == ERROR_ACCESS_DENIED
-}
-
-fn is_locked_error(error: &io::Error) -> bool {
-    error
-        .raw_os_error()
-        .is_some_and(|status| is_locked_status(status.cast_unsigned()))
-}
-
-fn should_skip_before_apply(mode: ACCESS_MODE, status: u32, ignore_missing: bool) -> bool {
-    (ignore_missing && is_missing_status(status))
-        || (mode == GRANT_ACCESS && is_locked_status(status))
 }
