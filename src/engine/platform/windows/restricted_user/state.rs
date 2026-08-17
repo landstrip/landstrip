@@ -3,35 +3,33 @@
 
 //! Persistent installation state and DPAPI-protected account credentials.
 
+use super::{
+    OwnedLocal, OwnedSecurityDescriptor, ToWideNul, current_process_token, sid_string, token_user,
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::ffi::{OsStr, c_void};
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, LocalFree};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT,
-    SetNamedSecurityInfoW,
-};
+use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+    TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use zeroize::Zeroize;
 
 pub(super) const INSTALLATION_VERSION: u32 = 1;
-const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 const STATE_DIRECTORY: &str = "Landstrip/windows-restricted-user-v1";
 const STATE_FILE: &str = "state.json";
 
@@ -171,8 +169,8 @@ pub(super) fn save(installation: &Installation) -> Result<()> {
 }
 
 pub(super) fn replace_file(temporary: &Path, path: &Path) -> Result<()> {
-    let temporary_wide = wide_string(temporary.as_os_str());
-    let path_wide = wide_string(path.as_os_str());
+    let temporary_wide = temporary.to_wide_nul();
+    let path_wide = path.to_wide_nul();
     if unsafe {
         MoveFileExW(
             temporary_wide.as_ptr(),
@@ -243,12 +241,9 @@ pub(super) fn protect_password(password: &str) -> Result<String> {
         return Err(io::Error::last_os_error()).context("protect sandbox account credential");
     }
 
-    let protected = unsafe {
-        let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
-        let encoded = encode_hex(bytes);
-        LocalFree(output.pbData.cast::<c_void>());
-        encoded
-    };
+    let size = output.cbData as usize;
+    let output = unsafe { OwnedLocal::from_raw(output.pbData) };
+    let protected = unsafe { encode_hex(std::slice::from_raw_parts(output.as_ptr(), size)) };
     Ok(protected)
 }
 
@@ -276,12 +271,9 @@ pub(super) fn unprotect_password(protected: &str) -> Result<SecretWide> {
         return Err(io::Error::last_os_error()).context("unprotect sandbox account credential");
     }
 
-    let mut clear = unsafe {
-        let bytes = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
-        let clear = bytes.to_vec();
-        LocalFree(output.pbData.cast::<c_void>());
-        clear
-    };
+    let size = output.cbData as usize;
+    let output = unsafe { OwnedLocal::from_raw(output.pbData) };
+    let mut clear = unsafe { std::slice::from_raw_parts(output.as_ptr(), size).to_vec() };
     let password = String::from_utf8(clear.clone()).context("sandbox password is not UTF-8")?;
     clear.zeroize();
     let mut wide = OsStr::new(&password).encode_wide().collect::<Vec<_>>();
@@ -294,37 +286,25 @@ pub(super) fn unprotect_password(protected: &str) -> Result<SecretWide> {
 pub(super) fn protect_path(path: &Path) -> Result<()> {
     let owner_sid = current_user_sid_string()?;
     let descriptor = format!("D:P(A;;FA;;;SY)(A;;FA;;;{owner_sid})");
-    let descriptor = wide_string(OsStr::new(&descriptor));
-    let mut security_descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    let converted = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            descriptor.as_ptr(),
-            SECURITY_DESCRIPTOR_REVISION,
-            &raw mut security_descriptor,
-            ptr::null_mut(),
-        )
-    };
-    if converted == 0 {
-        return Err(io::Error::last_os_error()).context("build restricted-user state DACL");
-    }
+    let descriptor = OwnedSecurityDescriptor::from_sddl(&descriptor)
+        .context("build restricted-user state DACL")?;
 
     let mut dacl: *mut ACL = ptr::null_mut();
     let mut dacl_present: i32 = 0;
     let mut dacl_defaulted: i32 = 0;
     if unsafe {
         GetSecurityDescriptorDacl(
-            security_descriptor,
+            descriptor.as_ptr(),
             &raw mut dacl_present,
             &raw mut dacl,
             &raw mut dacl_defaulted,
         )
     } == 0
     {
-        unsafe { LocalFree(security_descriptor.cast::<c_void>()) };
         return Err(io::Error::last_os_error()).context("get restricted-user state DACL");
     }
 
-    let path = wide_string(path.as_os_str());
+    let path = path.to_wide_nul();
     let status = unsafe {
         SetNamedSecurityInfoW(
             path.as_ptr().cast_mut(),
@@ -336,56 +316,17 @@ pub(super) fn protect_path(path: &Path) -> Result<()> {
             ptr::null_mut(),
         )
     };
-    unsafe {
-        LocalFree(security_descriptor.cast::<c_void>());
-    }
     if status != 0 {
         return Err(io::Error::from_raw_os_error(status.cast_signed()))
-        .context("protect restricted-user state DACL");
+            .context("protect restricted-user state DACL");
     }
     Ok(())
 }
 
 fn current_user_sid_string() -> Result<String> {
-    let mut token: HANDLE = ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(io::Error::last_os_error()).context("open current process token");
-    }
-    let token = Handle(token);
-
-    let mut required = 0;
-    unsafe {
-        GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &raw mut required);
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER.cast_signed()) {
-        return Err(error).context("query current user SID size");
-    }
-    let word_size = std::mem::size_of::<usize>();
-    let word_count = usize::try_from(required)?.div_ceil(word_size);
-    let mut buffer = vec![0_usize; word_count];
-    if unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            required,
-            &raw mut required,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error()).context("query current user SID");
-    }
-    let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
-    let mut sid_string = ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &raw mut sid_string) } == 0 {
-        return Err(io::Error::last_os_error()).context("format current user SID");
-    }
-    let value = unsafe { wide_ptr_to_string(sid_string) };
-    unsafe {
-        LocalFree(sid_string.cast::<c_void>());
-    }
-    value.context("current user SID is not valid UTF-16")
+    let token = current_process_token(TOKEN_QUERY).context("open current process token")?;
+    let user = token_user(token.as_raw_handle()).context("query current user SID")?;
+    unsafe { sid_string(user.User.Sid) }.context("format current user SID")
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -419,32 +360,5 @@ fn hex_digit(value: u8) -> Result<u8> {
         b'a'..=b'f' => Ok(value - b'a' + 10),
         b'A'..=b'F' => Ok(value - b'A' + 10),
         _ => bail!("protected password contains non-hexadecimal data"),
-    }
-}
-
-fn wide_string(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(Some(0)).collect()
-}
-
-unsafe fn wide_ptr_to_string(value: *const u16) -> Option<String> {
-    if value.is_null() {
-        return None;
-    }
-    let mut length = 0;
-    while unsafe { *value.add(length) } != 0 {
-        length += 1;
-    }
-    String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) }).ok()
-}
-
-struct Handle(HANDLE);
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
     }
 }

@@ -12,6 +12,11 @@ mod state;
 mod wfp;
 mod worker;
 
+pub(super) use super::{
+    OwnedLocal, OwnedSecurityDescriptor, ToWideNul, current_process_token, own_handle, sid_string,
+    token_user,
+};
+
 use crate::engine::error::{Error, Mechanism};
 use crate::engine::policy::AccessPolicy;
 use anyhow::{Context, Result};

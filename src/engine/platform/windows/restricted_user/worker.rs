@@ -4,25 +4,26 @@
 //! Restricted-account worker process.
 
 use super::state;
+use super::{
+    OwnedSecurityDescriptor, ToWideNul, current_process_token, own_handle, sid_string, token_user,
+};
 use crate::engine::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::ffi::{OsStr, OsString, c_void};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::iter;
 use std::mem;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree, WAIT_FAILED};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-};
+use windows_sys::Win32::Foundation::WAIT_FAILED;
 use windows_sys::Win32::Security::{
-    CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE, GetTokenInformation,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetKernelObjectSecurity,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
+    PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity, TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -30,12 +31,11 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
-    GetCurrentThread, GetExitCodeProcess, INFINITE, OpenProcessToken, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
+    GetCurrentThread, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
 };
 
 const REQUEST_VERSION: u32 = 2;
-const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,8 +109,8 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
     let restricted_token = create_restricted_token()?;
 
     let command_line = command_line(tool, args)?;
-    let mut command_line = wide(&command_line);
-    let cwd = cwd.encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let mut command_line = command_line.to_wide_nul();
+    let cwd = cwd.to_wide_nul();
     validate_environment(environment)?;
     let mut startup = unsafe { mem::zeroed::<STARTUPINFOW>() };
     startup.cb = u32::try_from(mem::size_of::<STARTUPINFOW>())?;
@@ -121,7 +121,7 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
     let mut process_info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
     let ok = unsafe {
         CreateProcessAsUserW(
-            restricted_token.0,
+            restricted_token.as_raw_handle(),
             ptr::null(),
             command_line.as_mut_ptr(),
             ptr::null(),
@@ -137,27 +137,27 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
     if ok == 0 {
         return Err(LandstripError::launch(tool, io::Error::last_os_error()).into());
     }
-    let process = Handle(process_info.hProcess);
-    let thread = Handle(process_info.hThread);
-    if unsafe { ResumeThread(thread.0) } == u32::MAX {
+    let process = unsafe { own_handle(process_info.hProcess) };
+    let thread = unsafe { own_handle(process_info.hThread) };
+    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
         return Err(LandstripError::sandbox_setup(
             Mechanism::Windowsuser,
             format!("ResumeThread: {}", io::Error::last_os_error()),
         )
         .into());
     }
-    let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
+    let wait = unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
     if wait == WAIT_FAILED {
         return Err(LandstripError::supervise(io::Error::last_os_error()).into());
     }
     let mut exit_code = 0;
-    if unsafe { GetExitCodeProcess(process.0, &raw mut exit_code) } == 0 {
+    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &raw mut exit_code) } == 0 {
         return Err(LandstripError::supervise(io::Error::last_os_error()).into());
     }
     Ok(exit_code)
 }
 
-fn create_restricted_token() -> Result<Handle> {
+fn create_restricted_token() -> Result<OwnedHandle> {
     // Strip all privileges from the worker's own primary token. landstrip's
     // filesystem write boundary is the dedicated SAM user's DACL (apply() in
     // access.rs), not the token's restricting-SID list: the DACL grants the
@@ -166,11 +166,11 @@ fn create_restricted_token() -> Result<Handle> {
     // the privilege-stripping, which defends the DACL against
     // SeBackupPrivilege / SeRestorePrivilege bypass. An empty restricting-SID
     // list (count 0, pointer NULL) is the textbook-valid minimal call.
-    let process_token = current_process_token()?;
+    let process_token = worker_process_token()?;
     let mut restricted_token = ptr::null_mut();
     let ok = unsafe {
         CreateRestrictedToken(
-            process_token.0,
+            process_token.as_raw_handle(),
             DISABLE_MAX_PRIVILEGE,
             0,
             ptr::null(),
@@ -188,59 +188,40 @@ fn create_restricted_token() -> Result<Handle> {
         )
         .into());
     }
-    Ok(Handle(restricted_token))
+    Ok(unsafe { own_handle(restricted_token) })
 }
-fn harden_worker_objects() -> Result<()> {
-    let descriptor = wide("D:P(A;;GA;;;SY)");
-    let mut security_descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            descriptor.as_ptr(),
-            SECURITY_DESCRIPTOR_REVISION,
-            &raw mut security_descriptor,
-            ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(LandstripError::sandbox_setup(
-            Mechanism::Windowsuser,
-            format!(
-                "ConvertStringSecurityDescriptorToSecurityDescriptorW: {}",
-                io::Error::last_os_error()
-            ),
-        )
-        .into());
-    }
 
-    let result = (|| {
-        for (handle, object) in [
-            (unsafe { GetCurrentProcess() }, "worker process"),
-            (unsafe { GetCurrentThread() }, "worker thread"),
-        ] {
-            if unsafe {
-                SetKernelObjectSecurity(
-                    handle,
-                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                    security_descriptor,
-                )
-            } == 0
-            {
-                return Err(LandstripError::sandbox_setup(
-                    Mechanism::Windowsuser,
-                    format!(
-                        "SetKernelObjectSecurity ({object}): {}",
-                        io::Error::last_os_error()
-                    ),
-                )
-                .into());
-            }
+fn harden_worker_objects() -> Result<()> {
+    let descriptor = OwnedSecurityDescriptor::from_sddl("D:P(A;;GA;;;SY)").map_err(|source| {
+        LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!("ConvertStringSecurityDescriptorToSecurityDescriptorW: {source}"),
+        )
+    })?;
+
+    for (handle, object) in [
+        (unsafe { GetCurrentProcess() }, "worker process"),
+        (unsafe { GetCurrentThread() }, "worker thread"),
+    ] {
+        if unsafe {
+            SetKernelObjectSecurity(
+                handle,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor.as_ptr(),
+            )
+        } == 0
+        {
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                format!(
+                    "SetKernelObjectSecurity ({object}): {}",
+                    io::Error::last_os_error()
+                ),
+            )
+            .into());
         }
-        Ok(())
-    })();
-    unsafe {
-        LocalFree(security_descriptor.cast::<c_void>());
     }
-    result
+    Ok(())
 }
 
 fn current_environment() -> Result<Vec<u16>> {
@@ -278,102 +259,34 @@ fn validate_environment(environment: &[u16]) -> Result<()> {
     Ok(())
 }
 
-fn current_process_token() -> Result<Handle> {
-    let mut token = ptr::null_mut();
-    if unsafe {
-        OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY,
-            &raw mut token,
-        )
-    } == 0
-    {
-        return Err(LandstripError::sandbox_setup(
+fn worker_process_token() -> Result<OwnedHandle> {
+    current_process_token(TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY).map_err(|source| {
+        LandstripError::sandbox_setup(
             Mechanism::Windowsuser,
-            format!("OpenProcessToken: {}", io::Error::last_os_error()),
+            format!("OpenProcessToken: {source}"),
         )
-        .into());
-    }
-    Ok(Handle(token))
-}
-
-fn token_user(token: HANDLE) -> Result<TokenUserBuffer> {
-    let mut size = 0;
-    unsafe {
-        GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &raw mut size);
-    }
-    if size == 0 {
-        return Err(LandstripError::sandbox_setup(
-            Mechanism::Windowsuser,
-            format!("GetTokenInformation (probe): {}", io::Error::last_os_error()),
-        )
-        .into());
-    }
-    let word_size = mem::size_of::<usize>();
-    let word_count = usize::try_from(size)?.div_ceil(word_size);
-    let mut words = vec![0_usize; word_count];
-    if unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            words.as_mut_ptr().cast(),
-            size,
-            &raw mut size,
-        )
-    } == 0
-    {
-        return Err(LandstripError::sandbox_setup(
-            Mechanism::Windowsuser,
-            format!("GetTokenInformation: {}", io::Error::last_os_error()),
-        )
-        .into());
-    }
-    Ok(TokenUserBuffer { words })
-}
-
-struct TokenUserBuffer {
-    words: Vec<usize>,
-}
-
-impl std::ops::Deref for TokenUserBuffer {
-    type Target = TOKEN_USER;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.words.as_ptr().cast() }
-    }
+        .into()
+    })
 }
 
 fn verify_current_sid(expected: &str) -> Result<()> {
-    let token = current_process_token()?;
-    let user = token_user(token.0)?;
-    let mut sid_string = ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &raw mut sid_string) } == 0 {
-        return Err(LandstripError::sandbox_setup(
+    let token = worker_process_token()?;
+    let user = token_user(token.as_raw_handle()).map_err(|source| {
+        LandstripError::sandbox_setup(
             Mechanism::Windowsuser,
-            format!("ConvertSidToStringSidW: {}", io::Error::last_os_error()),
+            format!("GetTokenInformation: {source}"),
         )
-        .into());
-    }
-    let actual = wide_ptr_to_string(sid_string);
-    unsafe {
-        LocalFree(sid_string.cast::<c_void>());
-    }
+    })?;
+    let actual = unsafe { sid_string(user.User.Sid) }.map_err(|source| {
+        LandstripError::sandbox_setup(
+            Mechanism::Windowsuser,
+            format!("ConvertSidToStringSidW: {source}"),
+        )
+    })?;
     if !actual.eq_ignore_ascii_case(expected) {
         bail!("restricted-user worker account SID does not match request");
     }
     Ok(())
-}
-
-struct Handle(HANDLE);
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
 }
 
 fn command_line(tool: &OsStr, args: &[OsString]) -> Result<String> {
@@ -422,16 +335,3 @@ fn quote_command_arg(arg: &OsStr) -> Result<String> {
     quoted.push('"');
     Ok(quoted)
 }
-
-fn wide(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(Some(0)).collect()
-}
-
-fn wide_ptr_to_string(value: *const u16) -> String {
-    let mut length = 0;
-    while unsafe { *value.add(length) } != 0 {
-        length += 1;
-    }
-    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(value, length) })
-}
-

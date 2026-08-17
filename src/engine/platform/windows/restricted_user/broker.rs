@@ -4,16 +4,17 @@
 //! Elevated broker that starts a worker under a leased local account.
 
 use super::state::{self, Account};
+use super::{ToWideNul, own_handle};
 use crate::engine::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result};
 use std::ffi::{OsStr, c_void};
 use std::io;
 use std::iter;
 use std::mem;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
+use windows_sys::Win32::Foundation::WAIT_FAILED;
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
@@ -35,18 +36,18 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
         )
         .into());
     }
-    let executable = wide_os(runner_path.as_os_str());
+    let executable = runner_path.to_wide_nul();
     let command_line = format!(
         "{} {}",
         quote(runner_path.as_os_str())?,
         quote(request_path.as_os_str())?
     );
-    let mut command_line = wide(&command_line);
-    let username = wide(&account.name);
-    let domain = wide("");
+    let mut command_line = command_line.to_wide_nul();
+    let username = account.name.to_wide_nul();
+    let domain = "".to_wide_nul();
     let password = state::unprotect_password(&account.encrypted_password)?;
     let current_directory = std::env::current_dir()?;
-    let current_directory = wide_os(current_directory.as_os_str());
+    let current_directory = current_directory.to_wide_nul();
     let job = create_job()?;
 
     let mut startup = unsafe { mem::zeroed::<STARTUPINFOW>() };
@@ -78,12 +79,12 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
         )
         .into());
     }
-    let process = Handle(process_info.hProcess);
-    let thread = Handle(process_info.hThread);
-    if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0 {
+    let process = unsafe { own_handle(process_info.hProcess) };
+    let thread = unsafe { own_handle(process_info.hThread) };
+    if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) } == 0 {
         let error = io::Error::last_os_error();
         unsafe {
-            TerminateProcess(process.0, 1);
+            TerminateProcess(process.as_raw_handle(), 1);
         }
         return Err(LandstripError::sandbox_setup(
             Mechanism::Windowsuser,
@@ -91,25 +92,25 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
         )
         .into());
     }
-    if unsafe { ResumeThread(thread.0) } == u32::MAX {
+    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
         return Err(LandstripError::sandbox_setup(
             Mechanism::Windowsuser,
             format!("ResumeThread: {}", io::Error::last_os_error()),
         )
         .into());
     }
-    let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
+    let wait = unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
     if wait == WAIT_FAILED {
         return Err(LandstripError::supervise(io::Error::last_os_error()).into());
     }
     let mut exit_code = 0;
-    if unsafe { GetExitCodeProcess(process.0, &raw mut exit_code) } == 0 {
+    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &raw mut exit_code) } == 0 {
         return Err(LandstripError::supervise(io::Error::last_os_error()).into());
     }
     Ok(exit_code)
 }
 
-fn create_job() -> Result<Handle> {
+fn create_job() -> Result<OwnedHandle> {
     let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
     if job.is_null() {
         return Err(LandstripError::sandbox_setup(
@@ -118,12 +119,12 @@ fn create_job() -> Result<Handle> {
         )
         .into());
     }
-    let job = Handle(job);
+    let job = unsafe { own_handle(job) };
     let mut limits = unsafe { mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     if unsafe {
         SetInformationJobObject(
-            job.0,
+            job.as_raw_handle(),
             JobObjectExtendedLimitInformation,
             (&raw const limits).cast::<c_void>(),
             u32::try_from(mem::size_of_val(&limits))?,
@@ -137,18 +138,6 @@ fn create_job() -> Result<Handle> {
         .into());
     }
     Ok(job)
-}
-
-struct Handle(HANDLE);
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
 }
 
 fn quote(value: &OsStr) -> Result<String> {
@@ -183,12 +172,3 @@ fn quote(value: &OsStr) -> Result<String> {
     quoted.push('"');
     Ok(quoted)
 }
-
-fn wide(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(Some(0)).collect()
-}
-
-fn wide_os(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(Some(0)).collect()
-}
-

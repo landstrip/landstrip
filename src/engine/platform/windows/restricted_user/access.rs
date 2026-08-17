@@ -3,15 +3,13 @@
 
 //! Temporary filesystem grants for a leased sandbox account.
 
+use super::{OwnedLocal, ToWideNul};
 use crate::engine::error::{Error as LandstripError, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::ffi::{OsStr, c_void};
 use std::io;
-use std::iter;
 use std::mem;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use windows_sys::Win32::Foundation::{
@@ -145,7 +143,7 @@ impl GrantPlan {
         for entry in &self.entries {
             match set_path_access(
                 &entry.path,
-                sid.0,
+                sid.as_psid(),
                 entry.access,
                 entry.access_mode,
                 entry.inherit,
@@ -158,7 +156,7 @@ impl GrantPlan {
                     for applied_entry in applied.entries.iter().rev() {
                         let _ = set_path_access(
                             &applied_entry.path,
-                            sid.0,
+                            sid.as_psid(),
                             0,
                             REVOKE_ACCESS,
                             false,
@@ -179,7 +177,7 @@ impl GrantPlan {
         for entry in self.entries.iter().rev() {
             let error = set_path_access(
                 &entry.path,
-                sid.0,
+                sid.as_psid(),
                 0,
                 REVOKE_ACCESS,
                 false,
@@ -198,11 +196,11 @@ impl GrantPlan {
     }
 }
 
-struct OwnedSid(PSID);
+struct OwnedSid(OwnedLocal);
 
 impl OwnedSid {
     fn parse(value: &str) -> Result<Self> {
-        let value = wide(value);
+        let value = value.to_wide_nul();
         let mut sid = ptr::null_mut();
         if unsafe { ConvertStringSidToSidW(value.as_ptr(), &raw mut sid) } == 0 {
             return Err(LandstripError::sandbox_setup(
@@ -211,17 +209,11 @@ impl OwnedSid {
             )
             .into());
         }
-        Ok(Self(sid))
+        Ok(Self(unsafe { OwnedLocal::from_raw(sid) }))
     }
-}
 
-impl Drop for OwnedSid {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                LocalFree(self.0.cast::<c_void>());
-            }
-        }
+    fn as_psid(&self) -> PSID {
+        self.0.as_ptr()
     }
 }
 
@@ -234,11 +226,7 @@ fn set_path_access(
     propagate: bool,
     ignore_missing: bool,
 ) -> Result<bool> {
-    let path_wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect::<Vec<_>>();
+    let path_wide = path.to_wide_nul();
     let mut old_dacl: *mut ACL = ptr::null_mut();
     let mut security_descriptor = ptr::null_mut();
     let status = unsafe {
@@ -403,8 +391,4 @@ fn is_locked_error(error: &io::Error) -> bool {
 fn should_skip_before_apply(mode: ACCESS_MODE, status: u32, ignore_missing: bool) -> bool {
     (ignore_missing && is_missing_status(status))
         || (mode == GRANT_ACCESS && is_locked_status(status))
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }

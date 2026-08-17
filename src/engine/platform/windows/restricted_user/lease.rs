@@ -3,15 +3,14 @@
 
 //! Exclusive account leasing and crash-recovery journals.
 
+use super::ToWideNul;
 use super::access::GrantPlan;
 use super::state::{self, Account, Installation, NetworkMode};
 use crate::engine::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr;
 use windows_sys::Win32::Foundation::{
@@ -118,7 +117,7 @@ impl<'a> Lease<'a> {
             "Global\\LandstripRestrictedUser-{}-{}",
             installation.id, account.name
         );
-        let name = wide(&name);
+        let name = name.to_wide_nul();
         let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error()).context("create restricted-user lease mutex");
@@ -193,8 +192,4 @@ impl Drop for Lease<'_> {
             }
         }
     }
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }

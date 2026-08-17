@@ -4,17 +4,15 @@
 //! Local sandbox account provisioning.
 
 use super::state::{self, Account, NetworkMode};
+use super::{ToWideNul, sid_string};
 use anyhow::{Context, Result, bail};
-use std::ffi::{OsStr, c_void};
 use std::io;
-use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, LocalFree};
+use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows_sys::Win32::NetworkManagement::NetManagement::{
     NERR_Success, NetUserAdd, NetUserDel, UF_DONT_EXPIRE_PASSWD, UF_NORMAL_ACCOUNT,
     UF_PASSWD_CANT_CHANGE, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
 };
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
@@ -55,7 +53,7 @@ pub(super) fn provision(name: &str, network_mode: NetworkMode) -> Result<Account
 }
 
 pub(super) fn remove(name: &str) -> Result<()> {
-    let name = wide(name);
+    let name = name.to_wide_nul();
     let status = unsafe { NetUserDel(ptr::null(), name.as_ptr()) };
     if status == NERR_Success || status == 2221 {
         return Ok(());
@@ -65,7 +63,7 @@ pub(super) fn remove(name: &str) -> Result<()> {
 }
 
 pub(super) fn lookup_sid(name: &str) -> Result<String> {
-    let name = wide(name);
+    let name = name.to_wide_nul();
     let mut sid_size = 0;
     let mut domain_size = 0;
     let mut sid_use: SID_NAME_USE = 0;
@@ -102,15 +100,7 @@ pub(super) fn lookup_sid(name: &str) -> Result<String> {
         return Err(io::Error::last_os_error()).context("query sandbox account SID");
     }
 
-    let mut sid_string = ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(sid.as_mut_ptr().cast(), &raw mut sid_string) } == 0 {
-        return Err(io::Error::last_os_error()).context("format sandbox account SID");
-    }
-    let value = unsafe { nul_terminated_to_string(sid_string) };
-    unsafe {
-        LocalFree(sid_string.cast::<c_void>());
-    }
-    value.context("sandbox account SID is not valid UTF-16")
+    unsafe { sid_string(sid.as_mut_ptr().cast()) }.context("format sandbox account SID")
 }
 
 pub(super) fn random_identifier(bytes: usize) -> Result<String> {
@@ -131,9 +121,9 @@ pub(super) fn random_identifier(bytes: usize) -> Result<String> {
 }
 
 fn create(name: &str, password: &str) -> Result<()> {
-    let mut name_wide = wide(name);
-    let mut password_wide = wide(password);
-    let mut comment = wide(ACCOUNT_COMMENT);
+    let mut name_wide = name.to_wide_nul();
+    let mut password_wide = password.to_wide_nul();
+    let mut comment = ACCOUNT_COMMENT.to_wide_nul();
     let mut user = USER_INFO_1 {
         usri1_name: name_wide.as_mut_ptr(),
         usri1_password: password_wide.as_mut_ptr(),
@@ -195,23 +185,8 @@ fn net_error(status: u32) -> io::Error {
     io::Error::from_raw_os_error(status.cast_signed())
 }
 
-fn wide(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(Some(0)).collect()
-}
-
 fn display_wide(value: &[u16]) -> String {
     String::from_utf16_lossy(&value[..value.len().saturating_sub(1)])
-}
-
-unsafe fn nul_terminated_to_string(value: *const u16) -> Option<String> {
-    if value.is_null() {
-        return None;
-    }
-    let mut length = 0;
-    while unsafe { *value.add(length) } != 0 {
-        length += 1;
-    }
-    String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) }).ok()
 }
 
 fn hex(bytes: &[u8]) -> String {

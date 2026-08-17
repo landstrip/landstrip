@@ -7,6 +7,7 @@ use super::account;
 use super::lease;
 use super::state::{self, INSTALLATION_VERSION, Installation, NetworkMode};
 use super::wfp;
+use super::{ToWideNul, current_process_token, own_handle};
 use crate::engine::outcome::{SandboxImplementation, WindowsStatusReport};
 use crate::engine::platform::WindowsCommand;
 use anyhow::{Context, Result, bail};
@@ -15,7 +16,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::mem;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use windows_sys::Win32::Foundation::{
@@ -25,8 +26,7 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, ReleaseMutex,
-    WaitForSingleObject,
+    CreateMutexW, GetExitCodeProcess, INFINITE, ReleaseMutex, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{
     SEE_MASK_NO_CONSOLE, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHELLEXECUTEINFOW_0,
@@ -313,9 +313,9 @@ fn elevate_uninstall() -> Result<()> {
 
 fn elevate(parameters: &str) -> Result<()> {
     let executable = env::current_exe().context("locate current landstrip executable")?;
-    let executable = wide(executable.as_os_str());
-    let parameters = wide(OsStr::new(parameters));
-    let verb = wide(OsStr::new("runas"));
+    let executable = executable.to_wide_nul();
+    let parameters = parameters.to_wide_nul();
+    let verb = OsStr::new("runas").to_wide_nul();
     let mut execute = SHELLEXECUTEINFOW {
         cbSize: u32::try_from(mem::size_of::<SHELLEXECUTEINFOW>())
             .context("ShellExecute structure is too large")?,
@@ -340,12 +340,12 @@ fn elevate(parameters: &str) -> Result<()> {
     if execute.hProcess.is_null() {
         bail!("Windows elevation returned no process handle");
     }
-    let process = Handle(execute.hProcess);
-    if unsafe { WaitForSingleObject(process.0, INFINITE) } != WAIT_OBJECT_0 {
+    let process = unsafe { own_handle(execute.hProcess) };
+    if unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) } != WAIT_OBJECT_0 {
         return Err(io::Error::last_os_error()).context("wait for elevated landstrip");
     }
     let mut exit_code = 0;
-    if unsafe { GetExitCodeProcess(process.0, &raw mut exit_code) } == 0 {
+    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &raw mut exit_code) } == 0 {
         return Err(io::Error::last_os_error()).context("query elevated landstrip exit code");
     }
     if exit_code != 0 {
@@ -355,16 +355,12 @@ fn elevate(parameters: &str) -> Result<()> {
 }
 
 fn is_elevated() -> Result<bool> {
-    let mut token = ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
-        return Err(io::Error::last_os_error()).context("open current process token");
-    }
-    let token = Handle(token);
+    let token = current_process_token(TOKEN_QUERY).context("open current process token")?;
     let mut elevation = TOKEN_ELEVATION::default();
     let mut returned = 0;
     if unsafe {
         GetTokenInformation(
-            token.0,
+            token.as_raw_handle(),
             TokenElevation,
             (&raw mut elevation).cast(),
             u32::try_from(mem::size_of::<TOKEN_ELEVATION>())
@@ -378,27 +374,11 @@ fn is_elevated() -> Result<bool> {
     Ok(elevation.TokenIsElevated != 0)
 }
 
-fn wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(Some(0)).collect()
-}
-
-struct Handle(HANDLE);
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-}
-
 struct ManagementLock(HANDLE);
 
 impl ManagementLock {
     fn acquire() -> Result<Self> {
-        let name = wide(OsStr::new(MANAGEMENT_MUTEX));
+        let name = MANAGEMENT_MUTEX.to_wide_nul();
         let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
         if handle.is_null() {
             return Err(io::Error::last_os_error())

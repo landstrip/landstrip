@@ -3,6 +3,7 @@
 
 //! Windows sandbox platform using `AppContainer`.
 
+use super::{ToWideNul, own_handle};
 use crate::engine::config::AppContainerMode;
 use crate::engine::error::{Error as LandstripError, Mechanism};
 use crate::engine::policy::{AccessPolicy, ReadAccess};
@@ -14,8 +15,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::iter;
 use std::mem;
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -200,9 +200,9 @@ struct AppContainerProfile {
 
 impl AppContainerProfile {
     fn new(moniker: &str, delete_on_drop: bool) -> Result<Self> {
-        let moniker = wide_string(moniker);
-        let display = wide_string("landstrip");
-        let description = wide_string("landstrip sandbox");
+        let moniker = moniker.to_wide_nul();
+        let display = "landstrip".to_wide_nul();
+        let description = "landstrip sandbox".to_wide_nul();
         let mut sid = ptr::null_mut();
         let hr = unsafe {
             CreateAppContainerProfile(
@@ -322,20 +322,24 @@ impl Drop for LoopbackExemption {
 }
 
 struct LoopbackMutex {
-    handle: Handle,
+    handle: OwnedHandle,
 }
 
 impl LoopbackMutex {
     fn lock() -> Result<Self> {
-        let name = wide_string(LOOPBACK_MUTEX_NAME);
+        let name = LOOPBACK_MUTEX_NAME.to_wide_nul();
         let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
         if handle.is_null() {
-            return Err(LandstripError::sandbox_setup(Mechanism::Appcontainer, io::Error::last_os_error()).into());
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Appcontainer,
+                io::Error::last_os_error(),
+            )
+            .into());
         }
         let mutex = Self {
-            handle: Handle(handle),
+            handle: unsafe { own_handle(handle) },
         };
-        match unsafe { WaitForSingleObject(mutex.handle.0, INFINITE) } {
+        match unsafe { WaitForSingleObject(mutex.handle.as_raw_handle(), INFINITE) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(mutex),
             WAIT_FAILED => Err(LandstripError::sandbox_setup(
                 Mechanism::Appcontainer,
@@ -353,7 +357,7 @@ impl LoopbackMutex {
 
 impl Drop for LoopbackMutex {
     fn drop(&mut self) {
-        unsafe { ReleaseMutex(self.handle.0) };
+        unsafe { ReleaseMutex(self.handle.as_raw_handle()) };
     }
 }
 
@@ -421,15 +425,15 @@ fn process_is_running(pid: u32) -> bool {
     if handle.is_null() {
         return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
     }
-    let process = Handle(handle);
+    let process = unsafe { own_handle(handle) };
     matches!(
-        unsafe { WaitForSingleObject(process.0, 0) },
+        unsafe { WaitForSingleObject(process.as_raw_handle(), 0) },
         WAIT_TIMEOUT | WAIT_FAILED
     )
 }
 
 fn derive_appcontainer_sid(moniker: &str) -> Result<Option<OwnedSid>> {
-    let moniker = wide_string(moniker);
+    let moniker = moniker.to_wide_nul();
     let mut sid = ptr::null_mut();
     let hr = unsafe { DeriveAppContainerSidFromAppContainerName(moniker.as_ptr(), &raw mut sid) };
     if hresult_win32(hr).map(u32::from) == Some(ERROR_NOT_FOUND) {
@@ -444,7 +448,7 @@ fn derive_appcontainer_sid(moniker: &str) -> Result<Option<OwnedSid>> {
 }
 
 fn delete_appcontainer_profile(moniker: &str) -> Result<()> {
-    let moniker = wide_string(moniker);
+    let moniker = moniker.to_wide_nul();
     let hr = unsafe { DeleteAppContainerProfile(moniker.as_ptr()) };
     if hr != 0 {
         return Err(
@@ -665,11 +669,7 @@ fn set_path_access(
     inherit: bool,
     propagate: bool,
 ) -> Result<()> {
-    let path_wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect::<Vec<_>>();
+    let path_wide = path.to_wide_nul();
     let mut old_dacl: *mut ACL = ptr::null_mut();
     let mut security_descriptor = ptr::null_mut();
 
@@ -803,24 +803,28 @@ fn apply_path_dacl(path: &[u16], dacl: *mut ACL, propagate: bool) -> Win32CallRe
 }
 
 struct SandboxJob {
-    handle: Handle,
+    handle: OwnedHandle,
 }
 
 impl SandboxJob {
     fn new() -> Result<Self> {
         let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
         if handle.is_null() {
-            return Err(LandstripError::sandbox_setup(Mechanism::Appcontainer, io::Error::last_os_error()).into());
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Appcontainer,
+                io::Error::last_os_error(),
+            )
+            .into());
         }
 
         let job = Self {
-            handle: Handle(handle),
+            handle: unsafe { own_handle(handle) },
         };
         let mut limits = unsafe { mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let ok = unsafe {
             SetInformationJobObject(
-                job.handle.0,
+                job.handle.as_raw_handle(),
                 JobObjectExtendedLimitInformation,
                 (&raw const limits).cast(),
                 u32::try_from(mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
@@ -828,21 +832,25 @@ impl SandboxJob {
             )
         };
         if ok == 0 {
-            return Err(LandstripError::sandbox_setup(Mechanism::Appcontainer, io::Error::last_os_error()).into());
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Appcontainer,
+                io::Error::last_os_error(),
+            )
+            .into());
         }
 
         Ok(job)
     }
 
     fn as_raw(&self) -> HANDLE {
-        self.handle.0
+        self.handle.as_raw_handle()
     }
 }
 
 struct StandardHandles {
-    stdin: Handle,
-    stdout: Handle,
-    stderr: Handle,
+    stdin: OwnedHandle,
+    stdout: OwnedHandle,
+    stderr: OwnedHandle,
 }
 
 impl StandardHandles {
@@ -864,7 +872,11 @@ impl StandardHandles {
     }
 
     fn raw(&self) -> [HANDLE; 3] {
-        [self.stdin.0, self.stdout.0, self.stderr.0]
+        [
+            self.stdin.as_raw_handle(),
+            self.stdout.as_raw_handle(),
+            self.stderr.as_raw_handle(),
+        ]
     }
 }
 
@@ -886,7 +898,7 @@ impl StandardHandleDirection {
 fn inheritable_standard_handle(
     source: HANDLE,
     direction: StandardHandleDirection,
-) -> Result<Handle> {
+) -> Result<OwnedHandle> {
     if !is_real_handle_value(source as isize) || !is_io_file_type(unsafe { GetFileType(source) }) {
         return inheritable_null_handle(direction);
     }
@@ -905,11 +917,15 @@ fn inheritable_standard_handle(
         )
     };
     if ok == 0 {
-        return Err(LandstripError::sandbox_setup(Mechanism::Appcontainer, io::Error::last_os_error()).into());
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Appcontainer,
+            io::Error::last_os_error(),
+        )
+        .into());
     }
-    let duplicate = Handle(duplicate);
-    if !is_real_handle_value(duplicate.0 as isize)
-        || !is_io_file_type(unsafe { GetFileType(duplicate.0) })
+    let duplicate = unsafe { own_handle(duplicate) };
+    if !is_real_handle_value(duplicate.as_raw_handle() as isize)
+        || !is_io_file_type(unsafe { GetFileType(duplicate.as_raw_handle()) })
     {
         return inheritable_null_handle(direction);
     }
@@ -917,7 +933,7 @@ fn inheritable_standard_handle(
     Ok(duplicate)
 }
 
-fn inheritable_null_handle(direction: StandardHandleDirection) -> Result<Handle> {
+fn inheritable_null_handle(direction: StandardHandleDirection) -> Result<OwnedHandle> {
     const NUL: [u16; 4] = [b'N' as u16, b'U' as u16, b'L' as u16, 0];
 
     let security_attributes = SECURITY_ATTRIBUTES {
@@ -938,7 +954,11 @@ fn inheritable_null_handle(direction: StandardHandleDirection) -> Result<Handle>
         )
     };
     if handle == INVALID_HANDLE_VALUE || handle.is_null() {
-        return Err(LandstripError::sandbox_setup(Mechanism::Appcontainer, io::Error::last_os_error()).into());
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Appcontainer,
+            io::Error::last_os_error(),
+        )
+        .into());
     }
     if !is_io_file_type(unsafe { GetFileType(handle) }) {
         unsafe { CloseHandle(handle) };
@@ -949,7 +969,7 @@ fn inheritable_null_handle(direction: StandardHandleDirection) -> Result<Handle>
         .into());
     }
 
-    Ok(Handle(handle))
+    Ok(unsafe { own_handle(handle) })
 }
 
 fn is_real_handle_value(value: isize) -> bool {
@@ -1056,7 +1076,11 @@ fn current_process_in_job() -> Result<bool> {
     let mut in_job = 0;
     let ok = unsafe { IsProcessInJob(GetCurrentProcess(), ptr::null_mut(), &raw mut in_job) };
     if ok == 0 {
-        return Err(LandstripError::sandbox_setup(Mechanism::Appcontainer, io::Error::last_os_error()).into());
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Appcontainer,
+            io::Error::last_os_error(),
+        )
+        .into());
     }
     Ok(in_job != 0)
 }
@@ -1093,7 +1117,7 @@ fn create_process(
     startup_info: &mut STARTUPINFOEXW,
     creation_flags: u32,
 ) -> io::Result<PROCESS_INFORMATION> {
-    let mut command_line = wide_string(command_line);
+    let mut command_line = command_line.to_wide_nul();
     let mut process_info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
     let created = unsafe {
         CreateProcessW(
@@ -1123,15 +1147,15 @@ fn is_access_denied(error: &io::Error) -> bool {
 }
 
 fn supervise_process(process_info: PROCESS_INFORMATION) -> Result<u32> {
-    let process = Handle(process_info.hProcess);
-    let thread = Handle(process_info.hThread);
-    let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
+    let process = unsafe { own_handle(process_info.hProcess) };
+    let thread = unsafe { own_handle(process_info.hThread) };
+    let wait = unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
     if wait == WAIT_FAILED {
         return Err(LandstripError::supervise(io::Error::last_os_error()).into());
     }
 
     let mut exit_code = 0;
-    let ok = unsafe { GetExitCodeProcess(process.0, &raw mut exit_code) };
+    let ok = unsafe { GetExitCodeProcess(process.as_raw_handle(), &raw mut exit_code) };
     if ok == 0 {
         return Err(LandstripError::supervise(io::Error::last_os_error()).into());
     }
@@ -1159,7 +1183,11 @@ fn update_attribute(
         )
     };
     if ok == 0 {
-        return Err(LandstripError::sandbox_setup(Mechanism::Appcontainer, io::Error::last_os_error()).into());
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Appcontainer,
+            io::Error::last_os_error(),
+        )
+        .into());
     }
     Ok(())
 }
@@ -1175,14 +1203,22 @@ impl ProcThreadAttributeList {
             unsafe { InitializeProcThreadAttributeList(ptr::null_mut(), count, 0, &raw mut size) };
         let code = unsafe { GetLastError() };
         if ok != 0 || code != ERROR_INSUFFICIENT_BUFFER {
-            return Err(LandstripError::sandbox_setup(Mechanism::Appcontainer, io::Error::last_os_error()).into());
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Appcontainer,
+                io::Error::last_os_error(),
+            )
+            .into());
         }
 
         let mut storage = vec![0_u8; size];
         let list = storage.as_mut_ptr().cast();
         let ok = unsafe { InitializeProcThreadAttributeList(list, count, 0, &raw mut size) };
         if ok == 0 {
-            return Err(LandstripError::sandbox_setup(Mechanism::Appcontainer, io::Error::last_os_error()).into());
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Appcontainer,
+                io::Error::last_os_error(),
+            )
+            .into());
         }
 
         Ok(Self { storage })
@@ -1228,7 +1264,11 @@ impl NetworkCapabilities {
                 )
             };
             if ok == 0 {
-                return Err(LandstripError::sandbox_setup(Mechanism::Appcontainer, io::Error::last_os_error()).into());
+                return Err(LandstripError::sandbox_setup(
+                    Mechanism::Appcontainer,
+                    io::Error::last_os_error(),
+                )
+                .into());
             }
             sids.push(sid);
         }
@@ -1254,16 +1294,6 @@ impl NetworkCapabilities {
 
     fn count(&self) -> u32 {
         u32::try_from(self.entries.len()).unwrap_or(0)
-    }
-}
-
-struct Handle(HANDLE);
-
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { CloseHandle(self.0) };
-        }
     }
 }
 
@@ -1317,13 +1347,6 @@ fn quote_command_arg(arg: &OsStr) -> std::result::Result<String, &'static str> {
     quoted.extend(iter::repeat_n('\\', backslashes * 2));
     quoted.push('"');
     Ok(quoted)
-}
-
-fn wide_string(value: &str) -> Vec<u16> {
-    OsStr::new(value)
-        .encode_wide()
-        .chain(iter::once(0))
-        .collect()
 }
 
 fn hresult_value(hr: i32) -> u32 {

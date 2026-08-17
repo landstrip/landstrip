@@ -5,13 +5,11 @@
 
 use super::account;
 use super::state::{Account, Installation, NetworkMode};
+use super::{OwnedSecurityDescriptor, ToWideNul};
 use anyhow::{Context, Result, bail};
-use std::ffi::{OsStr, c_void};
-use std::io;
-use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use windows_sys::Win32::Foundation::{
-    FWP_E_ALREADY_EXISTS, FWP_E_FILTER_NOT_FOUND, FWP_E_NOT_FOUND, HANDLE, LocalFree,
+    FWP_E_ALREADY_EXISTS, FWP_E_FILTER_NOT_FOUND, FWP_E_NOT_FOUND, HANDLE,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWP_ACTION_BLOCK, FWP_ACTION_PERMIT, FWP_BYTE_BLOB, FWP_CONDITION_VALUE0,
@@ -29,12 +27,9 @@ use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FwpmProviderDeleteByKey0, FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FwpmTransactionAbort0,
     FwpmTransactionBegin0, FwpmTransactionCommit0,
 };
-use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_DEFAULT;
 use windows_sys::core::GUID;
 
-const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 const IPPROTO_TCP: u8 = 6;
 const FILTER_WEIGHT_BLOCK: u8 = 0;
 const FILTER_WEIGHT_PERMIT: u8 = 15;
@@ -152,7 +147,7 @@ fn next_filter_key<'a>(keys: &mut impl Iterator<Item = &'a str>) -> Result<GUID>
 }
 
 fn add_provider(engine: HANDLE, key: GUID) -> Result<()> {
-    let name = wide("Landstrip restricted-user sandbox");
+    let name = "Landstrip restricted-user sandbox".to_wide_nul();
     let provider = FWPM_PROVIDER0 {
         providerKey: key,
         displayData: display(&name),
@@ -168,7 +163,7 @@ fn add_provider(engine: HANDLE, key: GUID) -> Result<()> {
 }
 
 fn add_sublayer(engine: HANDLE, provider: GUID, key: GUID) -> Result<()> {
-    let name = wide("Landstrip restricted-user sandbox");
+    let name = "Landstrip restricted-user sandbox".to_wide_nul();
     let mut provider = provider;
     let sublayer = FWPM_SUBLAYER0 {
         subLayerKey: key,
@@ -293,7 +288,7 @@ fn add_filter(
     weight: u8,
     conditions: &mut [FWPM_FILTER_CONDITION0],
 ) -> Result<()> {
-    let name = wide("Landstrip restricted-user network boundary");
+    let name = "Landstrip restricted-user network boundary".to_wide_nul();
     let filter = FWPM_FILTER0 {
         filterKey: key,
         displayData: display(&name),
@@ -334,32 +329,21 @@ enum AddressFamily {
 }
 
 struct UserCondition {
-    descriptor: PSECURITY_DESCRIPTOR,
+    _descriptor: OwnedSecurityDescriptor,
     blob: FWP_BYTE_BLOB,
 }
 
 impl UserCondition {
     fn new(sid: &str) -> Result<Self> {
-        let sddl = wide(&format!("D:(A;;0x00000001;;;{sid})"));
-        let mut descriptor = ptr::null_mut();
-        let mut size = 0;
-        if unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SECURITY_DESCRIPTOR_REVISION,
-                &raw mut descriptor,
-                &raw mut size,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error()).context("build WFP account condition");
-        }
+        let descriptor = OwnedSecurityDescriptor::from_sddl(format!("D:(A;;0x00000001;;;{sid})"))
+            .context("build WFP account condition")?;
+        let blob = FWP_BYTE_BLOB {
+            size: descriptor.size(),
+            data: descriptor.as_ptr().cast(),
+        };
         Ok(Self {
-            descriptor,
-            blob: FWP_BYTE_BLOB {
-                size,
-                data: descriptor.cast(),
-            },
+            _descriptor: descriptor,
+            blob,
         })
     }
 
@@ -377,23 +361,13 @@ impl UserCondition {
     }
 }
 
-impl Drop for UserCondition {
-    fn drop(&mut self) {
-        if !self.descriptor.is_null() {
-            unsafe {
-                LocalFree(self.descriptor.cast::<c_void>());
-            }
-        }
-    }
-}
-
 struct Engine {
     handle: HANDLE,
 }
 
 impl Engine {
     fn open() -> Result<Self> {
-        let name = wide("Landstrip restricted-user management");
+        let name = "Landstrip restricted-user management".to_wide_nul();
         let session = FWPM_SESSION0 {
             sessionKey: GUID::from_u128(0),
             displayData: display(&name),
@@ -525,8 +499,4 @@ fn empty_value() -> FWP_VALUE0 {
             uint64: ptr::null_mut(),
         },
     }
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }
