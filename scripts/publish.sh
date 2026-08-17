@@ -164,6 +164,81 @@ publish_cargo_package() {
   )
 }
 
+github_retry() {
+  local attempt
+  local error_file="$workdir/gh-retry-error"
+
+  for attempt in {1..6}; do
+    if "$@" 2>"$error_file"; then
+      cat "$error_file" >&2
+      return 0
+    fi
+    cat "$error_file" >&2
+    if ((attempt == 6)) || ! grep -Eq 'HTTP 502|HTTP 503|HTTP 429' "$error_file"; then
+      return 1
+    fi
+    printf 'transient GitHub error (attempt %s/6), retrying...\n' "$attempt" >&2
+    sleep $((attempt * 2))
+  done
+}
+
+github_release_exists() {
+  local attempt
+  local error_file="$workdir/gh-release-error"
+
+  for attempt in {1..6}; do
+    if $GH api "repos/:owner/:repo/releases/tags/$version" \
+      >"$workdir/gh-release.json" 2>"$error_file"; then
+      return 0
+    fi
+    if grep -q 'HTTP 404' "$error_file"; then
+      return 1
+    fi
+    if ((attempt == 6)) || ! grep -Eq 'HTTP 502|HTTP 503|HTTP 429' "$error_file"; then
+      cat "$error_file" >&2
+      die "cannot query GitHub release $version"
+    fi
+    printf 'transient GitHub error querying release %s (attempt %s/6), retrying...\n' \
+      "$version" "$attempt" >&2
+    sleep $((attempt * 2))
+  done
+}
+
+publish_github_release() {
+  local asset name
+  local missing=()
+
+  if github_release_exists; then
+    for asset in "$workdir"/release/*.tar.gz "$workdir"/release/*.sha256; do
+      name="${asset##*/}"
+      if $NODE -e '
+        const fs = require("fs");
+        const release = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        const name = process.argv[2];
+        const assets = Array.isArray(release.assets) ? release.assets : [];
+        process.exit(assets.some((asset) => asset.name === name) ? 0 : 1);
+      ' "$workdir/gh-release.json" "$name"; then
+        printf '%s\n' "GitHub release $version already has $name"
+      else
+        missing+=("$asset")
+      fi
+    done
+    if ((${#missing[@]} == 0)); then
+      printf '%s\n' "GitHub release $version is already published"
+      return
+    fi
+    github_retry "$GH" release upload "$version" "${missing[@]}"
+    return
+  fi
+
+  github_retry "$GH" release create "$version" \
+    "$workdir"/release/*.tar.gz \
+    "$workdir"/release/*.sha256 \
+    --notes-from-tag \
+    --title "landstrip $version" \
+    --verify-tag
+}
+
 platform_binary() {
   local platform="$1"
   if [[ "$platform" == win32-* ]]; then
@@ -315,16 +390,7 @@ for package_name in "${package_names[@]}"; do
   wait_for_npm_package "$package_name"
 done
 
-if $GH release view "$version" >/dev/null 2>&1; then
-  $GH release upload "$version" "$workdir"/release/*.tar.gz \
-    "$workdir"/release/*.sha256 --clobber
-else
-  $GH release create "$version" "$workdir"/release/*.tar.gz \
-    "$workdir"/release/*.sha256 \
-    --notes-from-tag \
-    --title "landstrip $version" \
-    --verify-tag
-fi
+publish_github_release
 
 NPM="$NPM" "$NODE" scripts/update-npm-integrity.mjs "$version" "${extension_dirs[@]}"
 git add -- "${lock_files[@]}"
