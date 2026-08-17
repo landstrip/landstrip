@@ -5,12 +5,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
-export function expandHomePath(path: string): string {
-  if (path === '~' || path === '$HOME') return homedir();
-  if (path.startsWith('~/')) return join(homedir(), path.slice(2));
-  if (path.startsWith('$HOME/')) return join(homedir(), path.slice(6));
-  return path;
-}
+export { expandHomePath, isRecord } from '@landstrip/landstrip/shared';
 
 /** Expand OpenCode-style `{file:path}` tokens. Relative paths use baseDir. */
 export function expandFileReferences(text: string, baseDir: string): string {
@@ -47,10 +42,6 @@ export function expandFileReferences(text: string, baseDir: string): string {
 
 export function formatError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-export function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 const OPENCODE_THEME_COLORS = new Set([

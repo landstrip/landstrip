@@ -6,6 +6,8 @@ import type { Readable, Writable } from 'node:stream';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 
+import { isRecord } from '@landstrip/landstrip/shared';
+
 export const LANDSTRIP_CONTEXT_ENV = 'LANDSTRIP_CONTEXT';
 export const LANDSTRIP_RUNTIME_VERSION = 2;
 
@@ -166,10 +168,6 @@ interface EventBusLike {
 
 function eventBus(pi: ExtensionAPI): EventBusLike | undefined {
   return (pi as ExtensionAPI & { events?: EventBusLike }).events;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function isRuntime(value: unknown): value is PiLandstripRuntimeV2 {

@@ -24,7 +24,7 @@ import {
   type Socket,
   Socket as NetSocket,
 } from 'node:net';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath, URL } from 'node:url';
@@ -53,8 +53,29 @@ import {
   type LandstripControlResponse,
   type LandstripFilesystemTrap,
   type LandstripNetworkTrap,
-  type LandstripTrap,
 } from '@landstrip/landstrip';
+import {
+  allowsAllDomains,
+  controlResponseLine,
+  domainMatchesAny,
+  formatLandstripTraps,
+  isDenialTrap,
+  isFilesystemTrap,
+  isQueryTrap,
+  parseLandstripTraps,
+  parseTrapLine,
+  pathUnderDirectory,
+  sessionScopeFor,
+} from '@landstrip/landstrip/shared';
+
+export {
+  controlResponseLine,
+  domainMatchesAny,
+  formatLandstripTraps,
+  isQueryTrap,
+  parseTrapLine,
+  sessionScopeFor,
+};
 import {
   type LandstripContextV2,
   type LandstripEvent,
@@ -168,8 +189,6 @@ export function resolveProcessReadPolicy(
   }
   return { denyRead, allowRead };
 }
-
-type LandstripDenialTrap = LandstripFilesystemTrap | LandstripNetworkTrap;
 
 interface LandstripBashCallbacks {
   onStderr?: (data: Buffer) => void;
@@ -519,29 +538,6 @@ function mergeAllowances(base: string[], session: string[], execution?: string[]
   return [...base, ...session, ...(execution ?? [])];
 }
 
-function domainMatchesPattern(domain: string, pattern: string): boolean {
-  // A trailing dot ("pastebin.com.") is the same host to DNS but would slip past
-  // a literal deny entry; strip it from both sides before matching.
-  const normalizedDomain = domain.toLowerCase().replace(/\.+$/, '');
-  const normalizedPattern = pattern.toLowerCase().replace(/\.+$/, '');
-
-  if (normalizedPattern === '*') return true;
-  if (normalizedPattern.startsWith('*.')) {
-    const base = normalizedPattern.slice(2);
-    return normalizedDomain === base || normalizedDomain.endsWith(`.${base}`);
-  }
-
-  return normalizedDomain === normalizedPattern;
-}
-
-export function domainMatchesAny(domain: string, patterns: string[]): boolean {
-  return patterns.some((pattern) => domainMatchesPattern(domain, pattern));
-}
-
-function allowsAllDomains(allowedDomains: string[]): boolean {
-  return allowedDomains.includes('*');
-}
-
 export function shouldPromptForWrite(path: string, allowWrite: string[], cwd: string): boolean {
   return allowWrite.length === 0 || !matchesPattern(path, allowWrite, cwd);
 }
@@ -635,51 +631,6 @@ function normalizeBlockedPath(path: string, cwd: string): string {
   return canonicalizePath(isAbsolute(nativePath) ? nativePath : join(cwd, nativePath), cwd);
 }
 
-// Breadth-first filesystem approval: when the user allows a blocked read/write,
-// approve the broadest reasonable ancestor (e.g. `~/.cargo`, not each subcrate
-// file) so a single scan does not spawn one prompt per file. matchesPattern
-// already treats a bare directory entry as covering everything beneath it, so
-// storing the scope is enough for sibling files to auto-allow.
-function pathUnderDirectory(filePath: string, dir: string): boolean {
-  const normalizedFilePath = normalizePathSeparators(filePath);
-  const normalizedDir = normalizePathSeparators(dir);
-  if (normalizedFilePath === normalizedDir) return true;
-  const sep = normalizedDir.endsWith('/') ? '' : '/';
-  return normalizedFilePath.startsWith(normalizedDir + sep);
-}
-
-// The broadest ancestor worth approving in one action: the immediate child of
-// `$HOME` (e.g. `~/.cargo`) for paths under the user's home, the project root
-// for paths under it, otherwise the containing directory. When the file sits
-// directly on a boundary (so the only ancestor is `$HOME` itself, which would
-// over-broaden), fall back to the exact file so nothing widens silently.
-export function sessionScopeFor(filePath: string, baseDirectory: string): string {
-  const dir = dirname(filePath);
-  const normalizedDir = normalizePathSeparators(dir);
-  const home = homedir();
-  const boundaries = new Set<string>();
-  if (home) boundaries.add(home);
-  try {
-    const realHome = realpathSync.native(home);
-    if (realHome) boundaries.add(realHome);
-  } catch {
-    // $HOME not resolvable — fall back to the raw value only.
-  }
-
-  for (const boundary of boundaries) {
-    const normalizedBoundary = normalizePathSeparators(boundary);
-    if (pathUnderDirectory(dir, boundary)) {
-      const rest = normalizedDir.slice(normalizedBoundary.length).replace(/^\/+/, '');
-      const first = rest.split('/')[0];
-      if (!first) return filePath;
-      return join(boundary, first);
-    }
-  }
-
-  if (pathUnderDirectory(dir, baseDirectory)) return baseDirectory;
-  return dir;
-}
-
 // Length of the longest entry in `patterns` that matches `path`, or -1 for no
 // match. Canonicalized so the value reflects how specific the rule is.
 function longestPrefixMatch(path: string, patterns: string[], cwd: string): number {
@@ -730,22 +681,6 @@ function isPathLike(value: string): boolean {
 
 function normalizePathMatch(value: string, cwd: string): string | null {
   return isPathLike(value) ? normalizeBlockedPath(value, cwd) : null;
-}
-
-function isFilesystemTrap(trap: LandstripTrap): trap is LandstripFilesystemTrap {
-  return trap.kind === 'filesystem';
-}
-
-// filesystem and network traps report an access the policy denied; launch, usage
-// and internal traps report that landstrip itself failed.
-function isDenialTrap(trap: LandstripTrap): trap is LandstripDenialTrap {
-  return trap.kind === 'filesystem' || trap.kind === 'network';
-}
-
-// A `state: "query"` trap suspends the child's syscall until we answer it on the
-// trap socket. An `info` trap is terminal and carries a `query_id` of "0".
-export function isQueryTrap(trap: LandstripTrap): trap is LandstripDenialTrap {
-  return isDenialTrap(trap) && trap.state === 'query';
 }
 
 // Structured traps come only from the trap socket (fd 3); the sandboxed command
@@ -840,92 +775,6 @@ function extractTrapBlockedPath(
   }
 
   return null;
-}
-
-// landstrip emits each trap as a flat JSON record tagged by a `kind` discriminant
-// (`filesystem`, `network`, `launch`, `usage`, `internal`) alongside a stable
-// `code` and variant-specific fields. The declarations it ships are erased at
-// compile time, so validate the fields this extension reads before trusting a
-// decoded line.
-function isLandstripTrap(value: unknown): value is LandstripTrap {
-  if (typeof value !== 'object' || value === null) return false;
-
-  const obj = value as Record<string, unknown>;
-  switch (obj.kind) {
-    case 'filesystem':
-      return (
-        (obj.operation === 'read' || obj.operation === 'write') &&
-        typeof obj.path === 'string' &&
-        typeof obj.query_id === 'string'
-      );
-    case 'network':
-      return (
-        typeof obj.operation === 'string' &&
-        typeof obj.target === 'string' &&
-        typeof obj.query_id === 'string'
-      );
-    case 'launch':
-      return typeof obj.program === 'string' && typeof obj.message === 'string';
-    case 'usage':
-      return typeof obj.message === 'string';
-    case 'internal':
-      return typeof obj.code === 'string' && typeof obj.message === 'string';
-    default:
-      return false;
-  }
-}
-
-export function parseTrapLine(line: string): LandstripTrap | null {
-  try {
-    const parsed: unknown = JSON.parse(line);
-    return isLandstripTrap(parsed) ? parsed : null;
-  } catch {
-    // Ignore non-JSON lines (e.g. stderr from child processes)
-    return null;
-  }
-}
-
-function parseLandstripTraps(output: string): LandstripTrap[] {
-  const traps: LandstripTrap[] = [];
-
-  for (const line of output.trim().split('\n')) {
-    const trap = parseTrapLine(line);
-    if (trap) traps.push(trap);
-  }
-
-  return traps;
-}
-
-export function formatLandstripTraps(traps: LandstripTrap[]): string {
-  return traps
-    .map((trap) => {
-      switch (trap.kind) {
-        case 'filesystem':
-          return `landstrip: filesystem ${trap.operation} denied: ${trap.path} (${trap.mechanism})`;
-        case 'network':
-          return `landstrip: network ${trap.operation} denied: ${trap.target} (${trap.mechanism})`;
-        case 'launch':
-          return `landstrip: launch failed: ${trap.program}: ${trap.message}`;
-        case 'usage':
-          return `landstrip: usage error: ${trap.message}`;
-        case 'internal': {
-          const mechanism = trap.mechanism ? ` (${trap.mechanism})` : '';
-          return `landstrip: ${trap.code}${mechanism}: ${trap.message}`;
-        }
-      }
-    })
-    .join('\n');
-}
-
-// The broker matches an answer to its query by the exact decimal `query_id`
-// string the trap carried. A numeric id fails its deserializer, the line is
-// dropped, and the child's syscall stays suspended.
-export function controlResponseLine(
-  queryId: string,
-  action: LandstripControlResponse['action'],
-): string {
-  const response: LandstripControlResponse = { query_id: queryId, action };
-  return JSON.stringify(response) + '\n';
 }
 
 function notify(ctx: ExtensionContext, message: string, level: NotificationLevel): void {

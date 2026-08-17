@@ -1214,7 +1214,7 @@ describe('controlResponseLine', () => {
 describe('formatLandstripTraps', () => {
   it('renders a filesystem denial with its resolved path', () => {
     expect(formatLandstripTraps([parseTrapLine(line(FS_TRAP))!])).toBe(
-      'landstrip: filesystem read denied: /etc/passwd (seccomp)',
+      'landstrip: filesystem read denied (/etc/passwd) [seccomp]',
     );
   });
 
@@ -1222,7 +1222,7 @@ describe('formatLandstripTraps', () => {
     const trap = parseTrapLine(
       line({ kind: 'launch', code: 'LAUNCH_FAILED', program: 'nope', message: 'not found' }),
     );
-    expect(formatLandstripTraps([trap!])).toBe('landstrip: launch failed: nope: not found');
+    expect(formatLandstripTraps([trap!])).toBe('landstrip: launch failed (nope): not found');
   });
 
   it('renders an internal failure by its code, with the mechanism when present', () => {
@@ -1240,7 +1240,7 @@ describe('formatLandstripTraps', () => {
       }),
     );
     expect(formatLandstripTraps([setup!])).toBe(
-      'landstrip: SANDBOX_SETUP_FAILED (landlock): no ABI',
+      'landstrip: SANDBOX_SETUP_FAILED [landlock]: no ABI',
     );
   });
 });
