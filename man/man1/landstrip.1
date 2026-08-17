@@ -1,4 +1,4 @@
-.Dd August 15, 2026
+.Dd August 17, 2026
 .Dt LANDSTRIP 1
 .Os
 .Sh NAME
@@ -179,6 +179,9 @@ Once it contains an entry, reads use an allowlist and
 .Va allowRead
 adds exceptions.
 The most specific read rule wins.
+On Linux, a hard link or rename that would give a
+.Va denyRead
+inode a readable name is denied, even when the destination is writable.
 .Pp
 Concrete
 .Va denyWrite

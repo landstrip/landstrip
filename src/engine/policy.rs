@@ -7,6 +7,8 @@
 //! denied; `allowWrite` grants roots and `denyWrite` subtracts from them. Reads
 //! stay unrestricted unless `denyRead` is set; `allowRead` then adds paths back,
 //! with the most specific rule winning where an allow and a deny overlap.
+//! Hard links and renames that would give a `denyRead` inode a readable name
+//! stay denied even when the destination is under `allowWrite`.
 //!
 //! Paths accept absolute names, names relative to the policy base, `~`, and the
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded

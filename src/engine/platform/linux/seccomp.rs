@@ -1508,6 +1508,13 @@ impl Syscall {
     fn is_mkdir(&self) -> bool {
         matches!(self.name, "mkdir" | "mkdirat")
     }
+
+    fn is_reparent(&self) -> bool {
+        matches!(
+            self.name,
+            "link" | "linkat" | "rename" | "renameat" | "renameat2"
+        )
+    }
 }
 
 const MUTATION_SYSCALLS: &[Syscall] = &[
@@ -1677,6 +1684,24 @@ const MUTATION_SYSCALLS: &[Syscall] = &[
     },
 ];
 
+/// Deny link/rename of a `denyRead` source when the new name would be readable.
+fn reparent_read_denial(
+    policy: &AccessPolicy,
+    spec: &Syscall,
+    slots: &[Option<(PathBuf, PathBuf)>],
+) -> Option<(usize, &'static str, TrapOperation)> {
+    if !spec.is_reparent() {
+        return None;
+    }
+    let (source, _) = slots.first().and_then(Option::as_ref)?;
+    let reason = fs_read_denial_reason(policy, source)?;
+    let dest_readable = slots
+        .get(1)
+        .and_then(Option::as_ref)
+        .is_none_or(|(dest, _)| fs_read_denial_reason(policy, dest).is_none());
+    dest_readable.then_some((0, reason, TrapOperation::Read))
+}
+
 fn handle_mutation(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
@@ -1695,7 +1720,7 @@ fn handle_mutation(
     let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
 
     let mut slots: Vec<Option<(PathBuf, PathBuf)>> = Vec::with_capacity(spec.paths.len());
-    let mut denial: Option<(usize, &'static str)> = None;
+    let mut denial: Option<(usize, &'static str, TrapOperation)> = None;
     let no_follow = spec.no_follow(&request.data.args);
     for (index, (dirfd_arg, path_arg)) in spec.paths.iter().enumerate() {
         let dirfd = match dirfd_arg {
@@ -1729,21 +1754,26 @@ fn handle_mutation(
             let lexical = normalize_path_lexically(&raw);
             let surface_allow_miss = query_enabled || !spec.landlock_backed;
             if let Some(reason) = policy.to_reason(&resolved, &lexical, surface_allow_miss) {
-                denial = Some((index, reason));
+                denial = Some((index, reason, TrapOperation::Write));
             }
         }
         slots.push(Some((resolved, path)));
     }
 
-    let Some((index, reason)) = denial else {
+    denial = denial.or_else(|| reparent_read_denial(policy, spec, &slots));
+
+    let Some((index, reason, operation)) = denial else {
         // Allowed mutations still race under CONTINUE when denyWrite sits under
         // an allowWrite root (Landlock cannot express those holes). Fulfill the
         // op in the broker whenever any denyWrite list is present; otherwise
         // landlock-backed ops may CONTINUE under the child's write roots.
+        // Reparenting also races when denyRead sits under an allowWrite root:
+        // CONTINUE would let link/rename alias a swapped-in secret.
         let must_pin = !policy.write_denied_roots.is_empty()
             || !policy.write_denied_patterns.is_empty()
             || !policy.write_denied_links.is_empty()
-            || !spec.landlock_backed;
+            || !spec.landlock_backed
+            || (spec.is_reparent() && !matches!(policy.read_access, ReadAccess::Unrestricted));
         if must_pin {
             match Grant::mutation(spec, request, pid, &slots)? {
                 Some(Grant::Mutation(grant)) => {
@@ -1765,7 +1795,7 @@ fn handle_mutation(
 
     if !query_enabled {
         denials.record(Denial::Filesystem(FilesystemDenial {
-            operation: TrapOperation::Write,
+            operation,
             path: resolved,
             requested_path: path,
             syscall: spec.name,
@@ -1783,7 +1813,7 @@ fn handle_mutation(
         qid,
         Trap::filesystem(
             FilesystemDenial {
-                operation: TrapOperation::Write,
+                operation,
                 path: resolved,
                 requested_path: path,
                 syscall: spec.name,
