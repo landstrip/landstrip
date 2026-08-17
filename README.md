@@ -66,7 +66,8 @@ limits, traps, and exit status are in the manual page.
 
 ### Package
 
-Artifacts land in `npm/*/bin` and `artifacts/`.
+Artifacts land in `npm/*/bin` and `artifacts/`. Staging writes platform tarballs
+and matching `<file>.sha256` sidecars under `artifacts/`.
 
 Non-host targets use [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild)
 (Zig as linker). Requires `cargo-zigbuild`, `zig`, and the matching `rustup`
@@ -80,6 +81,13 @@ redistributed).
 make package
 make package PLATFORMS='linux-x64 win32-x64'
 PACKAGE_STRICT=1 make package
+```
+
+`make publish` uploads each GitHub release tarball with its `<file>.sha256`
+sidecar. Verify a download with:
+
+```sh
+sha256sum -c landstrip-<version>-<platform>.tar.gz.sha256
 ```
 
 ## License

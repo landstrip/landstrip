@@ -10,6 +10,10 @@
 
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=sha256.sh
+source "$script_dir/sha256.sh"
+
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--no-deprecation"
 
 CARGO="${CARGO:-cargo}"
@@ -168,6 +172,10 @@ platform_binary() {
 for command in "$CARGO" "$GH" "$NODE" "$NPM" bun tar; do
   require_command "$command"
 done
+if ! command -v sha256sum >/dev/null 2>&1 && \
+  ! command -v shasum >/dev/null 2>&1; then
+  die "required command not found: sha256sum or shasum"
+fi
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
   || die "not inside a Git repository"
@@ -248,10 +256,14 @@ missing=()
 for platform in "${platforms[@]}"; do
   binary="$(platform_binary "$platform")"
   source_bin="npm/$platform/bin/$binary"
-  if [[ ! -f "$source_bin" ]]; then
-    missing+=("$source_bin")
+  digest_file="artifacts/${platform}.bin.sha256"
+  if [[ ! -f "$source_bin" || ! -f "$digest_file" ]]; then
+    missing+=("$platform binary or checksum")
     continue
   fi
+
+  [[ "$(sha256_digest "$source_bin")" == "$(<"$digest_file")" ]] \
+    || die "platform binary mismatch for $platform; rerun make package"
 
   package_dir="$workdir/packages/$platform"
   cp -a "npm/$platform" "$package_dir"
@@ -264,13 +276,14 @@ for platform in "${platforms[@]}"; do
   done
   asset_platform="$platform"
   [[ "$platform" == linux-* ]] && asset_platform="$platform-musl"
-  tar -C "$package_dir/bin" -czf \
-    "$workdir/release/landstrip-$version-$asset_platform.tar.gz" "$binary"
+  asset_path="$workdir/release/landstrip-$version-$asset_platform.tar.gz"
+  tar -C "$package_dir/bin" -czf "$asset_path" "$binary"
+  write_sha256_sidecar "$asset_path"
   npm_package_dirs+=("$package_dir")
 done
 
 if ((${#missing[@]} > 0)); then
-  printf 'missing platform binaries:\n' >&2
+  printf 'missing platform release inputs:\n' >&2
   printf '  %s\n' "${missing[@]}" >&2
   die "run 'PACKAGE_STRICT=1 make package' before publish"
 fi
@@ -299,9 +312,11 @@ for package_name in "${package_names[@]}"; do
 done
 
 if $GH release view "$version" >/dev/null 2>&1; then
-  $GH release upload "$version" "$workdir"/release/*.tar.gz --clobber
+  $GH release upload "$version" "$workdir"/release/*.tar.gz \
+    "$workdir"/release/*.sha256 --clobber
 else
   $GH release create "$version" "$workdir"/release/*.tar.gz \
+    "$workdir"/release/*.sha256 \
     --notes-from-tag \
     --title "landstrip $version" \
     --verify-tag

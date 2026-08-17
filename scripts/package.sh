@@ -22,6 +22,8 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=package-target.sh
 source "$script_dir/package-target.sh"
+# shellcheck source=sha256.sh
+source "$script_dir/sha256.sh"
 
 CARGO="${CARGO:-cargo}"
 RUSTC="${RUSTC:-rustc}"
@@ -46,6 +48,10 @@ require_command() {
 for command in "$CARGO" "$RUSTC" "$NODE" git tar "$FILE"; do
   require_command "$command"
 done
+if ! command -v sha256sum >/dev/null 2>&1 && \
+  ! command -v shasum >/dev/null 2>&1; then
+  die "required command not found: sha256sum or shasum"
+fi
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
   || die "not inside a Git repository"
@@ -265,6 +271,9 @@ for platform in "${requested[@]}"; do
   fi
 
   tar -C "$package_dir/bin" -czf "artifacts/${platform}.tar.gz" "$binary"
+  printf '%s\n' "$(sha256_digest "$package_dir/bin/$binary")" \
+    >"artifacts/${platform}.bin.sha256"
+  write_sha256_sidecar "artifacts/${platform}.tar.gz"
   built+=("$platform")
   printf 'packaged %s -> npm/%s/bin/%s and artifacts/%s.tar.gz\n' \
     "$platform" "$platform" "$binary" "$platform"
