@@ -125,10 +125,7 @@ fn validate_requested_policy(request: &PolicyRequest) -> Result<PolicyValidation
 
 fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport> {
     match result {
-        Ok(()) => Ok(PolicyValidationReport {
-            valid: true,
-            error: None,
-        }),
+        Ok(()) => Ok(PolicyValidationReport::Valid),
         Err(error) => {
             let Some(engine_error) = find_engine_error(&error) else {
                 return Err(error);
@@ -144,10 +141,10 @@ fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport
                 rendered_message
             };
 
-            Ok(PolicyValidationReport {
-                valid: false,
-                error: Some(PolicyValidationError { code, message }),
-            })
+            Ok(PolicyValidationReport::Invalid(PolicyValidationError {
+                code,
+                message,
+            }))
         }
     }
 }

@@ -101,12 +101,19 @@ pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
 #[cfg(target_os = "windows")]
 pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
     let status = windows::status()?;
-    let error = (!status.healthy).then(|| "restricted-user installation is unhealthy".to_owned());
-    Ok(DoctorReport {
-        ok: status.healthy,
-        platform: std::env::consts::OS,
-        implementation: status.active,
-        error,
+    let platform = std::env::consts::OS;
+    let implementation = status.active();
+    Ok(if status.healthy() {
+        DoctorReport::Healthy {
+            platform,
+            implementation,
+        }
+    } else {
+        DoctorReport::Unhealthy {
+            platform,
+            implementation,
+            error: "restricted-user installation is unhealthy".to_owned(),
+        }
     })
 }
 
@@ -120,11 +127,16 @@ fn doctor_report(
     implementation: SandboxImplementation,
     result: anyhow::Result<()>,
 ) -> DoctorReport {
-    let error = result.err().map(|error| format!("{error:#}"));
-    DoctorReport {
-        ok: error.is_none(),
-        platform: std::env::consts::OS,
-        implementation,
-        error,
+    let platform = std::env::consts::OS;
+    match result {
+        Ok(()) => DoctorReport::Healthy {
+            platform,
+            implementation,
+        },
+        Err(error) => DoctorReport::Unhealthy {
+            platform,
+            implementation,
+            error: format!("{error:#}"),
+        },
     }
 }
