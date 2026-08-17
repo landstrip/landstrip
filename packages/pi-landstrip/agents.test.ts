@@ -9,6 +9,7 @@ import { describe, expect, test } from 'vitest';
 import {
   agentSupportsMode,
   availableAgents,
+  isPrimaryAgent,
   loadAgentCatalog,
   mergePermissionRules,
   permissionAlwaysDenied,
@@ -105,6 +106,80 @@ describe('landstrip agent configuration', () => {
     const untrustedCatalog = loadAgentCatalog(cwd, agentDir, false);
     expect(untrustedCatalog.agents.has('advisor')).toBe(true);
     expect(untrustedCatalog.agents.has('local-review')).toBe(false);
+  });
+
+  test('overlays landstrip fields onto markdown subagents without changing their mode', () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    const advisorPath = join(agentDir, 'agents', 'advisor.md');
+    mkdirSync(dirname(advisorPath), { recursive: true });
+    writeFileSync(
+      advisorPath,
+      '---\ndescription: Stronger reviewer\nmode: subagent\n---\nAdvise.\n',
+    );
+    write(join(agentDir, 'landstrip.json'), {
+      agent: { advisor: { model: 'test/advisor-model' } },
+    });
+
+    const catalog = loadAgentCatalog(cwd, agentDir);
+    const advisor = catalog.agents.get('advisor');
+    expect(catalog.diagnostics).toEqual([]);
+    expect(advisor).toMatchObject({
+      source: 'global',
+      description: 'Stronger reviewer',
+      prompt: 'Advise.',
+      mode: 'subagent',
+      model: 'test/advisor-model',
+    });
+    expect(advisor?.origin).toMatchObject({ kind: 'pi-markdown', path: advisorPath });
+    expect(agentSupportsMode(advisor!, 'primary')).toBe(false);
+    expect(agentSupportsMode(advisor!, 'subagent')).toBe(true);
+    expect(
+      availableAgents(catalog)
+        .filter((agent) => agentSupportsMode(agent, 'primary'))
+        .map((agent) => agent.name),
+    ).toEqual(['build', 'plan']);
+  });
+
+  test('keeps JSON and Markdown user-defined agents off the primary list unless mode is primary', () => {
+    const cwd = temporaryDirectory();
+    const agentDir = temporaryDirectory();
+    const helperPath = join(agentDir, 'agents', 'helper.md');
+    mkdirSync(dirname(helperPath), { recursive: true });
+    writeFileSync(helperPath, '---\ndescription: Markdown helper\n---\nHelp.\n');
+    write(join(agentDir, 'landstrip.json'), {
+      agent: {
+        helper: { model: 'test/helper-model' },
+        notes: { description: 'JSON notes', prompt: 'Take notes.' },
+      },
+    });
+
+    const catalog = loadAgentCatalog(cwd, agentDir);
+    const helper = catalog.agents.get('helper');
+    const notes = catalog.agents.get('notes');
+    expect(catalog.diagnostics).toEqual([]);
+    expect(helper).toMatchObject({
+      source: 'global',
+      description: 'Markdown helper',
+      prompt: 'Help.',
+      mode: 'all',
+      model: 'test/helper-model',
+    });
+    expect(notes).toMatchObject({
+      source: 'global',
+      description: 'JSON notes',
+      prompt: 'Take notes.',
+      mode: 'all',
+    });
+    expect(isPrimaryAgent(helper!)).toBe(false);
+    expect(isPrimaryAgent(notes!)).toBe(false);
+    expect(agentSupportsMode(helper!, 'subagent')).toBe(true);
+    expect(agentSupportsMode(notes!, 'subagent')).toBe(true);
+    expect(
+      availableAgents(catalog)
+        .filter(isPrimaryAgent)
+        .map((agent) => agent.name),
+    ).toEqual(['build', 'plan']);
   });
 
   test('merges global and trusted-project landstrip settings', () => {

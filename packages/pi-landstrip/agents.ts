@@ -230,16 +230,27 @@ export function loadAgentCatalog(
       continue;
     }
     const imported = normalized.get(name);
-    if (Object.keys(value).every((key) => key === 'disable')) {
-      if (imported) {
-        normalized.set(name, {
-          ...imported,
-          disabled: value.disable === true,
-          raw: { ...imported.raw, disable: value.disable },
-        });
+    if (imported) {
+      try {
+        const source = agentSources.get(name) ?? imported.source;
+        normalized.set(
+          name,
+          normalizeAgent(
+            name,
+            { ...imported.raw, ...value },
+            source,
+            imported.origin ?? {
+              kind: 'pi-markdown',
+              source: imported.source,
+            },
+          ),
+        );
+      } catch (error) {
+        diagnostics.push(formatError(error));
       }
       continue;
     }
+    if (Object.keys(value).every((key) => key === 'disable')) continue;
     try {
       const source = agentSources.get(name) ?? 'built-in';
       normalized.set(
@@ -302,6 +313,10 @@ export function mergePermissionRules(...values: PermissionRules[]): PermissionRu
 
 export function availableAgents(catalog: AgentCatalog): AgentDefinition[] {
   return [...catalog.agents.values()].filter((agent) => !agent.hidden && !agent.disabled);
+}
+
+export function isPrimaryAgent(agent: AgentDefinition): boolean {
+  return agent.mode === 'primary';
 }
 
 export function agentSupportsMode(agent: AgentDefinition, mode: 'primary' | 'subagent'): boolean {

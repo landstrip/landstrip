@@ -1320,9 +1320,18 @@ test('inspects and navigates persisted child sessions without switching sessions
             prompt: 'Review globally.',
             mode: 'subagent',
           },
+          notes: {
+            description: 'JSON notes',
+            prompt: 'Take notes.',
+          },
         },
       },
     }),
+  );
+  mkdirSync(join(agentDir, 'agents'), { recursive: true });
+  writeFileSync(
+    join(agentDir, 'agents', 'helper.md'),
+    '---\ndescription: Markdown helper\n---\nHelp.\n',
   );
   mkdirSync(join(cwd, '.pi'), { recursive: true });
   writeFileSync(
@@ -1482,6 +1491,9 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(agents).toContain('@build');
   expect(agents).toContain('@plan');
   expect(agents).not.toContain('@general');
+  expect(agents).not.toContain('@notes');
+  expect(agents).not.toContain('@helper');
+  expect(agents).not.toContain('@review');
   const primaryHeader = agents
     .split('\n')
     .find((line) => line.includes('Agent') && line.includes('Source'));
@@ -1518,7 +1530,10 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(subagents).toContain('@explore');
   expect(subagents).toContain('@general');
   expect(subagents).toContain('@review');
+  expect(subagents).toContain('@notes');
+  expect(subagents).toContain('@helper');
   expect(subagents).not.toContain('@build');
+  expect(subagents).not.toContain('@plan');
   const subagentHeader = subagents
     .split('\n')
     .find((line) => line.includes('Agent') && line.includes('Source'));

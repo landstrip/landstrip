@@ -49,6 +49,7 @@ import {
   type AgentDefinition,
   agentSupportsMode,
   availableAgents,
+  isPrimaryAgent,
   loadAgentCatalog,
   mergePermissionRules,
   permissionAlwaysDenied,
@@ -1351,7 +1352,7 @@ export class SubagentRuntime {
       : 'primary';
     const agentsForTab = (): AgentDefinition[] =>
       agents.filter((agent) =>
-        agentSupportsMode(agent, tab === 'subagent' ? 'subagent' : 'primary'),
+        tab === 'subagent' ? agentSupportsMode(agent, 'subagent') : isPrimaryAgent(agent),
       );
     let selectedAgent = Math.max(
       0,
@@ -1844,7 +1845,7 @@ export class SubagentRuntime {
               matchesKey(data, 'return') &&
               agent &&
               !agent.disabled &&
-              agentSupportsMode(agent, 'primary')
+              isPrimaryAgent(agent)
             ) {
               void this.selectPrimaryAgent(agent.name, ctx)
                 .then(() => tui.requestRender())
@@ -2066,7 +2067,7 @@ export class SubagentRuntime {
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
     if (catalog.diagnostics.length > 0) return false;
     const agent = availableAgents(catalog).find(
-      (candidate) => candidate.name === name && agentSupportsMode(candidate, 'primary'),
+      (candidate) => candidate.name === name && isPrimaryAgent(candidate),
     );
     if (!agent) {
       ctx.ui.notify(`Unknown primary agent: ${name}`, 'error');
@@ -2089,7 +2090,7 @@ export class SubagentRuntime {
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
     if (catalog.diagnostics.length > 0) return;
 
-    const agents = availableAgents(catalog).filter((agent) => agentSupportsMode(agent, 'primary'));
+    const agents = availableAgents(catalog).filter(isPrimaryAgent);
     if (agents.length === 0) {
       ctx.ui.notify('No primary agents are available', 'warning');
       return;
@@ -3134,7 +3135,7 @@ export class SubagentRuntime {
       const value = entry.data as { name?: unknown } | undefined;
       if (typeof value?.name === 'string') name = value.name;
     }
-    const agents = availableAgents(catalog).filter((agent) => agentSupportsMode(agent, 'primary'));
+    const agents = availableAgents(catalog).filter(isPrimaryAgent);
     const agent = agents.find((candidate) => candidate.name === name) ?? agents[0];
     if (agent && !(await this.activatePrimaryAgent(agent, catalog, ctx, false))) {
       this.invalidatePrimaryAgent(catalog, ctx);

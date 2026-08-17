@@ -136,12 +136,16 @@ forms at one scope is an error.
 Agent definitions accept `name`, `description`, `prompt`, `mode`, `model`,
 `variant`, `temperature`, `top_p`, `steps`, `color`, `hidden`, `disable`,
 `options`, and `permission`. `mode` is `primary`, `subagent`, or `all` and
-defaults to `all`.
+defaults to `all`. `/agents` Primary lists only `mode: primary` agents. The
+Subagent tab lists `mode: subagent` and `mode: all` agents, including JSON and
+Markdown definitions.
 
 The built-in primary agents are `build` and `plan`; built-in subagents are
 `general`, `scout`, and `explore`. Pi also loads Markdown agents from
-`~/.pi/agent/agents/` and `.pi/agents/`. Project definitions override global
-definitions, and configured agents override Markdown agents with the same name.
+`~/.pi/agent/agents/` and `.pi/agents/`. Project definitions overlay global
+definitions. Configured fields overlay Markdown agents with the same name, so a
+model-only `landstrip.json` entry keeps the Markdown agent's mode, prompt, and
+permissions.
 
 ## Commands and tasks
 
