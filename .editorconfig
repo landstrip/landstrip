@@ -5,9 +5,23 @@ charset = utf-8
 end_of_line = lf
 insert_final_newline = true
 trim_trailing_whitespace = true
+
+[{Makefile,*.mk}]
+indent_style = tab
+indent_size = 8
+tab_width = 8
+
+[*.rs]
+indent_style = space
+indent_size = 4
+
+[*.toml]
+indent_style = space
+indent_size = 4
+
+[*.{sh,js,cjs,mjs,ts,tsx,jsx,json,jsonc,yml,yaml,md}]
 indent_style = space
 indent_size = 2
 
-[*.sh]
-indent_style = space
-indent_size = 2
+[*.{ts,tsx,js,jsx,mjs,cjs}]
+quote_type = single

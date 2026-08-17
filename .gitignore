@@ -3,3 +3,5 @@ node_modules
 /artifacts
 /npm/*/bin/landstrip
 /npm/*/bin/landstrip.exe
+dist/
+*.tgz
