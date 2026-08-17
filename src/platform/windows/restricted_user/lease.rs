@@ -3,7 +3,7 @@
 
 //! Exclusive account leasing and crash-recovery journals.
 
-use super::ToWideNul;
+use super::NamedMutex;
 use super::access::GrantPlan;
 use super::state::{self, Account, Installation, NetworkMode};
 use crate::error::{Error as LandstripError, Mechanism};
@@ -12,11 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::ptr;
-use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
-};
-use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,7 +22,7 @@ struct Journal {
 
 pub(super) struct Lease<'a> {
     account: &'a Account,
-    handle: HANDLE,
+    _mutex: NamedMutex,
     journal_path: PathBuf,
 }
 
@@ -117,27 +112,14 @@ impl<'a> Lease<'a> {
             "Global\\LandstripRestrictedUser-{}-{}",
             installation.id, account.name
         );
-        let name = name.to_wide_nul();
-        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error()).context("create restricted-user lease mutex");
-        }
-        let wait = unsafe { WaitForSingleObject(handle, 0) };
-        if wait == WAIT_TIMEOUT {
-            unsafe {
-                CloseHandle(handle);
-            }
+        let Some(mutex) =
+            NamedMutex::acquire(name, 0).context("acquire restricted-user lease mutex")?
+        else {
             return Ok(None);
-        }
-        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-            unsafe {
-                CloseHandle(handle);
-            }
-            return Err(io::Error::last_os_error()).context("acquire restricted-user lease mutex");
-        }
+        };
         Ok(Some(Self {
             account,
-            handle,
+            _mutex: mutex,
             journal_path,
         }))
     }
@@ -181,15 +163,4 @@ pub(super) fn recover_all(installation: &Installation) -> Result<()> {
         leases.push(lease);
     }
     Ok(())
-}
-
-impl Drop for Lease<'_> {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe {
-                ReleaseMutex(self.handle);
-                CloseHandle(self.handle);
-            }
-        }
-    }
 }

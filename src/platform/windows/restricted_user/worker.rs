@@ -6,7 +6,7 @@
 use super::state;
 use super::{
     OwnedSecurityDescriptor, ToWideNul, current_process_token, join_command_line, own_handle,
-    quote_command_text, sid_string, token_user,
+    quote_command_text, sid_string, token_user, wait_process_exit,
 };
 use crate::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result, bail};
@@ -19,7 +19,6 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr;
-use windows_sys::Win32::Foundation::WAIT_FAILED;
 use windows_sys::Win32::Security::{
     CreateRestrictedToken, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
     PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity, TOKEN_ASSIGN_PRIMARY,
@@ -31,8 +30,7 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
-    GetCurrentThread, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
+    GetCurrentThread, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 const REQUEST_VERSION: u32 = 2;
@@ -146,15 +144,7 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
         )
         .into());
     }
-    let wait = unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
-    if wait == WAIT_FAILED {
-        return Err(LandstripError::supervise(io::Error::last_os_error()).into());
-    }
-    let mut exit_code = 0;
-    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &raw mut exit_code) } == 0 {
-        return Err(LandstripError::supervise(io::Error::last_os_error()).into());
-    }
-    Ok(exit_code)
+    wait_process_exit(&process)
 }
 
 fn create_restricted_token() -> Result<OwnedHandle> {

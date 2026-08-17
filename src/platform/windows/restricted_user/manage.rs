@@ -7,7 +7,7 @@ use super::account;
 use super::lease;
 use super::state::{self, INSTALLATION_VERSION, Installation, NetworkMode};
 use super::wfp;
-use super::{ToWideNul, current_process_token, own_handle};
+use super::{NamedMutex, ToWideNul, current_process_token, own_handle};
 use crate::outcome::{SandboxImplementation, WindowsStatusReport};
 use crate::platform::WindowsCommand;
 use anyhow::{Context, Result, bail};
@@ -19,15 +19,11 @@ use std::mem;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
-};
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
 };
-use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetExitCodeProcess, INFINITE, ReleaseMutex, WaitForSingleObject,
-};
+use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 use windows_sys::Win32::UI::Shell::{
     SEE_MASK_NO_CONSOLE, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHELLEXECUTEINFOW_0,
     ShellExecuteExW,
@@ -56,7 +52,8 @@ pub(crate) fn manage(command: &WindowsCommand) -> Result<WindowsStatusReport> {
                 )?;
                 return status();
             }
-            let _management_lock = ManagementLock::acquire()?;
+            let _management_lock = NamedMutex::lock(MANAGEMENT_MUTEX)
+                .context("acquire restricted-user management mutex")?;
             setup(
                 *restricted_accounts,
                 *unrestricted_accounts,
@@ -70,7 +67,8 @@ pub(crate) fn manage(command: &WindowsCommand) -> Result<WindowsStatusReport> {
                 elevate_uninstall()?;
                 return status();
             }
-            let _management_lock = ManagementLock::acquire()?;
+            let _management_lock = NamedMutex::lock(MANAGEMENT_MUTEX)
+                .context("acquire restricted-user management mutex")?;
             uninstall()
         }
     }
@@ -372,37 +370,4 @@ fn is_elevated() -> Result<bool> {
         return Err(io::Error::last_os_error()).context("query process elevation");
     }
     Ok(elevation.TokenIsElevated != 0)
-}
-
-struct ManagementLock(HANDLE);
-
-impl ManagementLock {
-    fn acquire() -> Result<Self> {
-        let name = MANAGEMENT_MUTEX.to_wide_nul();
-        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
-        if handle.is_null() {
-            return Err(io::Error::last_os_error())
-                .context("create restricted-user management mutex");
-        }
-        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-            unsafe { CloseHandle(handle) };
-            let error = if wait == WAIT_FAILED {
-                io::Error::last_os_error()
-            } else {
-                io::Error::other(format!("unexpected mutex wait result {wait}"))
-            };
-            return Err(error).context("acquire restricted-user management mutex");
-        }
-        Ok(Self(handle))
-    }
-}
-
-impl Drop for ManagementLock {
-    fn drop(&mut self) {
-        unsafe {
-            ReleaseMutex(self.0);
-            CloseHandle(self.0);
-        }
-    }
 }

@@ -4,8 +4,9 @@
 //! Windows sandbox platform using `AppContainer`.
 
 use super::{
-    ToWideNul, is_locked_error, join_command_line, own_handle, path_access_failed,
-    quote_command_text, set_path_access, win32_error, win32_status,
+    NamedMutex, SandboxJob, ToWideNul, is_locked_error, join_command_line, own_handle,
+    path_access_failed, quote_command_text, set_path_access, wait_process_exit, win32_error,
+    win32_status,
 };
 use crate::config::AppContainerMode;
 use crate::error::{Cause, Error as LandstripError, Mechanism};
@@ -25,8 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
     ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, GENERIC_READ,
-    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
     NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
@@ -48,25 +48,19 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR, FILE_TYPE_DISK,
     FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING,
 };
-use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
-};
+use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CreateMutexW, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
+    CREATE_BREAKAWAY_FROM_JOB, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE,
-    ReleaseMutex, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
-const INFINITE: u32 = 0xffff_ffff;
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 /// The `HRESULT` facility that wraps a Win32 error code.
 const FACILITY_WIN32: u32 = 7;
@@ -233,7 +227,8 @@ struct LoopbackExemption {
 
 impl LoopbackExemption {
     fn new(moniker: &str, sid: PSID) -> Result<Self> {
-        let _mutex = LoopbackMutex::lock()?;
+        let _mutex = NamedMutex::lock(LOOPBACK_MUTEX_NAME)
+            .map_err(|source| LandstripError::sandbox_setup(Mechanism::Appcontainer, source))?;
         let state_dir = dirs::data_local_dir()
             .ok_or_else(|| {
                 LandstripError::sandbox_setup(
@@ -268,7 +263,8 @@ impl LoopbackExemption {
             return Ok(());
         }
 
-        let _mutex = LoopbackMutex::lock()?;
+        let _mutex = NamedMutex::lock(LOOPBACK_MUTEX_NAME)
+            .map_err(|source| LandstripError::sandbox_setup(Mechanism::Appcontainer, source))?;
         update_loopback_config(None, &[self.sid])?;
         delete_appcontainer_profile(&self.moniker)?;
         remove_marker(&self.marker)?;
@@ -282,46 +278,6 @@ impl Drop for LoopbackExemption {
         if let Err(error) = self.remove() {
             log::warn!("windows: could not remove AppContainer loopback exemption: {error:#}");
         }
-    }
-}
-
-struct LoopbackMutex {
-    handle: OwnedHandle,
-}
-
-impl LoopbackMutex {
-    fn lock() -> Result<Self> {
-        let name = LOOPBACK_MUTEX_NAME.to_wide_nul();
-        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
-        if handle.is_null() {
-            return Err(LandstripError::sandbox_setup(
-                Mechanism::Appcontainer,
-                io::Error::last_os_error(),
-            )
-            .into());
-        }
-        let mutex = Self {
-            handle: unsafe { own_handle(handle) },
-        };
-        match unsafe { WaitForSingleObject(mutex.handle.as_raw_handle(), INFINITE) } {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(mutex),
-            WAIT_FAILED => Err(LandstripError::sandbox_setup(
-                Mechanism::Appcontainer,
-                io::Error::last_os_error(),
-            )
-            .into()),
-            status => Err(LandstripError::sandbox_setup(
-                Mechanism::Appcontainer,
-                format!("unexpected mutex wait status {status}"),
-            )
-            .into()),
-        }
-    }
-}
-
-impl Drop for LoopbackMutex {
-    fn drop(&mut self) {
-        unsafe { ReleaseMutex(self.handle.as_raw_handle()) };
     }
 }
 
@@ -660,51 +616,6 @@ fn set_appcontainer_path_access(
     }
 }
 
-struct SandboxJob {
-    handle: OwnedHandle,
-}
-
-impl SandboxJob {
-    fn new() -> Result<Self> {
-        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
-        if handle.is_null() {
-            return Err(LandstripError::sandbox_setup(
-                Mechanism::Appcontainer,
-                io::Error::last_os_error(),
-            )
-            .into());
-        }
-
-        let job = Self {
-            handle: unsafe { own_handle(handle) },
-        };
-        let mut limits = unsafe { mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let ok = unsafe {
-            SetInformationJobObject(
-                job.handle.as_raw_handle(),
-                JobObjectExtendedLimitInformation,
-                (&raw const limits).cast(),
-                u32::try_from(mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
-                    .map_err(|_| LandstripError::IntegerTooLarge)?,
-            )
-        };
-        if ok == 0 {
-            return Err(LandstripError::sandbox_setup(
-                Mechanism::Appcontainer,
-                io::Error::last_os_error(),
-            )
-            .into());
-        }
-
-        Ok(job)
-    }
-
-    fn as_raw(&self) -> HANDLE {
-        self.handle.as_raw_handle()
-    }
-}
-
 struct StandardHandles {
     stdin: OwnedHandle,
     stdout: OwnedHandle,
@@ -865,7 +776,7 @@ fn create_process_in_appcontainer(
     startup_info.StartupInfo.hStdOutput = inherited_handles[1];
     startup_info.StartupInfo.hStdError = inherited_handles[2];
 
-    let job = SandboxJob::new()?;
+    let job = SandboxJob::new(Mechanism::Appcontainer)?;
     let mut job_handle = job.as_raw();
     let mut mitigation_policy = MITIGATION_POLICY;
     let attribute_count = if app_container_mode == AppContainerMode::Lpac {
@@ -927,7 +838,10 @@ fn create_process_in_appcontainer(
     )?;
     drop(standard_handles);
 
-    supervise_process(process_info)
+    let process = unsafe { own_handle(process_info.hProcess) };
+    let thread = unsafe { own_handle(process_info.hThread) };
+    drop(thread);
+    wait_process_exit(&process)
 }
 
 fn current_process_in_job() -> Result<bool> {
@@ -999,25 +913,6 @@ fn create_process(
 
 fn is_access_denied(error: &io::Error) -> bool {
     win32_status(error) == Some(ERROR_ACCESS_DENIED)
-}
-
-fn supervise_process(process_info: PROCESS_INFORMATION) -> Result<u32> {
-    let process = unsafe { own_handle(process_info.hProcess) };
-    let thread = unsafe { own_handle(process_info.hThread) };
-    let wait = unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) };
-    if wait == WAIT_FAILED {
-        return Err(LandstripError::supervise(io::Error::last_os_error()).into());
-    }
-
-    let mut exit_code = 0;
-    let ok = unsafe { GetExitCodeProcess(process.as_raw_handle(), &raw mut exit_code) };
-    if ok == 0 {
-        return Err(LandstripError::supervise(io::Error::last_os_error()).into());
-    }
-
-    drop(thread);
-    drop(process);
-    Ok(exit_code)
 }
 
 fn update_attribute(

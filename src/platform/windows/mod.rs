@@ -16,12 +16,13 @@ use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_PATH_NOT_FOUND,
-    ERROR_SHARING_VIOLATION, HANDLE, LocalFree,
+    ERROR_SHARING_VIOLATION, HANDLE, LocalFree, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ACCESS_MODE, ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -34,7 +35,14 @@ use windows_sys::Win32::Security::{
     PSECURITY_DESCRIPTOR, PSID, SECURITY_DESCRIPTOR, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
     SetFileSecurityW, SetSecurityDescriptorDacl, TOKEN_USER, TokenUser,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::JobObjects::{
+    CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectExtendedLimitInformation, SetInformationJobObject,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken, ReleaseMutex,
+    WaitForSingleObject,
+};
 
 /// Take ownership of a live Win32 handle.
 ///
@@ -51,6 +59,93 @@ pub(crate) fn current_process_token(desired_access: u32) -> io::Result<OwnedHand
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { own_handle(token) })
+}
+
+pub(crate) struct SandboxJob {
+    handle: OwnedHandle,
+}
+
+impl SandboxJob {
+    pub(crate) fn new(mechanism: Mechanism) -> Result<Self> {
+        let handle = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if handle.is_null() {
+            return Err(Error::sandbox_setup(mechanism, io::Error::last_os_error()).into());
+        }
+
+        let job = Self {
+            handle: unsafe { own_handle(handle) },
+        };
+        let mut limits = unsafe { mem::zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = u32::try_from(mem::size_of_val(&limits)).map_err(|_| Error::IntegerTooLarge)?;
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.handle.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                size,
+            )
+        };
+        if ok == 0 {
+            return Err(Error::sandbox_setup(mechanism, io::Error::last_os_error()).into());
+        }
+
+        Ok(job)
+    }
+
+    pub(crate) fn as_raw(&self) -> HANDLE {
+        self.handle.as_raw_handle()
+    }
+}
+
+pub(crate) struct NamedMutex {
+    handle: OwnedHandle,
+}
+
+impl NamedMutex {
+    pub(crate) fn lock(name: impl AsRef<OsStr>) -> io::Result<Self> {
+        Self::acquire(name, INFINITE)?.ok_or_else(|| io::Error::other("named mutex wait timed out"))
+    }
+
+    pub(crate) fn acquire(name: impl AsRef<OsStr>, timeout_ms: u32) -> io::Result<Option<Self>> {
+        let name = name.as_ref().to_wide_nul();
+        let handle = unsafe { CreateMutexW(ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let handle = unsafe { own_handle(handle) };
+        match unsafe { WaitForSingleObject(handle.as_raw_handle(), timeout_ms) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(Self { handle })),
+            WAIT_TIMEOUT => Ok(None),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            status => Err(io::Error::other(format!(
+                "unexpected mutex wait status {status}"
+            ))),
+        }
+    }
+}
+
+impl Drop for NamedMutex {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseMutex(self.handle.as_raw_handle());
+        }
+    }
+}
+
+pub(crate) fn wait_process_exit(process: &impl AsRawHandle) -> Result<u32> {
+    let handle = process.as_raw_handle();
+    if unsafe { WaitForSingleObject(handle, INFINITE) } == WAIT_FAILED {
+        return Err(Error::supervise(io::Error::last_os_error()).into());
+    }
+
+    let mut exit_code = 0;
+    if unsafe { GetExitCodeProcess(handle, &raw mut exit_code) } == 0 {
+        return Err(Error::supervise(io::Error::last_os_error()).into());
+    }
+
+    Ok(exit_code)
 }
 
 /// A Win32 C string: UTF-16 units plus a trailing NUL.
