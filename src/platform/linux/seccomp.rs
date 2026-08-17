@@ -14,10 +14,7 @@
 //! path checks.
 
 use super::fd::close_inherited_fds;
-use super::filter::{
-    NetworkFilters, build_errno_filter, build_notify_filter, needs_unix_socket_broker,
-    unix_socket_filter,
-};
+use super::filter::{NetworkFilters, build_errno_filter, build_notify_filter};
 use super::landlock::enforce_broker_access_policy;
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::paths::{
@@ -141,15 +138,10 @@ pub(super) fn run_broker(
     needs_filesystem: bool,
     trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
-    let notify_unix_sockets = needs_unix_socket_broker(&policy.network_access.unix_socket_access);
-    let notify_bind =
-        needs_network && (policy.network_access.local_tcp_bind || notify_unix_sockets);
-    let notify_connect = needs_network
-        && (policy.network_access.local_tcp_bind
-            || !policy.network_access.connect_tcp_ports.is_empty()
-            || notify_unix_sockets);
+    let notify_bind = needs_network && policy.network_access.needs_bind_broker();
+    let notify_connect = needs_network && policy.network_access.needs_network_broker();
     let notify_filesystem = needs_filesystem;
-    let unix_sockets = unix_socket_filter(&policy.network_access.unix_socket_access);
+    let unix_sockets = policy.network_access.unix_socket_access().into();
     ensure_notification_supported()?;
 
     let syscalls = NotificationSyscalls::new();
@@ -759,7 +751,7 @@ fn handle_bind(
 
     match socket.info.kind() {
         SocketKind::Tcp => {
-            if !policy.network_access.local_tcp_bind {
+            if !policy.network_access.allows_local_tcp_bind() {
                 if let Ok(endpoint) = tcp_endpoint(&socket.addr, socket.info.domain) {
                     if query_enabled {
                         return Ok(network_query(
@@ -823,10 +815,10 @@ fn handle_connect(
         SocketKind::Tcp => {
             let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
             if !endpoint.loopback
-                || (!policy.network_access.local_tcp_bind
+                || (!policy.network_access.allows_local_tcp_bind()
                     && !policy
                         .network_access
-                        .connect_tcp_ports
+                        .connect_tcp_ports()
                         .contains(&endpoint.port))
             {
                 if query_enabled {
@@ -933,12 +925,13 @@ fn unix_path_target(pid: u32, addr: &[u8]) -> SysResult<Option<(PathBuf, bool)>>
 }
 
 fn authorize_unix_path(policy: &AccessPolicy, target: &Path) -> SysResult<()> {
-    match &policy.network_access.unix_socket_access {
+    match policy.network_access.unix_socket_access() {
         UnixSocketAccess::Unrestricted => Ok(()),
         UnixSocketAccess::AllowPaths(paths) => target
             .is_under_any(paths)
             .then_some(())
             .ok_or(BrokerError::PolicyDenied),
+        UnixSocketAccess::Denied => Err(BrokerError::PolicyDenied),
     }
 }
 

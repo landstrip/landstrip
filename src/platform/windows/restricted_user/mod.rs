@@ -135,7 +135,7 @@ fn validate_restricted_network(
         )
         .into());
     }
-    if policy.network_access.local_tcp_bind || !policy.network_access.restrict_bind_tcp {
+    if policy.network_access.allows_local_tcp_bind() {
         return Err(Error::sandbox_setup(
             Mechanism::Windowsuser,
             "allowLocalBinding is not supported by restricted-user isolation",
@@ -144,7 +144,7 @@ fn validate_restricted_network(
     }
     if policy
         .network_access
-        .connect_tcp_ports
+        .connect_tcp_ports()
         .iter()
         .any(|port| *port < installation.proxy_port_low || *port > installation.proxy_port_high)
     {

@@ -54,26 +54,16 @@ pub(super) fn build_errno_filter(
     build_filter(errno_rules, SeccompAction::Errno(eafnosupport)).map(Some)
 }
 
-pub(super) fn network_filter(config: NetworkFilter, needs_network: bool) -> Result<NetworkFilters> {
+pub(super) fn network_filter(
+    unix_sockets: UnixSocketFilter,
+    needs_network: bool,
+) -> Result<NetworkFilters> {
     let syscalls = NotificationSyscalls::new();
-    let errno = build_errno_filter(&syscalls, needs_network, config.unix_sockets)?;
-    let notify = if config.notify_bind || config.notify_connect || config.notify_filesystem {
-        let mut notify_syscalls = Vec::new();
-        if config.notify_bind {
-            notify_syscalls.push(syscalls.bind);
-        }
-        if config.notify_connect {
-            notify_syscalls.push(syscalls.connect);
-        }
-        if config.notify_filesystem {
-            notify_syscalls.extend(syscalls.filesystem_syscalls());
-        }
-        Some(build_notify_filter(&notify_syscalls)?)
-    } else {
-        None
-    };
-
-    Ok(NetworkFilters { errno, notify })
+    let errno = build_errno_filter(&syscalls, needs_network, unix_sockets)?;
+    Ok(NetworkFilters {
+        errno,
+        notify: None,
+    })
 }
 
 pub(super) struct NetworkFilters {
@@ -278,28 +268,8 @@ pub(super) fn add_unix_socket_filters(
     Ok(())
 }
 
-pub(super) fn needs_unix_socket_broker(access: &UnixSocketAccess) -> bool {
-    matches!(access, UnixSocketAccess::AllowPaths(_))
-}
-
 pub(super) fn needs_filesystem_broker(policy: &AccessPolicy) -> bool {
     !policy.write_roots.is_empty() || !matches!(policy.read_access, ReadAccess::Unrestricted)
-}
-
-pub(super) fn unix_socket_filter(access: &UnixSocketAccess) -> UnixSocketFilter {
-    match access {
-        UnixSocketAccess::Unrestricted => UnixSocketFilter::Unrestricted,
-        UnixSocketAccess::AllowPaths(paths) if paths.is_empty() => UnixSocketFilter::DenyAll,
-        UnixSocketAccess::AllowPaths(_) => UnixSocketFilter::PathMediated,
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct NetworkFilter {
-    pub(super) notify_bind: bool,
-    pub(super) notify_connect: bool,
-    pub(super) notify_filesystem: bool,
-    pub(super) unix_sockets: UnixSocketFilter,
 }
 
 #[derive(Clone, Copy)]
@@ -307,6 +277,16 @@ pub(super) enum UnixSocketFilter {
     Unrestricted,
     PathMediated,
     DenyAll,
+}
+
+impl From<&UnixSocketAccess> for UnixSocketFilter {
+    fn from(access: &UnixSocketAccess) -> Self {
+        match access {
+            UnixSocketAccess::Unrestricted => Self::Unrestricted,
+            UnixSocketAccess::AllowPaths(_) => Self::PathMediated,
+            UnixSocketAccess::Denied => Self::DenyAll,
+        }
+    }
 }
 
 pub(super) fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Result<()> {

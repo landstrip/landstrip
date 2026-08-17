@@ -14,7 +14,6 @@ use crate::trap_fd::TrapFd;
 use ::landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
 use anyhow::{Context, Result};
 use fd::close_inherited_fds;
-use filter::NetworkFilter;
 use landlock::enforce_access_policy;
 use seccomp::ensure_notification_supported;
 use std::ffi::{OsStr, OsString};
@@ -39,16 +38,12 @@ pub(crate) fn execute(
     trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
     let network = &policy.network_access;
-    let unrestricted_network = network.is_unrestricted();
-    if filter::needs_unix_socket_broker(&network.unix_socket_access) {
+    if network.unix_socket_access().needs_broker() {
         log::debug!("linux: unix socket policy with seccomp enabled");
     }
 
     let needs_fs_broker = filter::needs_filesystem_broker(policy) || trap_fd.is_some();
-    let needs_network_broker = !unrestricted_network
-        && (network.local_tcp_bind
-            || !network.connect_tcp_ports.is_empty()
-            || filter::needs_unix_socket_broker(&network.unix_socket_access));
+    let needs_network_broker = network.needs_network_broker();
 
     if needs_network_broker || needs_fs_broker {
         let status = seccomp::run_broker(
@@ -64,16 +59,8 @@ pub(crate) fn execute(
 
     enforce_access_policy(policy)?;
 
-    if !unrestricted_network {
-        let filters = filter::network_filter(
-            NetworkFilter {
-                notify_bind: false,
-                notify_connect: false,
-                notify_filesystem: false,
-                unix_sockets: filter::unix_socket_filter(&network.unix_socket_access),
-            },
-            true,
-        )?;
+    if !network.is_unrestricted() {
+        let filters = filter::network_filter(network.unix_socket_access().into(), true)?;
         filters.load()?;
     }
     close_inherited_fds(&[]).map_err(Error::supervise)?;

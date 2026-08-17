@@ -104,7 +104,7 @@ pub(crate) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
     let grants = grant_policy_access(policy, profile.sid())?;
 
     let grant_network = policy.network_access.is_unrestricted();
-    if !grant_network && !policy.network_access.connect_tcp_ports.is_empty() {
+    if !grant_network && !policy.network_access.connect_tcp_ports().is_empty() {
         log::warn!(
             "windows: per-port TCP filtering is unavailable; running with no network access"
         );

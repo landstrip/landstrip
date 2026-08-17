@@ -47,10 +47,10 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
     };
 
     let mut handled_access_net = BitFlags::<AccessNet>::empty();
-    if policy.network_access.restrict_connect_tcp {
+    if policy.network_access.restricts_connect_tcp() {
         handled_access_net |= AccessNet::ConnectTcp;
     }
-    if policy.network_access.restrict_bind_tcp {
+    if policy.network_access.restricts_bind_tcp() {
         handled_access_net |= AccessNet::BindTcp;
     }
 
@@ -192,11 +192,11 @@ fn add_path_rules(
 }
 
 fn add_network_rules(mut ruleset: RulesetCreated, policy: &AccessPolicy) -> Result<RulesetCreated> {
-    if !policy.network_access.restrict_connect_tcp {
+    if !policy.network_access.restricts_connect_tcp() {
         return Ok(ruleset);
     }
 
-    for port in &policy.network_access.connect_tcp_ports {
+    for port in policy.network_access.connect_tcp_ports() {
         ruleset = ruleset
             .add_rule(NetPort::new(*port, AccessNet::ConnectTcp))
             .map_err(|source| Error::sandbox_setup(Mechanism::Landlock, source))?;
