@@ -3,6 +3,7 @@
 
 //! macOS Seatbelt (SBPL) sandbox platform.
 
+use super::unix::set_cloexec;
 use crate::engine::error::{Error, Mechanism};
 use crate::engine::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use crate::engine::trap_fd::TrapFd;
@@ -88,20 +89,6 @@ fn close_inherited_fds(trap_fd: Option<RawFd>) -> io::Result<()> {
 
     for fd in FIRST_INHERITED_FD..open_fd_limit() {
         close_fd(fd, trap_fd);
-    }
-    Ok(())
-}
-
-fn set_cloexec(fd: RawFd) -> io::Result<()> {
-    // SAFETY: fcntl(2) copies scalar arguments only.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SAFETY: fcntl(2) copies scalar arguments only.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

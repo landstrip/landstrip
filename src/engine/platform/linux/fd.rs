@@ -6,6 +6,7 @@
 //! Descriptors above stdio are closed so ambient inherited handles do not bypass
 //! the sandbox.
 
+use crate::engine::platform::unix::set_cloexec;
 use std::io;
 use std::os::fd::RawFd;
 
@@ -54,20 +55,6 @@ fn close_range(first: u32, last: u32) -> io::Result<()> {
     } else {
         Ok(())
     }
-}
-
-fn set_cloexec(fd: RawFd) -> io::Result<()> {
-    // SAFETY: fcntl(2) copies scalar arguments only.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // SAFETY: fcntl(2) copies scalar arguments only.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Reads an integer-valued socket option via `getsockopt(2)`.
