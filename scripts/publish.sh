@@ -126,6 +126,10 @@ preflight_npm_package() {
   [[ "$package_private" != true ]] || die "$package_name is marked private"
   [[ "$package_version" == "$version" ]] \
     || die "$package_name version $package_version does not match $version"
+  if npm_package_exists "$package_name"; then
+    printf '%s\n' "$package_name@$version is already published"
+    return
+  fi
   prepare_npm_package_build "$package_dir"
   $NPM publish "$package_dir" --access public --dry-run --loglevel=error >/dev/null
 }
