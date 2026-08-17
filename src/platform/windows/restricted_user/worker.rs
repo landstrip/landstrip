@@ -8,7 +8,7 @@ use super::{
     OwnedSecurityDescriptor, ToWideNul, current_process_token, join_command_line, own_handle,
     quote_command_text, sid_string, token_user,
 };
-use crate::engine::error::{Error as LandstripError, Mechanism};
+use crate::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};

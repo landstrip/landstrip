@@ -6,7 +6,7 @@
 use super::ToWideNul;
 use super::access::GrantPlan;
 use super::state::{self, Account, Installation, NetworkMode};
-use crate::engine::error::{Error as LandstripError, Mechanism};
+use crate::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};

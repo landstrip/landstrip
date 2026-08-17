@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::engine::policy::AccessPolicy;
+use crate::policy::AccessPolicy;
 use serde::Serialize;
 use std::io::{self, Write};
 #[cfg(target_os = "windows")]

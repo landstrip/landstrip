@@ -7,14 +7,14 @@ use self::args::{
     Command, Invocation, ParseOutcome, PolicyCommand, PolicyInput, PolicyRequest, RunCommand,
     parse_cli,
 };
-use crate::engine::config::{PolicyFormat, load_settings};
-use crate::engine::error::Error;
-use crate::engine::outcome::{CommandOutcome, PolicyValidationError, PolicyValidationReport};
-use crate::engine::platform;
-use crate::engine::policy::AccessPolicy;
-use crate::engine::trap::Trap;
+use crate::config::{PolicyFormat, load_settings};
+use crate::error::Error;
+use crate::outcome::{CommandOutcome, PolicyValidationError, PolicyValidationReport};
+use crate::platform;
+use crate::policy::AccessPolicy;
+use crate::trap::Trap;
 #[cfg(unix)]
-use crate::engine::trap_fd::TrapFd;
+use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::error::Error as StdError;
 use std::io::{self, Write};

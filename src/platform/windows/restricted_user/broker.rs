@@ -5,7 +5,7 @@
 
 use super::state::{self, Account};
 use super::{ToWideNul, own_handle, quote_command_arg};
-use crate::engine::error::{Error as LandstripError, Mechanism};
+use crate::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result};
 use std::ffi::{OsStr, c_void};
 use std::io;

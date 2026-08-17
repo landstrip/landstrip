@@ -4,9 +4,9 @@
 //! macOS Seatbelt (SBPL) sandbox platform.
 
 use super::unix::set_cloexec;
-use crate::engine::error::{Error, Mechanism};
-use crate::engine::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
-use crate::engine::trap_fd::TrapFd;
+use crate::error::{Error, Mechanism};
+use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
+use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};

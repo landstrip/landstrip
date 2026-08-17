@@ -18,8 +18,8 @@ pub(super) use super::{
     quote_command_arg, quote_command_text, set_path_access, sid_string, token_user, win32_error,
 };
 
-use crate::engine::error::{Error, Mechanism};
-use crate::engine::policy::AccessPolicy;
+use crate::error::{Error, Mechanism};
+use crate::policy::AccessPolicy;
 use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::fs;

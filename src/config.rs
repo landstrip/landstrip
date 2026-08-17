@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::engine::error::Error;
-use crate::engine::policy::{AccessPolicy, resolve_policy};
+use crate::error::Error;
+use crate::policy::{AccessPolicy, resolve_policy};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};

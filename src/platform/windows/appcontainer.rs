@@ -7,9 +7,9 @@ use super::{
     ToWideNul, is_locked_error, join_command_line, own_handle, path_access_failed,
     quote_command_text, set_path_access, win32_error, win32_status,
 };
-use crate::engine::config::AppContainerMode;
-use crate::engine::error::{Cause, Error as LandstripError, Mechanism};
-use crate::engine::policy::{AccessPolicy, ReadAccess};
+use crate::config::AppContainerMode;
+use crate::error::{Cause, Error as LandstripError, Mechanism};
+use crate::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString, c_void};

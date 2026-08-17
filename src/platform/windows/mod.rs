@@ -8,9 +8,9 @@ use super::WindowsCommand;
 mod appcontainer;
 mod restricted_user;
 
-use crate::engine::error::{Error, Mechanism};
-use crate::engine::outcome::WindowsStatusReport;
-use crate::engine::policy::AccessPolicy;
+use crate::error::{Error, Mechanism};
+use crate::outcome::WindowsStatusReport;
+use crate::policy::AccessPolicy;
 use anyhow::Result;
 use std::ffi::{OsStr, OsString, c_void};
 use std::io;

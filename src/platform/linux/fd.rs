@@ -6,7 +6,7 @@
 //! Descriptors above stdio are closed so ambient inherited handles do not bypass
 //! the sandbox.
 
-use crate::engine::platform::unix::set_cloexec;
+use crate::platform::unix::set_cloexec;
 use std::io;
 use std::os::fd::RawFd;
 

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::engine::config::PolicyFormat;
-use crate::engine::error::Error;
+use crate::config::PolicyFormat;
+use crate::error::Error;
 #[cfg(target_os = "windows")]
-use crate::engine::platform::WindowsCommand;
+use crate::platform::WindowsCommand;
 #[cfg(unix)]
-use crate::engine::trap_fd::TrapFd;
+use crate::trap_fd::TrapFd;
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use std::env;
 use std::ffi::OsString;

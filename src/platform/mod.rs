@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! OS-specific sandbox implementations that enforce a lowered engine policy.
+//! OS-specific sandbox implementations that enforce a lowered policy.
 //!
 //! Each target selects its implementation and re-exports its [`execute`] entry
 //! point, so callers use this module without naming an OS.
@@ -17,11 +17,11 @@ mod unix;
 #[cfg(target_os = "windows")]
 mod windows;
 
-use crate::engine::outcome::DoctorReport;
+use crate::outcome::DoctorReport;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::engine::outcome::SandboxImplementation;
+use crate::outcome::SandboxImplementation;
 #[cfg(target_os = "windows")]
-use crate::engine::outcome::WindowsStatusReport;
+use crate::outcome::WindowsStatusReport;
 
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
@@ -50,24 +50,24 @@ pub(crate) use linux::fd;
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_wraps, reason = "uniform platform validation API")]
-pub(crate) fn validate(_policy: &crate::engine::policy::AccessPolicy) -> anyhow::Result<()> {
+pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn validate(policy: &crate::engine::policy::AccessPolicy) -> anyhow::Result<()> {
+pub(crate) fn validate(policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
     policy.validate()?;
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn validate(policy: &crate::engine::policy::AccessPolicy) -> anyhow::Result<()> {
+pub(crate) fn validate(policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
     windows::validate(policy)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(crate) fn validate(_policy: &crate::engine::policy::AccessPolicy) -> anyhow::Result<()> {
-    Err(crate::engine::error::Error::PlatformUnsupported.into())
+pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
+    Err(crate::error::Error::PlatformUnsupported.into())
 }
 
 #[cfg(target_os = "windows")]
@@ -112,7 +112,7 @@ pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
-    Err(crate::engine::error::Error::PlatformUnsupported.into())
+    Err(crate::error::Error::PlatformUnsupported.into())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

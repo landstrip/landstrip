@@ -9,8 +9,8 @@
 //! policy-to-program translation; it does not run the notification loop.
 
 use super::seccomp::NotificationSyscalls;
-use crate::engine::error::{Error as LandstripError, Mechanism};
-use crate::engine::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
+use crate::error::{Error as LandstripError, Mechanism};
+use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
 use anyhow::Result;
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,

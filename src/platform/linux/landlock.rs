@@ -7,8 +7,8 @@
 //! This gives deny traversal snapshot semantics: a removed and recreated path is
 //! a new object unless an allowed ancestor covers it.
 
-use crate::engine::error::{Error, Mechanism, PathIo};
-use crate::engine::policy::{AccessPolicy, ReadAccess};
+use crate::error::{Error, Mechanism, PathIo};
+use crate::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, LandlockStatus, NetPort, PathBeneath, Ruleset,

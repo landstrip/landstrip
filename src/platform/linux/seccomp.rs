@@ -19,15 +19,13 @@ use super::filter::{
     unix_socket_filter,
 };
 use super::landlock::enforce_broker_access_policy;
-use crate::engine::error::{Error as LandstripError, Mechanism};
-use crate::engine::paths::{
+use crate::error::{Error as LandstripError, Mechanism};
+use crate::paths::{
     PathCoverage, normalize_path, normalize_path_lexically, normalize_path_nofollow,
 };
-use crate::engine::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
-use crate::engine::trap::{
-    FilesystemDenial, NetworkOperation, ProcessContext, Trap, TrapOperation,
-};
-use crate::engine::trap_fd::TrapFd;
+use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
+use crate::trap::{FilesystemDenial, NetworkOperation, ProcessContext, Trap, TrapOperation};
+use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, fcntl};

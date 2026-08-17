@@ -8,9 +8,9 @@ mod filter;
 mod landlock;
 mod seccomp;
 
-use crate::engine::error::Error;
-use crate::engine::policy::AccessPolicy;
-use crate::engine::trap_fd::TrapFd;
+use crate::error::Error;
+use crate::policy::AccessPolicy;
+use crate::trap_fd::TrapFd;
 use ::landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
 use anyhow::{Context, Result};
 use fd::close_inherited_fds;

@@ -14,11 +14,9 @@
 //! macOS-style `*`, `**`, `?`, and character-class globs. Globs are expanded
 //! while lowering the policy.
 
-use crate::engine::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows};
-use crate::engine::error::{Error, PathIo};
-use crate::engine::paths::{
-    PathCoverage, normalize_path, normalize_path_lexically, normalize_roots,
-};
+use crate::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, SandboxWindows};
+use crate::error::{Error, PathIo};
+use crate::paths::{PathCoverage, normalize_path, normalize_path_lexically, normalize_roots};
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::Serialize;

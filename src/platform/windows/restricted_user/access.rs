@@ -6,8 +6,8 @@
 use super::{
     OwnedLocal, ToWideNul, is_locked_error, is_missing_error, path_access_failed, set_path_access,
 };
-use crate::engine::error::{Error as LandstripError, Mechanism};
-use crate::engine::policy::{AccessPolicy, ReadAccess};
+use crate::error::{Error as LandstripError, Mechanism};
+use crate::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io;

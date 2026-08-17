@@ -4,7 +4,7 @@
 //! The trap record: one JSON object per landstrip event, tagged by `kind` and
 //! carrying the stable [`Error`] code of the event it reports.
 
-use crate::engine::error::{Error, Mechanism, errno_name};
+use crate::error::{Error, Mechanism, errno_name};
 use serde::Serialize;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
