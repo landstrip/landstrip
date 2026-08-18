@@ -1549,16 +1549,23 @@ enum MutationSyscall {
 
 impl MutationSyscall {
     /// Whether this invocation targets the symlink itself rather than what it
-    /// resolves to: an inherently no-follow call (`lchown`, `lsetxattr`,
-    /// `lremovexattr`) or an `*at` call carrying `AT_SYMLINK_NOFOLLOW`. The policy
-    /// check and the broker must then act on the link, not its target.
+    /// resolves to: an inherently no-follow call (`unlink`, `unlinkat`,
+    /// `rmdir`, `lchown`, `lsetxattr`, `lremovexattr`) or an `*at` call
+    /// carrying `AT_SYMLINK_NOFOLLOW`. The policy check and the broker must
+    /// then act on the link, not its target.
     fn no_follow(self, args: &[u64; 6]) -> bool {
         // The flags argument is an int; truncating to i32 recovers it from the
         // u64 register slot the same way the dirfd arguments are read.
         let flag = |index: usize| syscall_i32(args[index]) & libc::AT_SYMLINK_NOFOLLOW != 0;
         let follow = |index: usize| syscall_i32(args[index]) & libc::AT_SYMLINK_FOLLOW != 0;
         match self {
-            Self::Lchown | Self::Lsetxattr | Self::Lremovexattr | Self::Link => true,
+            Self::Unlink
+            | Self::Unlinkat
+            | Self::Rmdir
+            | Self::Lchown
+            | Self::Lsetxattr
+            | Self::Lremovexattr
+            | Self::Link => true,
             Self::Fchownat => flag(4),
             Self::Fchmodat | Self::Fchmodat2 | Self::Utimensat => flag(3),
             // linkat(2) links the symlink itself unless AT_SYMLINK_FOLLOW is set;
@@ -1567,7 +1574,6 @@ impl MutationSyscall {
             Self::Renameat2
             | Self::Renameat
             | Self::Symlinkat
-            | Self::Unlinkat
             | Self::Mkdirat
             | Self::Mknodat
             | Self::Truncate
@@ -1575,8 +1581,6 @@ impl MutationSyscall {
             | Self::Removexattr
             | Self::Rename
             | Self::Symlink
-            | Self::Unlink
-            | Self::Rmdir
             | Self::Mkdir
             | Self::Mknod
             | Self::Creat
