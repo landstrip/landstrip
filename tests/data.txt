@@ -130,6 +130,7 @@ name=denyWrite permits unrelated write under symlink root | os=linux | setup=mkd
 # --- no-follow metadata syscalls act on the link ---
 
 name=no-follow chown permits in-tree link to out-of-root target | os=linux | setup=write:denied/secret:;symlink:%TMP%/denied/secret:allowed/link | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'chown -h "$(id -u):$(id -g)" "$1"' _ %TMP%/allowed/link | status=0
+name=unlink removes in-tree link to out-of-root target | os=linux | setup=write:denied/secret:;symlink:%TMP%/denied/secret:allowed/link | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'rm "$1"; test ! -L "$1"' _ %TMP%/allowed/link | status=0
 name=follow chown still gated on in-tree link to out-of-root target | os=linux | setup=write:denied/secret:;symlink:%TMP%/denied/secret:allowed/link | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'chown "$(id -u):$(id -g)" "$1"' _ %TMP%/allowed/link | status=!0 | out="code":"FILESYSTEM_DENIED" | out="reason":"allow_miss" | out="syscall":"fchownat"
 
 # --- glob write roots ---
