@@ -159,8 +159,8 @@ fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<V
         return Ok(None);
     };
 
-    let Some(bytes) = HostStore::read_policy(&exe)
-        .with_context(|| format!("executable policy {}", exe.display()))?
+    let Some(bytes) =
+        read_policy_bytes(&exe).with_context(|| format!("executable policy {}", exe.display()))?
     else {
         return Ok(None);
     };
@@ -189,21 +189,14 @@ fn resolve_executable(tool: &OsStr) -> Option<PathBuf> {
         .is_some_and(|parent| !parent.as_os_str().is_empty());
 
     let candidate = if has_location {
-        HostStore::locate(tool_path)?
+        locate_executable(tool_path)?
     } else {
         let path_var = std::env::var_os("PATH")?;
-        std::env::split_paths(&path_var).find_map(|dir| HostStore::locate(&dir.join(tool_path)))?
+        std::env::split_paths(&path_var).find_map(|dir| locate_executable(&dir.join(tool_path)))?
     };
 
     candidate.canonicalize().ok()
 }
-
-trait ExecutableStore {
-    fn locate(path: &Path) -> Option<PathBuf>;
-    fn read_policy(exe: &Path) -> Result<Option<Vec<u8>>>;
-}
-
-struct HostStore;
 
 /// The extended attribute carrying a supplementary policy, in the
 /// unprivileged `user` namespace: unlike `trusted.*` or `security.*`, it
@@ -217,43 +210,41 @@ const EXECUTABLE_POLICY_XATTR: &str = "user.landstrip.policy";
 #[cfg(target_os = "windows")]
 const EXECUTABLE_POLICY_STREAM: &str = "landstrip.policy";
 
-impl ExecutableStore for HostStore {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn locate(path: &Path) -> Option<PathBuf> {
-        is_executable_file(path).then(|| path.to_path_buf())
-    }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn locate_executable(path: &Path) -> Option<PathBuf> {
+    is_executable_file(path).then(|| path.to_path_buf())
+}
 
-    #[cfg(target_os = "windows")]
-    fn locate(path: &Path) -> Option<PathBuf> {
-        resolve_with_extensions(path)
-    }
+#[cfg(target_os = "windows")]
+fn locate_executable(path: &Path) -> Option<PathBuf> {
+    resolve_with_extensions(path)
+}
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    fn locate(_path: &Path) -> Option<PathBuf> {
-        None
-    }
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn locate_executable(_path: &Path) -> Option<PathBuf> {
+    None
+}
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn read_policy(exe: &Path) -> Result<Option<Vec<u8>>> {
-        Ok(read_xattr(exe, EXECUTABLE_POLICY_XATTR)?)
-    }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_policy_bytes(exe: &Path) -> Result<Option<Vec<u8>>> {
+    Ok(read_xattr(exe, EXECUTABLE_POLICY_XATTR)?)
+}
 
-    #[cfg(target_os = "windows")]
-    fn read_policy(exe: &Path) -> Result<Option<Vec<u8>>> {
-        let mut stream = exe.as_os_str().to_os_string();
-        stream.push(":");
-        stream.push(EXECUTABLE_POLICY_STREAM);
-        match fs::read(PathBuf::from(stream)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(Error::PolicyIoFailed { source }.into()),
-        }
+#[cfg(target_os = "windows")]
+fn read_policy_bytes(exe: &Path) -> Result<Option<Vec<u8>>> {
+    let mut stream = exe.as_os_str().to_os_string();
+    stream.push(":");
+    stream.push(EXECUTABLE_POLICY_STREAM);
+    match fs::read(PathBuf::from(stream)) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::PolicyIoFailed { source }.into()),
     }
+}
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    fn read_policy(_exe: &Path) -> Result<Option<Vec<u8>>> {
-        Ok(None)
-    }
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn read_policy_bytes(_exe: &Path) -> Result<Option<Vec<u8>>> {
+    Ok(None)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
