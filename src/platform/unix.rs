@@ -20,7 +20,11 @@ pub(crate) fn close_inherited_fds(excluded: &[RawFd]) -> io::Result<()> {
         set_cloexec(fd)?;
     }
 
-    close_inherited_except(excluded)
+    #[cfg(target_os = "linux")]
+    close_inherited_except(excluded)?;
+    #[cfg(target_os = "macos")]
+    close_inherited_except(excluded);
+    Ok(())
 }
 
 fn set_cloexec(fd: RawFd) -> io::Result<()> {
@@ -79,7 +83,7 @@ fn close_range(first: u32, last: u32) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn close_inherited_except(excluded: &[RawFd]) -> io::Result<()> {
+fn close_inherited_except(excluded: &[RawFd]) {
     const FALLBACK_FD_LIMIT: RawFd = 1_048_576;
 
     if let Ok(mut entries) = std::fs::read_dir("/dev/fd") {
@@ -104,13 +108,12 @@ fn close_inherited_except(excluded: &[RawFd]) -> io::Result<()> {
         for fd in fds {
             close_fd(fd, excluded);
         }
-        return Ok(());
+        return;
     }
 
     for fd in FIRST_INHERITED_FD..open_fd_limit(FALLBACK_FD_LIMIT) {
         close_fd(fd, excluded);
     }
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
