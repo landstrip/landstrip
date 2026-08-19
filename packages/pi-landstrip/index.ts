@@ -2091,8 +2091,7 @@ function createLandstripIntegrationWithPrompts(
   ): Promise<LandstripRpcWorkerLaunch> {
     if (options.signal?.aborted) throw new Error('Task cancelled');
     if (!ensureSandboxState(options.ctx)) {
-      const explicitlyDisabled = noSandboxFlag || !loadConfig(options.cwd).enabled;
-      if (!explicitlyDisabled) {
+      if (sandboxState === 'unavailable') {
         throw new Error('Sandbox is unavailable; refusing subagent process');
       }
       if (!unsandboxedWorkerWarningShown) {
@@ -2216,7 +2215,7 @@ function createLandstripIntegrationWithPrompts(
   async function prepareProcess(
     options: LandstripProcessOptions,
   ): Promise<LandstripPreparedProcess> {
-    if (process.platform === 'win32' && (noSandboxFlag || !loadConfig(options.cwd).enabled)) {
+    if (process.platform === 'win32' && (getNoSandboxFlag() || !loadConfig(options.cwd).enabled)) {
       throw new Error('Generic process preparation requires sandboxing on Windows');
     }
     return prepareRpcWorker({
@@ -2947,7 +2946,7 @@ function createLandstripIntegrationWithPrompts(
     return true;
   }
 
-  let noSandboxFlag = false;
+  let getNoSandboxFlag = (): boolean => false;
   function disableSandbox(ctx: ExtensionContext): void {
     sandboxEnabled = false;
     sandboxReady = false;
@@ -2956,7 +2955,7 @@ function createLandstripIntegrationWithPrompts(
   }
 
   function ensureSandboxState(ctx: ExtensionContext): boolean {
-    if (noSandboxFlag) {
+    if (getNoSandboxFlag()) {
       disableSandbox(ctx);
       return false;
     }
@@ -3011,6 +3010,7 @@ function createLandstripIntegrationWithPrompts(
       type: 'boolean',
       default: false,
     });
+    getNoSandboxFlag = () => Boolean(maybePi.getFlag?.('no-sandbox'));
 
     unpublishRuntime?.();
     unpublishRuntime = publishLandstripRuntime(pi, integration);
@@ -3037,9 +3037,7 @@ function createLandstripIntegrationWithPrompts(
       resetSessionAllowances();
       const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
       projectConfigTrusted = trustContext.isProjectTrusted?.() ?? false;
-      noSandboxFlag = Boolean(maybePi.getFlag?.('no-sandbox'));
-
-      if (noSandboxFlag) {
+      if (getNoSandboxFlag()) {
         disableSandbox(ctx);
         notify(ctx, 'Sandbox disabled via --no-sandbox', 'warning');
         if (!unpublishRuntime) unpublishRuntime = publishLandstripRuntime(pi, integration);
@@ -3080,7 +3078,8 @@ function createLandstripIntegrationWithPrompts(
             const { muted, accent, text } = themeColors(theme);
 
             const sandboxStatus = (): { color: 'success' | 'warning'; label: string } => {
-              if (noSandboxFlag) return { color: 'warning', label: 'Disabled by --no-sandbox' };
+              if (getNoSandboxFlag())
+                return { color: 'warning', label: 'Disabled by --no-sandbox' };
               if (!config.enabled) return { color: 'warning', label: 'Disabled by configuration' };
               if (!sandboxEnabled || !sandboxReady) return { color: 'warning', label: 'Inactive' };
               return { color: 'success', label: 'Active' };
@@ -3261,10 +3260,10 @@ function createLandstripIntegrationWithPrompts(
           const scope = await setSandboxConfigEnabled(ctx.cwd, enabled, projectTrusted);
           if (!enabled) {
             disableSandbox(ctx);
-          } else if (!noSandboxFlag) {
+          } else if (!getNoSandboxFlag()) {
             enableSandbox(ctx);
           }
-          if (enabled && noSandboxFlag) {
+          if (enabled && getNoSandboxFlag()) {
             notify(ctx, 'Sandbox remains disabled via --no-sandbox', 'warning');
           } else {
             notify(ctx, `Sandbox ${enabled ? 'enabled' : 'disabled'} in ${scope} config`, 'info');
@@ -3285,7 +3284,7 @@ function createLandstripIntegrationWithPrompts(
     const effectiveEnabled = loadConfig(ctx.cwd).enabled;
     if (!effectiveEnabled) {
       disableSandbox(ctx);
-    } else if (!noSandboxFlag) {
+    } else if (!getNoSandboxFlag()) {
       enableSandbox(ctx);
     }
   }

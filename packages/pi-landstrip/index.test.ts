@@ -194,6 +194,23 @@ describe('main Pi tool composition', () => {
     expect(tools).not.toContain('read');
     expect(tools).not.toContain('write');
   });
+
+  it('keeps the task tool when sandboxing is disabled', () => {
+    const tools: string[] = [];
+    const pi = {
+      registerTool(tool: ToolDefinition) {
+        tools.push(tool.name);
+      },
+      registerFlag() {},
+      registerCommand() {},
+      registerShortcut() {},
+      getFlag: (name: string) => name === 'no-sandbox',
+      on() {},
+    } as unknown as ExtensionAPI;
+    landstripExtension(pi);
+    expect(tools).toContain('task');
+    expect(tools).toContain('bash');
+  });
 });
 
 it('prepares the default POSIX shell invocation and disposes its environment file', async () => {
@@ -826,6 +843,61 @@ it('allows RPC workers when sandboxing is explicitly disabled', async () => {
     expect(prepared.env.HOME).toBe(process.env.HOME);
     await prepared.dispose();
   }
+});
+
+it('allows RPC workers when sandboxing is disabled via config', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-config-disabled-'));
+  const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-config-disabled-agent-'));
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(join(agentDir, 'sandbox.json'), JSON.stringify({ enabled: false }), 'utf8');
+
+  let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<void> | void) | undefined;
+  const notifications: string[] = [];
+  const pi = {
+    registerFlag() {},
+    registerCommand() {},
+    registerTool() {},
+    getFlag: () => false,
+    on(event: string, handler: unknown) {
+      if (event === 'session_start') sessionStart = handler as typeof sessionStart;
+    },
+  } as unknown as ExtensionAPI;
+  const ctx = {
+    cwd,
+    hasUI: true,
+    mode: 'tui',
+    isProjectTrusted: () => true,
+    ui: {
+      notify(message: string) {
+        notifications.push(message);
+      },
+      setStatus() {},
+    },
+  } as unknown as ExtensionContext;
+  const integration = createLandstripIntegration({ registerBashTool: false, cwd });
+  integration.register(pi);
+  await sessionStart?.({}, ctx);
+
+  const launch = await integration.prepareRpcWorker({
+    command: process.execPath,
+    args: ['--version'],
+    cwd,
+    env: {},
+    ctx,
+    readPaths: [],
+    writePaths: [],
+  });
+
+  expect(launch.command).toBe(process.execPath);
+  expect(launch.args).toEqual(['--version']);
+  expect(notifications).toContain('Sandbox disabled via config');
+  expect(notifications).toContain('Subagent processes are running without Landstrip sandboxing');
+  await launch.dispose();
+
+  vi.unstubAllEnvs();
+  rmSync(cwd, { recursive: true, force: true });
+  rmSync(agentDir, { recursive: true, force: true });
 });
 
 // The broker resolves relative policy entries (notably ".") against the command
