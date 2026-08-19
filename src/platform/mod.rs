@@ -46,7 +46,7 @@ pub(crate) use macos::execute;
 pub(crate) use windows::execute;
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::fd;
+pub(crate) use linux::getsockopt_int;
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_wraps, reason = "uniform platform validation API")]

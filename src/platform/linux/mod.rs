@@ -3,22 +3,47 @@
 
 //! Linux sandbox platform using Landlock and seccomp.
 
-pub(crate) mod fd;
 mod filter;
 mod landlock;
 mod seccomp;
 
 use crate::error::Error;
+use crate::platform::unix::close_inherited_fds;
 use crate::policy::AccessPolicy;
 use crate::trap_fd::TrapFd;
 use ::landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
 use anyhow::{Context, Result};
-use fd::close_inherited_fds;
 use landlock::enforce_access_policy;
 use seccomp::ensure_notification_supported;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+
+/// Reads an integer-valued socket option via `getsockopt(2)`.
+pub(crate) fn getsockopt_int(fd: i32, level: i32, name: i32) -> std::io::Result<i32> {
+    // SAFETY: getsockopt writes a scalar into value; len bounds the storage.
+    let mut value: i32 = 0;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of_val(&value)).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket option size exceeds socklen_t",
+        )
+    })?;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            name,
+            (&raw mut value).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(value)
+    }
+}
 
 pub(crate) fn doctor() -> Result<()> {
     Ruleset::default()

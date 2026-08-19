@@ -3,16 +3,15 @@
 
 //! macOS Seatbelt (SBPL) sandbox platform.
 
-use super::unix::set_cloexec;
+use super::unix::close_inherited_fds;
 use crate::error::{Error, Mechanism};
 use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};
-use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -20,8 +19,6 @@ use std::ptr;
 
 const SBPL_PROFILE_FLAGS: u64 = 0;
 const SANDBOX_FILTER_NONE: libc::c_int = 0;
-const FIRST_INHERITED_FD: RawFd = 3;
-const FALLBACK_FD_LIMIT: RawFd = 1_048_576;
 
 pub(crate) fn execute(
     policy: &AccessPolicy,
@@ -32,7 +29,7 @@ pub(crate) fn execute(
     let profile = render_profile(policy)
         .map_err(|source| Error::sandbox_setup(Mechanism::Seatbelt, source))?;
     apply_profile(&profile)?;
-    close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd))
+    close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd).as_slice())
         .map_err(|source| Error::sandbox_setup(Mechanism::Seatbelt, source))?;
     let error = Command::new(tool).args(args).exec();
     Err(Error::launch(tool, error).into())
@@ -47,67 +44,6 @@ pub(crate) fn doctor() -> Result<()> {
         return Err(Error::sandbox_setup(Mechanism::Seatbelt, io::Error::last_os_error()).into());
     }
     Ok(())
-}
-
-/// Close every descriptor the launcher left open so the tool cannot reach them:
-/// an inherited descriptor is writable regardless of the Seatbelt profile, which
-/// would be a hole in the write policy.
-///
-/// The trap descriptor is the exception. landstrip still owes the launcher a
-/// launch trap on it right up until `exec` replaces this process, so it is
-/// marked close-on-exec instead: the kernel drops it the instant the tool
-/// starts, and it survives long enough to report an `exec` that never did.
-fn close_inherited_fds(trap_fd: Option<RawFd>) -> io::Result<()> {
-    if let Some(fd) = trap_fd {
-        set_cloexec(fd)?;
-    }
-
-    if let Ok(mut entries) = fs::read_dir("/dev/fd") {
-        let mut fds = Vec::new();
-        for entry in entries.by_ref().flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let Ok(fd) = name.parse::<RawFd>() else {
-                continue;
-            };
-            if fd >= FIRST_INHERITED_FD {
-                fds.push(fd);
-            }
-        }
-
-        drop(entries);
-
-        fds.sort_unstable();
-        fds.dedup();
-        for fd in fds {
-            close_fd(fd, trap_fd);
-        }
-        return Ok(());
-    }
-
-    for fd in FIRST_INHERITED_FD..open_fd_limit() {
-        close_fd(fd, trap_fd);
-    }
-    Ok(())
-}
-
-fn open_fd_limit() -> RawFd {
-    clamp_fd_limit(unsafe { libc::sysconf(libc::_SC_OPEN_MAX) })
-}
-
-fn clamp_fd_limit(limit: libc::c_long) -> RawFd {
-    if limit < i64::from(FIRST_INHERITED_FD) {
-        return FALLBACK_FD_LIMIT;
-    }
-    RawFd::try_from(limit).map_or(FALLBACK_FD_LIMIT, |limit| limit.min(FALLBACK_FD_LIMIT))
-}
-
-fn close_fd(fd: RawFd, trap_fd: Option<RawFd>) {
-    if fd >= FIRST_INHERITED_FD && Some(fd) != trap_fd {
-        unsafe { libc::close(fd) };
-    }
 }
 
 fn apply_profile(profile: &str) -> Result<()> {

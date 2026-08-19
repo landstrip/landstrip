@@ -13,7 +13,7 @@
 //! not path-mediated. `allowAllUnixSockets` permits new Unix sockets without
 //! path checks.
 
-use super::fd::close_inherited_fds;
+use crate::platform::unix::close_inherited_fds;
 use super::filter::{NetworkFilters, build_errno_filter, build_notify_filter};
 use super::landlock::enforce_broker_access_policy;
 use crate::error::{Error as LandstripError, Mechanism};
@@ -2541,7 +2541,7 @@ fn fs_read_denial_reason(policy: &AccessPolicy, path: &Path) -> Option<&'static 
 }
 
 fn sockopt(fd: RawFd, level: libc::c_int, name: libc::c_int) -> SysResult<i32> {
-    super::fd::getsockopt_int(fd, level, name).map_err(|error| BrokerError::SystemCall {
+    super::getsockopt_int(fd, level, name).map_err(|error| BrokerError::SystemCall {
         errno: error.raw_os_error().unwrap_or(0),
     })
 }

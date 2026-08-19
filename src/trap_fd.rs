@@ -30,8 +30,7 @@ impl AsRawFd for TrapFd {
 impl TrapFd {
     #[cfg(target_os = "linux")]
     pub(crate) fn is_socket(&self) -> bool {
-        crate::platform::fd::getsockopt_int(self.as_raw_fd(), libc::SOL_SOCKET, libc::SO_TYPE)
-            .is_ok()
+        crate::platform::getsockopt_int(self.as_raw_fd(), libc::SOL_SOCKET, libc::SO_TYPE).is_ok()
     }
 
     pub(crate) fn write(&self, trap: &Trap) {
