@@ -5,9 +5,9 @@
 //! carrying the stable [`Error`] code of the event it reports.
 
 use crate::error::{Error, Mechanism, errno_name};
-use serde::Serialize;
 #[cfg(target_os = "linux")]
-use std::collections::BTreeMap;
+use crate::policy::DenialReason;
+use serde::Serialize;
 use std::error::Error as StdError;
 
 use std::fmt;
@@ -21,24 +21,46 @@ const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
+pub(crate) enum TrapState {
+    Query,
+    Info,
+}
+
+#[cfg(target_os = "linux")]
+impl TrapState {
+    fn from_query_id(query_id: Option<u64>) -> (Self, String) {
+        match query_id {
+            Some(id) => (Self::Query, id.to_string()),
+            None => (Self::Info, "0".to_owned()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum TrapOperation {
     Read,
     Write,
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum::IntoStaticStr)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SuggestedGrant {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) allow_read: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) allow_write: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, strum::IntoStaticStr)]
+#[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum NetworkOperation {
     Connect,
     Bind,
-}
-
-#[cfg(target_os = "linux")]
-impl NetworkOperation {
-    fn syscall(self) -> &'static str {
-        self.into()
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -53,7 +75,7 @@ pub(crate) struct ProcessContext {
 #[derive(Debug, Serialize)]
 pub(crate) struct FilesystemTrap {
     pub(crate) code: &'static str,
-    pub(crate) state: &'static str,
+    pub(crate) state: TrapState,
     pub(crate) query_id: String,
     pub(crate) operation: TrapOperation,
     pub(crate) path: String,
@@ -61,8 +83,8 @@ pub(crate) struct FilesystemTrap {
     pub(crate) syscall: &'static str,
     pub(crate) errno: &'static str,
     pub(crate) flags: Vec<&'static str>,
-    pub(crate) reason: &'static str,
-    pub(crate) suggested_grant: BTreeMap<&'static str, String>,
+    pub(crate) reason: DenialReason,
+    pub(crate) suggested_grant: SuggestedGrant,
     pub(crate) process: ProcessContext,
     pub(crate) mechanism: Mechanism,
 }
@@ -77,7 +99,7 @@ pub(crate) struct FilesystemDenial {
     pub(crate) requested_path: PathBuf,
     pub(crate) syscall: &'static str,
     pub(crate) flags: Vec<&'static str>,
-    pub(crate) reason: &'static str,
+    pub(crate) reason: DenialReason,
     pub(crate) process: ProcessContext,
 }
 
@@ -85,9 +107,9 @@ pub(crate) struct FilesystemDenial {
 #[derive(Debug, Serialize)]
 pub(crate) struct NetworkTrap {
     pub(crate) code: &'static str,
-    pub(crate) state: &'static str,
+    pub(crate) state: TrapState,
     pub(crate) query_id: String,
-    pub(crate) operation: &'static str,
+    pub(crate) operation: NetworkOperation,
     pub(crate) target: String,
     pub(crate) syscall: &'static str,
     pub(crate) errno: &'static str,
@@ -146,18 +168,23 @@ impl Trap {
             reason,
             process,
         } = denial;
-        let grant_key = match operation {
-            TrapOperation::Read => "allowRead",
-            TrapOperation::Write => "allowWrite",
-        };
         let path = path.to_string_lossy().into_owned();
         let requested_path = requested_path.to_string_lossy().into_owned();
-        let mut suggested_grant = BTreeMap::new();
-        suggested_grant.insert(grant_key, path.clone());
+        let suggested_grant = match operation {
+            TrapOperation::Read => SuggestedGrant {
+                allow_read: Some(path.clone()),
+                allow_write: None,
+            },
+            TrapOperation::Write => SuggestedGrant {
+                allow_read: None,
+                allow_write: Some(path.clone()),
+            },
+        };
+        let (state, query_id) = TrapState::from_query_id(query_id);
         Self::Filesystem(Box::new(FilesystemTrap {
             code: Error::FilesystemDenied.code(),
-            state: if query_id.is_some() { "query" } else { "info" },
-            query_id: query_id.unwrap_or(0).to_string(),
+            state,
+            query_id,
             operation,
             path,
             requested_path,
@@ -178,12 +205,13 @@ impl Trap {
         process: ProcessContext,
         query_id: Option<u64>,
     ) -> Self {
-        let syscall = operation.syscall();
+        let syscall = operation.into();
+        let (state, query_id) = TrapState::from_query_id(query_id);
         Self::Network(Box::new(NetworkTrap {
             code: Error::NetworkDenied.code(),
-            state: if query_id.is_some() { "query" } else { "info" },
-            query_id: query_id.unwrap_or(0).to_string(),
-            operation: syscall,
+            state,
+            query_id,
+            operation,
             target,
             syscall,
             errno: "EACCES",

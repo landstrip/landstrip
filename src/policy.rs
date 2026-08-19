@@ -45,6 +45,14 @@ pub(crate) struct AccessPolicy {
     pub(crate) allow_windows_loopback: bool,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DenialReason {
+    DenyMatch,
+    AllowMiss,
+}
+
 // The write broker that consults these lives only in the Linux seccomp path.
 #[cfg(target_os = "linux")]
 impl AccessPolicy {
@@ -66,18 +74,33 @@ impl AccessPolicy {
     /// `surface_allow_miss` is set: content syscalls leave it to Landlock unless
     /// a query can resolve it, but metadata syscalls Landlock does not cover must
     /// always surface it so the broker can gate them.
-    pub(crate) fn to_reason(
+    pub(crate) fn write_reason(
         &self,
         canonical: &Path,
         lexical: &Path,
         surface_allow_miss: bool,
-    ) -> Option<&'static str> {
+    ) -> Option<DenialReason> {
         if self.is_write_denied(canonical, lexical) {
-            Some("deny_match")
+            Some(DenialReason::DenyMatch)
         } else if surface_allow_miss && !canonical.is_under_any(&self.write_roots) {
-            Some("allow_miss")
+            Some(DenialReason::AllowMiss)
         } else {
             None
+        }
+    }
+
+    pub(crate) fn read_reason(&self, path: &Path) -> Option<DenialReason> {
+        match &self.read_access {
+            ReadAccess::Unrestricted => None,
+            ReadAccess::AllowRoots(roots) => {
+                if path.is_under_any(&self.read_denied_roots) {
+                    Some(DenialReason::DenyMatch)
+                } else if path.is_under_any(roots) {
+                    None
+                } else {
+                    Some(DenialReason::AllowMiss)
+                }
+            }
         }
     }
 }

@@ -20,7 +20,7 @@ use crate::error::{Error as LandstripError, Mechanism};
 use crate::paths::{
     PathCoverage, normalize_path, normalize_path_lexically, normalize_path_nofollow,
 };
-use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
+use crate::policy::{AccessPolicy, DenialReason, ReadAccess, UnixSocketAccess};
 use crate::trap::{FilesystemDenial, NetworkOperation, ProcessContext, Trap, TrapOperation};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
@@ -1236,7 +1236,7 @@ struct OpenDenial {
     syscall: &'static str,
     flags: i32,
     mode: u32,
-    reason: &'static str,
+    reason: DenialReason,
     pid: u32,
     report: bool,
 }
@@ -1339,22 +1339,15 @@ fn handle_openat(
 
     let raw = resolve_child_path(pid, dirfd, &path)?;
     let resolved = normalize_path(&raw);
-    let wants_write =
-        (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC)) != 0;
-    let reports_write = (flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND)) != 0;
-    let wants_read = (flags & libc::O_WRONLY) == 0;
+    let wants_write = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0;
+    let reports_write = flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) != 0;
+    let wants_read = flags & libc::O_WRONLY == 0;
 
     if wants_write {
         let lexical = normalize_path_lexically(&raw);
-        let reason = if policy.is_write_denied(&resolved, &lexical) {
-            Some("deny_match")
-        } else if resolved.is_under_any(&policy.write_roots) {
-            None
-        } else {
-            Some("allow_miss")
-        };
+        let reason = policy.write_reason(&resolved, &lexical, true);
         if let Some(reason) = reason {
-            if (flags & libc::O_CREAT) == 0 && !path_exists(&resolved)? {
+            if flags & libc::O_CREAT == 0 && !path_exists(&resolved)? {
                 return Err(BrokerError::SystemCall {
                     errno: libc::ENOENT,
                 });
@@ -1377,7 +1370,7 @@ fn handle_openat(
             );
         }
     }
-    if wants_read && let Some(reason) = fs_read_denial_reason(policy, &resolved) {
+    if wants_read && let Some(reason) = policy.read_reason(&resolved) {
         if !path_exists(&resolved)? {
             return Err(BrokerError::SystemCall {
                 errno: libc::ENOENT,
@@ -1407,7 +1400,7 @@ fn handle_openat(
     // access — every dereferencing operation goes through its own brokered
     // syscall — and Landlock does not restrict O_PATH opens, so after the
     // policy checks above let the child's syscall re-execute natively.
-    if (flags & libc::O_PATH) != 0 {
+    if flags & libc::O_PATH != 0 {
         return Ok(NotificationResult::Continue);
     }
 
@@ -1665,16 +1658,16 @@ fn reparent_read_denial(
     policy: &AccessPolicy,
     spec: &Syscall,
     slots: &[Option<(PathBuf, PathBuf)>],
-) -> Option<(usize, &'static str, TrapOperation)> {
+) -> Option<(usize, DenialReason, TrapOperation)> {
     if !spec.is_reparent() {
         return None;
     }
     let (source, _) = slots.first().and_then(Option::as_ref)?;
-    let reason = fs_read_denial_reason(policy, source)?;
+    let reason = policy.read_reason(source)?;
     let dest_readable = slots
         .get(1)
         .and_then(Option::as_ref)
-        .is_none_or(|(dest, _)| fs_read_denial_reason(policy, dest).is_none());
+        .is_none_or(|(dest, _)| policy.read_reason(dest).is_none());
     dest_readable.then_some((0, reason, TrapOperation::Read))
 }
 
@@ -1696,7 +1689,7 @@ fn handle_mutation(
     let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
 
     let mut slots: Vec<Option<(PathBuf, PathBuf)>> = Vec::with_capacity(spec.paths.len());
-    let mut denial: Option<(usize, &'static str, TrapOperation)> = None;
+    let mut denial: Option<(usize, DenialReason, TrapOperation)> = None;
     let no_follow = spec.no_follow(&request.data.args);
     for (index, (dirfd_arg, path_arg)) in spec.paths.iter().enumerate() {
         let dirfd = match dirfd_arg {
@@ -1729,7 +1722,7 @@ fn handle_mutation(
         if denial.is_none() {
             let lexical = normalize_path_lexically(&raw);
             let surface_allow_miss = query_enabled || !spec.landlock_backed;
-            if let Some(reason) = policy.to_reason(&resolved, &lexical, surface_allow_miss) {
+            if let Some(reason) = policy.write_reason(&resolved, &lexical, surface_allow_miss) {
                 denial = Some((index, reason, TrapOperation::Write));
             }
         }
@@ -1837,7 +1830,7 @@ fn handle_fd_utimensat(
     let times = read_child_times(pid, args[2])?;
     let resolved = normalize_path(&requested_path);
     let lexical = normalize_path_lexically(&requested_path);
-    let reason = policy.to_reason(&resolved, &lexical, true);
+    let reason = policy.write_reason(&resolved, &lexical, true);
 
     let operation = MutationGrant {
         op: MutationOp::UtimesFd { target, times },
@@ -2522,22 +2515,6 @@ fn resolve_child_path(pid: Pid, dirfd: i32, path: &Path) -> SysResult<PathBuf> {
             errno: error.raw_os_error().unwrap_or(libc::EBADF),
         })?;
     Ok(dir_path.join(path))
-}
-
-fn fs_read_denial_reason(policy: &AccessPolicy, path: &Path) -> Option<&'static str> {
-    match &policy.read_access {
-        ReadAccess::Unrestricted => None,
-        ReadAccess::AllowRoots(roots) => {
-            if path.is_under_any(&policy.read_denied_roots) {
-                return Some("deny_match");
-            }
-            if path.is_under_any(roots) {
-                None
-            } else {
-                Some("allow_miss")
-            }
-        }
-    }
 }
 
 fn sockopt(fd: RawFd, level: libc::c_int, name: libc::c_int) -> SysResult<i32> {
