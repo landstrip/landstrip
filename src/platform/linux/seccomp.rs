@@ -13,13 +13,13 @@
 //! not path-mediated. `allowAllUnixSockets` permits new Unix sockets without
 //! path checks.
 
-use crate::platform::unix::close_inherited_fds;
 use super::filter::{NetworkFilters, build_errno_filter, build_notify_filter};
 use super::landlock::enforce_broker_access_policy;
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::paths::{
     PathCoverage, normalize_path, normalize_path_lexically, normalize_path_nofollow,
 };
+use crate::platform::unix::close_inherited_fds;
 use crate::policy::{AccessPolicy, DenialReason, ReadAccess, UnixSocketAccess};
 use crate::trap::{FilesystemDenial, NetworkOperation, ProcessContext, Trap, TrapOperation};
 use crate::trap_fd::TrapFd;
@@ -1156,7 +1156,7 @@ fn path_exists(path: &Path) -> SysResult<bool> {
     })
 }
 
-fn open_flags(flags: i32) -> Vec<&'static str> {
+fn open_flag_names(flags: i32) -> Vec<&'static str> {
     let mut names = Vec::new();
     match flags & libc::O_ACCMODE {
         libc::O_WRONLY => names.push("O_WRONLY"),
@@ -1173,6 +1173,14 @@ fn open_flags(flags: i32) -> Vec<&'static str> {
         names.push("O_APPEND");
     }
     names
+}
+
+fn reopen_bits(flags: i32) -> i32 {
+    (flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW)) | libc::O_CLOEXEC
+}
+
+fn create_bits(flags: i32) -> i32 {
+    flags | libc::O_NOFOLLOW | libc::O_CLOEXEC
 }
 
 // The open flags and creation mode an open syscall requested.
@@ -1277,7 +1285,7 @@ fn deny_open(
                     path,
                     requested_path,
                     syscall,
-                    flags: open_flags(flags),
+                    flags: open_flag_names(flags),
                     reason,
                     process: process_context(pid),
                 },
@@ -1292,7 +1300,7 @@ fn deny_open(
         path,
         requested_path,
         syscall,
-        flags: open_flags(flags),
+        flags: open_flag_names(flags),
         reason,
         process: process_context(pid),
     }));
@@ -1446,98 +1454,147 @@ mod legacy_syscall {
     pub const LCHOWN: Option<i64> = None;
 }
 
-struct Syscall {
-    nr: Option<i64>,
-    name: &'static str,
-    paths: &'static [(Option<usize>, usize)],
-    landlock_backed: bool,
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum MutationSyscall {
+    Renameat2,
+    Renameat,
+    Linkat,
+    Symlinkat,
+    Unlinkat,
+    Mkdirat,
+    Mknodat,
+    Truncate,
+    Fchmodat,
+    Fchmodat2,
+    Fchownat,
+    Utimensat,
+    Setxattr,
+    Lsetxattr,
+    Removexattr,
+    Lremovexattr,
+    Rename,
+    Link,
+    Symlink,
+    Unlink,
+    Rmdir,
+    Mkdir,
+    Mknod,
+    Creat,
+    Chmod,
+    Chown,
+    Lchown,
 }
 
-impl Syscall {
+impl MutationSyscall {
     /// Whether this invocation targets the symlink itself rather than what it
     /// resolves to: an inherently no-follow call (`lchown`, `lsetxattr`,
     /// `lremovexattr`) or an `*at` call carrying `AT_SYMLINK_NOFOLLOW`. The policy
     /// check and the broker must then act on the link, not its target.
-    fn no_follow(&self, args: &[u64; 6]) -> bool {
+    fn no_follow(self, args: &[u64; 6]) -> bool {
         // The flags argument is an int; truncating to i32 recovers it from the
         // u64 register slot the same way the dirfd arguments are read.
         let flag = |index: usize| syscall_i32(args[index]) & libc::AT_SYMLINK_NOFOLLOW != 0;
         let follow = |index: usize| syscall_i32(args[index]) & libc::AT_SYMLINK_FOLLOW != 0;
-        match self.name {
-            "lchown" | "lsetxattr" | "lremovexattr" | "link" => true,
-            "fchownat" => flag(4),
-            "fchmodat" | "fchmodat2" | "utimensat" => flag(3),
+        match self {
+            Self::Lchown | Self::Lsetxattr | Self::Lremovexattr | Self::Link => true,
+            Self::Fchownat => flag(4),
+            Self::Fchmodat | Self::Fchmodat2 | Self::Utimensat => flag(3),
             // linkat(2) links the symlink itself unless AT_SYMLINK_FOLLOW is set;
             // link(2) has no flags and never dereferences.
-            "linkat" => !follow(4),
-            _ => false,
+            Self::Linkat => !follow(4),
+            Self::Renameat2
+            | Self::Renameat
+            | Self::Symlinkat
+            | Self::Unlinkat
+            | Self::Mkdirat
+            | Self::Mknodat
+            | Self::Truncate
+            | Self::Setxattr
+            | Self::Removexattr
+            | Self::Rename
+            | Self::Symlink
+            | Self::Unlink
+            | Self::Rmdir
+            | Self::Mkdir
+            | Self::Mknod
+            | Self::Creat
+            | Self::Chmod
+            | Self::Chown => false,
         }
     }
 
-    fn is_mkdir(&self) -> bool {
-        matches!(self.name, "mkdir" | "mkdirat")
+    fn is_mkdir(self) -> bool {
+        matches!(self, Self::Mkdir | Self::Mkdirat)
     }
 
-    fn is_reparent(&self) -> bool {
+    fn is_reparent(self) -> bool {
         matches!(
-            self.name,
-            "link" | "linkat" | "rename" | "renameat" | "renameat2"
+            self,
+            Self::Link | Self::Linkat | Self::Rename | Self::Renameat | Self::Renameat2
         )
     }
+}
+
+struct Syscall {
+    nr: Option<i64>,
+    kind: MutationSyscall,
+    paths: &'static [(Option<usize>, usize)],
+    landlock_backed: bool,
 }
 
 const MUTATION_SYSCALLS: &[Syscall] = &[
     Syscall {
         nr: Some(libc::SYS_renameat2),
-        name: "renameat2",
+        kind: MutationSyscall::Renameat2,
         paths: &[(Some(0), 1), (Some(2), 3)],
         landlock_backed: true,
     },
     Syscall {
         nr: Some(libc::SYS_renameat),
-        name: "renameat",
+        kind: MutationSyscall::Renameat,
         paths: &[(Some(0), 1), (Some(2), 3)],
         landlock_backed: true,
     },
     Syscall {
         nr: Some(libc::SYS_linkat),
-        name: "linkat",
+        kind: MutationSyscall::Linkat,
         paths: &[(Some(0), 1), (Some(2), 3)],
         landlock_backed: true,
     },
     Syscall {
         nr: Some(libc::SYS_symlinkat),
-        name: "symlinkat",
+        kind: MutationSyscall::Symlinkat,
         paths: &[(Some(1), 2)],
         landlock_backed: true,
     },
     Syscall {
         nr: Some(libc::SYS_unlinkat),
-        name: "unlinkat",
+        kind: MutationSyscall::Unlinkat,
         paths: &[(Some(0), 1)],
         landlock_backed: true,
     },
     Syscall {
         nr: Some(libc::SYS_mkdirat),
-        name: "mkdirat",
+        kind: MutationSyscall::Mkdirat,
         paths: &[(Some(0), 1)],
         landlock_backed: true,
     },
     Syscall {
         nr: Some(libc::SYS_mknodat),
-        name: "mknodat",
+        kind: MutationSyscall::Mknodat,
         paths: &[(Some(0), 1)],
         landlock_backed: true,
     },
     Syscall {
         nr: Some(libc::SYS_truncate),
-        name: "truncate",
+        kind: MutationSyscall::Truncate,
         paths: &[(None, 0)],
         landlock_backed: true,
     },
     Syscall {
         nr: Some(libc::SYS_fchmodat),
-        name: "fchmodat",
+        kind: MutationSyscall::Fchmodat,
         paths: &[(Some(0), 1)],
         landlock_backed: false,
     },
@@ -1545,109 +1602,109 @@ const MUTATION_SYSCALLS: &[Syscall] = &[
         // fchmodat2 is Linux 6.6+ (nr 452 on all landstrip targets). glibc may
         // implement fchmodat via it; without mediation, mode changes bypass the broker.
         nr: Some(SYS_FCHMODAT2),
-        name: "fchmodat2",
+        kind: MutationSyscall::Fchmodat2,
         paths: &[(Some(0), 1)],
         landlock_backed: false,
     },
     Syscall {
         nr: Some(libc::SYS_fchownat),
-        name: "fchownat",
+        kind: MutationSyscall::Fchownat,
         paths: &[(Some(0), 1)],
         landlock_backed: false,
     },
     Syscall {
         nr: Some(libc::SYS_utimensat),
-        name: "utimensat",
+        kind: MutationSyscall::Utimensat,
         paths: &[(Some(0), 1)],
         landlock_backed: false,
     },
     Syscall {
         nr: Some(libc::SYS_setxattr),
-        name: "setxattr",
+        kind: MutationSyscall::Setxattr,
         paths: &[(None, 0)],
         landlock_backed: false,
     },
     Syscall {
         nr: Some(libc::SYS_lsetxattr),
-        name: "lsetxattr",
+        kind: MutationSyscall::Lsetxattr,
         paths: &[(None, 0)],
         landlock_backed: false,
     },
     Syscall {
         nr: Some(libc::SYS_removexattr),
-        name: "removexattr",
+        kind: MutationSyscall::Removexattr,
         paths: &[(None, 0)],
         landlock_backed: false,
     },
     Syscall {
         nr: Some(libc::SYS_lremovexattr),
-        name: "lremovexattr",
+        kind: MutationSyscall::Lremovexattr,
         paths: &[(None, 0)],
         landlock_backed: false,
     },
     Syscall {
         nr: legacy_syscall::RENAME,
-        name: "rename",
+        kind: MutationSyscall::Rename,
         paths: &[(None, 0), (None, 1)],
         landlock_backed: true,
     },
     Syscall {
         nr: legacy_syscall::LINK,
-        name: "link",
+        kind: MutationSyscall::Link,
         paths: &[(None, 0), (None, 1)],
         landlock_backed: true,
     },
     Syscall {
         nr: legacy_syscall::SYMLINK,
-        name: "symlink",
+        kind: MutationSyscall::Symlink,
         paths: &[(None, 1)],
         landlock_backed: true,
     },
     Syscall {
         nr: legacy_syscall::UNLINK,
-        name: "unlink",
+        kind: MutationSyscall::Unlink,
         paths: &[(None, 0)],
         landlock_backed: true,
     },
     Syscall {
         nr: legacy_syscall::RMDIR,
-        name: "rmdir",
+        kind: MutationSyscall::Rmdir,
         paths: &[(None, 0)],
         landlock_backed: true,
     },
     Syscall {
         nr: legacy_syscall::MKDIR,
-        name: "mkdir",
+        kind: MutationSyscall::Mkdir,
         paths: &[(None, 0)],
         landlock_backed: true,
     },
     Syscall {
         nr: legacy_syscall::MKNOD,
-        name: "mknod",
+        kind: MutationSyscall::Mknod,
         paths: &[(None, 0)],
         landlock_backed: true,
     },
     Syscall {
         nr: legacy_syscall::CREAT,
-        name: "creat",
+        kind: MutationSyscall::Creat,
         paths: &[(None, 0)],
         landlock_backed: true,
     },
     Syscall {
         nr: legacy_syscall::CHMOD,
-        name: "chmod",
+        kind: MutationSyscall::Chmod,
         paths: &[(None, 0)],
         landlock_backed: false,
     },
     Syscall {
         nr: legacy_syscall::CHOWN,
-        name: "chown",
+        kind: MutationSyscall::Chown,
         paths: &[(None, 0)],
         landlock_backed: false,
     },
     Syscall {
         nr: legacy_syscall::LCHOWN,
-        name: "lchown",
+        kind: MutationSyscall::Lchown,
         paths: &[(None, 0)],
         landlock_backed: false,
     },
@@ -1659,7 +1716,7 @@ fn reparent_read_denial(
     spec: &Syscall,
     slots: &[Option<(PathBuf, PathBuf)>],
 ) -> Option<(usize, DenialReason, TrapOperation)> {
-    if !spec.is_reparent() {
+    if !spec.kind.is_reparent() {
         return None;
     }
     let (source, _) = slots.first().and_then(Option::as_ref)?;
@@ -1682,7 +1739,7 @@ fn handle_mutation(
     let Some(spec) = MUTATION_SYSCALLS.iter().find(|s| s.nr == Some(syscall)) else {
         return Ok(NotificationResult::Continue);
     };
-    if spec.name == "utimensat" && request.data.args[1] == 0 {
+    if spec.kind == MutationSyscall::Utimensat && request.data.args[1] == 0 {
         return handle_fd_utimensat(policy, request, denials, query_enabled, next_query_id);
     }
 
@@ -1690,7 +1747,7 @@ fn handle_mutation(
 
     let mut slots: Vec<Option<(PathBuf, PathBuf)>> = Vec::with_capacity(spec.paths.len());
     let mut denial: Option<(usize, DenialReason, TrapOperation)> = None;
-    let no_follow = spec.no_follow(&request.data.args);
+    let no_follow = spec.kind.no_follow(&request.data.args);
     for (index, (dirfd_arg, path_arg)) in spec.paths.iter().enumerate() {
         let dirfd = match dirfd_arg {
             // args[i] is an i32 dirfd (including AT_FDCWD=-100) stored as u64.
@@ -1707,7 +1764,7 @@ fn handle_mutation(
         // mkdir -p intentionally invokes mkdir for each existing path component.
         // Return the syscall's EEXIST result without prompting instead of treating
         // an operation that cannot mutate the filesystem as a permission request.
-        if spec.is_mkdir() && mkdir_target_exists(&raw) {
+        if spec.kind.is_mkdir() && mkdir_target_exists(&raw) {
             return Err(BrokerError::SystemCall {
                 errno: libc::EEXIST,
             });
@@ -1742,7 +1799,7 @@ fn handle_mutation(
             || !policy.write_denied_patterns.is_empty()
             || !policy.write_denied_links.is_empty()
             || !spec.landlock_backed
-            || (spec.is_reparent() && !matches!(policy.read_access, ReadAccess::Unrestricted));
+            || (spec.kind.is_reparent() && !matches!(policy.read_access, ReadAccess::Unrestricted));
         if must_pin {
             match Grant::mutation(spec, request, pid, &slots)? {
                 Some(Grant::Mutation(grant)) => {
@@ -1767,7 +1824,7 @@ fn handle_mutation(
             operation,
             path: resolved,
             requested_path: path,
-            syscall: spec.name,
+            syscall: spec.kind.into(),
             flags: Vec::new(),
             reason,
             process: process_context(request.pid),
@@ -1785,7 +1842,7 @@ fn handle_mutation(
                 operation,
                 path: resolved,
                 requested_path: path,
-                syscall: spec.name,
+                syscall: spec.kind.into(),
                 flags: Vec::new(),
                 reason,
                 process: process_context(request.pid),
@@ -1846,7 +1903,7 @@ fn handle_fd_utimensat(
         operation: TrapOperation::Write,
         path: resolved,
         requested_path,
-        syscall: "utimensat",
+        syscall: MutationSyscall::Utimensat.into(),
         flags: Vec::new(),
         reason,
         process: process_context(request.pid),
@@ -1878,75 +1935,66 @@ impl Grant {
     ) -> SysResult<Option<Grant>> {
         let args = &request.data.args;
 
-        if spec.name == "creat" {
-            return creat_grant(slots, syscall_u32(args[1]));
-        }
-
-        let mut anchors = Vec::with_capacity(slots.len());
-        for slot in slots {
-            let Some((resolved, _)) = slot else {
-                return Ok(None);
-            };
-            anchors.push(Anchor::new(resolved).map_err(|errno| BrokerError::SystemCall { errno })?);
-        }
-
-        let op = match spec.name {
-            "mkdirat" => MutationOp::Mkdir {
+        let op = match spec.kind {
+            MutationSyscall::Creat => {
+                return creat_grant(slots, syscall_u32(args[1]));
+            }
+            MutationSyscall::Mkdirat => MutationOp::Mkdir {
                 mode: syscall_u32(args[2]),
             },
-            "mkdir" => MutationOp::Mkdir {
+            MutationSyscall::Mkdir => MutationOp::Mkdir {
                 mode: syscall_u32(args[1]),
             },
-            "mknodat" => MutationOp::Mknod {
+            MutationSyscall::Mknodat => MutationOp::Mknod {
                 mode: syscall_u32(args[2]),
                 dev: args[3],
             },
-            "mknod" => MutationOp::Mknod {
+            MutationSyscall::Mknod => MutationOp::Mknod {
                 mode: syscall_u32(args[1]),
                 dev: args[2],
             },
-            "unlinkat" => MutationOp::Unlink {
+            MutationSyscall::Unlinkat => MutationOp::Unlink {
                 flags: syscall_i32(args[2]),
             },
-            "unlink" => MutationOp::Unlink { flags: 0 },
-            "rmdir" => MutationOp::Unlink {
+            MutationSyscall::Unlink => MutationOp::Unlink { flags: 0 },
+            MutationSyscall::Rmdir => MutationOp::Unlink {
                 flags: libc::AT_REMOVEDIR,
             },
-            "renameat2" => MutationOp::Rename {
+            MutationSyscall::Renameat2 => MutationOp::Rename {
                 flags: syscall_u32(args[4]),
             },
-            "renameat" | "rename" => MutationOp::Rename { flags: 0 },
-            "linkat" => MutationOp::Link {
+            MutationSyscall::Renameat | MutationSyscall::Rename => MutationOp::Rename { flags: 0 },
+            MutationSyscall::Linkat => MutationOp::Link {
                 flags: syscall_i32(args[4]),
             },
-            "link" => MutationOp::Link { flags: 0 },
-            "symlinkat" | "symlink" => {
+            MutationSyscall::Link => MutationOp::Link { flags: 0 },
+            MutationSyscall::Symlinkat | MutationSyscall::Symlink => {
                 let Some(target) = read_child_target(pid, args[0])? else {
                     return Ok(None);
                 };
                 MutationOp::Symlink { target }
             }
-            "truncate" => MutationOp::Truncate {
+            MutationSyscall::Truncate => MutationOp::Truncate {
                 length: syscall_i64(args[1]),
             },
-            "fchmodat" | "fchmodat2" => MutationOp::Chmod {
+            MutationSyscall::Fchmodat | MutationSyscall::Fchmodat2 => MutationOp::Chmod {
                 mode: syscall_u32(args[2]),
             },
-            "chmod" => MutationOp::Chmod {
+            MutationSyscall::Chmod => MutationOp::Chmod {
                 mode: syscall_u32(args[1]),
             },
-            "fchownat" => MutationOp::Chown {
+            MutationSyscall::Fchownat => MutationOp::Chown {
                 uid: syscall_u32(args[2]),
                 gid: syscall_u32(args[3]),
             },
-            "chown" | "lchown" => MutationOp::Chown {
+            MutationSyscall::Chown | MutationSyscall::Lchown => MutationOp::Chown {
                 uid: syscall_u32(args[1]),
                 gid: syscall_u32(args[2]),
             },
-            "utimensat" => MutationOp::Utimes {
+            MutationSyscall::Utimensat => MutationOp::Utimes {
                 times: read_child_times(pid, args[2])?,
             },
-            "setxattr" | "lsetxattr" => {
+            MutationSyscall::Setxattr | MutationSyscall::Lsetxattr => {
                 let Some(name) = read_child_target(pid, args[1])? else {
                     return Ok(None);
                 };
@@ -1956,19 +2004,26 @@ impl Grant {
                     flags: syscall_i32(args[4]),
                 }
             }
-            "removexattr" | "lremovexattr" => {
+            MutationSyscall::Removexattr | MutationSyscall::Lremovexattr => {
                 let Some(name) = read_child_target(pid, args[1])? else {
                     return Ok(None);
                 };
                 MutationOp::RemoveXattr { name }
             }
-            _ => return Ok(None),
         };
+
+        let mut anchors = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let Some((resolved, _)) = slot else {
+                return Ok(None);
+            };
+            anchors.push(Anchor::new(resolved).map_err(|errno| BrokerError::SystemCall { errno })?);
+        }
 
         Ok(Some(Grant::Mutation(MutationGrant {
             op,
             anchors,
-            no_follow: spec.no_follow(args),
+            no_follow: spec.kind.no_follow(args),
         })))
     }
 }
@@ -2222,7 +2277,7 @@ fn grant_open(notify_fd: BorrowedFd<'_>, id: u64, grant: &OpenGrant) {
         }
     };
 
-    let cloexec = (grant.flags & libc::O_CLOEXEC) != 0;
+    let cloexec = grant.flags & libc::O_CLOEXEC != 0;
     let addfd = libc::seccomp_notif_addfd {
         id,
         flags: u32::try_from(libc::SECCOMP_ADDFD_FLAG_SEND).unwrap_or(0),
@@ -2461,8 +2516,7 @@ fn broker_open(grant: &OpenGrant) -> std::result::Result<OwnedFd, i32> {
         OpenKind::Reopen(handle) => {
             let proc_path = CString::new(format!("/proc/self/fd/{}", handle.as_raw_fd()))
                 .map_err(|_| libc::EINVAL)?;
-            let flags = (grant.flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW))
-                | libc::O_CLOEXEC;
+            let flags = reopen_bits(grant.flags);
             // SAFETY: proc_path is NUL-terminated and names the pinned inode.
             let fd = unsafe { libc::open(proc_path.as_ptr(), flags) };
             if fd < 0 {
@@ -2474,7 +2528,7 @@ fn broker_open(grant: &OpenGrant) -> std::result::Result<OwnedFd, i32> {
         // Create within the pinned parent; O_NOFOLLOW blocks a symlink swapped
         // into the final name from redirecting the create.
         OpenKind::Create { anchor, mode } => {
-            let flags = grant.flags | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let flags = create_bits(grant.flags);
             // SAFETY: name is NUL-terminated and resolved relative to the pinned parent.
             let fd = unsafe {
                 libc::openat(
