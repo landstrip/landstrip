@@ -9,9 +9,12 @@
 //! sockets are blocked.
 //!
 //! Unix sockets are denied by default. `allowUnixSockets` mediates pathname
-//! `connect` and `bind`; abstract sockets, unnamed sockets, and `socketpair` are
-//! not path-mediated. `allowAllUnixSockets` permits new Unix sockets without
-//! path checks.
+//! `connect` and `bind`; unnamed sockets and `socketpair` are not path-mediated.
+//! `allowAllUnixSockets` permits new Unix sockets without path checks. systemd
+//! and D-Bus control sockets stay denied either way: they start processes that
+//! would inherit neither Landlock nor seccomp. Host-created abstract Unix sockets
+//! are denied by Landlock scope on ABI 6+ (Linux 6.12+); the broker cannot tell
+//! those apart from sockets the child created itself.
 
 use super::filter::{NetworkFilters, build_errno_filter, build_notify_filter};
 use super::landlock::enforce_broker_access_policy;
@@ -33,6 +36,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::env;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
@@ -139,7 +143,14 @@ pub(super) fn run_broker(
     trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
     let notify_bind = needs_network && policy.network_access.needs_bind_broker();
-    let notify_connect = needs_network && policy.network_access.needs_network_broker();
+    // allowNetwork / allowAllUnixSockets leave unix unrestricted; still trap
+    // connect so systemd-run cannot start a process outside Landlock/seccomp.
+    let notify_connect = (needs_network && policy.network_access.needs_network_broker())
+        || needs_filesystem
+        || matches!(
+            policy.network_access.unix_socket_access(),
+            UnixSocketAccess::Unrestricted
+        );
     let notify_filesystem = needs_filesystem;
     let unix_sockets = policy.network_access.unix_socket_access().into();
     ensure_notification_supported()?;
@@ -813,6 +824,9 @@ fn handle_connect(
 
     match socket.info.kind() {
         SocketKind::Tcp => {
+            if policy.network_access.is_unrestricted() {
+                return Ok(NotificationResult::Continue);
+            }
             let endpoint = tcp_endpoint(&socket.addr, socket.info.domain)?;
             if !endpoint.loopback
                 || (!policy.network_access.allows_local_tcp_bind()
@@ -846,6 +860,9 @@ fn handle_connect(
         }
         SocketKind::Unix => handle_unix_connect(policy, request.pid, socket),
         SocketKind::Other => Ok(NotificationResult::Continue),
+        SocketKind::NotSupported if policy.network_access.is_unrestricted() => {
+            Ok(NotificationResult::Continue)
+        }
         SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
     }
 }
@@ -856,7 +873,17 @@ fn handle_unix_connect(
     socket: TargetSocket,
 ) -> SysResult<NotificationResult> {
     let Some((target, relative)) = unix_path_target(pid, &socket.addr)? else {
-        return Err(BrokerError::PolicyDenied);
+        // Abstract / unnamed: path policy cannot see these. Restricted unix
+        // policy denies them here. Unrestricted unix continues so Landlock can
+        // still refuse host-created abstract sockets (ABI 6+).
+        return if matches!(
+            policy.network_access.unix_socket_access(),
+            UnixSocketAccess::Unrestricted
+        ) {
+            Ok(NotificationResult::Continue)
+        } else {
+            Err(BrokerError::PolicyDenied)
+        };
     };
     authorize_unix_path(policy, &target)?;
 
@@ -925,6 +952,9 @@ fn unix_path_target(pid: u32, addr: &[u8]) -> SysResult<Option<(PathBuf, bool)>>
 }
 
 fn authorize_unix_path(policy: &AccessPolicy, target: &Path) -> SysResult<()> {
+    if is_supervisor_socket(target) {
+        return Err(BrokerError::PolicyDenied);
+    }
     match policy.network_access.unix_socket_access() {
         UnixSocketAccess::Unrestricted => Ok(()),
         UnixSocketAccess::AllowPaths(paths) => target
@@ -933,6 +963,37 @@ fn authorize_unix_path(policy: &AccessPolicy, target: &Path) -> SysResult<()> {
             .ok_or(BrokerError::PolicyDenied),
         UnixSocketAccess::Denied => Err(BrokerError::PolicyDenied),
     }
+}
+
+/// Sockets a sandboxed child can use to ask an unsandboxed service manager to
+/// start a process that inherits neither Landlock nor seccomp.
+fn is_supervisor_socket(target: &Path) -> bool {
+    let target = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    // SAFETY: getuid(2) is always defined and has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let uid_runtime = Path::new("/run/user").join(uid.to_string());
+    let runtime = env::var_os("XDG_RUNTIME_DIR").map_or_else(|| uid_runtime.clone(), PathBuf::from);
+    let candidates = [
+        runtime.join("bus"),
+        uid_runtime.join("bus"),
+        PathBuf::from("/run/dbus/system_bus_socket"),
+    ];
+    candidates
+        .iter()
+        .any(|socket| target == *socket || same_socket_inode(&target, socket))
+        || target.is_under("/run/systemd")
+        || target.is_under(runtime.join("systemd"))
+        || target.is_under(uid_runtime.join("systemd"))
+}
+
+fn same_socket_inode(left: &Path, right: &Path) -> bool {
+    let Ok(left) = fs::metadata(left) else {
+        return false;
+    };
+    let Ok(right) = fs::metadata(right) else {
+        return false;
+    };
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 fn rewrite_unix_path(addr: &mut Vec<u8>, target: &Path) -> SysResult<()> {

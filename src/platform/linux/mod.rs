@@ -9,7 +9,7 @@ mod seccomp;
 
 use crate::error::Error;
 use crate::platform::unix::close_inherited_fds;
-use crate::policy::AccessPolicy;
+use crate::policy::{AccessPolicy, UnixSocketAccess};
 use crate::trap_fd::TrapFd;
 use ::landlock::{AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr};
 use anyhow::{Context, Result};
@@ -69,8 +69,12 @@ pub(crate) fn execute(
 
     let needs_fs_broker = filter::needs_filesystem_broker(policy) || trap_fd.is_some();
     let needs_network_broker = network.needs_network_broker();
+    // allowNetwork / allowAllUnixSockets leave connect unmediated; still trap it so
+    // systemd-run cannot start a process outside Landlock and seccomp.
+    let needs_unix_supervisor =
+        matches!(network.unix_socket_access(), UnixSocketAccess::Unrestricted);
 
-    if needs_network_broker || needs_fs_broker {
+    if needs_network_broker || needs_fs_broker || needs_unix_supervisor {
         let status = seccomp::run_broker(
             policy,
             tool,

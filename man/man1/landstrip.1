@@ -222,8 +222,10 @@ applies the policy before
 , so that case does not arise in the sandbox itself.
 .Pp
 .Va allowNetwork
-set to true disables Landstrip network enforcement but leaves the filesystem
+set to true disables Landstrip TCP enforcement but leaves the filesystem
 policy active.
+On Linux, systemd and D-Bus control sockets stay denied so a service manager
+cannot start a process that inherits neither Landlock nor seccomp.
 .Ss Windows
 Windows requires an explicit read allowlist; a policy with unrestricted reads
 is rejected.
