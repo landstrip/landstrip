@@ -73,6 +73,9 @@ name=allowUnixSockets rejects directory path | os=macos | setup=mkdir:unix-socke
 name=allowUnixSockets rejects regular file path | os=macos | setup=mkdir:unix-sockets;write:unix-sockets/not-a-socket: | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%TMP%/unix-sockets/not-a-socket"]}} | cmd=%SHELL% -c 'printf ok' | status=!0
 name=allowUnixSockets permits missing path | os=macos | setup=mkdir:unix-sockets | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{"allowUnixSockets":["%TMP%/unix-sockets/missing.sock"]}} | cmd=%SHELL% -c 'printf ok' | status=0
 name=denied unix connect reports EACCES not EAFNOSUPPORT | os=linux | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]},"network":{}} | net=unix-denied
+name=host abstract unix connect denied under allowNetwork | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=unix-abstract-denied
+name=cannot signal process outside sandbox | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=signal-outside-denied
+name=same-process thread signal still works | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=signal-thread-allowed
 
 # --- TCP connect policy ---
 

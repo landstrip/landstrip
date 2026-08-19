@@ -1,4 +1,4 @@
-.Dd August 17, 2026
+.Dd August 19, 2026
 .Dt LANDSTRIP 1
 .Os
 .Sh NAME
@@ -211,6 +211,15 @@ allows pathname Unix sockets, while
 .Va allowAllUnixSockets
 allows all new Unix sockets.
 Unix socket policy is unsupported on Windows.
+On Linux 6.12+ (Landlock ABI 6), abstract Unix sockets created outside the
+sandbox stay denied even when those settings are enabled, and signals to
+processes outside the sandbox are denied.
+Kernels that have not backported Landlock erratum 2 may also block signals
+between threads that applied Landlock independently in the same process.
+.Nm
+applies the policy before
+.Xr execve 2
+, so that case does not arise in the sandbox itself.
 .Pp
 .Va allowNetwork
 set to true disables Landstrip network enforcement but leaves the filesystem

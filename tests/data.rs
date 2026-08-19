@@ -22,6 +22,9 @@ const DATA: &str = include_str!("data.txt");
 const OPATH_PROBE_ARG: &str = "--test-opath";
 const FUTIMENS_PROBE_ARG: &str = "--test-futimens";
 const TRUNCATE_PROBE_ARG: &str = "--test-truncate";
+const ABSTRACT_UNIX_PROBE_ARG: &str = "--test-abstract-connect";
+const SIGNAL_OUTSIDE_PROBE_ARG: &str = "--test-signal-outside";
+const SIGNAL_THREAD_PROBE_ARG: &str = "--test-signal-thread";
 
 fn main() {
     let mut args = std::env::args_os();
@@ -34,6 +37,15 @@ fn main() {
         }
         Some(value) if value == std::ffi::OsStr::new(TRUNCATE_PROBE_ARG) => {
             std::process::exit(truncate_probe(args.next()));
+        }
+        Some(value) if value == std::ffi::OsStr::new(ABSTRACT_UNIX_PROBE_ARG) => {
+            std::process::exit(abstract_connect_probe(args.next()));
+        }
+        Some(value) if value == std::ffi::OsStr::new(SIGNAL_OUTSIDE_PROBE_ARG) => {
+            std::process::exit(signal_outside_probe());
+        }
+        Some(value) if value == std::ffi::OsStr::new(SIGNAL_THREAD_PROBE_ARG) => {
+            std::process::exit(signal_thread_probe());
         }
         _ => {}
     }
@@ -178,6 +190,9 @@ enum Net {
     LoopbackAllowed,
     UnixAllowed,
     UnixDenied,
+    UnixAbstractDenied,
+    SignalOutsideDenied,
+    SignalThreadAllowed,
 }
 
 /// Fs action driven natively by the harness (no shell/tool can O_PATH portably).
@@ -565,6 +580,9 @@ fn parse_net(value: &str) -> Net {
         "loopback-allowed" => Net::LoopbackAllowed,
         "unix-allowed" => Net::UnixAllowed,
         "unix-denied" => Net::UnixDenied,
+        "unix-abstract-denied" => Net::UnixAbstractDenied,
+        "signal-outside-denied" => Net::SignalOutsideDenied,
+        "signal-thread-allowed" => Net::SignalThreadAllowed,
         other => panic!("unknown net kind `{other}`"),
     }
 }
@@ -801,6 +819,9 @@ fn run_net(
             run_unix_allowed(ctx, format, policies, &dir.join(resolver.subst(rel)))
         }
         Net::UnixDenied => run_unix_denied(ctx, format, policies, dir),
+        Net::UnixAbstractDenied => run_unix_abstract_denied(ctx, format, policies),
+        Net::SignalOutsideDenied => run_signal_outside_denied(ctx, format, policies),
+        Net::SignalThreadAllowed => run_signal_thread_allowed(ctx, format, policies),
     }
 }
 
@@ -1096,6 +1117,236 @@ fn run_unix_denied(
             merged.trim()
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_abi() -> i64 {
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_ulong = 1;
+    // SAFETY: a NULL attr with size 0 and the version flag is the documented
+    // Landlock ABI query form.
+    unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn skip_old_landlock() -> bool {
+    let abi = landlock_abi();
+    if abi < 6 {
+        eprint!("skipped Landlock ABI {abi} < 6; ");
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_self_probe(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+    probe: &str,
+    extra: Option<&std::ffi::OsStr>,
+    spawn_err: &str,
+    fail: &str,
+) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
+    let mut command = landstrip_net(ctx, format, policies);
+    command.arg(exe).arg(probe);
+    if let Some(extra) = extra {
+        command.arg(extra);
+    }
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("{spawn_err}: {e}"))?;
+    if output.status.code() == Some(0) {
+        return Ok(());
+    }
+    Err(format!(
+        "{fail}; status={:?} output={}",
+        output.status,
+        merge(&output.stdout, &output.stderr).trim()
+    ))
+}
+
+/// Re-exec probe: connect to a host-created abstract Unix socket. Exit 0 when
+/// Landlock denies the connect (EPERM/EACCES), 1 when it unexpectedly succeeds.
+#[cfg(target_os = "linux")]
+fn abstract_connect_probe(name: Option<std::ffi::OsString>) -> i32 {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::{SocketAddr, UnixStream};
+
+    let Some(name) = name else {
+        return 2;
+    };
+    let Ok(addr) = SocketAddr::from_abstract_name(name.as_bytes()) else {
+        return 2;
+    };
+    match UnixStream::connect_addr(&addr) {
+        Ok(_) => 1,
+        Err(error) => match error.raw_os_error() {
+            Some(libc::EACCES | libc::EPERM) => 0,
+            _ => 2,
+        },
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn abstract_connect_probe(_name: Option<std::ffi::OsString>) -> i32 {
+    2
+}
+
+/// Denies connect to an abstract Unix socket created by the harness before the
+/// sandbox started. Landlock ABI 6+ (Linux 6.12+) enforces the abstract-socket
+/// scope; older kernels are skipped because seccomp cannot tell a host socket
+/// from one the child created itself.
+#[cfg(target_os = "linux")]
+fn run_unix_abstract_denied(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+) -> Result<(), String> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+
+    if skip_old_landlock() {
+        return Ok(());
+    }
+
+    let name = format!("landstrip-abs-{}", ctx.pid);
+    let addr = SocketAddr::from_abstract_name(name.as_bytes()).map_err(|e| e.to_string())?;
+    let _listener =
+        UnixListener::bind_addr(&addr).map_err(|e| format!("bind abstract unix socket: {e}"))?;
+
+    run_self_probe(
+        ctx,
+        format,
+        policies,
+        ABSTRACT_UNIX_PROBE_ARG,
+        Some(std::ffi::OsStr::new(&name)),
+        "abstract unix connect spawn",
+        "host abstract unix connect not denied",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_unix_abstract_denied(
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+) -> Result<(), String> {
+    Err("unix-abstract-denied is linux-only".to_owned())
+}
+
+/// Re-exec probe: signal the parent process. Exit 0 when Landlock denies
+/// (EPERM/EACCES), 1 when the signal unexpectedly succeeds.
+#[cfg(target_os = "linux")]
+fn signal_outside_probe() -> i32 {
+    // SAFETY: getppid/kill with signal 0 have no preconditions.
+    let rc = unsafe { libc::kill(libc::getppid(), 0) };
+    if rc == 0 {
+        return 1;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM | libc::EACCES) => 0,
+        _ => 2,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_outside_probe() -> i32 {
+    2
+}
+
+/// Denies signaling a process outside the sandbox (the landstrip parent).
+/// Landlock ABI 6+ (Linux 6.12+) enforces signal scope; older kernels skip.
+#[cfg(target_os = "linux")]
+fn run_signal_outside_denied(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+) -> Result<(), String> {
+    if skip_old_landlock() {
+        return Ok(());
+    }
+    run_self_probe(
+        ctx,
+        format,
+        policies,
+        SIGNAL_OUTSIDE_PROBE_ARG,
+        None,
+        "signal-outside spawn",
+        "signal to parent not denied",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_signal_outside_denied(
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+) -> Result<(), String> {
+    Err("signal-outside-denied is linux-only".to_owned())
+}
+
+/// Re-exec probe: a thread signals the main thread of the same process.
+/// Exit 0 when that works. Landstrip restricts then execs, so both threads
+/// share one domain and erratum 2 does not apply.
+#[cfg(target_os = "linux")]
+fn signal_thread_probe() -> i32 {
+    // SAFETY: gettid(2) has no preconditions.
+    let main_tid = unsafe { libc::gettid() };
+    let result = std::thread::spawn(move || {
+        // SAFETY: tgkill with signal 0 only checks permission.
+        unsafe { libc::tgkill(libc::getpid(), main_tid, 0) }
+    })
+    .join();
+    match result {
+        Ok(0) => 0,
+        _ => 1,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_thread_probe() -> i32 {
+    2
+}
+
+#[cfg(target_os = "linux")]
+fn run_signal_thread_allowed(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+) -> Result<(), String> {
+    if skip_old_landlock() {
+        return Ok(());
+    }
+    run_self_probe(
+        ctx,
+        format,
+        policies,
+        SIGNAL_THREAD_PROBE_ARG,
+        None,
+        "signal-thread spawn",
+        "same-process thread signal failed",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_signal_thread_allowed(
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+) -> Result<(), String> {
+    Err("signal-thread-allowed is linux-only".to_owned())
 }
 
 fn wait_for_unix_socket(server: &mut Child, sock: &Path) -> Result<(), String> {

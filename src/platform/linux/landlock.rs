@@ -11,8 +11,8 @@ use crate::error::{Error, Mechanism, PathIo};
 use crate::policy::{AccessPolicy, ReadAccess};
 use anyhow::Result;
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, BitFlags, LandlockStatus, NetPort, PathBeneath, Ruleset,
-    RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
+    ABI, Access, AccessFs, AccessNet, BitFlags, Erratum, LandlockStatus, NetPort, PathBeneath,
+    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::{Mode, fstat};
@@ -62,6 +62,13 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
             .handle_access(handled_access_net)
             .map_err(|source| Error::sandbox_setup(Mechanism::Landlock, source))?;
     }
+    // Host-created abstract Unix sockets (D-Bus, systemd) and signals to processes
+    // outside the sandbox stay out of reach even when allowNetwork /
+    // allowAllUnixSockets leave pathname connect unrestricted.
+    // Best-effort: kernels before ABI 6 ignore this and still get the seccomp denylist.
+    ruleset = ruleset
+        .scope(Scope::AbstractUnixSocket | Scope::Signal)
+        .map_err(|source| Error::sandbox_setup(Mechanism::Landlock, source))?;
     let mut created = ruleset
         .create()
         .map_err(|source| Error::sandbox_setup(Mechanism::Landlock, source))?;
@@ -88,7 +95,7 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
         RulesetStatus::FullyEnforced => {}
         RulesetStatus::PartiallyEnforced => log::debug!(
             "{}",
-            partial_enforcement_warning(status.landlock, handled_access_fs, handled_access_net,)
+            partial_enforcement_warning(status.landlock, handled_access_fs, handled_access_net)
         ),
         RulesetStatus::NotEnforced => {
             return Err(Error::sandbox_setup(
@@ -98,6 +105,15 @@ fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Res
             )
             .into());
         }
+    }
+    // Keep Scope::Signal even when unfixed: the erratum over-restricts same-process
+    // thread signals (libpsx / independent per-thread restrict). Dropping the scope
+    // would be less secure. Landstrip restricts then execs, so this path is single-threaded.
+    if !Erratum::current().contains(Erratum::ScopedSignalHandling) {
+        log::debug!(
+            "landlock: kernel has not fixed scoped signal handling (erratum 2); threads that \
+             apply Landlock independently in one process may be unable to signal each other"
+        );
     }
 
     Ok(())
@@ -132,6 +148,13 @@ fn partial_enforcement_warning(
             missing.push(name);
         }
     }
+    let supported_scope = Scope::from_all(effective_abi);
+    if !supported_scope.contains(Scope::AbstractUnixSocket) {
+        missing.push("scope ABSTRACT_UNIX_SOCKET");
+    }
+    if !supported_scope.contains(Scope::Signal) {
+        missing.push("scope SIGNAL");
+    }
 
     let details = if missing.is_empty() {
         "some requested features".to_owned()
@@ -140,8 +163,8 @@ fn partial_enforcement_warning(
     };
     format!(
         "landlock: kernel ABI {effective_abi} only partially enforced the policy; unsupported \
-         access rights: {details}; supported rights remain enforced; Landlock ABI 5 or newer \
-         (upstream Linux 6.10+) is required for complete enforcement"
+         access rights: {details}; supported rights remain enforced; Landlock ABI 6 or newer \
+         (upstream Linux 6.12+) is required for complete enforcement"
     )
 }
 
