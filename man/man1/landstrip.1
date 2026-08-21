@@ -3,75 +3,44 @@
 .Os
 .Sh NAME
 .Nm landstrip
-.Nd run a command inside an OS-level sandbox
+.Nd run commands inside an OS-level sandbox
 .Sh SYNOPSIS
 .Nm
 .Op Fl -debug
-.Cm run
-.Op Fl -trap-fd Ar fd
-.Op Fl p Ar file | Fl -policy Ar file
-.Op Fl -policy-format Ar format
-.Fl -
-.Ar program
-.Op Ar argument ...
-.Nm
-.Op Fl -debug
-.Cm policy Cm validate | Cm resolve
-.Op Fl p Ar file | Fl -policy Ar file
-.Op Fl -policy-format Ar format
-.Op Fl -tool Ar program
-.Nm
-.Op Fl -debug
-.Cm doctor
-.Nm
-.Op Fl -debug
-.Cm windows Cm install
-.Op Fl -restricted-accounts Ar count
-.Op Fl -unrestricted-accounts Ar count
-.Op Fl -proxy-port-range Ar low-high
-.Nm
-.Op Fl -debug
-.Cm windows Cm status | Cm uninstall
-.Nm
-.Fl V
+.Ar command
+.Op Ar options
 .Sh DESCRIPTION
 .Nm
 loads one or more policies, applies the current platform sandbox, and runs a
 program.
-The
-.Fl -
-separator before the program is required.
-.Pp
-Policies use the supported subset of the Anthropic Sandbox Runtime format.
+Policies use the supported subset of the Anthropic Sandbox Runtime
+format.
 JSON is the default; YAML is also accepted.
-Unknown fields are ignored.
+.Pp
+Run
+.Nm Ar command Fl -help
+for complete command options.
 .Sh COMMANDS
 .Bl -tag -width "policy validate"
 .It Cm run
-Run a program under the merged file and executable policy.
+Run a program under the merged policy.
+The
+.Fl -
+separator before the program is required.
 .It Cm policy validate
-Check policy parsing, path resolution, executable policy, and current platform
-support without starting a program.
+Check policy parsing, path resolution, executable policy, and platform support.
 .It Cm policy resolve
 Print the normalized merged policy as JSON.
 .It Cm doctor
-Print a JSON report showing whether the current platform sandbox is usable.
+Print a JSON report showing whether the current sandbox is usable.
 .It Cm windows install
-Install and activate restricted-user isolation.
-This command requests elevation.
-The default installation creates eight restricted-network accounts, two
-unrestricted-network accounts, and permits proxy ports 60080 through 60111.
+Install restricted-user isolation.
+This Windows-only command requests elevation.
 .It Cm windows status
-Print the active Windows implementation and its health as JSON.
+Report the active Windows implementation and its health.
 .It Cm windows uninstall
 Remove restricted-user isolation and return to AppContainer.
 .El
-.Pp
-The
-.Cm windows
-command family exists only in Windows builds.
-AppContainer is used when restricted-user isolation is not installed.
-An unhealthy installation is an error and never causes silent fallback.
 .Sh OPTIONS
 .Bl -tag -width Ds
 .It Fl -debug
@@ -81,45 +50,35 @@ Read a policy file.
 This option may be repeated.
 Use
 .Sq -
-to read standard input; it may appear once and requires
+for standard input together with
 .Fl -policy-format .
 .It Fl -policy-format Ar format
-Set the format to
+Use
 .Va json
 or
 .Va yaml .
-The default for files is
-.Va json .
 .It Fl -tool Ar program
-For
-.Cm policy validate
-or
-.Cm policy resolve ,
-include policy attached to the resolved executable.
+Include policy attached to the resolved executable when validating or resolving.
 .It Fl -trap-fd Ar fd
-On Unix builds, write structured traps to an already-open descriptor numbered 3
-or higher.
+On Unix, write structured traps to an open descriptor numbered 3 or higher.
 .It Fl -restricted-accounts Ar count
 Set the restricted-network Windows account pool size.
-The default is 8.
 .It Fl -unrestricted-accounts Ar count
 Set the unrestricted-network Windows account pool size.
-The default is 2.
 .It Fl -proxy-port-range Ar low-high
-Set the inclusive loopback proxy range for restricted Windows accounts.
-The default is 60080-60111.
+Set the restricted-user loopback proxy range.
 .It Fl V , Fl -version
-Print version information and exit.
+Print the version.
 .It Fl h , Fl -help
-Print usage information and exit.
+Print help.
 .El
 .Sh POLICY
-Later policy files are merged over earlier files.
-Objects merge recursively, arrays are combined without duplicates, and scalar
-values replace earlier values.
+Later policy files merge over earlier files.
+Objects merge recursively, arrays
+combine without duplicates, and later scalar values replace earlier values.
 Executable policy is merged last.
 .Pp
-The accepted fields are:
+Supported fields include:
 .Bd -literal -offset indent
 {
   "filesystem": {
@@ -133,8 +92,7 @@ The accepted fields are:
     "httpProxyPort": 8080,
     "socksProxyPort": 8081,
     "allowLocalBinding": false,
-    "allowUnixSockets": ["/run/user/1000/agent.sock"],
-    "allowAllUnixSockets": false
+    "allowUnixSockets": []
   },
   "windows": {
     "appContainerMode": "lpac",
@@ -143,29 +101,10 @@ The accepted fields are:
 }
 .Ed
 .Pp
-YAML path fields may be lists or newline-separated strings.
-Relative paths are resolved from the directory where
-.Nm
-started.
-.Sq ~
-and
-.Sq ~/
-resolve to the current user's home directory.
-Path entries accept
-.Sq * ,
-.Sq ** ,
-.Sq ? ,
-and character-class globs.
-.Pp
-On Unix, supplementary executable policy is read from the
-.Va user.landstrip.policy
-extended attribute.
-On Windows it is read from the
-.Va landstrip.policy
-NTFS alternate data stream.
-The executable is resolved through
-.Ev PATH
-and canonicalized first.
+Relative paths resolve from the starting directory.
+Tilde paths use the current
+user's home directory.
+Path entries accept shell-style globs.
 .Ss Filesystem
 Writes are denied by default.
 .Va allowWrite
@@ -174,174 +113,79 @@ grants writable roots and
 always takes precedence.
 Reads remain unrestricted while
 .Va denyRead
-is empty.
-Once it contains an entry, reads use an allowlist and
+is empty; otherwise reads use an allowlist and
 .Va allowRead
 adds exceptions.
-The most specific read rule wins.
-On Linux, a hard link or rename that would give a
-.Va denyRead
-inode a readable name is denied, even when the destination is writable.
 .Pp
-Concrete
-.Va denyWrite
-paths are enforced on all platforms.
-Glob denies are matched at access time on Linux and macOS, including for files
-created after sandbox setup.
-Windows does not enforce glob
-.Va denyWrite
-entries.
+Concrete write denials are enforced on every platform.
+Linux and macOS enforce
+glob write denials at access time.
+Windows does not enforce write-denial globs.
 .Ss Network
 Direct TCP connections and new Unix sockets are denied by default.
-.Va httpProxyPort
-and
-.Va socksProxyPort
-allow loopback connections to those ports.
-.Nm
-does not start a proxy, set proxy environment variables, or filter domains;
-the caller must do so.
-.Pp
+Proxy port
+fields permit their loopback ports but do not start a proxy.
 .Va allowLocalBinding
-permits local TCP binding and connections to loopback addresses.
-Windows rejects this setting.
-On macOS, the Seatbelt localhost matcher may also include addresses assigned to
-other local interfaces.
+permits local TCP binding and loopback connections.
 .Va allowUnixSockets
-allows pathname Unix sockets, while
-.Va allowAllUnixSockets
-allows all new Unix sockets.
-Unix socket policy is unsupported on Windows.
-On Linux 6.12+ (Landlock ABI 6), abstract Unix sockets created outside the
-sandbox stay denied even when those settings are enabled, and signals to
-processes outside the sandbox are denied.
-Kernels that have not backported Landlock erratum 2 may also block signals
-between threads that applied Landlock independently in the same process.
-.Nm
-applies the policy before
-.Xr execve 2
-, so that case does not arise in the sandbox itself.
-.Pp
+permits listed pathname sockets.
 .Va allowNetwork
-set to true disables Landstrip TCP enforcement but leaves the filesystem
-policy active.
-On Linux, systemd and D-Bus control sockets stay denied so a service manager
-cannot start a process that inherits neither Landlock nor seccomp.
-.Ss Windows
-Windows requires an explicit read allowlist; a policy with unrestricted reads
-is rejected.
-The removed
-.Va windows.backend
-field is also rejected.
-Use the
-.Cm windows
-commands to select restricted-user isolation.
+turns off TCP enforcement while leaving filesystem policy active.
 .Pp
+Unix socket policy is unavailable on Windows.
+Linux 6.12 and newer also restrict
+abstract sockets and signals to processes outside the sandbox.
+.Ss Windows
+Windows requires an explicit read allowlist.
 .Va windows.appContainerMode
 selects
 .Va lpac
 or
 .Va standard .
-LPAC is the default and the stronger boundary.
-Standard AppContainer can also see resources granted to
-.Va ALL APPLICATION PACKAGES .
+LPAC is the default and stronger boundary.
 .Va windows.allowLoopback
-is an AppContainer-only opt-in that exposes every local loopback service, not a
-single proxy port.
-.Pp
-AppContainer cannot enforce individual proxy ports.
-With
-.Va allowNetwork
-false and no loopback exemption, it has no network access.
-Restricted-user isolation permits only proxy ports in the range selected at
-installation and rejects
-.Va windows.allowLoopback .
+exposes all local loopback services in AppContainer mode.
+Restricted-user mode
+instead permits only the proxy range selected during installation.
 .Sh PLATFORM NOTES
 .Bl -tag -width Windows
 .It Linux
-Landlock enforces filesystem roots.
-A seccomp broker handles policy operations Landlock cannot express, network
-address checks, and per-access query traps.
+Landlock enforces filesystem roots and a seccomp broker handles network and
+query traps.
 .It macOS
-Seatbelt enforces filesystem and network rules from a profile fixed at process
-startup.
+Seatbelt enforces a profile fixed at process startup.
 .It Windows
 AppContainer or restricted local users enforce explicit filesystem grants.
-Restricted-user mode uses account-scoped Windows Filtering Platform rules.
-Per-run grants are removed after the process tree exits.
+Restricted-user mode uses Windows Filtering Platform rules.
 .El
 .Sh OUTPUT
-.Cm policy validate ,
-.Cm policy resolve ,
-.Cm doctor ,
-and Windows management commands each write one JSON document to standard
-output.
-An invalid validation report has
-.Va valid
-set to false and includes stable
-.Va code
+Policy commands, doctor, and Windows management commands write one JSON document
+to standard output.
+Failures and completed denials are one-line JSON objects on
+standard error with stable kind and code fields.
+.Pp
+Trap kinds are
+.Va filesystem ,
+.Va network ,
+.Va launch ,
+.Va usage ,
 and
-.Va message
-fields.
-Operational failures remain traps rather than validation reports.
-.Pp
-Landstrip failures and broker-reported denials are one-line JSON objects with a
-fixed
-.Va kind
-and stable
-.Va code .
-Failures and completed denials are written to standard error; the sandboxed
-program may also write there.
-The trap kinds are:
-.Bl -tag -width filesystem
-.It Va filesystem
-A denied read or write, with code
-.Va FILESYSTEM_DENIED .
-.It Va network
-A denied connect or bind, with code
-.Va NETWORK_DENIED .
-.It Va launch
-The sandbox was installed but the program did not start, with code
-.Va LAUNCH_FAILED .
-.It Va usage
-The command line was rejected, with code
-.Va USAGE_ERROR .
-.It Va internal
-A failure before the program ran.
-The code identifies the failed stage, such as
-.Va POLICY_PARSE_FAILED
-or
-.Va SANDBOX_SETUP_FAILED .
-.El
-.Pp
-On Linux, a socket passed with
-.Fl -trap-fd
-may receive a filesystem or network trap whose
-.Va state
-is
-.Va query
-while the operation waits for an integrating host.
-Query traps go only to that socket.
-Kernel-only and static-profile denials do not always produce a per-access trap.
-Writes to the trap descriptor are best effort.
+.Va internal .
 .Sh EXIT STATUS
 .Cm run
-returns the sandboxed program's exit status.
-.Cm policy validate
-returns 1 when its report marks the policy invalid.
-.Cm doctor
-and
-.Cm windows status
-return 1 when their report is unhealthy.
-Other Landstrip failures return 1, and usage errors return 2.
+returns the sandboxed program's status.
+Invalid policy validation and unhealthy
+doctor or status reports return 1. Other failures return 1 and usage errors
+return 2.
 .Sh EXAMPLES
 Run tests with a JSON policy:
 .Bd -literal -offset indent
 landstrip run -p policy.json -- cargo test
 .Ed
 .Pp
-Validate a YAML policy from standard input:
+Validate YAML from standard input:
 .Bd -literal -offset indent
 cat policy.yaml | landstrip policy validate -p - --policy-format yaml
 .Ed
-.Sh AUTHORS
-.An Jarkko Sakkinen Aq Mt jarkko.sakkinen@iki.fi
+.Sh SEE ALSO
+.Lk https://github.com/landstrip/landstrip#readme
