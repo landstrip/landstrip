@@ -485,16 +485,25 @@ export function discoveryFilePath(baseDirectory: string): string {
 // /sandbox toggles the persisted `enabled` flag. Write it where the setting
 // already lives — the project config if it sets `enabled`, otherwise the global
 // config — and return the scope written so the UI can report it.
+export function sandboxConfigTarget(baseDirectory: string): {
+  scope: 'project' | 'global';
+  path: string;
+} {
+  const { globalPath, projectPath } = getConfigPaths(baseDirectory);
+  const projectConfig = readConfigFile(projectPath);
+  const useProject = projectConfig !== null && projectConfig.enabled !== undefined;
+  return useProject
+    ? { scope: 'project', path: projectPath }
+    : { scope: 'global', path: globalPath };
+}
+
 export function setSandboxConfigEnabled(
   baseDirectory: string,
   enabled: boolean,
 ): 'project' | 'global' {
-  const { globalPath, projectPath } = getConfigPaths(baseDirectory);
-  const projectConfig = readConfigFile(projectPath);
-  const useProject = projectConfig !== null && projectConfig.enabled !== undefined;
-  const target = useProject ? projectPath : globalPath;
-  writeConfigFile(target, { enabled });
-  return useProject ? 'project' : 'global';
+  const target = sandboxConfigTarget(baseDirectory);
+  writeConfigFile(target.path, { enabled });
+  return target.scope;
 }
 
 export function writeDiscoveryPort(baseDirectory: string, port: number): void {

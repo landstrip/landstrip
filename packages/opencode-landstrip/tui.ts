@@ -12,7 +12,7 @@ import type {
   TuiSlotPlugin,
 } from '@opencode-ai/plugin/tui';
 import { RGBA } from '@opentui/core';
-import { useTerminalDimensions } from '@opentui/solid';
+import { Portal, useTerminalDimensions } from '@opentui/solid';
 import { Fragment, jsx, jsxs } from '@opentui/solid/jsx-runtime';
 import { createSignal, onCleanup, onMount } from 'solid-js';
 
@@ -27,7 +27,7 @@ import {
   removeDiscoveryFile,
   sessionAllows,
   sessionAllowancesFor,
-  sandboxSummary,
+  sandboxConfigTarget,
   sessionScopeFor,
   rootSessionIDFor,
   setSandboxConfigEnabled,
@@ -118,16 +118,9 @@ function formatPath(input: string, base: string): string {
   return absolute;
 }
 
-function selectedForeground(theme: TuiSlotContext['theme']['current']): RGBA {
-  const resolved = theme as typeof theme & { _hasSelectedListItemText?: boolean };
-  if (resolved._hasSelectedListItemText) return theme.selectedListItemText;
-
-  if (theme.background.a === 0) {
-    const { r, g, b } = theme.warning;
-    const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-    return luminance > 0.5 ? RGBA.fromInts(0, 0, 0) : RGBA.fromInts(255, 255, 255);
-  }
-  return theme.background;
+function selectedForeground(background: RGBA): RGBA {
+  const luminance = 0.2126 * background.r + 0.7152 * background.g + 0.0722 * background.b;
+  return luminance > 0.5 ? RGBA.fromInts(0, 0, 0) : RGBA.fromInts(255, 255, 255);
 }
 
 const tui: TuiPlugin = async (api, options, meta) => {
@@ -138,6 +131,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     const theme = api.theme.current;
     const dimensions = useTerminalDimensions();
     const [selected, setSelected] = createSignal(0);
+    const [expanded, setExpanded] = createSignal(false);
     onMount(props.onShow);
 
     function move(direction: number): void {
@@ -152,12 +146,18 @@ const tui: TuiPlugin = async (api, options, meta) => {
     const unregister = api.keymap.registerLayer({
       priority: 1000,
       bindings: [
-        { key: 'left', cmd: () => move(-1) },
-        { key: 'h', cmd: () => move(-1) },
-        { key: 'right', cmd: () => move(1) },
-        { key: 'l', cmd: () => move(1) },
-        { key: 'return', cmd: submit },
-        { key: 'escape', cmd: props.onCancel },
+        { key: 'left', desc: 'Previous permission option', group: 'Sandbox', cmd: () => move(-1) },
+        { key: 'h', desc: 'Previous permission option', group: 'Sandbox', cmd: () => move(-1) },
+        { key: 'right', desc: 'Next permission option', group: 'Sandbox', cmd: () => move(1) },
+        { key: 'l', desc: 'Next permission option', group: 'Sandbox', cmd: () => move(1) },
+        { key: 'return', desc: 'Select permission option', group: 'Sandbox', cmd: submit },
+        { key: 'escape', desc: 'Reject permission', group: 'Sandbox', cmd: props.onCancel },
+        {
+          key: 'ctrl+f',
+          desc: 'Toggle permission prompt fullscreen',
+          group: 'Sandbox',
+          cmd: () => setExpanded((value) => !value),
+        },
       ],
     });
     onCleanup(unregister);
@@ -177,13 +177,126 @@ const tui: TuiPlugin = async (api, options, meta) => {
         },
         children: jsx('text', {
           get fg() {
-            return selected() === index ? selectedForeground(theme) : theme.textMuted;
+            return selected() === index ? selectedForeground(theme.warning) : theme.textMuted;
           },
           children: option.label,
         }),
       }),
     );
 
+    const children = [
+      jsxs('box', {
+        gap: 1,
+        paddingLeft: 1,
+        paddingRight: 3,
+        paddingTop: 1,
+        paddingBottom: 1,
+        flexGrow: 1,
+        children: [
+          jsxs('box', {
+            flexDirection: 'column',
+            gap: 0,
+            paddingLeft: 1,
+            flexShrink: 0,
+            children: [
+              jsxs('box', {
+                flexDirection: 'row',
+                gap: 1,
+                flexShrink: 0,
+                children: [
+                  jsx('text', { fg: theme.warning, children: '△' }),
+                  jsx('text', { fg: theme.text, children: 'Permission required' }),
+                ],
+              }),
+              jsxs('box', {
+                flexDirection: 'row',
+                gap: 1,
+                paddingLeft: 2,
+                flexShrink: 0,
+                children: [
+                  jsx('text', { fg: theme.textMuted, flexShrink: 0, children: props.icon }),
+                  jsx('text', { fg: theme.text, wrapMode: 'word', children: props.title }),
+                ],
+              }),
+            ],
+          }),
+        ],
+      }),
+      jsxs('box', {
+        get flexDirection() {
+          return dimensions().width < 80 ? 'column' : 'row';
+        },
+        flexShrink: 0,
+        gap: 1,
+        paddingTop: 1,
+        paddingLeft: 2,
+        paddingRight: 3,
+        paddingBottom: 1,
+        backgroundColor: theme.backgroundElement,
+        get justifyContent() {
+          return dimensions().width < 80 ? 'flex-start' : 'space-between';
+        },
+        get alignItems() {
+          return dimensions().width < 80 ? 'flex-start' : 'center';
+        },
+        children: [
+          jsx('box', {
+            flexDirection: 'row',
+            gap: 1,
+            flexShrink: 0,
+            children: optionButtons,
+          }),
+          jsxs('box', {
+            flexDirection: 'row',
+            gap: 2,
+            flexShrink: 0,
+            children: [
+              jsxs('text', {
+                fg: theme.text,
+                children: [
+                  'ctrl+f ',
+                  jsx('span', {
+                    style: { fg: theme.textMuted },
+                    children: expanded() ? 'minimize' : 'fullscreen',
+                  }),
+                ],
+              }),
+              jsxs('text', {
+                fg: theme.text,
+                children: [
+                  '⇆ ',
+                  jsx('span', { style: { fg: theme.textMuted }, children: 'select' }),
+                ],
+              }),
+              jsxs('text', {
+                fg: theme.text,
+                children: [
+                  'enter ',
+                  jsx('span', { style: { fg: theme.textMuted }, children: 'confirm' }),
+                ],
+              }),
+            ],
+          }),
+        ],
+      }),
+    ];
+
+    if (expanded()) {
+      return Portal({
+        children: jsxs('box', {
+          top: dimensions().height * -1 + 1,
+          bottom: 1,
+          left: 2,
+          right: 2,
+          position: 'absolute',
+          border: ['left'],
+          borderColor: theme.warning,
+          customBorderChars: promptBorderChars,
+          backgroundColor: theme.backgroundPanel,
+          children,
+        }),
+      });
+    }
     return jsxs('box', {
       top: 0,
       maxHeight: 15,
@@ -195,92 +308,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
       borderColor: theme.warning,
       customBorderChars: promptBorderChars,
       backgroundColor: theme.backgroundPanel,
-      children: [
-        jsxs('box', {
-          gap: 1,
-          paddingLeft: 1,
-          paddingRight: 3,
-          paddingTop: 1,
-          paddingBottom: 1,
-          flexGrow: 1,
-          children: [
-            jsxs('box', {
-              flexDirection: 'column',
-              gap: 0,
-              paddingLeft: 1,
-              flexShrink: 0,
-              children: [
-                jsxs('box', {
-                  flexDirection: 'row',
-                  gap: 1,
-                  flexShrink: 0,
-                  children: [
-                    jsx('text', { fg: theme.warning, children: '△' }),
-                    jsx('text', { fg: theme.text, children: 'Permission required' }),
-                  ],
-                }),
-                jsxs('box', {
-                  flexDirection: 'row',
-                  gap: 1,
-                  paddingLeft: 2,
-                  flexShrink: 0,
-                  children: [
-                    jsx('text', { fg: theme.textMuted, flexShrink: 0, children: props.icon }),
-                    jsx('text', { fg: theme.text, wrapMode: 'word', children: props.title }),
-                  ],
-                }),
-              ],
-            }),
-          ],
-        }),
-        jsxs('box', {
-          get flexDirection() {
-            return dimensions().width < 80 ? 'column' : 'row';
-          },
-          flexShrink: 0,
-          gap: 1,
-          paddingTop: 1,
-          paddingLeft: 2,
-          paddingRight: 3,
-          paddingBottom: 1,
-          backgroundColor: theme.backgroundElement,
-          get justifyContent() {
-            return dimensions().width < 80 ? 'flex-start' : 'space-between';
-          },
-          get alignItems() {
-            return dimensions().width < 80 ? 'flex-start' : 'center';
-          },
-          children: [
-            jsx('box', {
-              flexDirection: 'row',
-              gap: 1,
-              flexShrink: 0,
-              children: optionButtons,
-            }),
-            jsxs('box', {
-              flexDirection: 'row',
-              gap: 2,
-              flexShrink: 0,
-              children: [
-                jsxs('text', {
-                  fg: theme.text,
-                  children: [
-                    '⇆ ',
-                    jsx('span', { style: { fg: theme.textMuted }, children: 'select' }),
-                  ],
-                }),
-                jsxs('text', {
-                  fg: theme.text,
-                  children: [
-                    'enter ',
-                    jsx('span', { style: { fg: theme.textMuted }, children: 'confirm' }),
-                  ],
-                }),
-              ],
-            }),
-          ],
-        }),
-      ],
+      children,
     });
   }
 
@@ -662,23 +690,25 @@ const tui: TuiPlugin = async (api, options, meta) => {
     refreshPermissionPresentation,
   );
 
-  // /sandbox shows the config and toggles the persisted `enabled` flag. The
-  // server reads sandbox.json on every tool call, so the toggle takes effect on
-  // the next command without any cross-process signalling.
+  // /sandbox toggles the persisted `enabled` flag. The server reads
+  // sandbox.json on every tool call, so the toggle takes effect on the next
+  // command without any cross-process signalling.
   const showSandbox = () => {
     const directory = api.state.path.directory || process.cwd();
     const config = loadConfig(directory, optionOverrides);
-    const { globalPath, projectPath } = getConfigPaths(directory);
     const next = !config.enabled;
-    const message =
-      sandboxSummary(config, globalPath, projectPath) +
-      `\n\n${next ? 'Enable' : 'Disable'} the sandbox?  (enter = ${next ? 'enable' : 'disable'}, esc = close)`;
+    const target = sandboxConfigTarget(directory);
+    const message = [
+      `Sandbox is ${config.enabled ? 'enabled' : 'disabled'}.`,
+      `Network: ${config.network.allowNetwork ? 'open' : 'proxied'}`,
+      `Change: ${target.scope} config at ${formatPath(target.path, directory)}`,
+    ].join('\n');
 
     // No `clear()` in onConfirm: the host pops the dialog itself, and its
     // `clear()` re-invokes onClose, which would recurse and freeze the TUI.
     api.ui.dialog.replace(() =>
       api.ui.DialogConfirm({
-        title: 'Sandbox',
+        title: next ? 'Enable sandbox?' : 'Disable sandbox?',
         message,
         onConfirm: () => {
           const scope = setSandboxConfigEnabled(directory, next);
@@ -708,18 +738,6 @@ const tui: TuiPlugin = async (api, options, meta) => {
       },
     ],
   });
-
-  api.command?.register(() => [
-    {
-      title: 'Sandbox',
-      value: 'sandbox',
-      description: 'Inspect and toggle the sandbox',
-      category: 'Sandbox',
-      suggested: true,
-      slash: { name: 'sandbox' },
-      onSelect: showSandbox,
-    },
-  ]);
 
   // Persistent status badge in the prompt area.
   try {
