@@ -29,7 +29,6 @@ platforms=(
   win32-arm64
   win32-x64
 )
-license_files=(LICENSE-APACHE-2.0 LICENSE-LGPL-2.1)
 
 cleanup() {
   local status=$?
@@ -349,10 +348,6 @@ for platform in "${platforms[@]}"; do
   mkdir -p "$package_dir/bin"
   cp "$source_bin" "$package_dir/bin/$binary"
   chmod 755 "$package_dir/bin/$binary" 2>/dev/null || true
-  for license_file in "${license_files[@]}"; do
-    [[ -f "$license_file" ]] || die "missing $license_file"
-    cp "$license_file" "$package_dir/$license_file"
-  done
   asset_platform="$platform"
   [[ "$platform" == linux-* ]] && asset_platform="$platform-musl"
   asset_path="$workdir/release/landstrip-$version-$asset_platform.tar.gz"

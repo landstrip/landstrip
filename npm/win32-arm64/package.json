@@ -15,9 +15,7 @@
     "arm64"
   ],
   "files": [
-    "bin/landstrip.exe",
-    "LICENSE-APACHE-2.0",
-    "LICENSE-LGPL-2.1"
+    "bin/landstrip.exe"
   ],
   "publishConfig": {
     "access": "public"
