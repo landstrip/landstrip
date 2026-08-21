@@ -594,71 +594,37 @@ it('cancels an active permission prompt when the coordinator resets', async () =
   ).resolves.toBe(true);
 });
 
-it('registers the sandbox dashboard independently from agent supervision', async () => {
+it('exposes sandbox overview data without registering a dashboard command', async () => {
   const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-overlay-agent-'));
   vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
   const commandNames: string[] = [];
-  const commandHandlers = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
-  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
   const pi = {
     registerTool() {},
     registerFlag() {},
-    registerCommand(
-      name: string,
-      command: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
-    ) {
+    registerCommand(name: string) {
       commandNames.push(name);
-      commandHandlers.set(name, command.handler);
     },
     on() {},
   } as unknown as ExtensionAPI;
-  createLandstripIntegration({ registerBashTool: false }).register(pi);
-  let customResult: unknown;
-  let projectTrusted = true;
-  const ctx = {
-    cwd: join(tmpdir(), 'pi-landstrip-overlay-test'),
-    hasUI: true,
-    mode: 'tui',
-    isProjectTrusted: () => projectTrusted,
-    ui: {
-      async custom(factory: (...args: unknown[]) => unknown) {
-        component = factory(
-          { requestRender() {} },
-          { fg: (_color: string, value: string) => value, bold: (value: string) => value },
-          undefined,
-          (value: unknown) => {
-            customResult = value;
-          },
-        ) as typeof component;
-      },
-    },
-  } as unknown as ExtensionContext;
+  const integration = createLandstripIntegration({ registerBashTool: false });
+  integration.register(pi);
+  const cwd = join(tmpdir(), 'pi-landstrip-overlay-test');
 
-  await commandHandlers.get('sandbox')?.('', ctx);
-  const sandboxView = component?.render(78).join('\n') ?? '';
-  expect(sandboxView).toContain('Sandbox');
-  expect(sandboxView).toContain('[Overview]  Policy');
-  expect(sandboxView).toContain('Protection');
-  expect(sandboxView).toContain('Read rules');
-  expect(sandboxView).toContain('Shell reads');
-  expect(sandboxView).toContain('Tab next tab  ·  Enter disable in project  ·  Esc close');
-  component?.handleInput('\t');
-  expect(component?.render(78).join('\n')).toContain('Allowed domains');
-  expect(component?.render(78).join('\n')).toContain(
-    process.platform === 'win32' ? 'Policy (required)' : 'Host-aligned',
-  );
-  component?.handleInput('\r');
-  expect(customResult).toBe(true);
-  component?.handleInput('\x1b');
-  expect(customResult).toBe(false);
+  expect(commandNames).toEqual([]);
 
-  projectTrusted = false;
-  await commandHandlers.get('sandbox')?.('', ctx);
-  expect(component?.render(78).join('\n')).toContain('Enter disable in global');
+  const overview = integration.sandboxCallbacks!.overview(cwd, true);
+  expect(overview.enabled).toBe(true);
+  expect(overview.running).toBe(false);
+  expect(overview.changeScope).toBe('project');
+  expect(overview.shellReadMode).toBe(process.platform === 'win32' ? 'policy' : 'host');
+  expect(overview.networkMode).not.toBe('unrestricted');
+  expect(overview.paths.project).toContain('sandbox.json');
+  expect(overview.paths.global).toBe(join(agentDir, 'sandbox.json'));
+  expect(overview.config.filesystem.denyRead.length).toBeGreaterThan(0);
+  expect(overview.sessionDomains).toEqual([]);
 
-  expect(commandNames).toEqual(['sandbox']);
-  expect(commandNames).not.toContain('landstrip');
-  expect(commandNames).not.toContain('subagents');
+  expect(integration.sandboxCallbacks!.overview(cwd, false).changeScope).toBe('global');
+
   vi.unstubAllEnvs();
   rmSync(agentDir, { recursive: true, force: true });
 });

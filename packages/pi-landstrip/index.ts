@@ -36,7 +36,6 @@ import type {
   BashToolInput,
   ExtensionAPI,
   ExtensionContext,
-  Theme,
 } from '@earendil-works/pi-coding-agent';
 
 import {
@@ -47,7 +46,6 @@ import {
   SettingsManager,
   withFileMutationQueue,
 } from '@earendil-works/pi-coding-agent';
-import { matchesKey, truncateToWidth } from '@earendil-works/pi-tui';
 import {
   binaryPath,
   type LandstripControlResponse,
@@ -99,7 +97,6 @@ import {
   registerSubagentWorker,
   workerConfigFromEnvironment,
 } from './subagents.ts';
-import { boxBottom, boxRow, boxTop, dialogKeys, dialogTabs } from './box.ts';
 import { getPiConfigPaths } from './config.ts';
 import { expandHomePath, formatError, PermissionPromptCoordinator } from './util.ts';
 
@@ -132,7 +129,7 @@ interface SandboxWindowsConfig {
   allowLoopback: boolean;
 }
 
-interface SandboxConfig {
+export interface SandboxConfig {
   enabled: boolean;
   shell: SandboxShellConfig;
   network: SandboxNetworkConfig;
@@ -461,16 +458,6 @@ async function writeSandboxConfigEnabled(
   });
 }
 
-async function setSandboxConfigEnabled(
-  cwd: string,
-  enabled: boolean,
-  includeProject = true,
-): Promise<SandboxConfigScope> {
-  const { scope } = getSandboxConfigWriteTarget(cwd, includeProject);
-  await writeSandboxConfigEnabled(cwd, enabled, scope);
-  return scope;
-}
-
 function loadSandboxEnabledSettings(
   cwd: string,
   includeProject: boolean,
@@ -791,15 +778,6 @@ function hasTuiStatus(ctx: ExtensionContext): boolean {
 function setTuiStatus(ctx: ExtensionContext, key: string, value: string | undefined): void {
   if (!hasTuiStatus(ctx)) return;
   ctx.ui.setStatus(key, value);
-}
-
-function themeColors(theme: Theme) {
-  return {
-    dim: (value: string) => theme.fg('dim', value),
-    muted: (value: string) => theme.fg('muted', value),
-    accent: (value: string) => theme.fg('accent', value),
-    text: (value: string) => theme.fg('text', value),
-  };
 }
 
 function patchProcessGroupKill(child: ChildProcess): void {
@@ -1154,6 +1132,24 @@ export interface SandboxCallbacks {
   load(cwd: string, includeProject: boolean): { global: boolean; project?: boolean };
   setEnabled(ctx: ExtensionContext, enabled: boolean, scope: SandboxConfigScope): Promise<void>;
   clearProject(ctx: ExtensionContext): Promise<void>;
+  overview(cwd: string, includeProject: boolean): SandboxOverview;
+}
+
+/** Display data for the sandbox section of the settings pane. */
+export interface SandboxOverview {
+  readonly enabled: boolean;
+  readonly running: boolean;
+  readonly noSandboxFlag: boolean;
+  readonly networkMode: 'unrestricted' | 'blocked' | 'proxied';
+  readonly shellReadMode: 'host' | 'policy';
+  readonly readRuleScope: string;
+  readonly windowsMode?: string;
+  readonly changeScope: SandboxConfigScope;
+  readonly paths: { readonly global: string; readonly project: string; readonly binary: string };
+  readonly config: SandboxConfig;
+  readonly sessionDomains: readonly string[];
+  readonly sessionReadPaths: readonly string[];
+  readonly sessionWritePaths: readonly string[];
 }
 
 export interface LandstripRpcWorkerOptions extends LandstripProcessOptions {
@@ -3061,218 +3057,6 @@ function createLandstripIntegrationWithPrompts(
       unpublishRuntime?.();
       unpublishRuntime = undefined;
     });
-    maybePi.registerCommand?.('sandbox', {
-      description: 'Inspect and toggle the sandbox',
-      handler: async (_args, ctx) => {
-        if (!ctx.hasUI) return;
-        const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
-        const projectTrusted = trustContext.isProjectTrusted?.() ?? projectConfigTrusted;
-        const config = loadSandboxConfig(ctx.cwd, projectTrusted);
-        const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
-        const windowsImplementation =
-          process.platform === 'win32' ? activeWindowsImplementation() : undefined;
-        const target = getSandboxConfigWriteTarget(ctx.cwd, projectTrusted);
-        let tab: 'Overview' | 'Policy' = 'Overview';
-        const shouldToggle = await ctx.ui.custom<boolean>(
-          (tui, theme, _kb, done) => {
-            const { muted, accent, text } = themeColors(theme);
-
-            const sandboxStatus = (): { color: 'success' | 'warning'; label: string } => {
-              if (getNoSandboxFlag())
-                return { color: 'warning', label: 'Disabled by --no-sandbox' };
-              if (!config.enabled) return { color: 'warning', label: 'Disabled by configuration' };
-              if (!sandboxEnabled || !sandboxReady) return { color: 'warning', label: 'Inactive' };
-              return { color: 'success', label: 'Active' };
-            };
-            const networkMode = config.network.allowNetwork
-              ? 'Unrestricted'
-              : windowsImplementation === 'appContainer' && !config.windows.allowLoopback
-                ? 'Blocked'
-                : 'Proxied';
-            const shellReadMode =
-              process.platform === 'win32'
-                ? 'Policy (required)'
-                : config.shell.readAccess === 'host'
-                  ? 'Host-aligned'
-                  : 'Policy';
-            const readRuleScope = enforcesShellReadPolicy(config.shell.readAccess)
-              ? 'Workers and shell'
-              : 'Workers only';
-
-            return {
-              render(width: number): string[] {
-                const innerWidth = Math.max(1, width - 4);
-                const status = sandboxStatus();
-                const tabs = dialogTabs(theme, ['Overview', 'Policy'], tab);
-                const listValue = (values: string[]): string => {
-                  const value = values.join(', ') || 'none';
-                  return text(truncateToWidth(value, Math.max(10, innerWidth - 20)));
-                };
-                const item = (label: string, value: string): string =>
-                  `  ${muted(label.padEnd(16))} ${value}`;
-                const footer = dialogKeys(theme, [
-                  ['Tab', 'next tab'],
-                  ['Enter', `${config.enabled ? 'disable' : 'enable'} in ${target.scope}`],
-                  ['Esc', 'close'],
-                ]);
-                const content: string[] = [tabs, ''];
-
-                if (tab === 'Overview') {
-                  content.push(
-                    `${theme.fg(status.color, '●')} ${text(status.label)}`,
-                    item(
-                      'Configured',
-                      config.enabled ? text('Enabled') : theme.fg('warning', 'Disabled'),
-                    ),
-                    item(
-                      'Runtime',
-                      sandboxEnabled && sandboxReady
-                        ? theme.fg('success', 'Running')
-                        : muted('Not running'),
-                    ),
-                    '',
-                    accent('Protection'),
-                    item('Network', text(networkMode)),
-                    item('Shell reads', text(shellReadMode)),
-                    item(
-                      'Read rules',
-                      text(
-                        `${config.filesystem.denyRead.length + config.filesystem.allowRead.length} · ${readRuleScope}`,
-                      ),
-                    ),
-                    item(
-                      'Write rules',
-                      text(
-                        String(
-                          config.filesystem.allowWrite.length + config.filesystem.denyWrite.length,
-                        ),
-                      ),
-                    ),
-                    item(
-                      'Session grants',
-                      text(
-                        String(
-                          sessionAllowedDomains.length +
-                            sessionAllowedReadPaths.length +
-                            sessionAllowedWritePaths.length,
-                        ),
-                      ),
-                    ),
-                    '',
-                    accent('Configuration'),
-                    item('Change scope', text(target.scope === 'project' ? 'Project' : 'Global')),
-                    item(
-                      'Change file',
-                      text(truncateToWidth(target.path, Math.max(10, innerWidth - 20))),
-                    ),
-                    item(
-                      'Project file',
-                      text(truncateToWidth(projectPath, Math.max(10, innerWidth - 20))),
-                    ),
-                    item(
-                      'Global file',
-                      text(truncateToWidth(globalPath, Math.max(10, innerWidth - 20))),
-                    ),
-                    item(
-                      'Landstrip binary',
-                      text(truncateToWidth(binaryPath(), Math.max(10, innerWidth - 20))),
-                    ),
-                  );
-                  if (windowsImplementation !== undefined) {
-                    content.push(
-                      item(
-                        'Windows mode',
-                        text(
-                          windowsImplementation === 'restrictedUser'
-                            ? 'Restricted user'
-                            : `AppContainer (${config.windows.appContainerMode})`,
-                        ),
-                      ),
-                    );
-                  }
-                } else {
-                  content.push(
-                    accent(`Network · ${networkMode}`),
-                    item('Allowed domains', listValue(config.network.allowedDomains)),
-                    item('Denied domains', listValue(config.network.deniedDomains)),
-                    item(
-                      'Unix sockets',
-                      config.network.allowAllUnixSockets
-                        ? text('all')
-                        : listValue(config.network.allowUnixSockets),
-                    ),
-                    '',
-                    accent('Filesystem'),
-                    item('Shell reads', text(shellReadMode)),
-                    item('Read rules for', text(readRuleScope)),
-                    item('Denied reads', listValue(config.filesystem.denyRead)),
-                    item('Allowed reads', listValue(config.filesystem.allowRead)),
-                    item('Allowed writes', listValue(config.filesystem.allowWrite)),
-                    item('Denied writes', listValue(config.filesystem.denyWrite)),
-                    '',
-                    accent('Session grants'),
-                    item('Domains', listValue(sessionAllowedDomains)),
-                    item('Read paths', listValue(sessionAllowedReadPaths)),
-                    item('Write paths', listValue(sessionAllowedWritePaths)),
-                  );
-                }
-
-                content.push('', footer);
-                return [
-                  boxTop(theme, width, 'Sandbox'),
-                  ...content.map((line) => boxRow(theme, width, line)),
-                  boxBottom(theme, width),
-                ];
-              },
-
-              handleInput(data: string): void {
-                if (matchesKey(data, 'tab')) {
-                  tab = tab === 'Overview' ? 'Policy' : 'Overview';
-                  tui.requestRender();
-                  return;
-                }
-                if (matchesKey(data, 'return')) {
-                  done(true);
-                  return;
-                }
-                if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done(false);
-              },
-
-              invalidate(): void {},
-            };
-          },
-          {
-            overlay: true,
-            overlayOptions: { anchor: 'center', width: 78, margin: 2 },
-          },
-        );
-        if (!shouldToggle) return;
-
-        const enabled = !config.enabled;
-        if (!enabled) {
-          const confirmed = await ctx.ui.confirm(
-            'Disable sandbox?',
-            `Commands will run without OS isolation.\n\nChange: ${target.scope} configuration\n${target.path}`,
-          );
-          if (!confirmed) return;
-        }
-        try {
-          const scope = await setSandboxConfigEnabled(ctx.cwd, enabled, projectTrusted);
-          if (!enabled) {
-            disableSandbox(ctx);
-          } else if (!getNoSandboxFlag()) {
-            enableSandbox(ctx);
-          }
-          if (enabled && getNoSandboxFlag()) {
-            notify(ctx, 'Sandbox remains disabled via --no-sandbox', 'warning');
-          } else {
-            notify(ctx, `Sandbox ${enabled ? 'enabled' : 'disabled'} in ${scope} config`, 'info');
-          }
-        } catch (error) {
-          notify(ctx, `Could not update config: ${error}`, 'error');
-        }
-      },
-    });
   }
 
   async function applySandboxSetting(
@@ -3289,10 +3073,44 @@ function createLandstripIntegrationWithPrompts(
     }
   }
 
+  function sandboxOverview(cwd: string, includeProject: boolean): SandboxOverview {
+    const config = loadSandboxConfig(cwd, includeProject);
+    const { globalPath, projectPath } = getConfigPaths(cwd);
+    const windowsImplementation =
+      process.platform === 'win32' ? activeWindowsImplementation() : undefined;
+    return {
+      enabled: config.enabled,
+      running: sandboxEnabled && sandboxReady,
+      noSandboxFlag: getNoSandboxFlag(),
+      networkMode: config.network.allowNetwork
+        ? 'unrestricted'
+        : windowsImplementation === 'appContainer' && !config.windows.allowLoopback
+          ? 'blocked'
+          : 'proxied',
+      shellReadMode: process.platform === 'win32' ? 'policy' : config.shell.readAccess,
+      readRuleScope: enforcesShellReadPolicy(config.shell.readAccess)
+        ? 'Workers and shell'
+        : 'Workers only',
+      windowsMode:
+        windowsImplementation === undefined
+          ? undefined
+          : windowsImplementation === 'restrictedUser'
+            ? 'Restricted user'
+            : `AppContainer (${config.windows.appContainerMode})`,
+      changeScope: getSandboxConfigWriteTarget(cwd, includeProject).scope,
+      paths: { global: globalPath, project: projectPath, binary: binaryPath() },
+      config,
+      sessionDomains: [...sessionAllowedDomains],
+      sessionReadPaths: [...sessionAllowedReadPaths],
+      sessionWritePaths: [...sessionAllowedWritePaths],
+    };
+  }
+
   const sandboxCallbacks: SandboxCallbacks = {
     load: loadSandboxEnabledSettings,
     setEnabled: (ctx, enabled, scope) => applySandboxSetting(ctx, enabled, scope),
     clearProject: (ctx) => applySandboxSetting(ctx, undefined, 'project'),
+    overview: sandboxOverview,
   };
 
   const integration: LandstripIntegration = {

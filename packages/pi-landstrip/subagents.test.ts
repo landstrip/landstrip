@@ -1408,6 +1408,7 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<void>) | undefined;
   let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  let settingsCommand: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
   const commandNames: string[] = [];
   let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
   let finishCustom: (() => void) | undefined;
@@ -1419,6 +1420,7 @@ test('inspects and navigates persisted child sessions without switching sessions
     ) {
       commandNames.push(name);
       if (name === 'agents') command = definition.handler;
+      if (name === 'settings') settingsCommand = definition.handler;
     },
     registerShortcut() {},
     on(event: string, handler: unknown) {
@@ -1484,10 +1486,10 @@ test('inspects and navigates persisted child sessions without switching sessions
   } as unknown as ExtensionContext;
 
   await sessionStart?.({}, ctx);
-  expect(commandNames).toEqual(['agents']);
+  expect(commandNames).toEqual(['agents', 'settings', 'sandbox']);
   const running = command?.('', ctx);
   const agents = component?.render(96).join('\n') ?? '';
-  expect(agents).toContain('[Primary]  Subagent  Tasks  Log  Settings  Help');
+  expect(agents).toContain('[Primary]  Subagent  Tasks  Log  Help');
   expect(agents).toContain('@build');
   expect(agents).toContain('@plan');
   expect(agents).not.toContain('@general');
@@ -1496,10 +1498,11 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(agents).not.toContain('@review');
   const primaryHeader = agents
     .split('\n')
-    .find((line) => line.includes('Agent') && line.includes('Source'));
+    .find((line) => line.includes('Agent') && line.includes('Runtime'));
   expect(primaryHeader).not.toContain('Primary');
   expect(primaryHeader).not.toMatch(/\bMode\b/);
-  expect(bolded.some((value) => value.includes('@build') && value.includes('built-in'))).toBe(true);
+  expect(agents).toMatch(/@build.*★ primary/);
+  expect(bolded.some((value) => value.includes('@build'))).toBe(true);
   expect(agents).not.toContain('Tab next tab');
 
   component?.handleInput('e');
@@ -1516,17 +1519,17 @@ test('inspects and navigates persisted child sessions without switching sessions
     JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8')).landstrip.agent.build,
   ).toBeDefined();
   component?.handleInput('x');
-  component?.handleInput('y');
+  component?.handleInput('\r');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.agent.build).toBeUndefined();
-    expect(component?.render(96).join('\n')).toMatch(/@build\s+built-in/);
+    expect(component?.render(96).join('\n')).toMatch(/@build\s+current model/);
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
 
   component?.handleInput('\t');
   const subagents = component?.render(96).join('\n') ?? '';
-  expect(subagents).toContain('Primary  [Subagent]  Tasks  Log  Settings  Help');
+  expect(subagents).toContain('Primary  [Subagent]  Tasks  Log  Help');
   expect(subagents).toContain('@explore');
   expect(subagents).toContain('@general');
   expect(subagents).toContain('@review');
@@ -1536,7 +1539,7 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(subagents).not.toContain('@plan');
   const subagentHeader = subagents
     .split('\n')
-    .find((line) => line.includes('Agent') && line.includes('Source'));
+    .find((line) => line.includes('Agent') && line.includes('Runtime'));
   expect(subagentHeader).not.toContain('Primary');
   expect(subagentHeader).not.toMatch(/\bMode\b/);
 
@@ -1544,14 +1547,14 @@ test('inspects and navigates persisted child sessions without switching sessions
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.agent.explore.disable).toBe(true);
-    expect(component?.render(96).join('\n')).toMatch(/@explore\s+local.*disabled/);
+    expect(component?.render(96).join('\n')).toMatch(/@explore.*disabled/);
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
   component?.handleInput('i');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.agent.explore).toBeUndefined();
-    expect(component?.render(96).join('\n')).toMatch(/@explore\s+built-in.*inherited on/);
+    expect(component?.render(96).join('\n')).toMatch(/@explore.*inherited on/);
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
 
@@ -1656,11 +1659,11 @@ test('inspects and navigates persisted child sessions without switching sessions
   const selectedTask = component?.render(96).join('\n') ?? '';
   expect(selectedTask).toContain('1 selected');
   expect(selectedTask).toContain('✓');
-  component?.handleInput('\x04');
+  component?.handleInput('x');
   expect(component?.render(96).join('\n')).toContain('Delete task-876?');
   component?.handleInput('\x1b');
   expect(component?.render(96).join('\n')).toContain('Failed child');
-  component?.handleInput('\x04');
+  component?.handleInput('x');
   expect(component?.render(96).join('\n')).toContain('Delete task-876?');
   component?.handleInput('\r');
   const afterTaskDelete = component?.render(96).join('\n') ?? '';
@@ -1670,11 +1673,35 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(component?.render(96).join('\n')).toContain('[Log]');
   component?.handleInput('\t');
 
+  const help = component?.render(96).join('\n') ?? '';
+  expect(help).toContain('Primary  Subagent  Tasks  Log  [Help]');
+  expect(help).toMatch(/Shortcut\s+Description/);
+  expect(help).toMatch(/X\s+Delete selected agent or task sessions/);
+  expect(help).toMatch(/Space\s+Toggle agent enabled or select task/);
+  expect(help).toMatch(/Backspace\s+Open parent task/);
+  expect(help).toMatch(/F\s+Toggle task log follow/);
+  expect(help).toMatch(/Page Up \/ Down\s+Scroll task output by page/);
+  expect(help).toMatch(/Home \/ End\s+Jump to task output boundary/);
+
+  component?.handleInput('\t');
+  const cycledAgents = component?.render(96).join('\n') ?? '';
+  expect(cycledAgents).toContain('[Primary]  Subagent  Tasks  Log  Help');
+  expect(cycledAgents).not.toContain('Tab next tab');
+  finishCustom?.();
+  await running;
+
+  const settingsRunning = settingsCommand?.('', ctx);
+  const sandboxPane = component?.render(96).join('\n') ?? '';
+  expect(sandboxPane).toContain('[Sandbox]  Agents');
+  expect(sandboxPane).toContain('Sandbox settings are unavailable.');
+  expect(sandboxPane).not.toContain('maxSubagents');
+
+  component?.handleInput('\t');
   const projectSettings = component?.render(96).join('\n') ?? '';
-  expect(projectSettings).toContain('[Settings]');
+  expect(projectSettings).toContain('Sandbox  [Agents]');
   expect(projectSettings).toContain('[ 1 ] maxSubagents');
+  expect(projectSettings).toContain('[ host ] toolFilesystemPolicy');
   expect(projectSettings).not.toContain('sandboxEnabled');
-  expect(projectSettings).not.toContain('change limit');
 
   component?.handleInput('\r');
   expect(component?.render(96).join('\n')).toContain('Project maxSubagents · current 1');
@@ -1706,23 +1733,27 @@ test('inspects and navigates persisted child sessions without switching sessions
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
 
-  component?.handleInput('\t');
-  const help = component?.render(96).join('\n') ?? '';
-  expect(help).toContain('Primary  Subagent  Tasks  Log  Settings  [Help]');
-  expect(help).toMatch(/Shortcut\s+Description/);
-  expect(help).toMatch(/Ctrl\+D\s+Delete selected task sessions/);
-  expect(help).toMatch(/Space\s+Enable agent or select task/);
-  expect(help).toMatch(/Backspace\s+Open parent task/);
-  expect(help).toMatch(/F\s+Toggle task log follow/);
-  expect(help).toMatch(/Page Up \/ Down\s+Scroll task output by page/);
-  expect(help).toMatch(/Home \/ End\s+Jump to task output boundary/);
+  component?.handleInput('\x1b[B');
+  component?.handleInput('\r');
+  expect(component?.render(96).join('\n')).toContain('Project toolFilesystemPolicy · current host');
+  component?.handleInput('s');
+  component?.handleInput('\r');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+    expect(settings.landstrip.toolFilesystemPolicy).toBe('sandbox');
+    expect(component?.render(96).join('\n')).toContain('[ sandbox ] toolFilesystemPolicy');
+  });
+  component?.handleInput('\r');
+  component?.handleInput('\x08');
+  component?.handleInput('\r');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+    expect(settings.landstrip.toolFilesystemPolicy).toBeUndefined();
+    expect(component?.render(96).join('\n')).toContain('[ host ] toolFilesystemPolicy');
+  });
 
-  component?.handleInput('\t');
-  const cycledAgents = component?.render(96).join('\n') ?? '';
-  expect(cycledAgents).toContain('[Primary]  Subagent  Tasks  Log  Settings  Help');
-  expect(cycledAgents).not.toContain('Tab next tab');
-  finishCustom?.();
-  await running;
+  component?.handleInput('\x1b');
+  await settingsRunning;
 
   const direct = command?.('task-123', ctx);
   expect(component?.render(96).join('\n')).toContain('[Log]');
@@ -2508,4 +2539,130 @@ test('cleans up orphan subagent session files for the current cwd at startup', a
   expect(existsSync(join(piAgentDir, 'sessions', 'pi-landstrip', 'orphan-parent-other'))).toBe(
     true,
   );
+});
+
+test('renders sandbox state in the settings pane and toggles it', async () => {
+  const cwd = temporaryDirectory();
+  const piAgentDir = temporaryDirectory();
+  vi.stubEnv('PI_CODING_AGENT_DIR', piAgentDir);
+  const handlers = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
+  const pi = {
+    registerTool() {},
+    registerCommand(
+      name: string,
+      definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+    ) {
+      handlers.set(name, definition.handler);
+    },
+    registerShortcut() {},
+    on() {},
+    getActiveTools: () => [],
+    setActiveTools() {},
+  } as unknown as ExtensionAPI;
+
+  let enabled = true;
+  const setEnabledCalls: Array<{ enabled: boolean; scope: string }> = [];
+  const integration = {
+    sandboxCallbacks: {
+      load: () => ({ global: enabled }),
+      async setEnabled(_ctx: ExtensionContext, next: boolean, scope: string) {
+        enabled = next;
+        setEnabledCalls.push({ enabled: next, scope });
+      },
+      async clearProject() {},
+      overview: () => ({
+        enabled,
+        running: enabled,
+        noSandboxFlag: false,
+        networkMode: 'proxied',
+        shellReadMode: 'host',
+        readRuleScope: 'Workers only',
+        changeScope: 'project',
+        paths: {
+          global: '/global/sandbox.json',
+          project: '/project/sandbox.json',
+          binary: '/bin/landstrip',
+        },
+        config: {
+          enabled,
+          shell: { readAccess: 'host' },
+          network: {
+            allowNetwork: false,
+            allowLocalBinding: false,
+            allowAllUnixSockets: false,
+            allowUnixSockets: [],
+            allowedDomains: ['example.com'],
+            deniedDomains: [],
+          },
+          filesystem: {
+            denyRead: ['~/.ssh'],
+            allowRead: [],
+            allowWrite: ['.'],
+            denyWrite: ['**/.env'],
+          },
+          windows: { appContainerMode: 'lpac', allowLoopback: false },
+        },
+        sessionDomains: [],
+        sessionReadPaths: [],
+        sessionWritePaths: [],
+      }),
+    },
+  } as unknown as LandstripIntegration;
+  new SubagentRuntime(pi, integration).register();
+
+  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  let overlayOptions: unknown;
+  let finishCustom: (() => void) | undefined;
+  const ctx = {
+    cwd,
+    hasUI: true,
+    mode: 'tui',
+    isProjectTrusted: () => true,
+    ui: {
+      notify() {},
+      async confirm() {
+        return true;
+      },
+      custom(
+        factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => typeof component,
+        options: unknown,
+      ) {
+        overlayOptions = options;
+        return new Promise<void>((resolve) => {
+          finishCustom = resolve;
+          component = factory(
+            { requestRender() {} },
+            { fg: (_color: string, value: string) => value, bold: (value: string) => value },
+            undefined,
+            resolve,
+          );
+        });
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  const running = handlers.get('settings')?.('', ctx);
+  expect(overlayOptions).toMatchObject({
+    overlay: true,
+    overlayOptions: { anchor: 'bottom-center', width: '100%' },
+  });
+  const pane = component?.render(96).join('\n') ?? '';
+  expect(pane).toContain('[Sandbox]  Agents');
+  expect(pane).toContain('Active');
+  expect(pane).toContain('proxied');
+  expect(pane).toContain('example.com');
+  expect(pane).toContain('/project/sandbox.json');
+  expect(pane).toContain('Enter disable in project');
+
+  component?.handleInput('\r');
+  await vi.waitFor(() => {
+    expect(setEnabledCalls).toEqual([{ enabled: false, scope: 'project' }]);
+    expect(component?.render(96).join('\n')).toContain('Enter enable in project');
+  });
+  expect(component?.render(96).join('\n')).toContain('Disabled by configuration');
+
+  component?.handleInput('\x1b');
+  finishCustom?.();
+  await running;
+  vi.unstubAllEnvs();
 });

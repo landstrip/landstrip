@@ -49,6 +49,11 @@ export interface MaxSubagentsSettings {
   readonly project?: number;
 }
 
+export interface ToolFilesystemPolicySettings {
+  readonly global: ToolFilesystemPolicy;
+  readonly project?: ToolFilesystemPolicy;
+}
+
 interface LandstripConfigSource extends LandstripConfigTarget {
   readonly config: LandstripConfigFile;
 }
@@ -293,6 +298,38 @@ export async function clearMaxSubagentsConfigForScope(
   await writeMaxSubagentsConfigForScope(cwd, undefined, scope, agentDir);
 }
 
+async function writeToolFilesystemPolicyConfigForScope(
+  cwd: string,
+  policy: ToolFilesystemPolicy | undefined,
+  scope: 'global' | 'project',
+  agentDir: string,
+): Promise<void> {
+  await updateLandstripConfigForScope(cwd, scope, agentDir, (landstrip) => {
+    if (policy === undefined) delete landstrip.toolFilesystemPolicy;
+    else landstrip.toolFilesystemPolicy = policy;
+  });
+}
+
+export async function setToolFilesystemPolicyConfigForScope(
+  cwd: string,
+  policy: ToolFilesystemPolicy,
+  scope: 'global' | 'project',
+  agentDir = getAgentDir(),
+): Promise<void> {
+  if (policy !== 'host' && policy !== 'sandbox') {
+    throw new Error('toolFilesystemPolicy must be host or sandbox');
+  }
+  await writeToolFilesystemPolicyConfigForScope(cwd, policy, scope, agentDir);
+}
+
+export async function clearToolFilesystemPolicyConfigForScope(
+  cwd: string,
+  scope: 'global' | 'project',
+  agentDir = getAgentDir(),
+): Promise<void> {
+  await writeToolFilesystemPolicyConfigForScope(cwd, undefined, scope, agentDir);
+}
+
 export async function setAgentDisabledForScope(
   cwd: string,
   name: string,
@@ -412,6 +449,21 @@ export function loadMaxSubagentsSettings(
     (!Number.isInteger(project) || project < 0 || project > MAX_SUBAGENTS)
   ) {
     throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
+  }
+  return { global, project };
+}
+
+export function loadToolFilesystemPolicySettings(
+  cwd: string,
+  includeProject = true,
+  agentDir = getAgentDir(),
+): ToolFilesystemPolicySettings {
+  const global = loadLandstripConfig(cwd, false, agentDir).toolFilesystemPolicy;
+  if (!includeProject) return { global };
+
+  const project = readLandstripConfigSource(cwd, 'project', agentDir).config.toolFilesystemPolicy;
+  if (project !== undefined && project !== 'host' && project !== 'sandbox') {
+    throw new Error('toolFilesystemPolicy must be host or sandbox');
   }
   return { global, project };
 }
