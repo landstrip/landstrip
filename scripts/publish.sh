@@ -102,6 +102,7 @@ prepare_npm_package_build() {
 
 publish_npm_package() {
   local package_dir="$1"
+  local error_file="$workdir/npm-publish-error"
   local package_name
 
   package_name="$($NODE -p "require('$package_dir/package.json').name")"
@@ -110,7 +111,17 @@ publish_npm_package() {
     return
   fi
   prepare_npm_package_build "$package_dir"
-  $NPM publish "$package_dir" --access public
+  if $NPM publish "$package_dir" --access public 2>"$error_file"; then
+    cat "$error_file" >&2
+    return
+  fi
+  cat "$error_file" >&2
+  if grep -q 'E409' "$error_file" \
+    && grep -q 'Cannot publish over previously staged version' "$error_file"; then
+    wait_for_npm_package "$package_name"
+    return
+  fi
+  return 1
 }
 
 preflight_npm_package() {
