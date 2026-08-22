@@ -587,7 +587,22 @@ fn resolve_deny_paths(
         let resolved = resolve_sandbox_path(path, policy_base, home)?;
         let resolved_str = resolved.to_string_lossy();
         if resolved_str.bytes().any(is_glob_byte) {
-            patterns.push(resolved_str.into_owned());
+            patterns.push(resolved_str.clone().into_owned());
+            #[cfg(target_os = "macos")]
+            {
+                let base = glob_base(&resolved_str);
+                if let Ok(canonical) = fs::canonicalize(&base) {
+                    let base_str = base.to_string_lossy();
+                    let canonical_str = canonical.to_string_lossy();
+                    if canonical_str != base_str
+                        && let Some(suffix) = resolved_str.strip_prefix(base_str.as_ref())
+                    {
+                        let mut canonical_pattern = canonical_str.into_owned();
+                        canonical_pattern.push_str(suffix);
+                        patterns.push(canonical_pattern);
+                    }
+                }
+            }
         } else {
             let mut variants = Vec::new();
             push_path_variants(&mut variants, &resolved);
@@ -596,6 +611,8 @@ fn resolve_deny_paths(
     }
 
     normalize_roots(&mut concrete);
+    patterns.sort_unstable();
+    patterns.dedup();
 
     Ok((concrete, patterns))
 }
