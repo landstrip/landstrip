@@ -50,7 +50,7 @@ function harness(options: Record<string, unknown> = {}) {
       return child;
     },
     requestTimeoutMs: 100,
-    settleTimeoutMs: 100,
+    settleTimeoutMs: 500,
     stopTimeoutMs: 5,
     killTimeoutMs: 5,
     ...options,
@@ -142,6 +142,9 @@ describe('RpcProcess', () => {
     });
     await vi.waitFor(() => expect(commands).toHaveLength(1));
     respond(child, commands[0]);
+    await vi.waitFor(() => expect(commands).toHaveLength(2));
+    expect(commands[1]?.type).toBe('get_state');
+    respond(child, commands[1], { isStreaming: true });
     await Promise.resolve();
     expect(completed).toBe(false);
     child.stdout.write('{"type":"agent_settled"}\n');
@@ -149,17 +152,39 @@ describe('RpcProcess', () => {
     expect(completed).toBe(true);
   });
 
+  it('completes a prompt handled without starting an agent run', async () => {
+    const { child, process, commands } = await started();
+    const prompt = process.prompt('/handled');
+    await vi.waitFor(() => expect(commands).toHaveLength(1));
+    respond(child, commands[0]);
+    await vi.waitFor(() => expect(commands).toHaveLength(2));
+    respond(child, commands[1], { isStreaming: false });
+    await expect(prompt).resolves.toBeUndefined();
+  });
+
+  it('sends steering messages through the native RPC command', async () => {
+    const { child, process, commands } = await started();
+    const steering = process.steer('Check the tests first');
+    await vi.waitFor(() => expect(commands).toHaveLength(1));
+    expect(commands[0]).toMatchObject({ type: 'steer', message: 'Check the tests first' });
+    respond(child, commands[0]);
+    await steering;
+  });
   it('serializes concurrent prompts so one settled event completes one prompt', async () => {
     const { child, process, commands } = await started();
     const first = process.prompt('First');
     const second = process.prompt('Second');
     await vi.waitFor(() => expect(commands).toHaveLength(1));
     respond(child, commands[0]);
+    await vi.waitFor(() => expect(commands).toHaveLength(2));
+    respond(child, commands[1], { isStreaming: true });
     child.stdout.write('{"type":"agent_settled"}\n');
     await first;
 
-    await vi.waitFor(() => expect(commands).toHaveLength(2));
-    respond(child, commands[1]);
+    await vi.waitFor(() => expect(commands).toHaveLength(3));
+    respond(child, commands[2]);
+    await vi.waitFor(() => expect(commands).toHaveLength(4));
+    respond(child, commands[3], { isStreaming: true });
     child.stdout.write('{"type":"agent_settled"}\n');
     await second;
   });
@@ -245,7 +270,7 @@ describe('RpcProcess', () => {
   });
 
   it('aborts before graceful shutdown and escalates signals', async () => {
-    const { child, process, commands } = await started();
+    const { child, process, commands } = await started({ killTimeoutMs: 200 });
     const stopping = process.stop();
     await vi.waitFor(() => expect(commands[0]?.type).toBe('abort'));
     respond(child, commands[0]);
@@ -254,38 +279,21 @@ describe('RpcProcess', () => {
     await stopping;
   });
 
-  it('ignores late events from a stopped child after restart', async () => {
-    const first = new FakeChild();
-    const second = new FakeChild();
-    const children = [first, second];
-    const secondCommands: RpcRecord[] = [];
-    second.stdin.on('data', (chunk: Buffer) => {
-      for (const line of chunk.toString().trim().split('\n')) {
-        if (line) secondCommands.push(JSON.parse(line) as RpcRecord);
-      }
-    });
-    const process = new RpcProcess({
-      command: 'custom-pi',
-      spawn: () => {
-        const child = children.shift();
-        if (!child) throw new Error('unexpected spawn');
-        queueMicrotask(() => child.launch());
-        return child;
-      },
-      requestTimeoutMs: 100,
-      stopTimeoutMs: 1,
-      killTimeoutMs: 1,
-    });
-    await process.start();
-    await process.stop();
-    await process.start();
-    const pending = process.request('work');
-    await vi.waitFor(() => expect(secondCommands).toHaveLength(1));
+  it('rejects shutdown and restart while a child remains alive after SIGKILL', async () => {
+    const { child, process, commands } = await started();
+    const errors: Error[] = [];
+    process.onError((error) => errors.push(error));
+    const stopping = process.stop();
+    const failedStop = expect(stopping).rejects.toThrow('RPC process did not exit after SIGKILL');
+    await vi.waitFor(() => expect(commands[0]?.type).toBe('abort'));
+    respond(child, commands[0]);
 
-    first.exit(1);
-    respond(second, secondCommands[0]);
+    await failedStop;
+    expect(child.signals).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(errors.at(-1)?.message).toContain('RPC process did not exit after SIGKILL');
+    await expect(process.start()).rejects.toThrow('RPC process is already started');
 
-    await expect(pending).resolves.toBeUndefined();
+    child.exit(null, 'SIGKILL');
   });
 });
 

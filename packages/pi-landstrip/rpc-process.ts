@@ -225,10 +225,21 @@ export class RpcProcess {
     return prompt;
   }
 
+  public async steer(message: string): Promise<void> {
+    await this.request('steer', { message });
+  }
+
   private async runPrompt(message: string): Promise<void> {
     const settled = this.waitForAgentSettled();
+    void settled.promise.catch(() => undefined);
     try {
-      await Promise.all([this.request('prompt', { message }), settled.promise]);
+      await this.request('prompt', { message });
+      const state = await this.request<{ isStreaming: boolean }>('get_state');
+      if (!state.isStreaming) {
+        settled.cancel();
+        return;
+      }
+      await settled.promise;
     } catch (error) {
       settled.cancel();
       throw error;
@@ -273,8 +284,11 @@ export class RpcProcess {
     child.kill('SIGKILL');
     if (await this.waitForExit(exit, killTimeout)) return;
 
-    if (this.child === child) this.child = null;
-    this.failAll(this.withStderr('RPC process did not exit after SIGKILL'));
+    const error = this.withStderr('RPC process did not exit after SIGKILL');
+    this.fatalError = error;
+    this.failAll(error);
+    this.reportError(error);
+    throw error;
   }
 
   private async waitForExit(exit: Promise<void>, timeout: number): Promise<boolean> {
