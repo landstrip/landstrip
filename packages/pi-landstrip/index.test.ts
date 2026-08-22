@@ -28,13 +28,14 @@ import landstripExtension, {
   createWindowsDenyRead,
   matchesPattern,
   enforcesShellReadPolicy,
-  isPublicProxyAddress,
   readAllowed,
   sessionScopeFor,
   resolveProcessReadPolicy,
   shouldPromptForWrite,
   writeEnvFile,
 } from './index.ts';
+
+import { isPublicProxyAddress } from '@landstrip/landstrip/proxy';
 
 import { AsyncQueue, PermissionPromptCoordinator } from './util.ts';
 

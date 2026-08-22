@@ -24,11 +24,13 @@ export async function installLandstripMock(tempDir, source) {
     JSON.stringify({
       name: '@landstrip/landstrip',
       main: './index.mjs',
-      exports: { '.': './index.mjs', './shared': './shared.js' },
+      exports: { '.': './index.mjs', './shared': './shared.js', './proxy': './proxy.js' },
     }),
   );
   await writeFile(join(directory, 'index.mjs'), source);
   const shared = await readFile(join(packageRoot, '..', 'landstrip', 'lib', 'shared.js'), 'utf8');
   await writeFile(join(directory, 'shared.js'), shared);
+  const proxy = await readFile(join(packageRoot, '..', 'landstrip', 'lib', 'proxy.js'), 'utf8');
+  await writeFile(join(directory, 'proxy.js'), proxy);
   return directory;
 }
