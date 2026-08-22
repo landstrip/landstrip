@@ -5,36 +5,32 @@ import type { Hooks, Plugin, PluginInput, PluginOptions } from '@opencode-ai/plu
 
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { lookup } from 'node:dns/promises';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import {
-  type AddressInfo,
-  BlockList,
-  connect as connectNet,
-  createServer,
-  isIP,
-  type Socket,
-} from 'node:net';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { type AddressInfo, connect as connectNet, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
-import { URL } from 'node:url';
+import { basename, join } from 'node:path';
+
+import { startFilterProxy } from '@landstrip/landstrip/proxy';
 
 import {
   type LandstripTrap,
   type SandboxConfig,
   type SandboxFilesystemConfig,
   allowsAllDomains,
+  canonicalizeGlobPattern,
+  canonicalizePath,
   controlResponseLine,
   decodeLandstripTrap,
   domainMatchesAny,
-  expandHomePath,
   extractDomainsFromCommand,
   formatLandstripTraps,
   getConfigPaths,
+  globToRegExp,
   isRecord,
   landstripBinaryPath,
   loadConfig,
   normalizeOptions,
+  normalizePathSeparators,
   parseLandstripTraps,
   permissionPatterns,
   permissionType,
@@ -79,121 +75,13 @@ const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 const DISCOVERY_CONNECT_TIMEOUT_MS = 250;
 
-const prohibitedProxyAddresses = new BlockList();
-
-for (const [network, prefix] of [
-  ['0.0.0.0', 8],
-  ['10.0.0.0', 8],
-  ['100.64.0.0', 10],
-  ['127.0.0.0', 8],
-  ['169.254.0.0', 16],
-  ['172.16.0.0', 12],
-  ['192.0.0.0', 24],
-  ['192.168.0.0', 16],
-  ['198.18.0.0', 15],
-  ['224.0.0.0', 4],
-  ['240.0.0.0', 4],
-] as const) {
-  prohibitedProxyAddresses.addSubnet(network, prefix, 'ipv4');
-}
-for (const [network, prefix] of [
-  ['::', 128],
-  ['::1', 128],
-  ['fc00::', 7],
-  ['fe80::', 10],
-  ['ff00::', 8],
-] as const) {
-  prohibitedProxyAddresses.addSubnet(network, prefix, 'ipv6');
-}
-
-function expandPath(filePath: string, baseDirectory: string): string {
-  const expanded = expandHomePath(filePath);
-  return resolve(isAbsolute(expanded) ? expanded : join(baseDirectory, expanded));
-}
-
 function configuredShellPath(config: unknown): string | undefined {
   if (!isRecord(config)) return undefined;
   return typeof config.shell === 'string' ? config.shell : undefined;
 }
 
-function canonicalizePath(filePath: string, baseDirectory: string): string {
-  const abs = expandPath(filePath, baseDirectory);
-
-  try {
-    return realpathSync.native(abs);
-  } catch {
-    const tail: string[] = [];
-    let probe = abs;
-
-    while (!existsSync(probe)) {
-      const parent = dirname(probe);
-      if (parent === probe) return abs;
-      tail.unshift(basename(probe));
-      probe = parent;
-    }
-
-    try {
-      return resolve(realpathSync.native(probe), ...tail);
-    } catch {
-      return abs;
-    }
-  }
-}
-
-function canonicalizeGlobPath(pattern: string, baseDirectory: string): string {
-  const abs = expandPath(pattern, baseDirectory);
-  const wildcardIndex = abs.indexOf('*');
-  if (wildcardIndex === -1) return canonicalizePath(abs, baseDirectory);
-
-  const prefixEnd = abs.lastIndexOf(sep, wildcardIndex);
-  const root = parse(abs).root;
-  const wildcardAtRoot = prefixEnd < root.length;
-  const prefix = wildcardAtRoot ? root : abs.slice(0, prefixEnd);
-  const suffixStart = wildcardAtRoot ? root.length : prefixEnd;
-  return canonicalizePath(prefix, baseDirectory) + abs.slice(suffixStart);
-}
-
 function normalizePathForMatch(filePath: string): string {
-  return process.platform === 'win32' ? filePath.replaceAll('\\', '/').toLowerCase() : filePath;
-}
-
-const globRegExpCache = new Map<string, RegExp>();
-
-/**
- * Translates an absolute glob pattern to a regular expression using standard
- * path semantics: `**` crosses directory boundaries (and `**​/` may match zero
- * segments), while a single `*` is confined to one path segment.
- */
-function globToRegExp(globPattern: string): RegExp {
-  const cached = globRegExpCache.get(globPattern);
-  if (cached) return cached;
-
-  let regex = '';
-
-  for (let i = 0; i < globPattern.length; i++) {
-    const char = globPattern.charAt(i);
-    if (char === '*') {
-      if (globPattern.charAt(i + 1) === '*') {
-        i++;
-        if (globPattern.charAt(i + 1) === '/') {
-          i++;
-          regex += '(?:.*/)?';
-        } else {
-          regex += '.*';
-        }
-      } else {
-        regex += '[^/]*';
-      }
-    } else if (/[.+^${}()|[\]\\]/.test(char)) {
-      regex += `\\${char}`;
-    } else {
-      regex += char;
-    }
-  }
-
-  const result = new RegExp(`^${regex}$`);
-  globRegExpCache.set(globPattern, result);
-  return result;
+  return process.platform === 'win32' ? normalizePathSeparators(filePath).toLowerCase() : filePath;
 }
 
 // Component count of an absolute path; "/" is 0. Used to rank how specific a
@@ -211,7 +99,7 @@ function matchDepth(filePath: string, patterns: string[], baseDirectory: string)
 
   for (const pattern of patterns) {
     if (pattern.includes('*')) {
-      const absPattern = normalizePathForMatch(canonicalizeGlobPath(pattern, baseDirectory));
+      const absPattern = normalizePathForMatch(canonicalizeGlobPattern(pattern, baseDirectory));
       if (globToRegExp(absPattern).test(abs)) depth = Math.max(depth, pathDepth(abs));
     } else {
       const absPattern = normalizePathForMatch(canonicalizePath(pattern, baseDirectory));
@@ -228,7 +116,7 @@ function matchDepth(filePath: string, patterns: string[], baseDirectory: string)
 function resolveFilesystemPatterns(patterns: string[], baseDirectory: string): string[] {
   return patterns.map((pattern) =>
     pattern.includes('*')
-      ? canonicalizeGlobPath(pattern, baseDirectory)
+      ? canonicalizeGlobPattern(pattern, baseDirectory)
       : canonicalizePath(pattern, baseDirectory),
   );
 }
@@ -450,76 +338,6 @@ function hasMinimumVersion(version: string, minimum: readonly [number, number, n
   return true;
 }
 
-function parseProxyPort(value: string | undefined, defaultPort: number): number | null {
-  const rawPort = value ?? String(defaultPort);
-  if (!/^\d+$/.test(rawPort)) return null;
-
-  const port = Number(rawPort);
-  return port >= 1 && port <= 65535 ? port : null;
-}
-
-function splitHostPort(target: string, defaultPort: number): { host: string; port: number } | null {
-  const bracketMatch = target.match(/^\[([^\]]+)\](?::(.*))?$/);
-  const host = bracketMatch?.[1];
-  if (host) {
-    const port = parseProxyPort(bracketMatch?.[2], defaultPort);
-    return port === null ? null : { host, port };
-  }
-
-  const lastColon = target.lastIndexOf(':');
-  if (lastColon > -1 && target.indexOf(':') === lastColon) {
-    const port = parseProxyPort(target.slice(lastColon + 1), defaultPort);
-    return port === null ? null : { host: target.slice(0, lastColon), port };
-  }
-
-  return { host: target, port: defaultPort };
-}
-
-function denyProxyRequest(client: Socket, status = '403 Forbidden'): void {
-  client.write(`HTTP/1.1 ${status}\r\nContent-Length: 0\r\n\r\n`);
-  client.end();
-}
-
-function isPublicProxyAddress(address: string, family = isIP(address)): boolean {
-  if (family === 4) return !prohibitedProxyAddresses.check(address, 'ipv4');
-  if (family === 6) return !prohibitedProxyAddresses.check(address, 'ipv6');
-  return false;
-}
-
-async function resolveProxyEndpoint(host: string): Promise<{ address: string; family: 4 | 6 }> {
-  const literalFamily = isIP(host);
-  if (literalFamily === 4 || literalFamily === 6) {
-    if (!isPublicProxyAddress(host, literalFamily)) {
-      throw new Error(`Proxy destination is not public: ${host}`);
-    }
-    return { address: host, family: literalFamily };
-  }
-
-  const addresses = await lookup(host, { all: true, verbatim: true });
-  if (
-    addresses.length === 0 ||
-    addresses.some(({ address, family }) => !isPublicProxyAddress(address, family))
-  ) {
-    throw new Error(`Proxy destination resolves to a non-public address: ${host}`);
-  }
-
-  const endpoint = addresses[0];
-  if (!endpoint || (endpoint.family !== 4 && endpoint.family !== 6)) {
-    throw new Error(`Proxy could not resolve destination: ${host}`);
-  }
-  return { address: endpoint.address, family: endpoint.family };
-}
-
-function pipeSockets(client: Socket, upstream: Socket, initialData?: Buffer): void {
-  upstream.on('error', () => client.destroy());
-  client.on('error', () => upstream.destroy());
-
-  if (initialData?.length) upstream.write(initialData);
-
-  client.pipe(upstream);
-  upstream.pipe(client);
-}
-
 function buildLandstripPolicy(
   config: SandboxConfig,
   baseDirectory: string,
@@ -550,192 +368,6 @@ function writePolicyFile(
   );
 
   return { dir, path };
-}
-
-function startProxy(
-  config: SandboxConfig,
-  authorization?: string,
-): Promise<{ port: number; stop: () => Promise<void> }> {
-  const sockets = new Set<Socket>();
-
-  // Track the upstream socket so stop() tears it down, and abandon a still-
-  // connecting upstream when its client goes away — otherwise a connect to a
-  // black-holed host lingers in SYN-retry (~2 min), leaking an fd per request.
-  function trackUpstream(upstream: Socket, client: Socket, settled: () => boolean): void {
-    sockets.add(upstream);
-    upstream.once('close', () => sockets.delete(upstream));
-    client.once('close', () => {
-      if (!settled()) upstream.destroy();
-    });
-  }
-
-  async function handleConnect(client: Socket, target: string, rest: Buffer): Promise<void> {
-    const endpoint = splitHostPort(target, 443);
-    if (!endpoint) {
-      denyProxyRequest(client, '400 Bad Request');
-      return;
-    }
-
-    if (!isDomainAllowed(endpoint.host, config)) {
-      denyProxyRequest(client);
-      return;
-    }
-
-    const resolved = await resolveProxyEndpoint(endpoint.host);
-    let settled = false;
-    const upstream = connectNet(
-      { host: resolved.address, port: endpoint.port, family: resolved.family },
-      () => {
-        settled = true;
-        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        pipeSockets(client, upstream, rest);
-      },
-    );
-    trackUpstream(upstream, client, () => settled);
-    upstream.once('error', () => {
-      if (settled) return;
-      settled = true;
-      denyProxyRequest(client, '502 Bad Gateway');
-    });
-  }
-
-  async function handleHttp(client: Socket, headerText: string, rest: Buffer): Promise<void> {
-    const lines = headerText.split(/\r?\n/);
-    const requestLine = lines[0];
-    if (!requestLine) {
-      denyProxyRequest(client, '400 Bad Request');
-      return;
-    }
-
-    const [method, rawTarget, version] = requestLine.split(' ');
-
-    if (!method || !rawTarget || !version) {
-      denyProxyRequest(client, '400 Bad Request');
-      return;
-    }
-
-    let url: URL;
-    try {
-      url = new URL(rawTarget);
-    } catch {
-      const host = lines
-        .find((line) => line.toLowerCase().startsWith('host:'))
-        ?.slice(5)
-        .trim();
-      if (!host) {
-        denyProxyRequest(client, '400 Bad Request');
-        return;
-      }
-      url = new URL(`http://${host}${rawTarget}`);
-    }
-
-    if (!isDomainAllowed(url.hostname, config)) {
-      denyProxyRequest(client);
-      return;
-    }
-
-    const port = parseProxyPort(url.port || undefined, url.protocol === 'https:' ? 443 : 80);
-    if (port === null) {
-      denyProxyRequest(client, '400 Bad Request');
-      return;
-    }
-
-    const path = `${url.pathname}${url.search}` || '/';
-    lines[0] = `${method} ${path} ${version}`;
-
-    const rewrittenHeader = lines
-      .filter(
-        (line) =>
-          !line.toLowerCase().startsWith('proxy-connection:') &&
-          !line.toLowerCase().startsWith('proxy-authorization:'),
-      )
-      .map((line) => (line.toLowerCase().startsWith('host:') ? `Host: ${url.host}` : line))
-      .join('\r\n');
-    const resolved = await resolveProxyEndpoint(url.hostname);
-    let settled = false;
-    const upstream = connectNet({ host: resolved.address, port, family: resolved.family }, () => {
-      settled = true;
-      upstream.write(`${rewrittenHeader}\r\n\r\n`);
-      pipeSockets(client, upstream, rest);
-    });
-    trackUpstream(upstream, client, () => settled);
-    upstream.once('error', () => {
-      if (settled) return;
-      settled = true;
-      denyProxyRequest(client, '502 Bad Gateway');
-    });
-  }
-
-  function handleClient(client: Socket): void {
-    sockets.add(client);
-    client.on('close', () => sockets.delete(client));
-    client.on('error', () => sockets.delete(client));
-
-    let buffered = Buffer.alloc(0);
-
-    client.on('data', (chunk: Buffer) => {
-      buffered = Buffer.concat([buffered, chunk]);
-      const headerEnd = buffered.indexOf('\r\n\r\n');
-      if (headerEnd === -1) {
-        if (buffered.length > 65536) {
-          client.removeAllListeners('data');
-          client.pause();
-          denyProxyRequest(client, '431 Request Header Fields Too Large');
-        }
-        return;
-      }
-
-      client.pause();
-      client.removeAllListeners('data');
-
-      const header = buffered.subarray(0, headerEnd).toString('utf-8');
-      const rest = buffered.subarray(headerEnd + 4);
-      if (authorization) {
-        const supplied = header
-          .split(/\r?\n/)
-          .find((line) => line.toLowerCase().startsWith('proxy-authorization:'))
-          ?.slice('proxy-authorization:'.length)
-          .trim();
-        if (supplied !== authorization) {
-          denyProxyRequest(client, '407 Proxy Authentication Required');
-          return;
-        }
-      }
-      const firstLine = header.split(/\r?\n/, 1)[0];
-      const [method, target] = (firstLine ?? '').split(' ');
-
-      const task =
-        method?.toUpperCase() === 'CONNECT' && target
-          ? handleConnect(client, target, rest)
-          : handleHttp(client, header, rest);
-      task.catch(() => denyProxyRequest(client, '502 Bad Gateway'));
-    });
-  }
-
-  const server = createServer(handleClient);
-  let stopped = false;
-
-  return new Promise((resolvePromise, reject) => {
-    server.on('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      server.removeListener('error', reject);
-      const address = server.address() as AddressInfo;
-
-      resolvePromise({
-        port: address.port,
-        stop: () =>
-          new Promise<void>((done) => {
-            if (stopped) {
-              done();
-              return;
-            }
-            stopped = true;
-            for (const socket of sockets) socket.destroy();
-            server.close(() => done());
-          }),
-      });
-    });
-  });
 }
 
 function proxyEnv(
@@ -1324,7 +956,12 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       proxyToken === null
         ? undefined
         : `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
-    const proxy = allowNetwork ? null : await startProxy(effectiveConfig, proxyAuthorization);
+    const proxy = allowNetwork
+      ? null
+      : await startFilterProxy({
+          isDomainAllowed: (domain) => isDomainAllowed(domain, effectiveConfig),
+          ...(proxyAuthorization === undefined ? {} : { authorization: proxyAuthorization }),
+        });
     const proxyPort = proxy ? proxy.port : null;
     let policy: { dir: string; path: string };
 

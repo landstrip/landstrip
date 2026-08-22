@@ -21,6 +21,10 @@
     "./shared": {
       "types": "./lib/shared.d.ts",
       "default": "./lib/shared.js"
+    },
+    "./proxy": {
+      "types": "./lib/proxy.d.ts",
+      "default": "./lib/proxy.js"
     }
   },
   "bin": {
