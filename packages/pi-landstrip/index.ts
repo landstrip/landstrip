@@ -7,16 +7,14 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  lstatSync,
   readFileSync,
   realpathSync,
-  readlinkSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { type AddressInfo, createServer, Socket as NetSocket } from 'node:net';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath } from 'node:url';
 
@@ -52,6 +50,11 @@ import {
   isFilesystemTrap,
   isQueryTrap,
   parseLandstripTraps,
+  canonicalizeGlobPattern,
+  canonicalizePath,
+  expandPath,
+  globToRegExp,
+  normalizePathSeparators,
   parseTrapLine,
   pathUnderDirectory,
   sessionScopeFor,
@@ -90,7 +93,7 @@ import {
   workerConfigFromEnvironment,
 } from './subagents.ts';
 import { getPiConfigPaths } from './config.ts';
-import { expandHomePath, formatError, PermissionPromptCoordinator } from './util.ts';
+import { formatError, PermissionPromptCoordinator } from './util.ts';
 
 type LandstripBashTool = ReturnType<typeof createBashToolDefinition>;
 
@@ -489,80 +492,17 @@ export function shouldPromptForWrite(path: string, allowWrite: string[], cwd: st
   return allowWrite.length === 0 || !matchesPattern(path, allowWrite, cwd);
 }
 
-// Relative entries (notably ".") resolve against `cwd` — the command's working
-// directory that landstrip itself uses as its policy base — not the extension
-// process's own cwd. Resolving against process.cwd() would let the broker's
-// allow/deny decision diverge from landstrip's whenever the agent operates
-// outside the directory pi was launched from.
-function expandPath(filePath: string, cwd: string): string {
-  return resolve(cwd, expandHomePath(filePath));
-}
-
-function canonicalizePath(filePath: string, cwd: string, seen = new Set<string>()): string {
-  const abs = expandPath(filePath, cwd);
-  const missing: string[] = [];
-  let existing = abs;
-
-  for (;;) {
-    try {
-      const stat = lstatSync(existing);
-      if (stat.isSymbolicLink()) {
-        if (seen.has(existing)) return abs;
-        seen.add(existing);
-        const target = resolve(dirname(existing), readlinkSync(existing), ...missing);
-        return canonicalizePath(target, cwd, seen);
-      }
-      break;
-    } catch {
-      const parent = dirname(existing);
-      if (parent === existing) return abs;
-      missing.unshift(basename(existing));
-      existing = parent;
-    }
-  }
-
-  try {
-    return resolve(realpathSync.native(existing), ...missing);
-  } catch {
-    return abs;
-  }
-}
-
-function canonicalizePattern(pattern: string, cwd: string): string {
-  const expanded = expandPath(pattern, cwd);
-  const wildcard = expanded.indexOf('*');
-  if (wildcard < 0) return canonicalizePath(expanded, cwd);
-
-  const prefix = expanded.slice(0, wildcard);
-  const base = prefix.endsWith(sep) ? prefix : dirname(prefix);
-  const suffixOffset = base.endsWith(sep) ? base.length - 1 : base.length;
-  const canonicalBase = canonicalizePath(base, cwd);
-  const suffix = expanded.slice(suffixOffset);
-  return canonicalBase.endsWith(sep) && suffix.startsWith(sep)
-    ? `${canonicalBase}${suffix.slice(1)}`
-    : `${canonicalBase}${suffix}`;
-}
-
-function normalizePathSeparators(path: string): string {
-  return process.platform === 'win32' ? path.replaceAll('\\', '/') : path;
-}
-
 export function matchesPattern(filePath: string, patterns: string[], cwd: string): boolean {
   const abs = normalizePathSeparators(canonicalizePath(filePath, cwd));
 
   return patterns.some((pattern) => {
-    const absPattern = normalizePathSeparators(canonicalizePattern(pattern, cwd));
+    const absPattern = normalizePathSeparators(canonicalizeGlobPattern(pattern, cwd));
 
     if (pattern.includes('*')) {
       // Mirror landstrip's matcher: `**/` spans directories, `**` spans any run,
       // but a single `*` stops at `/` — so `/srv/*/pub` cannot reach
       // `/srv/a/secret/pub`. Compiling `*` to `.*` would over-match across `/`.
-      const escaped = absPattern
-        .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-        .replace(/\*\*\/|\*\*|\*/g, (token) =>
-          token === '**/' ? '(?:.*/)?' : token === '**' ? '.*' : '[^/]*',
-        );
-      return new RegExp(`^${escaped}$`).test(abs);
+      return globToRegExp(absPattern).test(abs);
     }
 
     const sep = absPattern.endsWith('/') ? '' : '/';

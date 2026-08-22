@@ -5,10 +5,10 @@ import type { Hooks, Plugin, PluginInput, PluginOptions } from '@opencode-ai/plu
 
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { type AddressInfo, connect as connectNet, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
+import { basename, join } from 'node:path';
 
 import { startFilterProxy } from '@landstrip/landstrip/proxy';
 
@@ -17,17 +17,20 @@ import {
   type SandboxConfig,
   type SandboxFilesystemConfig,
   allowsAllDomains,
+  canonicalizeGlobPattern,
+  canonicalizePath,
   controlResponseLine,
   decodeLandstripTrap,
   domainMatchesAny,
-  expandHomePath,
   extractDomainsFromCommand,
   formatLandstripTraps,
   getConfigPaths,
+  globToRegExp,
   isRecord,
   landstripBinaryPath,
   loadConfig,
   normalizeOptions,
+  normalizePathSeparators,
   parseLandstripTraps,
   permissionPatterns,
   permissionType,
@@ -72,94 +75,13 @@ const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 const DISCOVERY_CONNECT_TIMEOUT_MS = 250;
 
-function expandPath(filePath: string, baseDirectory: string): string {
-  const expanded = expandHomePath(filePath);
-  return resolve(isAbsolute(expanded) ? expanded : join(baseDirectory, expanded));
-}
-
 function configuredShellPath(config: unknown): string | undefined {
   if (!isRecord(config)) return undefined;
   return typeof config.shell === 'string' ? config.shell : undefined;
 }
 
-function canonicalizePath(filePath: string, baseDirectory: string): string {
-  const abs = expandPath(filePath, baseDirectory);
-
-  try {
-    return realpathSync.native(abs);
-  } catch {
-    const tail: string[] = [];
-    let probe = abs;
-
-    while (!existsSync(probe)) {
-      const parent = dirname(probe);
-      if (parent === probe) return abs;
-      tail.unshift(basename(probe));
-      probe = parent;
-    }
-
-    try {
-      return resolve(realpathSync.native(probe), ...tail);
-    } catch {
-      return abs;
-    }
-  }
-}
-
-function canonicalizeGlobPath(pattern: string, baseDirectory: string): string {
-  const abs = expandPath(pattern, baseDirectory);
-  const wildcardIndex = abs.indexOf('*');
-  if (wildcardIndex === -1) return canonicalizePath(abs, baseDirectory);
-
-  const prefixEnd = abs.lastIndexOf(sep, wildcardIndex);
-  const root = parse(abs).root;
-  const wildcardAtRoot = prefixEnd < root.length;
-  const prefix = wildcardAtRoot ? root : abs.slice(0, prefixEnd);
-  const suffixStart = wildcardAtRoot ? root.length : prefixEnd;
-  return canonicalizePath(prefix, baseDirectory) + abs.slice(suffixStart);
-}
-
 function normalizePathForMatch(filePath: string): string {
-  return process.platform === 'win32' ? filePath.replaceAll('\\', '/').toLowerCase() : filePath;
-}
-
-const globRegExpCache = new Map<string, RegExp>();
-
-/**
- * Translates an absolute glob pattern to a regular expression using standard
- * path semantics: `**` crosses directory boundaries (and `**​/` may match zero
- * segments), while a single `*` is confined to one path segment.
- */
-function globToRegExp(globPattern: string): RegExp {
-  const cached = globRegExpCache.get(globPattern);
-  if (cached) return cached;
-
-  let regex = '';
-
-  for (let i = 0; i < globPattern.length; i++) {
-    const char = globPattern.charAt(i);
-    if (char === '*') {
-      if (globPattern.charAt(i + 1) === '*') {
-        i++;
-        if (globPattern.charAt(i + 1) === '/') {
-          i++;
-          regex += '(?:.*/)?';
-        } else {
-          regex += '.*';
-        }
-      } else {
-        regex += '[^/]*';
-      }
-    } else if (/[.+^${}()|[\]\\]/.test(char)) {
-      regex += `\\${char}`;
-    } else {
-      regex += char;
-    }
-  }
-
-  const result = new RegExp(`^${regex}$`);
-  globRegExpCache.set(globPattern, result);
-  return result;
+  return process.platform === 'win32' ? normalizePathSeparators(filePath).toLowerCase() : filePath;
 }
 
 // Component count of an absolute path; "/" is 0. Used to rank how specific a
@@ -177,7 +99,7 @@ function matchDepth(filePath: string, patterns: string[], baseDirectory: string)
 
   for (const pattern of patterns) {
     if (pattern.includes('*')) {
-      const absPattern = normalizePathForMatch(canonicalizeGlobPath(pattern, baseDirectory));
+      const absPattern = normalizePathForMatch(canonicalizeGlobPattern(pattern, baseDirectory));
       if (globToRegExp(absPattern).test(abs)) depth = Math.max(depth, pathDepth(abs));
     } else {
       const absPattern = normalizePathForMatch(canonicalizePath(pattern, baseDirectory));
@@ -194,7 +116,7 @@ function matchDepth(filePath: string, patterns: string[], baseDirectory: string)
 function resolveFilesystemPatterns(patterns: string[], baseDirectory: string): string[] {
   return patterns.map((pattern) =>
     pattern.includes('*')
-      ? canonicalizeGlobPath(pattern, baseDirectory)
+      ? canonicalizeGlobPattern(pattern, baseDirectory)
       : canonicalizePath(pattern, baseDirectory),
   );
 }

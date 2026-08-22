@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 'use strict';
 
-const { realpathSync } = require('node:fs');
+const { lstatSync, readlinkSync, realpathSync } = require('node:fs');
 const { homedir } = require('node:os');
-const { dirname, isAbsolute, join, relative, sep } = require('node:path');
+const { basename, dirname, isAbsolute, join, relative, resolve, sep } = require('node:path');
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -191,6 +191,81 @@ function formatLandstripTraps(traps) {
   return traps.map(formatLandstripTrap).join('\n');
 }
 
+// Relative entries (notably ".") resolve against the caller-supplied base
+// directory — the command's working directory that landstrip itself uses as
+// its policy base — never the host process's own cwd.
+function expandPath(filePath, baseDirectory) {
+  return resolve(baseDirectory, expandHomePath(filePath));
+}
+
+function canonicalizePath(filePath, baseDirectory, seen = new Set()) {
+  const abs = expandPath(filePath, baseDirectory);
+  const missing = [];
+  let existing = abs;
+
+  for (;;) {
+    try {
+      const stat = lstatSync(existing);
+      if (stat.isSymbolicLink()) {
+        if (seen.has(existing)) return abs;
+        seen.add(existing);
+        const target = resolve(dirname(existing), readlinkSync(existing), ...missing);
+        return canonicalizePath(target, baseDirectory, seen);
+      }
+      break;
+    } catch {
+      const parent = dirname(existing);
+      if (parent === existing) return abs;
+      missing.unshift(basename(existing));
+      existing = parent;
+    }
+  }
+
+  try {
+    return resolve(realpathSync.native(existing), ...missing);
+  } catch {
+    return abs;
+  }
+}
+
+function canonicalizeGlobPattern(pattern, baseDirectory) {
+  const expanded = expandPath(pattern, baseDirectory);
+  const wildcard = expanded.indexOf('*');
+  if (wildcard < 0) return canonicalizePath(expanded, baseDirectory);
+
+  const prefix = expanded.slice(0, wildcard);
+  const base = prefix.endsWith(sep) ? prefix : dirname(prefix);
+  const suffixOffset = base.endsWith(sep) ? base.length - 1 : base.length;
+  const canonicalBase = canonicalizePath(base, baseDirectory);
+  const suffix = expanded.slice(suffixOffset);
+  return canonicalBase.endsWith(sep) && suffix.startsWith(sep)
+    ? `${canonicalBase}${suffix.slice(1)}`
+    : `${canonicalBase}${suffix}`;
+}
+
+function normalizePathSeparators(path) {
+  return process.platform === 'win32' ? path.replaceAll('\\', '/') : path;
+}
+
+const globRegExpCache = new Map();
+
+// Translates an absolute glob pattern to a regular expression using standard
+// path semantics: `**` crosses directory boundaries (and `**/` may match zero
+// segments), while a single `*` is confined to one path segment.
+function globToRegExp(globPattern) {
+  const cached = globRegExpCache.get(globPattern);
+  if (cached) return cached;
+
+  const escaped = globPattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*\/|\*\*|\*/g, (token) =>
+      token === '**/' ? '(?:.*/)?' : token === '**' ? '.*' : '[^/]*',
+    );
+  const result = new RegExp(`^${escaped}$`);
+  globRegExpCache.set(globPattern, result);
+  return result;
+}
+
 // The broker matches an answer to its query by the exact decimal `query_id`
 // string the trap carried. A numeric id fails its deserializer, the line is
 // dropped, and the child's syscall stays suspended.
@@ -201,6 +276,11 @@ function controlResponseLine(queryId, action) {
 module.exports = {
   isRecord,
   expandHomePath,
+  expandPath,
+  canonicalizePath,
+  canonicalizeGlobPattern,
+  normalizePathSeparators,
+  globToRegExp,
   pathUnderDirectory,
   sessionAllows,
   sessionScopeFor,

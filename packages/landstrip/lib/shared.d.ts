@@ -13,6 +13,16 @@ export function isRecord(value: unknown): value is Record<string, unknown>;
 
 export function expandHomePath(path: string): string;
 
+export function expandPath(filePath: string, baseDirectory: string): string;
+
+export function canonicalizePath(filePath: string, baseDirectory: string): string;
+
+export function canonicalizeGlobPattern(pattern: string, baseDirectory: string): string;
+
+export function normalizePathSeparators(path: string): string;
+
+export function globToRegExp(globPattern: string): RegExp;
+
 export function pathUnderDirectory(filePath: string, dir: string): boolean;
 
 export function sessionAllows(prefixes: Set<string>, filePath: string): boolean;
