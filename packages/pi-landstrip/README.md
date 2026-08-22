@@ -26,7 +26,7 @@ sandbox approvals update `.pi/sandbox.json` or `~/.pi/agent/sandbox.json`.
 
 Policy merges from bundled `sandbox.json`, global
 `~/.pi/agent/sandbox.json`, then trusted-project `.pi/sandbox.json`.
-`/settings` displays or toggles the effective policy.
+`/landstrip` opens the bottom management pane to inspect or toggle the policy.
 
 ```json
 {
@@ -64,13 +64,13 @@ project definitions.
 
 ## Commands and tasks
 
-- `/settings` opens a screen-wide pane with sandbox and agent settings.
-- `/sandbox` opens the same pane on its sandbox section.
-- `/agents` selects agents and lists task sessions.
+- `/landstrip` opens the screen-wide bottom pane for sandbox settings, agent
+  settings, agents, and task sessions.
 - `Ctrl+Shift+A` cycles primary agents while Pi is idle.
 
 The `task` tool starts isolated workers. Set `background: true` to return
 immediately and use `task_id` to continue a saved task.
+In a running or queued task's log view, press `Enter` to send a steering message.
 
 ## Licensing
 

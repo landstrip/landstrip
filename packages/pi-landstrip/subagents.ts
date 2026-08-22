@@ -30,6 +30,7 @@ import {
 import {
   decodeKittyPrintable,
   matchesKey,
+  Input,
   Text,
   truncateToWidth,
   visibleWidth,
@@ -61,7 +62,7 @@ import {
   deleteProjectAgent,
   prepareProjectAgentEditor,
 } from './agent-files.ts';
-import { boxBottom, boxRow, boxTop, dialogKeys, dialogTabs } from './box.ts';
+import { dialogKeys, dialogTabs, paneRow, paneTop } from './box.ts';
 import {
   clearAgentDisabledForScope,
   clearMaxSubagentsConfigForScope,
@@ -98,7 +99,7 @@ const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', '
 const AGENTS_HELP_ROWS = [
   ['Tab', 'Next tab'],
   ['↑ / ↓', 'Select item or scroll when follow is off'],
-  ['Enter', 'Activate: set primary, open log, confirm'],
+  ['Enter', 'Activate: set primary, open log, steer, confirm'],
   ['Esc', 'Back one level, or close from a top-level tab'],
   ['Ctrl+C', 'Close'],
   ['Space', 'Toggle agent enabled or select task'],
@@ -499,7 +500,10 @@ function isSubagentSessionDirForCwd(parentSessionDir: string, targetCwd: string)
         }
       } else if (parentSessionFile) {
         const resolvedParent = resolve(parentSessionFile);
-        if (resolvedParent.startsWith(targetSessionDir)) {
+        if (
+          resolvedParent === targetSessionDir ||
+          resolvedParent.startsWith(`${targetSessionDir}${sep}`)
+        ) {
           hasTargetCwd = true;
         } else {
           hasOtherCwd = true;
@@ -694,6 +698,11 @@ class Semaphore {
     return this.releaseOnce();
   }
 
+  restoreTransferred(): () => void {
+    this.active += 1;
+    return this.releaseOnce();
+  }
+
   async acquire(signal?: AbortSignal): Promise<() => void> {
     if (signal?.aborted) throw new Error('Task cancelled');
     if (this.active < this.limit) {
@@ -723,7 +732,7 @@ class Semaphore {
       if (released) return;
       released = true;
       this.active -= 1;
-      this.waiters.shift()?.();
+      if (this.active < this.limit) this.waiters.shift()?.();
     };
   }
 }
@@ -1184,6 +1193,8 @@ export class SubagentRuntime {
   private readonly leases = new Map<string, TaskLease>();
   private readonly foregroundClaims = new Map<string, number>();
   private readonly pendingPrompts = new Map<string, string[]>();
+  private workerUiQueue: Promise<void> = Promise.resolve();
+  private readonly pendingSteers = new Map<string, string[]>();
   private primaryAgent: AgentDefinition | undefined;
   private primaryRules: PermissionRules | undefined;
   private primaryConfigurationError = false;
@@ -1210,17 +1221,9 @@ export class SubagentRuntime {
 
   register(): void {
     this.pi.registerTool(this.createTaskTool());
-    this.pi.registerCommand('agents', {
-      description: 'Manage agents, tasks, and concurrency',
-      handler: async (args, ctx) => this.openAgents(args, ctx),
-    });
-    this.pi.registerCommand('settings', {
-      description: 'Manage sandbox and agent settings',
-      handler: async (_args, ctx) => this.openSettings(ctx),
-    });
-    this.pi.registerCommand('sandbox', {
-      description: 'Inspect and toggle the sandbox',
-      handler: async (_args, ctx) => this.openSettings(ctx),
+    this.pi.registerCommand('landstrip', {
+      description: 'Manage Landstrip agents, tasks, sandbox, and settings',
+      handler: async (args, ctx) => this.openLandstrip(args, ctx),
     });
     this.pi.registerShortcut('ctrl+shift+a', {
       description: 'Cycle to the next primary agent',
@@ -1334,14 +1337,14 @@ export class SubagentRuntime {
       throw new Error(`maxSubagents must be an integer from 0 to ${MAX_SUBAGENTS}`);
     }
     this.maxSubagents = maxSubagents;
-    this.semaphore.setLimit(Math.max(1, maxSubagents));
+    this.semaphore.setLimit(maxSubagents);
     const activeTools = this.pi.getActiveTools();
     const withoutTask = activeTools.filter((tool) => tool !== 'task');
     const nextTools = maxSubagents > 0 ? [...withoutTask, 'task'] : withoutTask;
     if (nextTools.join('\0') !== activeTools.join('\0')) this.pi.setActiveTools(nextTools);
   }
 
-  private async openAgents(args: string, ctx: ExtensionContext): Promise<void> {
+  private async openLandstrip(args: string, ctx: ExtensionContext): Promise<void> {
     if (ctx.mode !== 'tui') {
       ctx.ui.notify('Agent management is available in TUI mode', 'warning');
       return;
@@ -1356,7 +1359,47 @@ export class SubagentRuntime {
       .filter((agent) => !agent.hidden)
       .sort((left, right) => left.name.localeCompare(right.name));
     let disabledOverrides = loadAgentDisabledOverrides(ctx.cwd, projectTrusted);
-    let tab: 'primary' | 'subagent' | 'tasks' | 'log' | 'help' = requested ? 'log' : 'primary';
+    let overview = this.integration.sandboxCallbacks?.overview?.(ctx.cwd, projectTrusted);
+    let maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
+    let policySettings = loadToolFilesystemPolicySettings(ctx.cwd, projectTrusted);
+    let selectedSetting = 0;
+    let settingEditor: SettingsEditor | undefined;
+    let saving = false;
+    let confirmingSandboxDisable = false;
+
+    type LandstripTab = 'overview' | 'settings' | 'primary' | 'subagent' | 'tasks' | 'log' | 'help';
+
+    let tab: LandstripTab = 'overview';
+    let selectedTask = 0;
+    let follow = false;
+
+    if (requested === 'agents' || requested === 'primary') {
+      tab = 'primary';
+    } else if (requested === 'settings') {
+      tab = 'settings';
+    } else if (requested === 'overview' || requested === 'sandbox') {
+      tab = 'overview';
+    } else if (requested === 'subagent' || requested === 'subagents') {
+      tab = 'subagent';
+    } else if (requested === 'tasks') {
+      tab = 'tasks';
+    } else if (requested === 'help') {
+      tab = 'help';
+    } else if (requested === 'log') {
+      tab = 'log';
+      follow = true;
+    } else if (requested) {
+      selectedTask = tasks.findIndex(
+        (task) => task.id === requested || task.id.startsWith(requested),
+      );
+      if (selectedTask < 0) {
+        ctx.ui.notify(`Unknown task session: ${requested}`, 'error');
+        return;
+      }
+      tab = 'log';
+      follow = true;
+    }
+
     const agentsForTab = (): AgentDefinition[] =>
       agents.filter((agent) =>
         tab === 'subagent' ? agentSupportsMode(agent, 'subagent') : isPrimaryAgent(agent),
@@ -1365,19 +1408,11 @@ export class SubagentRuntime {
       0,
       agentsForTab().findIndex((agent) => agent.name === this.primaryAgent?.name),
     );
-    let selectedTask = requested
-      ? tasks.findIndex((task) => task.id === requested || task.id.startsWith(requested))
-      : 0;
-    if (selectedTask < 0) {
-      ctx.ui.notify(`Unknown task session: ${requested}`, 'error');
-      return;
-    }
-    let saving = false;
     let confirmingDeleteAgent: string | undefined;
     let pendingTaskAction: TaskListAction | undefined;
     const selectedTaskIds = new Set<string>();
-    let follow = requested.length > 0;
     let scroll = 0;
+    let steering: Input | undefined;
 
     const reloadAgents = (): void => {
       const selectedName = agentsForTab()[selectedAgent]?.name;
@@ -1421,25 +1456,225 @@ export class SubagentRuntime {
         this.pi.registerTool(this.createTaskTool(undefined, this.primaryRules, ctx));
       }
     };
-    await ctx.ui.custom<void>(
+
+    return ctx.ui.custom<void>(
       (tui, theme, _keybindings, done) => ({
         render: (width: number) => {
-          const contentWidth = Math.max(1, width - 4);
-          const box = (lines: string[]) => [
-            boxTop(theme, width, 'Agents'),
-            ...lines.map((line) => boxRow(theme, width, line)),
-            boxBottom(theme, width),
+          const contentWidth = Math.max(1, width - 2);
+          const pane = (lines: string[]) => [
+            paneTop(theme, width, 'Landstrip'),
+            ...lines.map((line) => paneRow(theme, width, line)),
           ];
           const pad = (value: string, cellWidth: number): string => {
             const clipped = truncateToWidth(value, cellWidth);
             return `${clipped}${' '.repeat(Math.max(0, cellWidth - visibleWidth(clipped)))}`;
           };
+          const listValue = (values: readonly string[]): string => {
+            const value = values.join(', ') || 'none';
+            return truncateToWidth(value, Math.max(10, contentWidth - 20));
+          };
           refreshTasks();
+          const tabLabels: Record<LandstripTab, string> = {
+            overview: 'Overview',
+            settings: 'Settings',
+            primary: 'Primary',
+            subagent: 'Subagent',
+            tasks: 'Tasks',
+            log: 'Log',
+            help: 'Help',
+          };
           const tabs = dialogTabs(
             theme,
-            ['Primary', 'Subagent', 'Tasks', 'Log', 'Help'],
-            `${tab[0]?.toUpperCase()}${tab.slice(1)}`,
+            ['Overview', 'Settings', 'Primary', 'Subagent', 'Tasks', 'Log', 'Help'],
+            tabLabels[tab],
           );
+
+          if (tab === 'overview') {
+            const lines = [tabs, ''];
+            if (!overview) {
+              lines.push(theme.fg('muted', '  Sandbox settings are unavailable.'));
+              lines.push('', dialogKeys(theme, [['Esc', 'close']]));
+              return pane(lines);
+            }
+            const status = overview.noSandboxFlag
+              ? { color: 'warning', label: 'Disabled by --no-sandbox' }
+              : !overview.enabled
+                ? { color: 'warning', label: 'Disabled by configuration' }
+                : !overview.running
+                  ? { color: 'warning', label: 'Inactive' }
+                  : { color: 'success', label: 'Active' };
+            const networkMode = overview.networkMode;
+            const shellReadMode =
+              overview.windowsMode !== undefined
+                ? 'Policy (required)'
+                : overview.shellReadMode === 'host'
+                  ? 'Host-aligned'
+                  : 'Policy';
+            const changePath =
+              overview.changeScope === 'project' ? overview.paths.project : overview.paths.global;
+            const item = (label: string, value: string): string =>
+              `  ${theme.fg('dim', label.padEnd(16))} ${value}`;
+            lines.push(
+              `${theme.fg(status.color as 'success' | 'warning', '●')} ${theme.fg('text', status.label)}`,
+              item(
+                'Configured',
+                overview.enabled ? theme.fg('text', 'Enabled') : theme.fg('warning', 'Disabled'),
+              ),
+              item(
+                'Runtime',
+                overview.running ? theme.fg('success', 'Running') : theme.fg('dim', 'Not running'),
+              ),
+              '',
+              theme.fg('accent', 'Protection'),
+              item('Network', networkMode),
+              item('Shell reads', shellReadMode),
+              item(
+                'Read rules',
+                `${overview.config.filesystem.denyRead.length + overview.config.filesystem.allowRead.length} · ${overview.readRuleScope}`,
+              ),
+              item(
+                'Write rules',
+                String(
+                  overview.config.filesystem.allowWrite.length +
+                    overview.config.filesystem.denyWrite.length,
+                ),
+              ),
+              item(
+                'Session grants',
+                String(
+                  overview.sessionDomains.length +
+                    overview.sessionReadPaths.length +
+                    overview.sessionWritePaths.length,
+                ),
+              ),
+              '',
+              theme.fg('accent', 'Configuration'),
+              item('Change scope', overview.changeScope === 'project' ? 'Project' : 'Global'),
+              item('Change file', truncateToWidth(changePath, Math.max(10, contentWidth - 20))),
+              item(
+                'Project file',
+                truncateToWidth(overview.paths.project, Math.max(10, contentWidth - 20)),
+              ),
+              item(
+                'Global file',
+                truncateToWidth(overview.paths.global, Math.max(10, contentWidth - 20)),
+              ),
+              item(
+                'Landstrip binary',
+                truncateToWidth(overview.paths.binary, Math.max(10, contentWidth - 20)),
+              ),
+            );
+            if (overview.windowsMode !== undefined)
+              lines.push(item('Windows mode', overview.windowsMode));
+            lines.push(
+              '',
+              theme.fg('accent', 'Network'),
+              item('Allowed domains', listValue(overview.config.network.allowedDomains)),
+              item('Denied domains', listValue(overview.config.network.deniedDomains)),
+              item(
+                'Unix sockets',
+                overview.config.network.allowAllUnixSockets
+                  ? 'all'
+                  : listValue(overview.config.network.allowUnixSockets),
+              ),
+              '',
+              theme.fg('accent', 'Filesystem'),
+              item('Shell reads', shellReadMode),
+              item('Read rules for', overview.readRuleScope),
+              item('Denied reads', listValue(overview.config.filesystem.denyRead)),
+              item('Allowed reads', listValue(overview.config.filesystem.allowRead)),
+              item('Allowed writes', listValue(overview.config.filesystem.allowWrite)),
+              item('Denied writes', listValue(overview.config.filesystem.denyWrite)),
+              '',
+              theme.fg('accent', 'Session grants'),
+              item('Domains', listValue(overview.sessionDomains)),
+              item('Read paths', listValue(overview.sessionReadPaths)),
+              item('Write paths', listValue(overview.sessionWritePaths)),
+            );
+            if (saving) lines.push('', theme.fg('dim', 'Saving…'));
+            lines.push('');
+            if (confirmingSandboxDisable) {
+              lines.push(
+                theme.fg('error', 'Disable the sandbox? Commands will run without OS isolation.'),
+                dialogKeys(theme, [
+                  ['Enter', 'confirm'],
+                  ['Esc', 'cancel'],
+                ]),
+              );
+            } else {
+              lines.push(
+                dialogKeys(theme, [
+                  ['Tab', 'next tab'],
+                  [
+                    'Enter',
+                    `${overview.enabled ? 'disable' : 'enable'} in ${overview.changeScope}`,
+                  ],
+                  ['Esc', 'close'],
+                ]),
+              );
+            }
+            return pane(lines);
+          }
+
+          if (tab === 'settings') {
+            const rows: Array<{
+              kind: 'maxSubagents' | 'toolFilesystemPolicy';
+              label: string;
+              value: string;
+              inherited: boolean;
+            }> = [
+              {
+                kind: 'maxSubagents',
+                label: 'Maximum Subagents',
+                value: String(maxSubagentsSettings.project ?? maxSubagentsSettings.global),
+                inherited: maxSubagentsSettings.project === undefined,
+              },
+              {
+                kind: 'toolFilesystemPolicy',
+                label: 'Filesystem Tool Policy',
+                value: policySettings.project ?? policySettings.global,
+                inherited: policySettings.project === undefined,
+              },
+            ];
+            const lines = [tabs, ''];
+            if (settingEditor) {
+              const kindLabel =
+                settingEditor.kind === 'maxSubagents'
+                  ? 'Project Maximum Subagents'
+                  : 'Project Filesystem Tool Policy';
+              const current =
+                settingEditor.kind === 'maxSubagents'
+                  ? String(maxSubagentsSettings.project ?? maxSubagentsSettings.global)
+                  : (policySettings.project ?? policySettings.global);
+              const hint =
+                settingEditor.kind === 'maxSubagents'
+                  ? 'empty inherit  ·  enter submit  ·  esc cancel'
+                  : 'h host  ·  s sandbox  ·  backspace inherit  ·  enter submit  ·  esc cancel';
+              lines.push(
+                theme.fg('dim', `  ${kindLabel} · current ${current}`),
+                '',
+                `  ${theme.fg('accent', '›')} [ ${settingEditor.value}${theme.fg('accent', '█')} ]`,
+                '',
+                theme.fg('dim', `  ${hint}`),
+              );
+              if (saving) lines.push('', theme.fg('dim', 'Saving…'));
+              return pane(lines);
+            }
+            const labelWidth = Math.max(...rows.map((row) => visibleWidth(row.label)));
+            for (const [index, row] of rows.entries()) {
+              const selected = index === selectedSetting;
+              const cursor = selected ? theme.fg('accent', '›') : ' ';
+              const value = row.inherited
+                ? theme.fg('dim', `[ ${row.value} ]`)
+                : selected
+                  ? theme.fg('accent', `[ ${row.value} ]`)
+                  : theme.fg('text', `[ ${row.value} ]`);
+              lines.push(`${cursor} ${theme.fg('text', row.label.padEnd(labelWidth))}  ${value}`);
+            }
+            lines.push('', theme.fg('dim', '  enter edit  ·  ↑↓ select  ·  esc close'));
+            if (saving) lines.push('', theme.fg('dim', 'Saving…'));
+            return pane(lines);
+          }
 
           if (tab === 'primary' || tab === 'subagent') {
             const listedAgents = agentsForTab();
@@ -1576,7 +1811,7 @@ export class SubagentRuntime {
             } else if (saving) {
               lines.push('', theme.fg('dim', 'Saving…'));
             }
-            return box(lines);
+            return pane(lines);
           }
 
           if (tab === 'help') {
@@ -1597,7 +1832,7 @@ export class SubagentRuntime {
                   )}`,
               ),
             ];
-            return box(lines);
+            return pane(lines);
           }
 
           if (tab === 'tasks') {
@@ -1636,11 +1871,11 @@ export class SubagentRuntime {
                 theme.fg('dim', '↑↓ move · space select · enter inspect · x delete · esc close'),
               );
             }
-            return box([tabs, '', ...listLines]);
+            return pane([tabs, '', ...listLines]);
           }
 
           const task = tasks[selectedTask];
-          if (!task) return box([tabs, '', 'No task sessions in this session.']);
+          if (!task) return pane([tabs, '', 'No task sessions in this session.']);
           const transcript = taskTranscript(task).flatMap((line) =>
             wrapTextWithAnsi(line, contentWidth),
           );
@@ -1671,14 +1906,18 @@ export class SubagentRuntime {
               theme.fg('dim', `${scroll + 1}–${scroll + shown.length} of ${transcript.length}`),
             );
           }
-          return box(lines.map((line) => truncateToWidth(line, contentWidth)));
+          if (steering) {
+            const input =
+              steering.render(Math.max(2, contentWidth - visibleWidth('Steer ')))[0] ?? '';
+            lines.push(`${theme.fg('accent', 'Steer')} ${input.replace(/^>/, '›')}`);
+          } else if (task.state === 'queued' || task.state === 'running') {
+            lines.push(theme.fg('dim', 'Enter steer · F follow · Esc tasks'));
+          }
+          return pane(lines.map((line) => truncateToWidth(line, contentWidth)));
         },
         handleInput: (data: string) => {
+          if (saving) return;
           if (confirmingDeleteAgent !== undefined) {
-            if (matchesKey(data, 'ctrl+c')) {
-              done();
-              return;
-            }
             if (matchesKey(data, 'escape')) {
               confirmingDeleteAgent = undefined;
               tui.requestRender();
@@ -1710,13 +1949,27 @@ export class SubagentRuntime {
             }
             return;
           }
+          if (steering) {
+            steering.handleInput(data);
+            tui.requestRender();
+            return;
+          }
           if (matchesKey(data, 'tab')) {
             const selectedName =
               tab === 'primary' || tab === 'subagent'
                 ? agentsForTab()[selectedAgent]?.name
                 : undefined;
-            const tabs = ['primary', 'subagent', 'tasks', 'log', 'help'] as const;
-            tab = tabs[(tabs.indexOf(tab) + 1) % tabs.length] ?? 'primary';
+            const tabs: readonly LandstripTab[] = [
+              'overview',
+              'settings',
+              'primary',
+              'subagent',
+              'tasks',
+              'log',
+              'help',
+            ];
+            const nextIndex = (tabs.indexOf(tab) + 1) % tabs.length;
+            tab = tabs[nextIndex]!;
             if (tab === 'primary' || tab === 'subagent') {
               const listedAgents = agentsForTab();
               const preferredName =
@@ -1732,6 +1985,187 @@ export class SubagentRuntime {
             if (tab === 'log' && tasks.length > 0) follow = true;
             else follow = false;
             scroll = 0;
+            confirmingDeleteAgent = undefined;
+            pendingTaskAction = undefined;
+            confirmingSandboxDisable = false;
+            settingEditor = undefined;
+            steering = undefined;
+            reloadAgents();
+            tui.requestRender();
+            return;
+          }
+
+          if (tab === 'overview') {
+            if (confirmingSandboxDisable) {
+              if (matchesKey(data, 'escape')) {
+                confirmingSandboxDisable = false;
+                tui.requestRender();
+                return;
+              }
+              if (!matchesKey(data, 'return')) return;
+            }
+            if (matchesKey(data, 'escape')) {
+              done(undefined);
+              return;
+            }
+            if (!matchesKey(data, 'return')) return;
+            const callbacks = this.integration.sandboxCallbacks;
+            const current = overview;
+            if (!callbacks || !current) {
+              ctx.ui.notify('Sandbox settings are unavailable', 'warning');
+              return;
+            }
+            const enabled = !current.enabled;
+            if (!enabled && !confirmingSandboxDisable) {
+              confirmingSandboxDisable = true;
+              tui.requestRender();
+              return;
+            }
+            confirmingSandboxDisable = false;
+            saving = true;
+            tui.requestRender();
+            void callbacks
+              .setEnabled(ctx, enabled, current.changeScope)
+              .then(() => {
+                overview = callbacks.overview(ctx.cwd, projectTrusted);
+                if (enabled && overview.noSandboxFlag) {
+                  ctx.ui.notify('Sandbox remains disabled via --no-sandbox', 'warning');
+                } else {
+                  ctx.ui.notify(
+                    `Sandbox ${enabled ? 'enabled' : 'disabled'} in ${current.changeScope} config`,
+                    'info',
+                  );
+                }
+              })
+              .catch((error: unknown) =>
+                ctx.ui.notify(`Could not update config: ${formatError(error)}`, 'error'),
+              )
+              .finally(() => {
+                saving = false;
+                tui.requestRender();
+              });
+            return;
+          }
+
+          if (tab === 'settings') {
+            if (settingEditor) {
+              if (matchesKey(data, 'escape')) {
+                settingEditor = undefined;
+                tui.requestRender();
+                return;
+              }
+              if (matchesKey(data, 'backspace')) {
+                settingEditor.value =
+                  settingEditor.kind === 'maxSubagents' ? settingEditor.value.slice(0, -1) : '';
+                tui.requestRender();
+                return;
+              }
+              if (matchesKey(data, 'return')) {
+                const input = settingEditor.value.trim();
+                if (!projectTrusted) {
+                  ctx.ui.notify('Project settings require a trusted project', 'warning');
+                  return;
+                }
+                let save: Promise<void>;
+                let notifyMessage: string;
+                if (settingEditor.kind === 'maxSubagents') {
+                  if (input === '') {
+                    save = clearMaxSubagentsConfigForScope(ctx.cwd, 'project');
+                    notifyMessage = 'Project maxSubagents inherits Global';
+                  } else {
+                    if (!/^\d+$/.test(input)) {
+                      ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
+                      return;
+                    }
+                    const parsed = Number(input);
+                    if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > MAX_SUBAGENTS) {
+                      ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
+                      return;
+                    }
+                    save = setMaxSubagentsConfigForScope(ctx.cwd, parsed, 'project');
+                    notifyMessage = `Project maxSubagents = ${parsed}`;
+                  }
+                } else {
+                  if (input === '') {
+                    save = clearToolFilesystemPolicyConfigForScope(ctx.cwd, 'project');
+                    notifyMessage = 'Project toolFilesystemPolicy inherits Global';
+                  } else {
+                    if (input !== 'host' && input !== 'sandbox') {
+                      ctx.ui.notify('Enter host or sandbox', 'error');
+                      return;
+                    }
+                    const policy: ToolFilesystemPolicy = input;
+                    save = setToolFilesystemPolicyConfigForScope(ctx.cwd, policy, 'project');
+                    notifyMessage = `Project toolFilesystemPolicy = ${policy}`;
+                  }
+                }
+                const kind = settingEditor.kind;
+                saving = true;
+                settingEditor = undefined;
+                tui.requestRender();
+                void save
+                  .then(() => {
+                    if (kind === 'maxSubagents') {
+                      maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
+                      this.setMaxSubagents(
+                        maxSubagentsSettings.project ?? maxSubagentsSettings.global,
+                      );
+                    } else {
+                      policySettings = loadToolFilesystemPolicySettings(ctx.cwd, projectTrusted);
+                      this.toolFilesystemPolicy = policySettings.project ?? policySettings.global;
+                    }
+                    ctx.ui.notify(notifyMessage, 'info');
+                  })
+                  .catch((error: unknown) =>
+                    ctx.ui.notify(`Could not save setting: ${formatError(error)}`, 'error'),
+                  )
+                  .finally(() => {
+                    saving = false;
+                    tui.requestRender();
+                  });
+                return;
+              }
+              const kittyChar = decodeKittyPrintable(data);
+              const printable =
+                kittyChar ?? (data.length === 1 && !isControlChar(data) ? data : undefined);
+              if (printable === undefined) return;
+              if (settingEditor.kind === 'maxSubagents') {
+                if (!/^\d$/.test(printable)) return;
+                settingEditor.value += printable;
+              } else {
+                const lower = printable.toLowerCase();
+                if (lower !== 'h' && lower !== 's') return;
+                settingEditor.value = lower === 'h' ? 'host' : 'sandbox';
+              }
+              tui.requestRender();
+              return;
+            }
+            if (matchesKey(data, 'escape')) {
+              done(undefined);
+              return;
+            }
+            if (matchesKey(data, 'up')) selectedSetting = Math.max(0, selectedSetting - 1);
+            else if (matchesKey(data, 'down')) selectedSetting = Math.min(1, selectedSetting + 1);
+            else if (matchesKey(data, 'return')) {
+              if (!projectTrusted) {
+                ctx.ui.notify('Project settings require a trusted project', 'warning');
+                return;
+              }
+              if (selectedSetting === 0) {
+                settingEditor = {
+                  kind: 'maxSubagents',
+                  value:
+                    maxSubagentsSettings.project !== undefined
+                      ? String(maxSubagentsSettings.project)
+                      : '',
+                };
+              } else {
+                settingEditor = {
+                  kind: 'toolFilesystemPolicy',
+                  value: policySettings.project ?? policySettings.global,
+                };
+              }
+            } else return;
             tui.requestRender();
             return;
           }
@@ -1739,8 +2173,8 @@ export class SubagentRuntime {
           if (tab === 'primary' || tab === 'subagent') {
             const listedAgents = agentsForTab();
             const agent = listedAgents[selectedAgent];
-            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) {
-              done();
+            if (matchesKey(data, 'escape')) {
+              done(undefined);
               return;
             }
             if (matchesKey(data, 'up')) selectedAgent = Math.max(0, selectedAgent - 1);
@@ -1846,7 +2280,7 @@ export class SubagentRuntime {
           }
 
           if (tab === 'help') {
-            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
+            if (matchesKey(data, 'escape')) done(undefined);
             return;
           }
 
@@ -1867,17 +2301,13 @@ export class SubagentRuntime {
                 tui.requestRender();
                 return;
               }
-              if (matchesKey(data, 'ctrl+c')) {
-                done();
-                return;
-              }
               if (matchesKey(data, 'escape')) {
                 pendingTaskAction = undefined;
                 tui.requestRender();
               }
               return;
             }
-            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
+            if (matchesKey(data, 'escape')) done(undefined);
             else if (matchesKey(data, 'up')) selectedTask = Math.max(0, selectedTask - 1);
             else if (matchesKey(data, 'down') && tasks.length > 0) {
               selectedTask = Math.min(tasks.length - 1, selectedTask + 1);
@@ -1905,15 +2335,53 @@ export class SubagentRuntime {
 
           const task = tasks[selectedTask];
           if (!task) {
-            if (matchesKey(data, 'escape') || matchesKey(data, 'ctrl+c')) done();
+            if (matchesKey(data, 'escape')) done(undefined);
             return;
           }
           if (matchesKey(data, 'escape')) {
             tab = 'tasks';
             follow = false;
             scroll = 0;
-          } else if (matchesKey(data, 'ctrl+c')) {
-            done();
+          } else if (
+            matchesKey(data, 'return') &&
+            (task.state === 'queued' || task.state === 'running')
+          ) {
+            const input = new Input();
+            input.focused = true;
+            input.onEscape = () => {
+              steering = undefined;
+              tui.requestRender();
+            };
+            input.onSubmit = (value) => {
+              const message = value.trim();
+              if (!message) {
+                ctx.ui.notify('Steering message must not be empty', 'warning');
+                return;
+              }
+              steering = undefined;
+              void (async () => {
+                const running = this.running.get(task.id);
+                if (running) {
+                  await running.rpc.steer(message);
+                } else if (
+                  (task.state === 'queued' || task.state === 'running') &&
+                  this.runPromises.has(task.id)
+                ) {
+                  const pending = this.pendingSteers.get(task.id) ?? [];
+                  pending.push(message);
+                  this.pendingSteers.set(task.id, pending);
+                } else {
+                  throw new Error('Task is no longer active');
+                }
+                ctx.ui.notify(`Steered task ${task.id.slice(0, 8)}`, 'info');
+              })()
+                .catch((error: unknown) =>
+                  ctx.ui.notify(`Could not steer task: ${formatError(error)}`, 'error'),
+                )
+                .finally(() => tui.requestRender());
+              tui.requestRender();
+            };
+            steering = input;
           } else if (data.toLowerCase() === 'f') {
             follow = !follow;
           } else if (!follow && matchesKey(data, 'up')) {
@@ -1945,390 +2413,9 @@ export class SubagentRuntime {
         },
         invalidate() {},
       }),
-      { overlay: true, overlayOptions: { anchor: 'center', width: 96, margin: 2 } },
-    );
-  }
-
-  private async openSettings(ctx: ExtensionContext): Promise<void> {
-    if (ctx.mode !== 'tui') {
-      ctx.ui.notify('Settings are available in TUI mode', 'warning');
-      return;
-    }
-
-    const projectTrusted = isProjectTrusted(ctx);
-    let tab: 'sandbox' | 'agents' = 'sandbox';
-    let overview = this.integration.sandboxCallbacks?.overview?.(ctx.cwd, projectTrusted);
-    let maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
-    let policySettings = loadToolFilesystemPolicySettings(ctx.cwd, projectTrusted);
-    let selectedSetting = 0;
-    let settingEditor: SettingsEditor | undefined;
-    let saving = false;
-
-    await ctx.ui.custom<void>(
-      (tui, theme, _keybindings, done) => ({
-        render: (width: number) => {
-          const contentWidth = Math.max(1, width - 4);
-          const box = (lines: string[]) => [
-            boxTop(theme, width, 'Settings'),
-            ...lines.map((line) => boxRow(theme, width, line)),
-            boxBottom(theme, width),
-          ];
-          const tabs = dialogTabs(
-            theme,
-            ['Sandbox', 'Agents'],
-            tab === 'sandbox' ? 'Sandbox' : 'Agents',
-          );
-          const listValue = (values: readonly string[]): string => {
-            const value = values.join(', ') || 'none';
-            return truncateToWidth(value, Math.max(10, contentWidth - 20));
-          };
-
-          if (tab === 'sandbox') {
-            const lines = [tabs, ''];
-            if (!overview) {
-              lines.push(theme.fg('muted', '  Sandbox settings are unavailable.'));
-              lines.push('', dialogKeys(theme, [['Esc', 'close']]));
-              return box(lines);
-            }
-            const status = overview.noSandboxFlag
-              ? { color: 'warning', label: 'Disabled by --no-sandbox' }
-              : !overview.enabled
-                ? { color: 'warning', label: 'Disabled by configuration' }
-                : !overview.running
-                  ? { color: 'warning', label: 'Inactive' }
-                  : { color: 'success', label: 'Active' };
-            const networkMode = overview.networkMode;
-            const shellReadMode =
-              overview.windowsMode !== undefined
-                ? 'Policy (required)'
-                : overview.shellReadMode === 'host'
-                  ? 'Host-aligned'
-                  : 'Policy';
-            const changePath =
-              overview.changeScope === 'project' ? overview.paths.project : overview.paths.global;
-            const item = (label: string, value: string): string =>
-              `  ${theme.fg('dim', label.padEnd(16))} ${value}`;
-            lines.push(
-              `${theme.fg(status.color as 'success' | 'warning', '●')} ${theme.fg('text', status.label)}`,
-              item(
-                'Configured',
-                overview.enabled ? theme.fg('text', 'Enabled') : theme.fg('warning', 'Disabled'),
-              ),
-              item(
-                'Runtime',
-                overview.running ? theme.fg('success', 'Running') : theme.fg('dim', 'Not running'),
-              ),
-              '',
-              theme.fg('accent', 'Protection'),
-              item('Network', networkMode),
-              item('Shell reads', shellReadMode),
-              item(
-                'Read rules',
-                `${overview.config.filesystem.denyRead.length + overview.config.filesystem.allowRead.length} · ${overview.readRuleScope}`,
-              ),
-              item(
-                'Write rules',
-                String(
-                  overview.config.filesystem.allowWrite.length +
-                    overview.config.filesystem.denyWrite.length,
-                ),
-              ),
-              item(
-                'Session grants',
-                String(
-                  overview.sessionDomains.length +
-                    overview.sessionReadPaths.length +
-                    overview.sessionWritePaths.length,
-                ),
-              ),
-              '',
-              theme.fg('accent', 'Configuration'),
-              item('Change scope', overview.changeScope === 'project' ? 'Project' : 'Global'),
-              item('Change file', truncateToWidth(changePath, Math.max(10, contentWidth - 20))),
-              item(
-                'Project file',
-                truncateToWidth(overview.paths.project, Math.max(10, contentWidth - 20)),
-              ),
-              item(
-                'Global file',
-                truncateToWidth(overview.paths.global, Math.max(10, contentWidth - 20)),
-              ),
-              item(
-                'Landstrip binary',
-                truncateToWidth(overview.paths.binary, Math.max(10, contentWidth - 20)),
-              ),
-            );
-            if (overview.windowsMode !== undefined)
-              lines.push(item('Windows mode', overview.windowsMode));
-            lines.push(
-              '',
-              theme.fg('accent', 'Network'),
-              item('Allowed domains', listValue(overview.config.network.allowedDomains)),
-              item('Denied domains', listValue(overview.config.network.deniedDomains)),
-              item(
-                'Unix sockets',
-                overview.config.network.allowAllUnixSockets
-                  ? 'all'
-                  : listValue(overview.config.network.allowUnixSockets),
-              ),
-              '',
-              theme.fg('accent', 'Filesystem'),
-              item('Shell reads', shellReadMode),
-              item('Read rules for', overview.readRuleScope),
-              item('Denied reads', listValue(overview.config.filesystem.denyRead)),
-              item('Allowed reads', listValue(overview.config.filesystem.allowRead)),
-              item('Allowed writes', listValue(overview.config.filesystem.allowWrite)),
-              item('Denied writes', listValue(overview.config.filesystem.denyWrite)),
-              '',
-              theme.fg('accent', 'Session grants'),
-              item('Domains', listValue(overview.sessionDomains)),
-              item('Read paths', listValue(overview.sessionReadPaths)),
-              item('Write paths', listValue(overview.sessionWritePaths)),
-            );
-            if (saving) lines.push('', theme.fg('dim', 'Saving…'));
-            lines.push(
-              '',
-              dialogKeys(theme, [
-                ['Tab', 'next tab'],
-                ['Enter', `${overview.enabled ? 'disable' : 'enable'} in ${overview.changeScope}`],
-                ['Esc', 'close'],
-              ]),
-            );
-            return box(lines);
-          }
-
-          const rows: Array<{
-            kind: 'maxSubagents' | 'toolFilesystemPolicy';
-            label: string;
-            value: string;
-            inherited: boolean;
-          }> = [
-            {
-              kind: 'maxSubagents',
-              label: 'maxSubagents',
-              value: String(maxSubagentsSettings.project ?? maxSubagentsSettings.global),
-              inherited: maxSubagentsSettings.project === undefined,
-            },
-            {
-              kind: 'toolFilesystemPolicy',
-              label: 'toolFilesystemPolicy',
-              value: policySettings.project ?? policySettings.global,
-              inherited: policySettings.project === undefined,
-            },
-          ];
-          const lines = [tabs, ''];
-          if (settingEditor) {
-            const kindLabel =
-              settingEditor.kind === 'maxSubagents'
-                ? 'Project maxSubagents'
-                : 'Project toolFilesystemPolicy';
-            const current =
-              settingEditor.kind === 'maxSubagents'
-                ? String(maxSubagentsSettings.project ?? maxSubagentsSettings.global)
-                : (policySettings.project ?? policySettings.global);
-            const hint =
-              settingEditor.kind === 'maxSubagents'
-                ? 'empty inherit  ·  enter submit  ·  esc cancel'
-                : 'h host  ·  s sandbox  ·  backspace inherit  ·  enter submit  ·  esc cancel';
-            lines.push(
-              theme.fg('dim', `  ${kindLabel} · current ${current}`),
-              '',
-              `  ${theme.fg('accent', '›')} [ ${settingEditor.value}${theme.fg('accent', '█')} ]`,
-              '',
-              theme.fg('dim', `  ${hint}`),
-            );
-            if (saving) lines.push('', theme.fg('dim', 'Saving…'));
-            return box(lines);
-          }
-          for (const [index, row] of rows.entries()) {
-            const selected = index === selectedSetting;
-            const cursor = selected ? theme.fg('accent', '›') : ' ';
-            const value = row.inherited
-              ? theme.fg('dim', `[ ${row.value} ]`)
-              : selected
-                ? theme.fg('accent', `[ ${row.value} ]`)
-                : theme.fg('text', `[ ${row.value} ]`);
-            lines.push(`${cursor} ${value} ${theme.fg('text', row.label)}`);
-          }
-          lines.push('', theme.fg('dim', '  enter edit  ·  ↑↓ select  ·  esc close'));
-          if (saving) lines.push('', theme.fg('dim', 'Saving…'));
-          return box(lines);
-        },
-        handleInput: (data: string) => {
-          if (saving) return;
-          if (matchesKey(data, 'ctrl+c')) {
-            done();
-            return;
-          }
-          if (matchesKey(data, 'escape')) {
-            if (settingEditor) {
-              settingEditor = undefined;
-              tui.requestRender();
-              return;
-            }
-            done();
-            return;
-          }
-          if (settingEditor) {
-            if (matchesKey(data, 'backspace')) {
-              settingEditor.value =
-                settingEditor.kind === 'maxSubagents' ? settingEditor.value.slice(0, -1) : '';
-              tui.requestRender();
-              return;
-            }
-            if (matchesKey(data, 'return')) {
-              const input = settingEditor.value.trim();
-              if (!projectTrusted) {
-                ctx.ui.notify('Project settings require a trusted project', 'warning');
-                return;
-              }
-              let save: Promise<void>;
-              let notifyMessage: string;
-              if (settingEditor.kind === 'maxSubagents') {
-                if (input === '') {
-                  save = clearMaxSubagentsConfigForScope(ctx.cwd, 'project');
-                  notifyMessage = 'Project maxSubagents inherits Global';
-                } else {
-                  if (!/^\d+$/.test(input)) {
-                    ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
-                    return;
-                  }
-                  const parsed = Number(input);
-                  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > MAX_SUBAGENTS) {
-                    ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
-                    return;
-                  }
-                  save = setMaxSubagentsConfigForScope(ctx.cwd, parsed, 'project');
-                  notifyMessage = `Project maxSubagents = ${parsed}`;
-                }
-              } else {
-                if (input === '') {
-                  save = clearToolFilesystemPolicyConfigForScope(ctx.cwd, 'project');
-                  notifyMessage = 'Project toolFilesystemPolicy inherits Global';
-                } else {
-                  if (input !== 'host' && input !== 'sandbox') {
-                    ctx.ui.notify('Enter host or sandbox', 'error');
-                    return;
-                  }
-                  const policy: ToolFilesystemPolicy = input;
-                  save = setToolFilesystemPolicyConfigForScope(ctx.cwd, policy, 'project');
-                  notifyMessage = `Project toolFilesystemPolicy = ${policy}`;
-                }
-              }
-              const kind = settingEditor.kind;
-              saving = true;
-              settingEditor = undefined;
-              tui.requestRender();
-              void save
-                .then(() => {
-                  if (kind === 'maxSubagents') {
-                    maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
-                    this.setMaxSubagents(
-                      maxSubagentsSettings.project ?? maxSubagentsSettings.global,
-                    );
-                  } else {
-                    policySettings = loadToolFilesystemPolicySettings(ctx.cwd, projectTrusted);
-                    this.toolFilesystemPolicy = policySettings.project ?? policySettings.global;
-                  }
-                  ctx.ui.notify(notifyMessage, 'info');
-                })
-                .catch((error: unknown) =>
-                  ctx.ui.notify(`Could not save setting: ${formatError(error)}`, 'error'),
-                )
-                .finally(() => {
-                  saving = false;
-                  tui.requestRender();
-                });
-              return;
-            }
-            const kittyChar = decodeKittyPrintable(data);
-            const printable =
-              kittyChar ?? (data.length === 1 && !isControlChar(data) ? data : undefined);
-            if (printable === undefined) return;
-            if (settingEditor.kind === 'maxSubagents') {
-              if (!/^\d$/.test(printable)) return;
-              settingEditor.value += printable;
-            } else {
-              const lower = printable.toLowerCase();
-              if (lower !== 'h' && lower !== 's') return;
-              settingEditor.value = lower === 'h' ? 'host' : 'sandbox';
-            }
-            tui.requestRender();
-            return;
-          }
-          if (matchesKey(data, 'tab')) {
-            tab = tab === 'sandbox' ? 'agents' : 'sandbox';
-            tui.requestRender();
-            return;
-          }
-          if (tab === 'sandbox') {
-            if (!matchesKey(data, 'return')) return;
-            const callbacks = this.integration.sandboxCallbacks;
-            const current = overview;
-            if (!callbacks || !current) {
-              ctx.ui.notify('Sandbox settings are unavailable', 'warning');
-              return;
-            }
-            saving = true;
-            tui.requestRender();
-            void (async () => {
-              try {
-                const enabled = !current.enabled;
-                if (!enabled) {
-                  const confirmed = await ctx.ui.confirm(
-                    'Disable sandbox?',
-                    `Commands will run without OS isolation.\n\nChange: ${current.changeScope} configuration\n${current.changeScope === 'project' ? current.paths.project : current.paths.global}`,
-                  );
-                  if (!confirmed) return;
-                }
-                await callbacks.setEnabled(ctx, enabled, current.changeScope);
-                overview = callbacks.overview(ctx.cwd, projectTrusted);
-                if (enabled && overview.noSandboxFlag) {
-                  ctx.ui.notify('Sandbox remains disabled via --no-sandbox', 'warning');
-                } else {
-                  ctx.ui.notify(
-                    `Sandbox ${enabled ? 'enabled' : 'disabled'} in ${current.changeScope} config`,
-                    'info',
-                  );
-                }
-              } catch (error) {
-                ctx.ui.notify(`Could not update config: ${formatError(error)}`, 'error');
-              } finally {
-                saving = false;
-                tui.requestRender();
-              }
-            })();
-            return;
-          }
-          if (matchesKey(data, 'up')) selectedSetting = Math.max(0, selectedSetting - 1);
-          else if (matchesKey(data, 'down')) selectedSetting = Math.min(1, selectedSetting + 1);
-          else if (matchesKey(data, 'return')) {
-            if (!projectTrusted) {
-              ctx.ui.notify('Project settings require a trusted project', 'warning');
-              return;
-            }
-            if (selectedSetting === 0) {
-              settingEditor = {
-                kind: 'maxSubagents',
-                value:
-                  maxSubagentsSettings.project !== undefined
-                    ? String(maxSubagentsSettings.project)
-                    : '',
-              };
-            } else {
-              settingEditor = {
-                kind: 'toolFilesystemPolicy',
-                value: policySettings.project ?? policySettings.global,
-              };
-            }
-          } else return;
-          tui.requestRender();
-        },
-        invalidate() {},
-      }),
       {
         overlay: true,
-        overlayOptions: { anchor: 'bottom-center', width: '100%', maxHeight: '60%' },
+        overlayOptions: { anchor: 'bottom-center', width: '100%', maxHeight: '70%' },
       },
     );
   }
@@ -2790,6 +2877,10 @@ export class SubagentRuntime {
           .prompt(prompt)
           .then(async () => (await worker?.rpc.getLastAssistantText()) ?? '');
         this.running.set(task.id, { rpc: worker.rpc, promise });
+        await Promise.resolve(); // Let the initial prompt reach RPC before queued messages.
+        const pendingSteers = this.pendingSteers.get(task.id) ?? [];
+        this.pendingSteers.delete(task.id);
+        for (const pendingSteer of pendingSteers) await worker.rpc.steer(pendingSteer);
         const pendingPrompts = this.pendingPrompts.get(task.id) ?? [];
         this.pendingPrompts.delete(task.id);
         for (const pendingPrompt of pendingPrompts) {
@@ -2829,6 +2920,7 @@ export class SubagentRuntime {
       }
       this.running.delete(task.id);
       this.pendingPrompts.delete(task.id);
+      this.pendingSteers.delete(task.id);
       await worker?.rpc.stop().catch(() => undefined);
       await worker?.dispose().catch(() => undefined);
       this.releaseLease(task.id);
@@ -3107,9 +3199,8 @@ export class SubagentRuntime {
           try {
             result = await this.execute(input, ctx, signal, task, rules, () => undefined);
           } finally {
-            // Reclaim capacity even if the parent is already aborted; never let
-            // restore failure mask a successful nested-task result.
-            if (handedOff) await this.restoreLease(task.id).catch(() => undefined);
+            // Reclaim the parent's transferred permit even if admission was disabled mid-task.
+            if (handedOff) this.restoreLease(task.id);
           }
           response = {
             ok: true,
@@ -3122,7 +3213,21 @@ export class SubagentRuntime {
       }
       return { value: JSON.stringify(response) };
     }
+    if (['select', 'confirm', 'input', 'editor'].includes(request.method)) {
+      return this.enqueueWorkerUi(() =>
+        this.forwardWorkerUi(ctx, task, request, this.controllers.get(task.id)?.signal),
+      );
+    }
     return this.forwardWorkerUi(ctx, task, request, this.controllers.get(task.id)?.signal);
+  }
+
+  private enqueueWorkerUi<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.workerUiQueue.then(operation);
+    this.workerUiQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   private async forwardWorkerUi(
@@ -3303,6 +3408,7 @@ export class SubagentRuntime {
       }
       this.tasks.delete(taskId);
       this.pendingPrompts.delete(taskId);
+      this.pendingSteers.delete(taskId);
       this.foregroundClaims.delete(taskId);
       this.persist(task);
       deleted += 1;
@@ -3395,7 +3501,7 @@ export class SubagentRuntime {
     const catalog = this.loadCatalog(ctx.cwd, getAgentDir(), isProjectTrusted(ctx));
     this.maxSubagents = catalog.maxSubagents;
     this.toolFilesystemPolicy = catalog.toolFilesystemPolicy;
-    this.semaphore = new Semaphore(Math.max(1, this.maxSubagents));
+    this.semaphore = new Semaphore(this.maxSubagents);
     if (catalog.diagnostics.length > 0) {
       this.invalidatePrimaryAgent(catalog, ctx);
       return;
@@ -3503,6 +3609,7 @@ export class SubagentRuntime {
     this.controllers.clear();
     this.foregroundClaims.clear();
     this.pendingPrompts.clear();
+    this.pendingSteers.clear();
     for (const taskId of this.leases.keys()) this.releaseLease(taskId);
     this.leases.clear();
   }
@@ -3525,11 +3632,10 @@ export class SubagentRuntime {
     return true;
   }
 
-  private async restoreLease(taskId: string): Promise<void> {
+  private restoreLease(taskId: string): void {
     const lease = this.leases.get(taskId);
     if (!lease || lease.release) return;
-    // No abort signal: parent cancellation must not drop the slot permanently.
-    const release = await this.semaphore.acquire();
+    const release = this.semaphore.restoreTransferred();
     const current = this.leases.get(taskId);
     if (!current || current.release) {
       release();

@@ -22,23 +22,14 @@ export function dialogKeys(
     .join(separator);
 }
 
-export function boxTop(theme: Theme, width: number, title: string): string {
-  if (width < 5) return truncateToWidth(theme.fg('accent', title), Math.max(1, width));
-  const label = theme.fg('accent', ` ${title} `);
-  const fill = theme.fg('border', '─'.repeat(Math.max(0, width - 4 - visibleWidth(label))));
-  return `${theme.fg('border', '╭─')}${label}${fill}${theme.fg('border', '─╮')}`;
+export function paneTop(theme: Theme, width: number, title: string): string {
+  if (width < 3) return truncateToWidth(theme.fg('accent', title), Math.max(1, width));
+  const label = theme.fg('accent', theme.bold(` ${title} `));
+  return `${label}${theme.fg('border', '─'.repeat(Math.max(0, width - visibleWidth(label))))}`;
 }
 
-export function boxRow(theme: Theme, width: number, content = ''): string {
-  if (width < 5) return truncateToWidth(content, Math.max(1, width));
-  const innerWidth = Math.max(1, width - 4);
-  const border = theme.fg('border', '│');
-  const line = truncateToWidth(content, innerWidth);
-  return `${border} ${line}${' '.repeat(Math.max(0, innerWidth - visibleWidth(line)))} ${border}`;
-}
-
-export function boxBottom(theme: Theme, width: number): string {
-  if (width < 5) return '';
-  const border = (value: string) => theme.fg('border', value);
-  return `${border('╰')}${border('─'.repeat(Math.max(0, width - 2)))}${border('╯')}`;
+export function paneRow(_theme: Theme, width: number, content = ''): string {
+  if (width < 2) return ' '.repeat(Math.max(0, width));
+  const line = truncateToWidth(content, Math.max(1, width - 2));
+  return ` ${line}${' '.repeat(Math.max(0, width - visibleWidth(line) - 1))}`;
 }

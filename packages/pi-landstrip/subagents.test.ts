@@ -971,7 +971,7 @@ test('removes the task tool when maxSubagents is zero', async () => {
   expect(activeTools).toEqual(['read']);
 });
 
-test('updates task availability when maxSubagents changes', () => {
+test('updates task availability without promoting queued work at zero', async () => {
   let activeTools = ['read', 'task'];
   const pi = {
     registerTool() {},
@@ -986,6 +986,27 @@ test('updates task availability when maxSubagents changes', () => {
   runtime.setMaxSubagents(0);
   expect(runtime.getMaxSubagents()).toBe(0);
   expect(activeTools).toEqual(['read']);
+
+  runtime.setMaxSubagents(1);
+  const semaphore = (
+    runtime as unknown as {
+      semaphore: { acquire(): Promise<() => void> };
+    }
+  ).semaphore;
+  const releaseRunning = await semaphore.acquire();
+  let promoted = false;
+  const queued = semaphore.acquire().then((release) => {
+    promoted = true;
+    return release;
+  });
+  runtime.setMaxSubagents(0);
+  releaseRunning();
+  await Promise.resolve();
+  expect(promoted).toBe(false);
+  runtime.setMaxSubagents(1);
+  const releaseQueued = await queued;
+  expect(promoted).toBe(true);
+  releaseQueued();
 
   runtime.setMaxSubagents(3);
   expect(runtime.getMaxSubagents()).toBe(3);
@@ -1022,6 +1043,10 @@ test('runs a foreground task in an injected RPC worker', async () => {
   const sentMessages: unknown[] = [];
   const widgets: unknown[] = [];
   const dialogTitles: string[] = [];
+  let releaseSelect = (): void => {};
+  const selectPending = new Promise<void>((resolve) => {
+    releaseSelect = resolve;
+  });
   const pi = {
     registerTool(tool: ToolDefinition) {
       taskTool = tool;
@@ -1127,8 +1152,22 @@ test('runs a foreground task in an injected RPC worker', async () => {
           toolInput: { command: 'git status' },
         }),
       });
-      await forwardRequest?.({ method: 'select', title: 'Choose item', options: ['one'] });
-      await forwardRequest?.({ method: 'confirm', title: 'Confirm action', message: 'Proceed?' });
+      const selectRequest = forwardRequest?.({
+        method: 'select',
+        title: 'Choose item',
+        options: ['one'],
+      });
+      const confirmRequest = forwardRequest?.({
+        method: 'confirm',
+        title: 'Confirm action',
+        message: 'Proceed?',
+      });
+      await vi.waitFor(() => {
+        expect(dialogTitles).toHaveLength(1);
+        expect(dialogTitles[0]).toContain('\nChoose item');
+      });
+      releaseSelect();
+      await Promise.all([selectRequest, confirmRequest]);
       await forwardRequest?.({ method: 'input', title: 'Enter value', placeholder: 'value' });
       await forwardRequest?.({ method: 'editor', title: 'Edit value', prefill: 'value' });
     },
@@ -1166,6 +1205,7 @@ test('runs a foreground task in an injected RPC worker', async () => {
       notify() {},
       async select(title: string) {
         dialogTitles.push(title);
+        await selectPending;
         return 'one';
       },
       async confirm(title: string) {
@@ -1408,7 +1448,6 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   let sessionStart: ((event: unknown, ctx: ExtensionContext) => Promise<void>) | undefined;
   let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
-  let settingsCommand: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
   const commandNames: string[] = [];
   let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
   let finishCustom: (() => void) | undefined;
@@ -1419,8 +1458,7 @@ test('inspects and navigates persisted child sessions without switching sessions
       definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
     ) {
       commandNames.push(name);
-      if (name === 'agents') command = definition.handler;
-      if (name === 'settings') settingsCommand = definition.handler;
+      if (name === 'landstrip') command = definition.handler;
     },
     registerShortcut() {},
     on(event: string, handler: unknown) {
@@ -1448,7 +1486,8 @@ test('inspects and navigates persisted child sessions without switching sessions
       },
     },
   } as unknown as LandstripIntegration;
-  new SubagentRuntime(pi, integration).register();
+  const runtime = new SubagentRuntime(pi, integration);
+  runtime.register();
   const bolded: string[] = [];
   const theme = {
     fg: (_color: string, value: string) => value,
@@ -1486,10 +1525,20 @@ test('inspects and navigates persisted child sessions without switching sessions
   } as unknown as ExtensionContext;
 
   await sessionStart?.({}, ctx);
-  expect(commandNames).toEqual(['agents', 'settings', 'sandbox']);
-  const running = command?.('', ctx);
+  const steer = vi.fn(async () => {});
+  const privateRuntime = runtime as unknown as {
+    tasks: Map<string, { state: string }>;
+    running: Map<string, { rpc: { steer: typeof steer }; promise: Promise<string> }>;
+  };
+  privateRuntime.tasks.get('task-12345678')!.state = 'running';
+  privateRuntime.running.set('task-12345678', {
+    rpc: { steer },
+    promise: new Promise<string>(() => {}),
+  });
+  expect(commandNames).toEqual(['landstrip']);
+  const running = command?.('agents', ctx);
   const agents = component?.render(96).join('\n') ?? '';
-  expect(agents).toContain('[Primary]  Subagent  Tasks  Log  Help');
+  expect(agents).toContain('Overview  Settings  [Primary]  Subagent  Tasks  Log  Help');
   expect(agents).toContain('@build');
   expect(agents).toContain('@plan');
   expect(agents).not.toContain('@general');
@@ -1600,6 +1649,19 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(logs).not.toContain('Inspect this child session.');
   expect(logs).toContain('2 tool calls · 1.0s');
   expect(logs).toContain('2 turns in:2.0k out:345 R500 W50 $0.0143');
+  expect(logs).toContain('Enter steer · F follow · Esc tasks');
+  component?.handleInput('\r');
+  expect(component?.render(96).join('\n')).toContain('Steer ›');
+  component?.handleInput('x');
+  component?.handleInput('\x1b');
+  expect(component?.render(96).join('\n')).toContain('Enter steer · F follow · Esc tasks');
+  component?.handleInput('\r');
+  component?.handleInput('\x1b[200~Check tests first🧪\x1b[201~');
+  expect(component?.render(96).join('\n')).toContain('Steer › Check tests first🧪');
+  component?.handleInput('\x7f');
+  expect(component?.render(96).join('\n')).not.toContain('🧪');
+  component?.handleInput('\r');
+  await vi.waitFor(() => expect(steer).toHaveBeenCalledWith('Check tests first'));
   component?.handleInput('\x1b[A');
   expect(component?.render(96).join('\n')).toBe(logs);
   component?.handleInput('\x1b[C');
@@ -1682,29 +1744,26 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(help).toMatch(/F\s+Toggle task log follow/);
   expect(help).toMatch(/Page Up \/ Down\s+Scroll task output by page/);
   expect(help).toMatch(/Home \/ End\s+Jump to task output boundary/);
+  expect(help).toMatch(/Enter\s+Activate: set primary, open log, steer, confirm/);
 
   component?.handleInput('\t');
-  const cycledAgents = component?.render(96).join('\n') ?? '';
-  expect(cycledAgents).toContain('[Primary]  Subagent  Tasks  Log  Help');
-  expect(cycledAgents).not.toContain('Tab next tab');
-  finishCustom?.();
-  await running;
-
-  const settingsRunning = settingsCommand?.('', ctx);
+  await vi.waitFor(() => {
+    expect(component?.render(96).join('\n')).toContain('[Overview]  Settings');
+  });
   const sandboxPane = component?.render(96).join('\n') ?? '';
-  expect(sandboxPane).toContain('[Sandbox]  Agents');
+  expect(sandboxPane).toContain('[Overview]  Settings');
   expect(sandboxPane).toContain('Sandbox settings are unavailable.');
   expect(sandboxPane).not.toContain('maxSubagents');
 
   component?.handleInput('\t');
   const projectSettings = component?.render(96).join('\n') ?? '';
-  expect(projectSettings).toContain('Sandbox  [Agents]');
-  expect(projectSettings).toContain('[ 1 ] maxSubagents');
-  expect(projectSettings).toContain('[ host ] toolFilesystemPolicy');
+  expect(projectSettings).toContain('Overview  [Settings]');
+  expect(projectSettings).toMatch(/Maximum Subagents\s+\[ 1 \]/);
+  expect(projectSettings).toMatch(/Filesystem Tool Policy\s+\[ host \]/);
   expect(projectSettings).not.toContain('sandboxEnabled');
 
   component?.handleInput('\r');
-  expect(component?.render(96).join('\n')).toContain('Project maxSubagents · current 1');
+  expect(component?.render(96).join('\n')).toContain('Project Maximum Subagents · current 1');
   component?.handleInput('2');
   component?.handleInput('\r');
   await vi.waitFor(() => {
@@ -1713,7 +1772,7 @@ test('inspects and navigates persisted child sessions without switching sessions
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
   component?.handleInput('\r');
-  expect(component?.render(96).join('\n')).toContain('Project maxSubagents · current 2');
+  expect(component?.render(96).join('\n')).toContain('Project Maximum Subagents · current 2');
   component?.handleInput('\x08');
   component?.handleInput('3');
   component?.handleInput('\r');
@@ -1735,13 +1794,15 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   component?.handleInput('\x1b[B');
   component?.handleInput('\r');
-  expect(component?.render(96).join('\n')).toContain('Project toolFilesystemPolicy · current host');
+  expect(component?.render(96).join('\n')).toContain(
+    'Project Filesystem Tool Policy · current host',
+  );
   component?.handleInput('s');
   component?.handleInput('\r');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.toolFilesystemPolicy).toBe('sandbox');
-    expect(component?.render(96).join('\n')).toContain('[ sandbox ] toolFilesystemPolicy');
+    expect(component?.render(96).join('\n')).toMatch(/Filesystem Tool Policy\s+\[ sandbox \]/);
   });
   component?.handleInput('\r');
   component?.handleInput('\x08');
@@ -1749,11 +1810,11 @@ test('inspects and navigates persisted child sessions without switching sessions
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.toolFilesystemPolicy).toBeUndefined();
-    expect(component?.render(96).join('\n')).toContain('[ host ] toolFilesystemPolicy');
+    expect(component?.render(96).join('\n')).toMatch(/Filesystem Tool Policy\s+\[ host \]/);
   });
 
   component?.handleInput('\x1b');
-  await settingsRunning;
+  await running;
 
   const direct = command?.('task-123', ctx);
   expect(component?.render(96).join('\n')).toContain('[Log]');
@@ -1823,7 +1884,7 @@ test('cancels worker startup promptly and disposes a worker created afterward', 
   expect(stop).toHaveBeenCalledOnce();
 });
 
-test('sends a continuation queued during worker startup once RPC is available', async () => {
+test('sends messages queued during worker startup once RPC is available', async () => {
   const cwd = temporaryDirectory();
   const piAgentDir = temporaryDirectory();
   mkdirSync(join(cwd, '.pi'), { recursive: true });
@@ -1855,6 +1916,7 @@ test('sends a continuation queued during worker startup once RPC is available', 
   });
   const createWorker = vi.fn(() => workerPromise);
   const request = vi.fn(async () => {});
+  const steer = vi.fn(async () => {});
   const fakeRpc = {
     onEvent: () => () => {},
     async prompt() {},
@@ -1862,12 +1924,17 @@ test('sends a continuation queued during worker startup once RPC is available', 
       return 'Reviewed.';
     },
     request,
+    steer,
     async abort() {},
     async stop() {},
   };
-  new SubagentRuntime(pi, {} as LandstripIntegration, createWorker as never, (projectCwd) =>
-    loadAgentCatalog(projectCwd, piAgentDir),
-  ).register();
+  const runtime = new SubagentRuntime(
+    pi,
+    {} as LandstripIntegration,
+    createWorker as never,
+    (projectCwd) => loadAgentCatalog(projectCwd, piAgentDir),
+  );
+  runtime.register();
   const ctx = {
     cwd,
     hasUI: true,
@@ -1909,11 +1976,16 @@ test('sends a continuation queued during worker startup once RPC is available', 
     ctx,
   );
   expect(request).not.toHaveBeenCalled();
+  (runtime as unknown as { pendingSteers: Map<string, string[]> }).pendingSteers.set(taskId!, [
+    'Focus on tests first.',
+  ]);
+  expect(steer).not.toHaveBeenCalled();
 
   resolveWorker?.({ rpc: fakeRpc, async dispose() {} });
   await vi.waitFor(() =>
     expect(request).toHaveBeenCalledWith('follow_up', { message: 'Also inspect tests.' }),
   );
+  await vi.waitFor(() => expect(steer).toHaveBeenCalledWith('Focus on tests first.'));
 });
 
 test('records a running foreground task when continued in background', async () => {
@@ -2419,6 +2491,24 @@ test('semaphore enforces the configured scheduler-permit capacity', async () => 
   nextRelease?.();
 });
 
+test('restores a transferred scheduler permit after the admission limit drops to zero', async () => {
+  const runtime = new SubagentRuntime({} as ExtensionAPI, {} as LandstripIntegration);
+  const internals = runtime as unknown as {
+    semaphore: { acquire(): Promise<() => void>; setLimit(limit: number): void };
+    leases: Map<string, { release?: () => void }>;
+    releaseLease(taskId: string): boolean;
+    restoreLease(taskId: string): void;
+  };
+  internals.leases.set('parent', { release: await internals.semaphore.acquire() });
+
+  expect(internals.releaseLease('parent')).toBe(true);
+  internals.semaphore.setLimit(0);
+  internals.restoreLease('parent');
+
+  expect(internals.leases.get('parent')?.release).toBeTypeOf('function');
+  internals.leases.get('parent')?.release?.();
+});
+
 test('does not deliver old background results into a new session', async () => {
   const sendMessage = vi.fn();
   const runtime = new SubagentRuntime(
@@ -2475,7 +2565,7 @@ test('resolves the running Pi package from the extension location', () => {
 test('cleans up orphan subagent session files for the current cwd at startup', async () => {
   const cwd = temporaryDirectory();
   const piAgentDir = temporaryDirectory();
-  process.env.PI_CODING_AGENT_DIR = piAgentDir;
+  vi.stubEnv('PI_CODING_AGENT_DIR', piAgentDir);
 
   const orphanDirCurrentCwd = join(
     piAgentDir,
@@ -2501,6 +2591,22 @@ test('cleans up orphan subagent session files for the current cwd at startup', a
   writeFileSync(
     join(orphanDirOtherCwd, 'session.jsonl'),
     JSON.stringify({ type: 'header', version: 1, cwd: '/some/other/cwd' }) + '\n',
+  );
+
+  const orphanDirPrefixCollision = join(
+    piAgentDir,
+    'sessions',
+    'pi-landstrip',
+    'orphan-parent-prefix-collision',
+    'task-3',
+  );
+  mkdirSync(orphanDirPrefixCollision, { recursive: true });
+  const encodedCwd = `--${cwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+  writeFileSync(
+    join(orphanDirPrefixCollision, 'task.json'),
+    JSON.stringify({
+      parentSessionFile: join(piAgentDir, 'sessions', `${encodedCwd}-sibling`, 'session.jsonl'),
+    }),
   );
 
   let sessionStartHandler: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -2539,6 +2645,9 @@ test('cleans up orphan subagent session files for the current cwd at startup', a
   expect(existsSync(join(piAgentDir, 'sessions', 'pi-landstrip', 'orphan-parent-other'))).toBe(
     true,
   );
+  expect(
+    existsSync(join(piAgentDir, 'sessions', 'pi-landstrip', 'orphan-parent-prefix-collision')),
+  ).toBe(true);
 });
 
 test('renders sandbox state in the settings pane and toggles it', async () => {
@@ -2641,19 +2750,23 @@ test('renders sandbox state in the settings pane and toggles it', async () => {
     },
   } as unknown as ExtensionContext;
 
-  const running = handlers.get('settings')?.('', ctx);
+  const running = handlers.get('landstrip')?.('', ctx);
   expect(overlayOptions).toMatchObject({
     overlay: true,
     overlayOptions: { anchor: 'bottom-center', width: '100%' },
   });
   const pane = component?.render(96).join('\n') ?? '';
-  expect(pane).toContain('[Sandbox]  Agents');
+  expect(pane).toContain('[Overview]  Settings');
   expect(pane).toContain('Active');
   expect(pane).toContain('proxied');
   expect(pane).toContain('example.com');
   expect(pane).toContain('/project/sandbox.json');
   expect(pane).toContain('Enter disable in project');
+  expect(pane).not.toMatch(/[╭╮╰╯│]/);
 
+  component?.handleInput('\r');
+  expect(component?.render(96).join('\n')).toContain('Disable the sandbox?');
+  expect(setEnabledCalls).toEqual([]);
   component?.handleInput('\r');
   await vi.waitFor(() => {
     expect(setEnabledCalls).toEqual([{ enabled: false, scope: 'project' }]);
