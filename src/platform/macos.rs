@@ -204,7 +204,8 @@ fn render_write_rules(
     // Regex rules are evaluated at syscall time, so unlike expand_glob_path
     // they also cover paths created after sandbox_init.
     for pattern in write_denied_patterns {
-        let escaped = escape_sbpl_literal(&glob_to_sbpl_regex(pattern));
+        let regex = glob_to_sbpl_regex(pattern);
+        let escaped = escape_sbpl_regex_literal(&regex);
         writeln!(sb, "(deny file-write* (regex #\"{escaped}\"))")?;
     }
 
@@ -339,6 +340,18 @@ fn escape_sbpl_literal(path: &str) -> String {
         match ch {
             '"' => escaped.push_str("\\\""),
             '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn escape_sbpl_regex_literal(regex: &str) -> String {
+    let mut escaped = String::with_capacity(regex.len());
+    for ch in regex.chars() {
+        match ch {
+            '"' => escaped.push_str("\\\""),
             '\n' => escaped.push_str("\\n"),
             _ => escaped.push(ch),
         }
