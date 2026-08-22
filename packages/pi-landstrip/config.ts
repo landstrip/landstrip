@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from '
 import { dirname, join } from 'node:path';
 
 import { getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent';
+import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 import {
   applyEdits,
   modify,
@@ -17,6 +18,11 @@ import { BUILT_IN_LANDSTRIP_CONFIG } from './built-in-agents.ts';
 import { expandFileReferences, formatError, isRecord } from './util.ts';
 
 export type ConfigObject = Record<string, unknown>;
+
+export function isProjectTrusted(ctx: ExtensionContext): boolean {
+  const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
+  return trustContext.isProjectTrusted?.() ?? false;
+}
 
 export const MAX_SUBAGENTS = 16;
 

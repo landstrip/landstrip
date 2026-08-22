@@ -63,10 +63,12 @@ import {
   prepareProjectAgentEditor,
 } from './agent-files.ts';
 import { dialogKeys, dialogTabs, paneRow, paneTop } from './box.ts';
+import { type CommandSubagentRuntime, registerLandstripCommands } from './commands.ts';
 import {
   clearAgentDisabledForScope,
   clearMaxSubagentsConfigForScope,
   clearToolFilesystemPolicyConfigForScope,
+  isProjectTrusted,
   loadAgentDisabledOverrides,
   loadMaxSubagentsSettings,
   loadToolFilesystemPolicySettings,
@@ -649,11 +651,6 @@ type WorkerFactory = (
   onRequest: (request: ExtensionUiRequest) => Promise<ExtensionUiResult>,
 ) => Promise<WorkerHandle>;
 
-function isProjectTrusted(ctx: ExtensionContext): boolean {
-  const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
-  return trustContext.isProjectTrusted?.() ?? false;
-}
-
 function dependencyRoot(path: string): string | undefined {
   const marker = `${sep}node_modules${sep}`;
   const index = path.lastIndexOf(marker);
@@ -1183,7 +1180,7 @@ export function workerConfigFromEnvironment(): WorkerConfig | undefined {
   return parseWorkerConfig();
 }
 
-export class SubagentRuntime {
+export class SubagentRuntime implements CommandSubagentRuntime {
   private semaphore = new Semaphore(1);
   private readonly broker: PermissionBroker;
   private readonly tasks = new Map<string, TaskRecord>();
@@ -1219,12 +1216,17 @@ export class SubagentRuntime {
     });
   }
 
+  getTasks(): TaskRecord[] {
+    return [...this.tasks.values()];
+  }
+
+  primaryAgentName(): string | undefined {
+    return this.primaryAgent?.name;
+  }
+
   register(): void {
     this.pi.registerTool(this.createTaskTool());
-    this.pi.registerCommand('landstrip', {
-      description: 'Manage Landstrip agents, tasks, sandbox, and settings',
-      handler: async (args, ctx) => this.openLandstrip(args, ctx),
-    });
+    registerLandstripCommands(this.pi, this, this.integration);
     this.pi.registerShortcut('ctrl+shift+a', {
       description: 'Cycle to the next primary agent',
       handler: async (ctx) => this.cyclePrimaryAgent(ctx),
@@ -1344,7 +1346,7 @@ export class SubagentRuntime {
     if (nextTools.join('\0') !== activeTools.join('\0')) this.pi.setActiveTools(nextTools);
   }
 
-  private async openLandstrip(args: string, ctx: ExtensionContext): Promise<void> {
+  async openLandstrip(args: string, ctx: ExtensionContext): Promise<void> {
     if (ctx.mode !== 'tui') {
       ctx.ui.notify('Agent management is available in TUI mode', 'warning');
       return;
@@ -3395,7 +3397,7 @@ export class SubagentRuntime {
     }));
   }
 
-  private deleteTasks(taskIds: readonly string[], ctx: ExtensionContext): number {
+  deleteTasks(taskIds: readonly string[], ctx: ExtensionContext): number {
     let deleted = 0;
     for (const taskId of taskIds) {
       const task = this.tasks.get(taskId);

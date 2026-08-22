@@ -954,6 +954,8 @@ export interface LandstripIntegration extends PiLandstripRuntimeV2 {
   ): Promise<FilesystemToolAuthorization>;
   /** Register the integration's tools, events, flags, and commands with Pi. */
   register(pi: ExtensionAPI): void;
+  /** Return the active Pi extension context, when a session is running. */
+  getExtensionContext(): ExtensionContext | undefined;
   /** Publish an integration lifecycle event from an embedded runtime. */
   emit(event: LandstripEvent): void;
   /** Callbacks for querying and toggling sandbox state. */
@@ -2767,6 +2769,7 @@ function createLandstripIntegrationWithPrompts(
   const integration: LandstripIntegration = {
     version: LANDSTRIP_RUNTIME_VERSION,
     getContext,
+    getExtensionContext: () => activeContext,
     registerShellProvider,
     registerPermissionAskProvider,
     resolvePermissionAsk,
