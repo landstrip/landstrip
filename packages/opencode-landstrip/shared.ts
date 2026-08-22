@@ -482,7 +482,7 @@ export function discoveryFilePath(baseDirectory: string): string {
   return join(discoveryDir(), `port-${directoryHash(baseDirectory)}.json`);
 }
 
-// /sandbox toggles the persisted `enabled` flag. Write it where the setting
+// /landstrip toggles the persisted `enabled` flag. Write it where the setting
 // already lives — the project config if it sets `enabled`, otherwise the global
 // config — and return the scope written so the UI can report it.
 export function sandboxConfigTarget(baseDirectory: string): {

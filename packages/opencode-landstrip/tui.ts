@@ -147,9 +147,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
       priority: 1000,
       bindings: [
         { key: 'left', desc: 'Previous permission option', group: 'Sandbox', cmd: () => move(-1) },
-        { key: 'h', desc: 'Previous permission option', group: 'Sandbox', cmd: () => move(-1) },
         { key: 'right', desc: 'Next permission option', group: 'Sandbox', cmd: () => move(1) },
-        { key: 'l', desc: 'Next permission option', group: 'Sandbox', cmd: () => move(1) },
         { key: 'return', desc: 'Select permission option', group: 'Sandbox', cmd: submit },
         { key: 'escape', desc: 'Reject permission', group: 'Sandbox', cmd: props.onCancel },
         {
@@ -690,58 +688,152 @@ const tui: TuiPlugin = async (api, options, meta) => {
     refreshPermissionPresentation,
   );
 
-  // /sandbox toggles the persisted `enabled` flag. The server reads
-  // sandbox.json on every tool call, so the toggle takes effect on the next
-  // command without any cross-process signalling.
-  const showSandbox = () => {
+  const [landstripOpen, setLandstripOpen] = createSignal(false);
+  const [confirmingDisable, setConfirmingDisable] = createSignal(false);
+  const [sandboxRevision, setSandboxRevision] = createSignal(0);
+  let unregisterLandstripKeys: (() => void) | undefined;
+  let popLandstripMode: (() => void) | undefined;
+
+  const closeLandstrip = () => {
+    unregisterLandstripKeys?.();
+    popLandstripMode?.();
+    unregisterLandstripKeys = undefined;
+    popLandstripMode = undefined;
+    setConfirmingDisable(false);
+    setLandstripOpen(false);
+  };
+  const toggleLandstrip = () => {
     const directory = api.state.path.directory || process.cwd();
     const config = loadConfig(directory, optionOverrides);
-    const next = !config.enabled;
-    const target = sandboxConfigTarget(directory);
-    const message = [
-      `Sandbox is ${config.enabled ? 'enabled' : 'disabled'}.`,
-      `Network: ${config.network.allowNetwork ? 'open' : 'proxied'}`,
-      `Change: ${target.scope} config at ${formatPath(target.path, directory)}`,
-    ].join('\n');
-
-    // No `clear()` in onConfirm: the host pops the dialog itself, and its
-    // `clear()` re-invokes onClose, which would recurse and freeze the TUI.
-    api.ui.dialog.replace(() =>
-      api.ui.DialogConfirm({
-        title: next ? 'Enable sandbox?' : 'Disable sandbox?',
-        message,
-        onConfirm: () => {
-          const scope = setSandboxConfigEnabled(directory, next);
-          refreshSandboxStatus?.();
-          api.ui.toast({
-            title: 'Sandbox',
-            message: `Sandbox ${next ? 'enabled' : 'disabled'} (${scope} config)`,
-            variant: next ? 'success' : 'warning',
-          });
-        },
-      }),
-    );
+    if (config.enabled && !confirmingDisable()) {
+      setConfirmingDisable(true);
+      return;
+    }
+    setConfirmingDisable(false);
+    const enabled = !config.enabled;
+    const scope = setSandboxConfigEnabled(directory, enabled);
+    refreshSandboxStatus?.();
+    api.ui.toast({
+      title: 'Landstrip',
+      message: `Sandbox ${enabled ? 'enabled' : 'disabled'} (${scope} config)`,
+      variant: enabled ? 'success' : 'warning',
+    });
   };
+  const cancelLandstrip = () => {
+    if (confirmingDisable()) setConfirmingDisable(false);
+    else closeLandstrip();
+  };
+
+  function LandstripPane() {
+    const theme = api.theme.current;
+    const dimensions = useTerminalDimensions();
+
+    const row = (label: string, value: string) =>
+      jsxs('box', {
+        flexDirection: 'row',
+        paddingLeft: 2,
+        paddingRight: 2,
+        children: [
+          jsx('text', { fg: theme.textMuted, width: 22, children: label }),
+          jsx('text', { fg: theme.text, flexGrow: 1, wrapMode: 'word', children: value }),
+        ],
+      });
+
+    return Portal({
+      get children() {
+        if (!landstripOpen()) return null;
+        sandboxRevision();
+        const directory = api.state.path.directory || process.cwd();
+        const config = loadConfig(directory, optionOverrides);
+        const target = sandboxConfigTarget(directory);
+        const values = (items: readonly string[]) => items.join(', ') || 'none';
+        const status = config.enabled ? 'Active' : 'Disabled by configuration';
+        return jsxs('box', {
+          position: 'absolute',
+          zIndex: 4000,
+          bottom: 0,
+          left: 0,
+          right: 0,
+          get height() {
+            return Math.min(22, Math.max(12, dimensions().height - 2));
+          },
+          flexDirection: 'column',
+          border: ['top'],
+          borderColor: theme.primary,
+          backgroundColor: theme.backgroundPanel,
+          children: [
+            jsxs('box', {
+              flexDirection: 'row',
+              paddingLeft: 2,
+              paddingRight: 2,
+              paddingTop: 1,
+              paddingBottom: 1,
+              justifyContent: 'space-between',
+              children: [
+                jsx('text', { fg: theme.primary, children: 'Landstrip' }),
+                jsx('text', {
+                  fg: config.enabled ? theme.success : theme.warning,
+                  children: status,
+                }),
+              ],
+            }),
+            row('Network', config.network.allowNetwork ? 'Unrestricted' : 'Proxied'),
+            row('Allowed Domains', values(config.network.allowedDomains)),
+            row('Denied Domains', values(config.network.deniedDomains)),
+            row('Allowed Reads', values(config.filesystem.allowRead)),
+            row('Denied Reads', values(config.filesystem.denyRead)),
+            row('Allowed Writes', values(config.filesystem.allowWrite)),
+            row('Denied Writes', values(config.filesystem.denyWrite)),
+            row('Configuration Scope', target.scope === 'project' ? 'Project' : 'Global'),
+            row('Configuration File', formatPath(target.path, directory)),
+            jsx('box', { flexGrow: 1 }),
+            jsx('text', {
+              fg: confirmingDisable() ? theme.error : theme.textMuted,
+              marginLeft: 2,
+              marginRight: 2,
+              marginBottom: 1,
+              children: confirmingDisable()
+                ? 'Disable the sandbox? Commands will run without OS isolation.  Enter confirm · Esc cancel'
+                : `Enter ${config.enabled ? 'disable' : 'enable'} · Esc close`,
+            }),
+          ],
+        });
+      },
+    });
+  }
+
+  const showLandstrip = () => {
+    if (landstripOpen()) return;
+    setLandstripOpen(true);
+    popLandstripMode = api.mode.push('modal');
+    unregisterLandstripKeys = api.keymap.registerLayer({
+      priority: 1000,
+      bindings: [
+        { key: 'return', desc: 'Toggle sandbox', group: 'Landstrip', cmd: toggleLandstrip },
+        { key: 'escape', desc: 'Close Landstrip', group: 'Landstrip', cmd: cancelLandstrip },
+      ],
+    });
+  };
+  api.lifecycle.onDispose(closeLandstrip);
 
   api.keymap.registerLayer({
     commands: [
       {
         namespace: 'palette',
-        name: 'sandbox',
-        title: 'Sandbox',
-        desc: 'Inspect and toggle the sandbox',
-        category: 'Sandbox',
+        name: 'landstrip',
+        title: 'Landstrip',
+        desc: 'Manage the Landstrip sandbox',
+        category: 'Landstrip',
         suggested: true,
-        slash: { name: 'sandbox' },
-        slashName: 'sandbox',
-        run: showSandbox,
+        slash: { name: 'landstrip' },
+        slashName: 'landstrip',
+        run: showLandstrip,
       },
     ],
   });
 
   // Persistent status badge in the prompt area.
   try {
-    const [sandboxRevision, setSandboxRevision] = createSignal(0);
     const statusBadge = (ctx: TuiSlotContext) => {
       sandboxRevision();
       const directory = api.state.path.directory || process.cwd();
@@ -759,6 +851,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
 
     const statusSlot: TuiSlotPlugin = {
       slots: {
+        app: () => jsx(LandstripPane, {}),
         home_prompt_right: (ctx) => statusBadge(ctx),
         session_prompt: (_ctx, props) => renderSessionPrompt(props),
         session_prompt_right: (ctx) => statusBadge(ctx),
@@ -767,7 +860,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     api.slots.register(statusSlot);
     refreshSandboxStatus = () => setSandboxRevision((revision) => revision + 1);
   } catch {
-    // Solid runtime unavailable on this host — skip the status badge.
+    // Solid runtime unavailable on this host — skip the pane and status badge.
   }
 
   // First-run onboarding: a single quiet pointer to the default-strict policy
@@ -777,7 +870,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     api.kv.set('onboarded', true);
     api.ui.toast({
       title: 'Sandbox active',
-      message: 'Landstrip sandbox is on. Run /sandbox to inspect it.',
+      message: 'Landstrip sandbox is on. Run /landstrip to inspect it.',
       variant: 'info',
       duration: 8000,
     });
