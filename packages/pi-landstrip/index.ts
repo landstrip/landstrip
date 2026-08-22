@@ -1790,6 +1790,7 @@ function createLandstripIntegrationWithPrompts(
             !line.toLowerCase().startsWith('proxy-connection:') &&
             !line.toLowerCase().startsWith('proxy-authorization:'),
         )
+        .map((line) => (line.toLowerCase().startsWith('host:') ? `Host: ${url.host}` : line))
         .join('\r\n');
       const resolved = await resolveProxyEndpoint(url.hostname);
       let settled = false;
