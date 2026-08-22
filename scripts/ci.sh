@@ -65,10 +65,10 @@ cp "target/debug/$binary_name" "npm/$host_platform/bin/$binary_name"
 chmod 755 "npm/$host_platform/bin/$binary_name" 2>/dev/null || true
 
 printf '==> npm install local platform package\n'
-tarball="$($NPM pack . --silent)"
+tarball="$($NPM pack ./packages/landstrip --silent)"
 $NPM install --package-lock=false --ignore-scripts --no-save "./$tarball" "./npm/$host_platform"
 rm -f "$tarball"
-$NODE bin/landstrip.js --version >/dev/null
+$NODE packages/landstrip/bin/landstrip.js --version >/dev/null
 
 export PATH="$repo_root/target/debug:$PATH"
 

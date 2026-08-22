@@ -23,7 +23,7 @@ for (const workspace of workspaces) {
   const parent = workspace.slice(0, -2);
   for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
     const packageDir = `${parent}/${entry.name}`;
-    if (entry.isDirectory() && fs.existsSync(`${packageDir}/package.json`)) {
+    if (entry.isDirectory() && entry.name !== "landstrip" && fs.existsSync(`${packageDir}/package.json`)) {
       console.log(packageDir);
     }
   }
@@ -67,7 +67,7 @@ cleanup_local_root() {
 }
 
 if ((local_root)); then
-  tarball="$(npm pack . --silent)"
+  tarball="$(npm pack ./packages/landstrip --silent)"
   platform_package="npm/$(node -p '`${process.platform}-${process.arch}`')"
   [[ -d "$platform_package" ]] || {
     printf 'no local binary package for %s\n' "$platform_package" >&2

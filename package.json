@@ -1,7 +1,8 @@
 {
-  "name": "@landstrip/landstrip",
+  "name": "landstrip-monorepo",
   "version": "0.18.35",
-  "description": "Sandbox runner using Landlock, Seatbelt, and AppContainer",
+  "private": true,
+  "description": "Monorepo for Landstrip sandbox and extensions",
   "license": "Apache-2.0 AND LGPL-2.1-or-later",
   "homepage": "https://github.com/landstrip/landstrip#readme",
   "repository": {
@@ -10,42 +11,6 @@
   },
   "bugs": {
     "url": "https://github.com/landstrip/landstrip/issues"
-  },
-  "main": "lib/index.js",
-  "types": "lib/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./lib/index.d.ts",
-      "default": "./lib/index.js"
-    },
-    "./shared": {
-      "types": "./lib/shared.d.ts",
-      "default": "./lib/shared.js"
-    }
-  },
-  "bin": {
-    "landstrip": "bin/landstrip.js"
-  },
-  "files": [
-    "bin",
-    "lib",
-    "README.md",
-    "LICENSE-APACHE-2.0",
-    "LICENSE-LGPL-2.1"
-  ],
-  "optionalDependencies": {
-    "@landstrip/landstrip-darwin-arm64": "0.18.35",
-    "@landstrip/landstrip-darwin-x64": "0.18.35",
-    "@landstrip/landstrip-linux-x64": "0.18.35",
-    "@landstrip/landstrip-linux-arm64": "0.18.35",
-    "@landstrip/landstrip-win32-x64": "0.18.35",
-    "@landstrip/landstrip-win32-arm64": "0.18.35"
-  },
-  "publishConfig": {
-    "access": "public"
-  },
-  "engines": {
-    "node": ">=18"
   },
   "workspaces": [
     "packages/*"

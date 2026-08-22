@@ -38,6 +38,7 @@ release_files=(
   Cargo.lock
   package.json
   package-lock.json
+  packages/landstrip/package.json
   npm/darwin-arm64/package.json
   npm/darwin-x64/package.json
   npm/linux-x64/package.json
@@ -116,7 +117,7 @@ const fs = require('node:fs');
 
 const [nextVersion, ...packageDirs] = process.argv.slice(2);
 const corePackagePaths = [
-  'package.json',
+  'packages/landstrip/package.json',
   'npm/darwin-arm64/package.json',
   'npm/darwin-x64/package.json',
   'npm/linux-x64/package.json',
@@ -138,6 +139,9 @@ for (const [, data] of corePackages.slice(1)) {
 for (const [packagePath, data] of corePackages) {
   fs.writeFileSync(packagePath, `${JSON.stringify(data, null, 2)}\n`);
 }
+const rootData = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+rootData.version = nextVersion;
+fs.writeFileSync('package.json', `${JSON.stringify(rootData, null, 2)}\n`);
 
 const landstripDependency = '@landstrip/landstrip';
 const landstripRange = `^${nextVersion}`;
@@ -170,8 +174,11 @@ const rootLockPath = 'package-lock.json';
 const rootLock = JSON.parse(fs.readFileSync(rootLockPath, 'utf8'));
 rootLock.version = nextVersion;
 rootLock.packages[''].version = nextVersion;
-for (const packageName of platformDependencies) {
-  rootLock.packages[''].optionalDependencies[packageName] = nextVersion;
+if (rootLock.packages['packages/landstrip']) {
+  rootLock.packages['packages/landstrip'].version = nextVersion;
+  for (const packageName of platformDependencies) {
+    rootLock.packages['packages/landstrip'].optionalDependencies[packageName] = nextVersion;
+  }
 }
 updateExtensionLock(rootLock);
 

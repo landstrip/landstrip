@@ -31,7 +31,9 @@ describe('package metadata', () => {
   it('matches the Landstrip release', () => {
     const extensionPackage = readJson<PackageJson>(new URL('./package.json', import.meta.url));
     const extensionLock = readJson<PackageLock>(new URL('./package-lock.json', import.meta.url));
-    const landstripPackage = readJson<PackageJson>(new URL('../../package.json', import.meta.url));
+    const landstripPackage = readJson<PackageJson>(
+      new URL('../landstrip/package.json', import.meta.url),
+    );
     const version = landstripPackage.version;
     const platformDependencies = Object.keys(landstripPackage.optionalDependencies ?? {});
 

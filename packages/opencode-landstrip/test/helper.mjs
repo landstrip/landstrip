@@ -28,7 +28,7 @@ export async function installLandstripMock(tempDir, source) {
     }),
   );
   await writeFile(join(directory, 'index.mjs'), source);
-  const shared = await readFile(join(packageRoot, '..', '..', 'lib', 'shared.js'), 'utf8');
+  const shared = await readFile(join(packageRoot, '..', 'landstrip', 'lib', 'shared.js'), 'utf8');
   await writeFile(join(directory, 'shared.js'), shared);
   return directory;
 }

@@ -57,7 +57,7 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
   || die "not inside a Git repository"
 cd "$repo_root"
 
-version="$("$NODE" -p "require('$repo_root/package.json').version")"
+version="$("$NODE" -p "require('$repo_root/packages/landstrip/package.json').version")"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid package.json version: $version"
 
 cargo_version="$(

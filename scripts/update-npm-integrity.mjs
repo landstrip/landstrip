@@ -11,7 +11,7 @@ if (!/^\d+\.\d+\.\d+$/.test(version ?? "") || extensionDirs.length === 0) {
 }
 
 const npm = process.env.NPM || "npm";
-const rootPackageData = JSON.parse(fs.readFileSync("package.json", "utf8"));
+const rootPackageData = JSON.parse(fs.readFileSync("packages/landstrip/package.json", "utf8"));
 const landstripPackage = rootPackageData.name;
 const platformPackages = Object.keys(rootPackageData.optionalDependencies ?? {});
 if (platformPackages.length !== 6) {

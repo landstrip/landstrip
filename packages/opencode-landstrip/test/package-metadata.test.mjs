@@ -15,7 +15,7 @@ function assertLockedPackage(lock, packageName, version) {
 test('package metadata matches the Landstrip release', () => {
   const extensionPackage = readJson(new URL('../package.json', import.meta.url));
   const extensionLock = readJson(new URL('../package-lock.json', import.meta.url));
-  const landstripPackage = readJson(new URL('../../../package.json', import.meta.url));
+  const landstripPackage = readJson(new URL('../../landstrip/package.json', import.meta.url));
   const version = landstripPackage.version;
   const platformDependencies = Object.keys(landstripPackage.optionalDependencies ?? {});
 
