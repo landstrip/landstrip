@@ -1649,12 +1649,12 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(logs).not.toContain('Inspect this child session.');
   expect(logs).toContain('2 tool calls · 1.0s');
   expect(logs).toContain('2 turns in:2.0k out:345 R500 W50 $0.0143');
-  expect(logs).toContain('Enter steer · F follow · Esc tasks');
+  expect(logs).toContain('Enter steer  ·  F follow  ·  Esc tasks');
   component?.handleInput('\r');
   expect(component?.render(96).join('\n')).toContain('Steer ›');
   component?.handleInput('x');
   component?.handleInput('\x1b');
-  expect(component?.render(96).join('\n')).toContain('Enter steer · F follow · Esc tasks');
+  expect(component?.render(96).join('\n')).toContain('Enter steer  ·  F follow  ·  Esc tasks');
   component?.handleInput('\r');
   component?.handleInput('\x1b[200~Check tests first🧪\x1b[201~');
   expect(component?.render(96).join('\n')).toContain('Steer › Check tests first🧪');
@@ -1758,12 +1758,12 @@ test('inspects and navigates persisted child sessions without switching sessions
   component?.handleInput('\t');
   const projectSettings = component?.render(96).join('\n') ?? '';
   expect(projectSettings).toContain('Overview  [Settings]');
-  expect(projectSettings).toMatch(/Maximum Subagents\s+\[ 1 \]/);
-  expect(projectSettings).toMatch(/Filesystem Tool Policy\s+\[ host \]/);
+  // Unset project values render the effective Global one.
+  expect(projectSettings).toMatch(/Maximum Subagents\s+1 \(global\)/);
+  expect(projectSettings).toMatch(/Filesystem Tool Policy\s+host \(global\)/);
   expect(projectSettings).not.toContain('sandboxEnabled');
 
   component?.handleInput('\r');
-  expect(component?.render(96).join('\n')).toContain('Project Maximum Subagents · current 1');
   component?.handleInput('2');
   component?.handleInput('\r');
   await vi.waitFor(() => {
@@ -1771,9 +1771,10 @@ test('inspects and navigates persisted child sessions without switching sessions
     expect(settings.landstrip.maxSubagents).toBe(2);
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
+  // The editor pre-fills the current project value, so backspace clears the 2.
+  expect(component?.render(96).join('\n')).toMatch(/Maximum Subagents\s+2/);
   component?.handleInput('\r');
-  expect(component?.render(96).join('\n')).toContain('Project Maximum Subagents · current 2');
-  component?.handleInput('\x08');
+  component?.handleInput('\x7f');
   component?.handleInput('3');
   component?.handleInput('\r');
   await vi.waitFor(() => {
@@ -1782,35 +1783,50 @@ test('inspects and navigates persisted child sessions without switching sessions
     expect(component?.render(96).join('\n')).not.toContain('Saving…');
   });
 
+  // Submitting an empty editor clears the project override.
   component?.handleInput('\r');
-  component?.handleInput('\x08');
+  component?.handleInput('\x7f');
   component?.handleInput('\r');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.maxSubagents).toBeUndefined();
     expect(settings.landstrip.agent.review).toBeDefined();
-    expect(component?.render(96).join('\n')).not.toContain('Saving…');
+    expect(component?.render(96).join('\n')).toMatch(/Maximum Subagents\s+1 \(global\)/);
+  });
+
+  // Rejected input leaves the stored value untouched.
+  component?.handleInput('\r');
+  component?.handleInput('9');
+  component?.handleInput('9');
+  component?.handleInput('\r');
+  await vi.waitFor(() => {
+    const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+    expect(settings.landstrip.maxSubagents).toBeUndefined();
+    expect(component?.render(96).join('\n')).toMatch(/Maximum Subagents\s+1 \(global\)/);
   });
 
   component?.handleInput('\x1b[B');
   component?.handleInput('\r');
-  expect(component?.render(96).join('\n')).toContain(
-    'Project Filesystem Tool Policy · current host',
-  );
-  component?.handleInput('s');
+  const policyChoices = component?.render(96).join('\n') ?? '';
+  expect(policyChoices).toContain('Use Global (host)');
+  expect(policyChoices).toContain('Resolve paths inside the sandbox');
+  // inherit / host / sandbox, pre-selected on the inherited entry.
+  component?.handleInput('\x1b[B');
+  component?.handleInput('\x1b[B');
   component?.handleInput('\r');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.toolFilesystemPolicy).toBe('sandbox');
-    expect(component?.render(96).join('\n')).toMatch(/Filesystem Tool Policy\s+\[ sandbox \]/);
+    expect(component?.render(96).join('\n')).toMatch(/Filesystem Tool Policy\s+sandbox/);
   });
   component?.handleInput('\r');
-  component?.handleInput('\x08');
+  component?.handleInput('\x1b[A');
+  component?.handleInput('\x1b[A');
   component?.handleInput('\r');
   await vi.waitFor(() => {
     const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
     expect(settings.landstrip.toolFilesystemPolicy).toBeUndefined();
-    expect(component?.render(96).join('\n')).toMatch(/Filesystem Tool Policy\s+\[ host \]/);
+    expect(component?.render(96).join('\n')).toMatch(/Filesystem Tool Policy\s+host \(global\)/);
   });
 
   component?.handleInput('\x1b');
@@ -1821,6 +1837,478 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(component?.render(96).join('\n')).toContain('Follow: on');
   finishCustom?.();
   await direct;
+  vi.unstubAllEnvs();
+});
+
+test('refuses to open a project setting editor when the project is untrusted', async () => {
+  const cwd = temporaryDirectory();
+  const agentDir = temporaryDirectory();
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  writeFileSync(
+    join(agentDir, 'settings.json'),
+    JSON.stringify({ landstrip: { maxSubagents: 1 } }),
+  );
+  mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(join(cwd, '.pi', 'settings.json'), JSON.stringify({ landstrip: {} }));
+
+  let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  let finishCustom: (() => void) | undefined;
+  const pi = {
+    registerTool() {},
+    registerCommand(
+      name: string,
+      definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+    ) {
+      if (name === 'landstrip') command = definition.handler;
+    },
+    registerShortcut() {},
+    on() {},
+    getActiveTools: () => ['task'],
+    setActiveTools() {},
+    appendEntry() {},
+  } as unknown as ExtensionAPI;
+  new SubagentRuntime(pi, {} as LandstripIntegration).register();
+
+  const warnings: string[] = [];
+  const theme = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const ctx = {
+    cwd,
+    hasUI: true,
+    mode: 'tui',
+    isProjectTrusted: () => false,
+    sessionManager: SessionManager.create(cwd, join(cwd, 'sessions')),
+    ui: {
+      notify(message: string, level: string) {
+        if (level === 'warning') warnings.push(message);
+      },
+      setStatus() {},
+      setWidget() {},
+      custom(
+        factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => typeof component,
+      ) {
+        return new Promise<void>((resolve) => {
+          finishCustom = resolve;
+          component = factory({ requestRender() {} }, theme, undefined, resolve);
+        });
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  const running = command?.('settings', ctx);
+  expect(component?.render(96).join('\n')).toContain('Overview  [Settings]');
+
+  component?.handleInput('\r');
+  expect(warnings).toEqual(['Project settings require a trusted project']);
+  // The editor never opened, so the row still shows the inherited Global value.
+  expect(component?.render(96).join('\n')).toMatch(/Maximum Subagents\s+1 \(global\)/);
+  const settings = JSON.parse(readFileSync(join(cwd, '.pi', 'settings.json'), 'utf8'));
+  expect(settings.landstrip.maxSubagents).toBeUndefined();
+
+  finishCustom?.();
+  await running;
+  vi.unstubAllEnvs();
+});
+
+test('narrows the agent list to a typed query and restores it on escape', async () => {
+  const cwd = temporaryDirectory();
+  const agentDir = temporaryDirectory();
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  writeFileSync(
+    join(agentDir, 'settings.json'),
+    JSON.stringify({
+      landstrip: {
+        agent: {
+          alpha: { description: 'A', prompt: 'Work.', mode: 'subagent' },
+          beta: { description: 'B', prompt: 'Work.', mode: 'subagent' },
+          gamma: { description: 'G', prompt: 'Work.', mode: 'subagent' },
+        },
+      },
+    }),
+  );
+
+  let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  let finishCustom: (() => void) | undefined;
+  const pi = {
+    registerTool() {},
+    registerCommand(
+      name: string,
+      definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+    ) {
+      if (name === 'landstrip') command = definition.handler;
+    },
+    registerShortcut() {},
+    on() {},
+    getActiveTools: () => ['task'],
+    setActiveTools() {},
+    appendEntry() {},
+  } as unknown as ExtensionAPI;
+  new SubagentRuntime(pi, {} as LandstripIntegration).register();
+
+  const theme = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const ctx = {
+    cwd,
+    hasUI: true,
+    mode: 'tui',
+    isProjectTrusted: () => true,
+    sessionManager: SessionManager.create(cwd, join(cwd, 'sessions')),
+    ui: {
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+      custom(
+        factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => typeof component,
+      ) {
+        return new Promise<void>((resolve) => {
+          finishCustom = resolve;
+          component = factory({ requestRender() {} }, theme, undefined, resolve);
+        });
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  const running = command?.('subagent', ctx);
+  expect(component?.render(96).join('\n')).toContain('@beta');
+
+  component?.handleInput('/');
+  component?.handleInput('g');
+  component?.handleInput('a');
+  const filtered = component?.render(96).join('\n') ?? '';
+  // gamma matches g-a in order; the built-in general does too, beta does not.
+  expect(filtered).toContain('Filter ga');
+  expect(filtered).toContain('@gamma');
+  expect(filtered).not.toContain('@beta');
+  expect(filtered).not.toContain('@alpha');
+
+  // While the query is open the letters spell it out rather than firing E or X.
+  component?.handleInput('e');
+  expect(component?.render(96).join('\n')).toContain('Filter gae');
+  component?.handleInput('\x7f');
+  expect(component?.render(96).join('\n')).toContain('Filter ga');
+
+  // Enter keeps the query but hands the letter keys back to the actions.
+  component?.handleInput('\r');
+  const kept = component?.render(96).join('\n') ?? '';
+  expect(kept).toContain('Filter ga');
+  expect(kept).toContain('Esc clear filter');
+
+  // Esc clears the query instead of closing the dialog, so the full list returns.
+  component?.handleInput('\x1b');
+  const restored = component?.render(96).join('\n') ?? '';
+  expect(restored).not.toContain('Filter');
+  expect(restored).toContain('@beta');
+  expect(restored).toContain('@alpha');
+
+  finishCustom?.();
+  await running;
+  vi.unstubAllEnvs();
+});
+
+test('offers X delete only for an agent the project can actually delete', async () => {
+  const cwd = temporaryDirectory();
+  const agentDir = temporaryDirectory();
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  writeFileSync(
+    join(agentDir, 'settings.json'),
+    JSON.stringify({
+      landstrip: {
+        agent: { global0: { description: 'Global', prompt: 'Work.', mode: 'subagent' } },
+      },
+    }),
+  );
+  mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(
+    join(cwd, '.pi', 'settings.json'),
+    JSON.stringify({
+      landstrip: { agent: { local0: { description: 'Local', prompt: 'Work.', mode: 'subagent' } } },
+    }),
+  );
+
+  let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  let finishCustom: (() => void) | undefined;
+  const pi = {
+    registerTool() {},
+    registerCommand(
+      name: string,
+      definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+    ) {
+      if (name === 'landstrip') command = definition.handler;
+    },
+    registerShortcut() {},
+    on() {},
+    getActiveTools: () => ['task'],
+    setActiveTools() {},
+    appendEntry() {},
+  } as unknown as ExtensionAPI;
+  new SubagentRuntime(pi, {} as LandstripIntegration).register();
+
+  const theme = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const ctx = {
+    cwd,
+    hasUI: true,
+    mode: 'tui',
+    isProjectTrusted: () => true,
+    sessionManager: SessionManager.create(cwd, join(cwd, 'sessions')),
+    ui: {
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+      custom(
+        factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => typeof component,
+      ) {
+        return new Promise<void>((resolve) => {
+          finishCustom = resolve;
+          component = factory({ requestRender() {} }, theme, undefined, resolve);
+        });
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  const running = command?.('subagent', ctx);
+  // Sorted: explore, general, global0, local0, scout. Selection starts on the first.
+  const onBuiltIn = component?.render(96).join('\n') ?? '';
+  expect(onBuiltIn).toContain('\u203a @explore');
+  expect(onBuiltIn).not.toContain('X delete');
+
+  component?.handleInput('\x1b[B');
+  component?.handleInput('\x1b[B');
+  const onGlobal = component?.render(96).join('\n') ?? '';
+  // global0 lives in the global config, so deleting it from this project is not offered.
+  expect(onGlobal).toContain('\u203a @global0');
+  expect(onGlobal).not.toContain('X delete');
+
+  component?.handleInput('\x1b[B');
+  const onLocal = component?.render(96).join('\n') ?? '';
+  // local0 is declared in the project config, so deleting it here is real.
+  expect(onLocal).toContain('\u203a @local0');
+  expect(onLocal).toContain('X delete');
+
+  // Toggling global0 writes it into the project config, which makes it deletable.
+  // The hint has to notice, so the cache must be rebuilt when agents reload.
+  component?.handleInput('\x1b[A');
+  component?.handleInput(' ');
+  await vi.waitFor(() => {
+    const view = component?.render(96).join('\n') ?? '';
+    expect(view).toContain('\u203a @global0');
+    expect(view).toContain('X delete');
+  });
+
+  finishCustom?.();
+  await running;
+  vi.unstubAllEnvs();
+});
+
+test('reports the hidden remainder when an agent list is longer than the window', async () => {
+  const cwd = temporaryDirectory();
+  const agentDir = temporaryDirectory();
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  const agent = Object.fromEntries(
+    Array.from({ length: 10 }, (_unused, index) => [
+      `sub${index}`,
+      { description: `Agent ${index}`, prompt: 'Work.', mode: 'subagent' },
+    ]),
+  );
+  writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ landstrip: { agent } }));
+  mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(join(cwd, '.pi', 'settings.json'), JSON.stringify({ landstrip: {} }));
+
+  let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  let finishCustom: (() => void) | undefined;
+  const pi = {
+    registerTool() {},
+    registerCommand(
+      name: string,
+      definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+    ) {
+      if (name === 'landstrip') command = definition.handler;
+    },
+    registerShortcut() {},
+    on() {},
+    getActiveTools: () => ['task'],
+    setActiveTools() {},
+    appendEntry() {},
+  } as unknown as ExtensionAPI;
+  new SubagentRuntime(pi, {} as LandstripIntegration).register();
+
+  const theme = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const ctx = {
+    cwd,
+    hasUI: true,
+    mode: 'tui',
+    isProjectTrusted: () => true,
+    sessionManager: SessionManager.create(cwd, join(cwd, 'sessions')),
+    ui: {
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+      custom(
+        factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => typeof component,
+      ) {
+        return new Promise<void>((resolve) => {
+          finishCustom = resolve;
+          component = factory({ requestRender() {} }, theme, undefined, resolve);
+        });
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  // 10 configured agents plus the three built-ins.
+  const running = command?.('subagent', ctx);
+  const top = component?.render(96).join('\n') ?? '';
+  expect(top).toContain('1\u20137 of 13');
+  expect(top).toContain('@sub0');
+  expect(top).not.toContain('@sub9');
+
+  for (let press = 0; press < 12; press += 1) component?.handleInput('\x1b[B');
+  const bottom = component?.render(96).join('\n') ?? '';
+  // The window follows the cursor, so the last agent is on screen and the count is honest.
+  expect(bottom).toContain('7\u201313 of 13');
+  expect(bottom).toContain('@sub9');
+  expect(bottom).not.toContain('@sub0 ');
+
+  // The tab advertises the keys it binds, minus the ones this selection ignores.
+  // These agents come from the global config, so X would only warn and is not offered.
+  expect(bottom).toContain('Space toggle enabled  ·  E edit  ·  / filter  ·  Esc close');
+  expect(bottom).not.toContain('X delete');
+  expect(bottom).not.toContain('inherit global');
+  expect(bottom).not.toContain('set primary');
+
+  finishCustom?.();
+  await running;
+  vi.unstubAllEnvs();
+});
+
+test('gives a tall terminal a taller agent window', async () => {
+  const cwd = temporaryDirectory();
+  const agentDir = temporaryDirectory();
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  const agent = Object.fromEntries(
+    Array.from({ length: 10 }, (_unused, index) => [
+      `sub${index}`,
+      { description: `Agent ${index}`, prompt: 'Work.', mode: 'subagent' },
+    ]),
+  );
+  writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ landstrip: { agent } }));
+
+  let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  let finishCustom: (() => void) | undefined;
+  const pi = {
+    registerTool() {},
+    registerCommand(
+      name: string,
+      definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+    ) {
+      if (name === 'landstrip') command = definition.handler;
+    },
+    registerShortcut() {},
+    on() {},
+    getActiveTools: () => ['task'],
+    setActiveTools() {},
+    appendEntry() {},
+  } as unknown as ExtensionAPI;
+  new SubagentRuntime(pi, {} as LandstripIntegration).register();
+
+  const theme = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const terminal = { rows: 24 };
+  const ctx = {
+    cwd,
+    hasUI: true,
+    mode: 'tui',
+    isProjectTrusted: () => true,
+    sessionManager: SessionManager.create(cwd, join(cwd, 'sessions')),
+    ui: {
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+      custom(
+        factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => typeof component,
+      ) {
+        return new Promise<void>((resolve) => {
+          finishCustom = resolve;
+          component = factory({ requestRender() {}, terminal }, theme, undefined, resolve);
+        });
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  const running = command?.('subagent', ctx);
+  // 24 rows leaves no room beyond the floor: 7 of the 13 agents, remainder reported.
+  const small = component?.render(96).join('\n') ?? '';
+  expect(small).toContain('1–7 of 13');
+
+  // 50 rows gives the overlay 35, and 35 minus the chrome fits all 13 agents.
+  terminal.rows = 50;
+  const tall = component?.render(96).join('\n') ?? '';
+  expect(tall).not.toContain('of 13');
+  expect(tall).toContain('@sub0');
+  expect(tall).toContain('@sub9');
+
+  finishCustom?.();
+  await running;
+  vi.unstubAllEnvs();
+});
+
+test('advertises only the keys an untrusted project can use', async () => {
+  const cwd = temporaryDirectory();
+  const agentDir = temporaryDirectory();
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ landstrip: {} }));
+
+  let command: ((args: string, ctx: ExtensionContext) => Promise<void>) | undefined;
+  let component: { render(width: number): string[]; handleInput(data: string): void } | undefined;
+  let finishCustom: (() => void) | undefined;
+  const pi = {
+    registerTool() {},
+    registerCommand(
+      name: string,
+      definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
+    ) {
+      if (name === 'landstrip') command = definition.handler;
+    },
+    registerShortcut() {},
+    on() {},
+    getActiveTools: () => ['task'],
+    setActiveTools() {},
+    appendEntry() {},
+  } as unknown as ExtensionAPI;
+  new SubagentRuntime(pi, {} as LandstripIntegration).register();
+
+  const theme = { fg: (_color: string, value: string) => value, bold: (value: string) => value };
+  const ctx = {
+    cwd,
+    hasUI: true,
+    mode: 'tui',
+    isProjectTrusted: () => false,
+    sessionManager: SessionManager.create(cwd, join(cwd, 'sessions')),
+    ui: {
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+      custom(
+        factory: (tui: unknown, theme: unknown, kb: unknown, done: () => void) => typeof component,
+      ) {
+        return new Promise<void>((resolve) => {
+          finishCustom = resolve;
+          component = factory({ requestRender() {} }, theme, undefined, resolve);
+        });
+      },
+    },
+  } as unknown as ExtensionContext;
+
+  const running = command?.('subagent', ctx);
+  const view = component?.render(96).join('\n') ?? '';
+  // Every mutating key notifies and does nothing here, so none of them are offered.
+  expect(view).toContain('Esc close');
+  expect(view).not.toContain('toggle enabled');
+  expect(view).not.toContain('E edit');
+  expect(view).not.toContain('X delete');
+
+  finishCustom?.();
+  await running;
   vi.unstubAllEnvs();
 });
 

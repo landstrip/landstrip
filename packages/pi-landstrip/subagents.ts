@@ -28,9 +28,14 @@ import {
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import {
-  decodeKittyPrintable,
+  fuzzyFilter,
   matchesKey,
   Input,
+  type TUI,
+  type SelectItem,
+  SelectList,
+  type SettingItem,
+  SettingsList,
   Text,
   truncateToWidth,
   visibleWidth,
@@ -97,6 +102,21 @@ const MAX_DEPTH = 3;
 const packageDir = dirname(fileURLToPath(import.meta.url));
 const MAX_TASK_OUTPUT_BYTES = 64 * 1024;
 const INSPECTOR_BODY_LINES = 16;
+/** Fewest list rows each tab shows; taller terminals get more via listRowBudget. */
+const AGENT_LIST_ROWS = 7;
+const TASK_LIST_ROWS = 11;
+/** Must match the overlayOptions maxHeight the landstrip dialog is opened with. */
+const OVERLAY_HEIGHT_RATIO = 0.7;
+/** Measured rows the agents tab draws around its list: title, tabs, table header,
+ * selection details with a typical permission block, and the key hints. */
+const AGENT_TAB_CHROME_ROWS = 15;
+/** Measured rows the tasks tab draws around its list. */
+const TASK_TAB_CHROME_ROWS = 8;
+/** Grow a list to fill the overlay on tall terminals, never below its floor. */
+function listRowBudget(terminalRows: number | undefined, floor: number, chrome: number): number {
+  if (!terminalRows) return floor;
+  return Math.max(floor, Math.floor(terminalRows * OVERLAY_HEIGHT_RATIO) - chrome);
+}
 const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
 const AGENTS_HELP_ROWS = [
   ['Tab', 'Next tab'],
@@ -108,16 +128,15 @@ const AGENTS_HELP_ROWS = [
   ['X', 'Delete selected agent or task sessions'],
   ['E', 'Edit project agent'],
   ['I', 'Inherit global agent state'],
+  ['/', 'Filter agents by name'],
   ['F', 'Toggle task log follow'],
   ['Page Up / Down', 'Scroll task output by page'],
   ['Home / End', 'Jump to task output boundary'],
   ['Backspace', 'Open parent task'],
 ] as const;
 
-interface SettingsEditor {
-  kind: 'maxSubagents' | 'toolFilesystemPolicy';
-  value: string;
-}
+/** Sentinel settings value that clears the project override so Global applies. */
+const INHERIT = 'inherit';
 
 interface TaskListAction {
   readonly type: 'delete';
@@ -213,9 +232,32 @@ function readPiPackage(pkgPath: string): PiPackage | undefined {
   }
 }
 
-function isControlChar(char: string): boolean {
-  const code = char.charCodeAt(0);
-  return code < 32 || code === 0x7f || (code >= 0x80 && code <= 0x9f);
+/**
+ * Scroll window that keeps `selected` visible and reports what is hidden, so a
+ * truncated list never looks complete.
+ */
+function listWindow<T>(
+  items: readonly T[],
+  selected: number,
+  rows: number,
+): { shown: readonly T[]; start: number; status: string | undefined } {
+  const start = Math.max(0, Math.min(selected - Math.floor(rows / 2), items.length - rows));
+  const shown = items.slice(start, start + rows);
+  return {
+    shown,
+    start,
+    status:
+      items.length > rows ? `${start + 1}–${start + shown.length} of ${items.length}` : undefined,
+  };
+}
+
+/** Per-frame drawing context handed to each tab renderer. */
+interface TabFrame {
+  contentWidth: number;
+  tabs: string;
+  pane: (lines: string[]) => string[];
+  pad: (value: string, cellWidth: number) => string;
+  listValue: (values: readonly string[]) => string;
 }
 
 const taskParameters = Type.Object({
@@ -1361,15 +1403,43 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       .filter((agent) => !agent.hidden)
       .sort((left, right) => left.name.localeCompare(right.name));
     let disabledOverrides = loadAgentDisabledOverrides(ctx.cwd, projectTrusted);
+    // canDeleteProjectAgent reads the project config, so the answer is cached per
+    // agent reload rather than recomputed for every frame the hint row is drawn.
+    const deletableAgents = new Set<string>();
+    const refreshDeletableAgents = (): void => {
+      deletableAgents.clear();
+      if (!projectTrusted) return;
+      for (const agent of agents) {
+        if (canDeleteProjectAgent(ctx.cwd, agent)) deletableAgents.add(agent.name);
+      }
+    };
+    refreshDeletableAgents();
     let overview = this.integration.sandboxCallbacks?.overview?.(ctx.cwd, projectTrusted);
     let maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
     let policySettings = loadToolFilesystemPolicySettings(ctx.cwd, projectTrusted);
-    let selectedSetting = 0;
-    let settingEditor: SettingsEditor | undefined;
+    let settingsList: SettingsList | undefined;
     let saving = false;
     let confirmingSandboxDisable = false;
 
     type LandstripTab = 'overview' | 'settings' | 'primary' | 'subagent' | 'tasks' | 'log' | 'help';
+    const TAB_ORDER: readonly LandstripTab[] = [
+      'overview',
+      'settings',
+      'primary',
+      'subagent',
+      'tasks',
+      'log',
+      'help',
+    ];
+    const TAB_LABELS: Record<LandstripTab, string> = {
+      overview: 'Overview',
+      settings: 'Settings',
+      primary: 'Primary',
+      subagent: 'Subagent',
+      tasks: 'Tasks',
+      log: 'Log',
+      help: 'Help',
+    };
 
     let tab: LandstripTab = 'overview';
     let selectedTask = 0;
@@ -1402,10 +1472,24 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       follow = true;
     }
 
-    const agentsForTab = (): AgentDefinition[] =>
-      agents.filter((agent) =>
+    let agentFilter = '';
+    let filteringAgents = false;
+    const agentsForTab = (): AgentDefinition[] => {
+      const listed = agents.filter((agent) =>
         tab === 'subagent' ? agentSupportsMode(agent, 'subagent') : isPrimaryAgent(agent),
       );
+      if (!agentFilter) return listed;
+      return fuzzyFilter(listed, agentFilter, (agent) => agent.name);
+    };
+    const setAgentFilter = (value: string): void => {
+      // The match set changes under the cursor, so keep the selection in range and
+      // pinned to the same agent when that agent survives the new query.
+      const selectedName = agentsForTab()[selectedAgent]?.name;
+      agentFilter = value;
+      const listed = agentsForTab();
+      const next = selectedName ? listed.findIndex((agent) => agent.name === selectedName) : 0;
+      selectedAgent = Math.max(0, Math.min(next < 0 ? 0 : next, listed.length - 1));
+    };
     let selectedAgent = Math.max(
       0,
       agentsForTab().findIndex((agent) => agent.name === this.primaryAgent?.name),
@@ -1423,6 +1507,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         .filter((agent) => !agent.hidden)
         .sort((left, right) => left.name.localeCompare(right.name));
       disabledOverrides = loadAgentDisabledOverrides(ctx.cwd, projectTrusted);
+      refreshDeletableAgents();
       const listedAgents = agentsForTab();
       const nextSelected = selectedName
         ? listedAgents.findIndex((agent) => agent.name === selectedName)
@@ -1459,39 +1544,464 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       }
     };
 
-    return ctx.ui.custom<void>(
-      (tui, theme, _keybindings, done) => ({
-        render: (width: number) => {
-          const contentWidth = Math.max(1, width - 2);
-          const pane = (lines: string[]) => [
-            paneTop(theme, width, 'Landstrip'),
-            ...lines.map((line) => paneRow(theme, width, line)),
-          ];
-          const pad = (value: string, cellWidth: number): string => {
-            const clipped = truncateToWidth(value, cellWidth);
-            return `${clipped}${' '.repeat(Math.max(0, cellWidth - visibleWidth(clipped)))}`;
-          };
-          const listValue = (values: readonly string[]): string => {
-            const value = values.join(', ') || 'none';
-            return truncateToWidth(value, Math.max(10, contentWidth - 20));
-          };
-          refreshTasks();
-          const tabLabels: Record<LandstripTab, string> = {
-            overview: 'Overview',
-            settings: 'Settings',
-            primary: 'Primary',
-            subagent: 'Subagent',
-            tasks: 'Tasks',
-            log: 'Log',
-            help: 'Help',
-          };
-          const tabs = dialogTabs(
-            theme,
-            ['Overview', 'Settings', 'Primary', 'Subagent', 'Tasks', 'Log', 'Help'],
-            tabLabels[tab],
-          );
+    const buildSettingsList = (
+      tui: TUI,
+      theme: Theme,
+      done: (result: void) => void,
+    ): SettingsList => {
+      if (settingsList) return settingsList;
+      // Only the project scope is editable here, so an unset project value shows the
+      // effective global one, matching what the runtime actually uses.
+      const settingValue = (
+        project: string | number | undefined,
+        global: string | number,
+      ): string => (project === undefined ? `${global} (global)` : String(project));
 
-          if (tab === 'overview') {
+      const syncSettingsList = (): void => {
+        settingsList?.updateValue(
+          'maxSubagents',
+          settingValue(maxSubagentsSettings.project, maxSubagentsSettings.global),
+        );
+        settingsList?.updateValue(
+          'toolFilesystemPolicy',
+          settingValue(policySettings.project, policySettings.global),
+        );
+      };
+
+      const saveSetting = (id: string, value: string): void => {
+        if (!projectTrusted) {
+          ctx.ui.notify('Project settings require a trusted project', 'warning');
+          syncSettingsList();
+          return;
+        }
+        let save: Promise<void>;
+        let notifyMessage: string;
+        if (id === 'maxSubagents') {
+          if (value === INHERIT || value === '') {
+            save = clearMaxSubagentsConfigForScope(ctx.cwd, 'project');
+            notifyMessage = 'Project maxSubagents inherits Global';
+          } else {
+            const parsed = Number(value);
+            if (
+              !/^\d+$/.test(value) ||
+              !Number.isSafeInteger(parsed) ||
+              parsed < 0 ||
+              parsed > MAX_SUBAGENTS
+            ) {
+              ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
+              syncSettingsList();
+              return;
+            }
+            save = setMaxSubagentsConfigForScope(ctx.cwd, parsed, 'project');
+            notifyMessage = `Project maxSubagents = ${parsed}`;
+          }
+        } else if (value === INHERIT) {
+          save = clearToolFilesystemPolicyConfigForScope(ctx.cwd, 'project');
+          notifyMessage = 'Project toolFilesystemPolicy inherits Global';
+        } else {
+          const policy: ToolFilesystemPolicy = value === 'host' ? 'host' : 'sandbox';
+          save = setToolFilesystemPolicyConfigForScope(ctx.cwd, policy, 'project');
+          notifyMessage = `Project toolFilesystemPolicy = ${policy}`;
+        }
+
+        saving = true;
+        tui.requestRender();
+        void save
+          .then(() => {
+            maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
+            policySettings = loadToolFilesystemPolicySettings(ctx.cwd, projectTrusted);
+            this.setMaxSubagents(maxSubagentsSettings.project ?? maxSubagentsSettings.global);
+            this.toolFilesystemPolicy = policySettings.project ?? policySettings.global;
+            ctx.ui.notify(notifyMessage, 'info');
+          })
+          .catch((error: unknown) =>
+            ctx.ui.notify(`Could not save setting: ${formatError(error)}`, 'error'),
+          )
+          .finally(() => {
+            saving = false;
+            syncSettingsList();
+            tui.requestRender();
+          });
+      };
+
+      const items: SettingItem[] = [
+        {
+          id: 'maxSubagents',
+          label: 'Maximum Subagents',
+          currentValue: settingValue(maxSubagentsSettings.project, maxSubagentsSettings.global),
+          description: 'Concurrent subagent tasks. Enter to edit, empty to inherit Global.',
+          submenu: (_currentValue, doneEditing) => {
+            const input = new Input();
+            input.focused = true;
+            // Typed rather than setValue() so the cursor lands after the prefill.
+            if (maxSubagentsSettings.project !== undefined) {
+              for (const char of String(maxSubagentsSettings.project)) input.handleInput(char);
+            }
+            input.onSubmit = (value) => doneEditing(value.trim() || INHERIT);
+            input.onEscape = () => doneEditing(undefined);
+            return input;
+          },
+        },
+        {
+          id: 'toolFilesystemPolicy',
+          label: 'Filesystem Tool Policy',
+          currentValue: settingValue(policySettings.project, policySettings.global),
+          description: 'How file tools resolve paths. Enter to choose.',
+          submenu: (_currentValue, doneEditing) => {
+            const options: SelectItem[] = [
+              {
+                value: INHERIT,
+                label: 'inherit',
+                description: `Use Global (${policySettings.global})`,
+              },
+              { value: 'host', label: 'host', description: 'Resolve paths on the host' },
+              {
+                value: 'sandbox',
+                label: 'sandbox',
+                description: 'Resolve paths inside the sandbox',
+              },
+            ];
+            const list = new SelectList(options, options.length, {
+              selectedPrefix: (text) => theme.fg('accent', text),
+              selectedText: (text) => theme.fg('accent', text),
+              description: (text) => theme.fg('dim', text),
+              scrollInfo: (text) => theme.fg('dim', text),
+              noMatch: (text) => theme.fg('dim', text),
+            });
+            list.setSelectedIndex(
+              options.findIndex((option) => option.value === (policySettings.project ?? INHERIT)),
+            );
+            list.onSelect = (item) => doneEditing(item.value);
+            list.onCancel = () => doneEditing(undefined);
+            return list;
+          },
+        },
+      ];
+      settingsList = new SettingsList(
+        items,
+        INSPECTOR_BODY_LINES,
+        {
+          label: (text, selected) => theme.fg(selected ? 'accent' : 'text', text),
+          value: (text, selected) => theme.fg(selected ? 'accent' : 'dim', text),
+          description: (text) => theme.fg('dim', text),
+          cursor: theme.fg('accent', '› '),
+          hint: (text) => theme.fg('dim', text),
+        },
+        saveSetting,
+        () => done(undefined),
+      );
+      return settingsList;
+    };
+
+    return ctx.ui.custom<void>(
+      (tui, theme, _keybindings, done) => {
+        const renderAgentsTab = (frame: TabFrame): string[] => {
+          const { tabs, pane, contentWidth, pad } = frame;
+          const listedAgents = agentsForTab();
+          const agentRows = listRowBudget(
+            (tui as Partial<TUI>).terminal?.rows,
+            AGENT_LIST_ROWS,
+            AGENT_TAB_CHROME_ROWS,
+          );
+          const { shown, start, status } = listWindow(listedAgents, selectedAgent, agentRows);
+          const nameWidth = Math.min(
+            20,
+            Math.max(5, ...listedAgents.map((agent) => visibleWidth(`@${agent.name}`))),
+          );
+          const modelWidth = Math.max(10, Math.min(24, Math.floor((contentWidth - 2) / 3)));
+          const enabledWidth = 13;
+          const runtimeWidth = Math.max(
+            12,
+            contentWidth - 2 - nameWidth - 1 - modelWidth - 1 - enabledWidth - 1,
+          );
+          const runtimeFor = (agent: AgentDefinition): string => {
+            const parts: string[] = [];
+            if (agent.name === this.primaryAgent?.name) parts.push('★ primary');
+            const byState = (state: TaskState): number =>
+              [...this.tasks.values()].filter(
+                (task) => task.agent === agent.name && task.state === state,
+              ).length;
+            const running = byState('running');
+            const queued = byState('queued');
+            if (running > 0) parts.push(`${running} running`);
+            if (queued > 0) parts.push(`${queued} queued`);
+            const rules = [...catalog.permissions, ...agent.permissions].length;
+            parts.push(rules > 0 ? `${rules} rules` : 'ask by default');
+            return parts.length > 0 ? parts.join(' · ') : '—';
+          };
+          const lines = [tabs, ''];
+          if (filteringAgents || agentFilter) {
+            lines.push(
+              `${theme.fg('accent', 'Filter')} ${agentFilter}${
+                filteringAgents ? theme.fg('accent', '\u2588') : ''
+              }`,
+            );
+          }
+          lines.push(
+            theme.fg(
+              'dim',
+              `  ${pad('Agent', nameWidth)} ${pad('Model', modelWidth)} ${pad(
+                'Enabled',
+                enabledWidth,
+              )} ${pad('Runtime', runtimeWidth)}`,
+            ),
+          );
+          for (const [offset, agent] of shown.entries()) {
+            const index = start + offset;
+            const selected = index === selectedAgent;
+            const cursor = selected ? theme.fg('accent', '›') : ' ';
+            const disabled = agent.disabled;
+            const deleting = confirmingDeleteAgent === agent.name;
+            const inherited = !disabledOverrides.project.has(agent.name);
+            const enabled = inherited
+              ? `inherited ${disabled ? 'off' : 'on'}`
+              : disabled
+                ? 'disabled'
+                : 'enabled';
+            const color = deleting ? 'error' : disabled ? 'muted' : 'text';
+            const plainName = pad(`@${agent.name}`, nameWidth);
+            const name = deleting
+              ? theme.fg('error', plainName)
+              : disabled
+                ? theme.fg('muted', plainName)
+                : colorizeAgentText(agent.color, plainName, (agentColor, text) =>
+                    theme.fg(agentColor as Parameters<Theme['fg']>[0], text),
+                  );
+            const runtime = runtimeFor(agent);
+            const line = `${cursor} ${name} ${theme.fg(
+              color,
+              pad(agent.model ?? 'current model', modelWidth),
+            )} ${theme.fg(
+              deleting ? 'error' : disabled ? 'warning' : color,
+              pad(enabled, enabledWidth),
+            )} ${theme.fg(disabled ? 'muted' : 'dim', pad(runtime, runtimeWidth))}`;
+            lines.push(agent.name === this.primaryAgent?.name ? theme.bold(line) : line);
+          }
+          if (listedAgents.length === 0) {
+            lines.push(
+              theme.fg(
+                'muted',
+                agentFilter
+                  ? `  No ${tab} agents match ${agentFilter}`
+                  : `  No ${tab} agents configured.`,
+              ),
+            );
+          }
+          if (status) lines.push(theme.fg('dim', `  ${status}`));
+
+          const agent = listedAgents[selectedAgent];
+          if (agent) {
+            lines.push(
+              '',
+              theme.fg(agent.disabled ? 'muted' : 'text', agent.description ?? 'No description'),
+            );
+            const details = [
+              agent.source,
+              agent.variant ? `variant ${agent.variant}` : undefined,
+              agent.steps ? `${agent.steps} steps` : undefined,
+            ].filter(Boolean);
+            if (details.length > 0) lines.push(theme.fg('dim', details.join(' · ')));
+            const permissions = [...catalog.permissions, ...agent.permissions];
+            lines.push(theme.fg('dim', 'Permissions'));
+            if (permissions.length === 0) lines.push(`  ${theme.fg('muted', 'default: ask')}`);
+            for (const rule of permissions.slice(0, 4)) {
+              const color =
+                rule.action === 'deny' ? 'error' : rule.action === 'allow' ? 'success' : 'warning';
+              lines.push(
+                `  ${theme.fg('text', `${rule.permission}:${rule.pattern}`)} ${theme.fg('dim', '→')} ${theme.fg(color, rule.action)}`,
+              );
+            }
+            if (permissions.length > 4) {
+              lines.push(`  ${theme.fg('muted', `… ${permissions.length - 4} more`)}`);
+            }
+            const unsupported = Object.keys(agent.providerOptions);
+            if (agent.variant && !PI_THINKING_LEVELS.has(agent.variant)) {
+              unsupported.push(`variant=${agent.variant}`);
+            }
+            if (unsupported.length > 0) {
+              lines.push(
+                `${theme.fg('dim', 'Unsupported RPC options:')} ${theme.fg('text', unsupported.join(', '))}`,
+              );
+            }
+          }
+          if (catalog.diagnostics.length > 0) {
+            lines.push(theme.fg('error', 'Catalog diagnostics'));
+            for (const diagnostic of catalog.diagnostics.slice(0, 3)) {
+              lines.push(`  ${theme.fg('error', diagnostic)}`);
+            }
+          }
+          if (confirmingDeleteAgent) {
+            lines.push(
+              '',
+              theme.fg('error', `Delete @${confirmingDeleteAgent}? This removes its project file.`),
+              dialogKeys(theme, [
+                ['Enter', 'confirm'],
+                ['Esc', 'cancel'],
+              ]),
+            );
+          } else if (saving) {
+            lines.push('', theme.fg('dim', 'Saving…'));
+          } else if (agent) {
+            // Only advertise what this selection actually accepts: I is a silent
+            // no-op without a project override, and Enter sets primary on that tab.
+            lines.push(
+              '',
+              dialogKeys(theme, [
+                ...(tab === 'primary' ? ([['Enter', 'set primary']] as const) : ([] as const)),
+                ...(projectTrusted
+                  ? ([
+                      ['Space', 'toggle enabled'],
+                      ['E', 'edit'],
+                    ] as const)
+                  : ([] as const)),
+                ...(deletableAgents.has(agent.name) ? ([['X', 'delete']] as const) : ([] as const)),
+                ...(projectTrusted && disabledOverrides.project.has(agent.name)
+                  ? ([['I', 'inherit global']] as const)
+                  : ([] as const)),
+                ['/', 'filter'],
+                ['Esc', agentFilter ? 'clear filter' : 'close'],
+              ]),
+            );
+          }
+          return pane(lines);
+        };
+        const handleAgentsInput = (data: string): void => {
+          if (filteringAgents) {
+            // While typing a query the letter keys spell it out instead of running
+            // the actions they are bound to, so only these four keys are special.
+            if (matchesKey(data, 'escape')) {
+              filteringAgents = false;
+              setAgentFilter('');
+            } else if (matchesKey(data, 'return')) {
+              filteringAgents = false;
+            } else if (matchesKey(data, 'backspace')) {
+              setAgentFilter(agentFilter.slice(0, -1));
+            } else if (data >= ' ' && data <= '~') {
+              setAgentFilter(agentFilter + data);
+            }
+            tui.requestRender();
+            return;
+          }
+          const listedAgents = agentsForTab();
+          const agent = listedAgents[selectedAgent];
+          if (data === '/') {
+            filteringAgents = true;
+            tui.requestRender();
+            return;
+          }
+          if (matchesKey(data, 'escape')) {
+            if (agentFilter) {
+              setAgentFilter('');
+              tui.requestRender();
+              return;
+            }
+            done(undefined);
+            return;
+          }
+          if (matchesKey(data, 'up')) selectedAgent = Math.max(0, selectedAgent - 1);
+          else if (matchesKey(data, 'down') && listedAgents.length > 0) {
+            selectedAgent = Math.min(listedAgents.length - 1, selectedAgent + 1);
+          } else if (data.toLowerCase() === 'x' && agent && !saving) {
+            if (!projectTrusted || !canDeleteProjectAgent(ctx.cwd, agent)) {
+              ctx.ui.notify('Only project agent files can be deleted here', 'warning');
+              return;
+            }
+            confirmingDeleteAgent = agent.name;
+            tui.requestRender();
+            return;
+          } else if (data.toLowerCase() === 'e' && agent && !saving) {
+            if (!projectTrusted) {
+              ctx.ui.notify('Agent editing requires a trusted project', 'warning');
+              return;
+            }
+            saving = true;
+            void (async () => {
+              const document = prepareProjectAgentEditor(ctx.cwd, agent);
+              const edited = await ctx.ui.editor(document.title, document.content);
+              if (edited === undefined) return;
+              await document.save(edited);
+              await refreshAgentRuntime(agent.name);
+              ctx.ui.notify(`Updated project agent ${agent.name}`, 'info');
+            })()
+              .catch((error: unknown) =>
+                ctx.ui.notify(`Could not edit agent: ${formatError(error)}`, 'error'),
+              )
+              .finally(() => {
+                saving = false;
+                tui.requestRender();
+              });
+            return;
+          } else if (data === ' ' && agent && !saving) {
+            if (!projectTrusted) {
+              ctx.ui.notify('Project settings require a trusted project', 'warning');
+              return;
+            }
+            const disabled = !agent.disabled;
+            saving = true;
+            void setAgentDisabledForScope(ctx.cwd, agent.name, disabled, 'project')
+              .then(async () => {
+                await refreshAgentRuntime(agent.name);
+                ctx.ui.notify(
+                  `${agent.name} ${disabled ? 'disabled' : 'enabled'} in project settings`,
+                  'info',
+                );
+              })
+              .catch((error: unknown) =>
+                ctx.ui.notify(`Could not update agent: ${formatError(error)}`, 'error'),
+              )
+              .finally(() => {
+                saving = false;
+                tui.requestRender();
+              });
+            return;
+          } else if (data.toLowerCase() === 'i' && agent && !saving) {
+            if (!projectTrusted) {
+              ctx.ui.notify('Project settings require a trusted project', 'warning');
+              return;
+            }
+            if (!disabledOverrides.project.has(agent.name)) return;
+            saving = true;
+            void clearAgentDisabledForScope(ctx.cwd, agent.name, 'project')
+              .then(async () => {
+                await refreshAgentRuntime(agent.name);
+                ctx.ui.notify(`${agent.name} now inherits its global state`, 'info');
+              })
+              .catch((error: unknown) =>
+                ctx.ui.notify(`Could not update agent: ${formatError(error)}`, 'error'),
+              )
+              .finally(() => {
+                saving = false;
+                tui.requestRender();
+              });
+            return;
+          } else if (
+            tab === 'primary' &&
+            matchesKey(data, 'return') &&
+            agent &&
+            !agent.disabled &&
+            isPrimaryAgent(agent)
+          ) {
+            void this.selectPrimaryAgent(agent.name, ctx)
+              .then(() => tui.requestRender())
+              .catch((error: unknown) =>
+                ctx.ui.notify(`Could not select primary agent: ${formatError(error)}`, 'error'),
+              );
+            return;
+          } else if (tab === 'primary' && matchesKey(data, 'return') && agent) {
+            ctx.ui.notify(
+              agent.disabled
+                ? 'Enable this agent before setting it as primary'
+                : 'This agent cannot be used as the primary agent',
+              'warning',
+            );
+            return;
+          } else return;
+          tui.requestRender();
+          return;
+        };
+        const renderTab: Record<LandstripTab, (frame: TabFrame) => string[]> = {
+          overview: (frame) => {
+            const { tabs, pane, contentWidth, listValue } = frame;
             const lines = [tabs, ''];
             if (!overview) {
               lines.push(theme.fg('muted', '  Sandbox settings are unavailable.'));
@@ -1616,207 +2126,119 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               );
             }
             return pane(lines);
-          }
-
-          if (tab === 'settings') {
-            const rows: Array<{
-              kind: 'maxSubagents' | 'toolFilesystemPolicy';
-              label: string;
-              value: string;
-              inherited: boolean;
-            }> = [
-              {
-                kind: 'maxSubagents',
-                label: 'Maximum Subagents',
-                value: String(maxSubagentsSettings.project ?? maxSubagentsSettings.global),
-                inherited: maxSubagentsSettings.project === undefined,
-              },
-              {
-                kind: 'toolFilesystemPolicy',
-                label: 'Filesystem Tool Policy',
-                value: policySettings.project ?? policySettings.global,
-                inherited: policySettings.project === undefined,
-              },
-            ];
-            const lines = [tabs, ''];
-            if (settingEditor) {
-              const kindLabel =
-                settingEditor.kind === 'maxSubagents'
-                  ? 'Project Maximum Subagents'
-                  : 'Project Filesystem Tool Policy';
-              const current =
-                settingEditor.kind === 'maxSubagents'
-                  ? String(maxSubagentsSettings.project ?? maxSubagentsSettings.global)
-                  : (policySettings.project ?? policySettings.global);
-              const hint =
-                settingEditor.kind === 'maxSubagents'
-                  ? 'empty inherit  ·  enter submit  ·  esc cancel'
-                  : 'h host  ·  s sandbox  ·  backspace inherit  ·  enter submit  ·  esc cancel';
-              lines.push(
-                theme.fg('dim', `  ${kindLabel} · current ${current}`),
-                '',
-                `  ${theme.fg('accent', '›')} [ ${settingEditor.value}${theme.fg('accent', '█')} ]`,
-                '',
-                theme.fg('dim', `  ${hint}`),
-              );
-              if (saving) lines.push('', theme.fg('dim', 'Saving…'));
-              return pane(lines);
-            }
-            const labelWidth = Math.max(...rows.map((row) => visibleWidth(row.label)));
-            for (const [index, row] of rows.entries()) {
-              const selected = index === selectedSetting;
-              const cursor = selected ? theme.fg('accent', '›') : ' ';
-              const value = row.inherited
-                ? theme.fg('dim', `[ ${row.value} ]`)
-                : selected
-                  ? theme.fg('accent', `[ ${row.value} ]`)
-                  : theme.fg('text', `[ ${row.value} ]`);
-              lines.push(`${cursor} ${theme.fg('text', row.label.padEnd(labelWidth))}  ${value}`);
-            }
-            lines.push('', theme.fg('dim', '  enter edit  ·  ↑↓ select  ·  esc close'));
+          },
+          settings: (frame) => {
+            const { tabs, pane, contentWidth } = frame;
+            const lines = [tabs, '', ...buildSettingsList(tui, theme, done).render(contentWidth)];
             if (saving) lines.push('', theme.fg('dim', 'Saving…'));
             return pane(lines);
-          }
-
-          if (tab === 'primary' || tab === 'subagent') {
-            const listedAgents = agentsForTab();
-            const start = Math.max(0, Math.min(selectedAgent - 3, listedAgents.length - 7));
-            const shown = listedAgents.slice(start, start + 7);
-            const nameWidth = Math.min(
-              20,
-              Math.max(5, ...listedAgents.map((agent) => visibleWidth(`@${agent.name}`))),
+          },
+          primary: renderAgentsTab,
+          subagent: renderAgentsTab,
+          tasks: (frame) => {
+            const { tabs, pane } = frame;
+            const listLines: string[] = [];
+            if (tasks.length === 0) {
+              listLines.push('No task sessions in this session.');
+            } else {
+              const taskRows = listRowBudget(
+                (tui as Partial<TUI>).terminal?.rows,
+                TASK_LIST_ROWS,
+                TASK_TAB_CHROME_ROWS,
+              );
+              const { shown, start, status } = listWindow(tasks, selectedTask, taskRows);
+              for (const [offset, task] of shown.entries()) {
+                const index = start + offset;
+                const cursor = index === selectedTask ? theme.fg('accent', '›') : ' ';
+                const selected = selectedTaskIds.has(task.id) ? theme.fg('accent', '✓') : ' ';
+                const indent = '  '.repeat(Math.max(0, task.depth - 1));
+                listLines.push(
+                  `${cursor} ${selected} ${indent}${taskState(theme, task)} ${theme.fg('accent', `@${task.agent}`)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
+                );
+              }
+              if (status) listLines.push(theme.fg('dim', `  ${status}`));
+            }
+            const selectedCount = tasks.filter((task) => selectedTaskIds.has(task.id)).length;
+            if (selectedCount > 0) {
+              listLines.push('', theme.fg('dim', `${selectedCount} selected`));
+            }
+            listLines.push('');
+            if (pendingTaskAction) {
+              const count = pendingTaskAction.taskIds.length;
+              const label =
+                count === 1
+                  ? `Delete ${pendingTaskAction.taskIds[0]?.slice(0, 8) ?? 'task'}?`
+                  : `Delete ${count} selected task sessions?`;
+              listLines.push(
+                `${theme.fg('warning', label)} ${dialogKeys(theme, [
+                  ['Enter', 'confirm'],
+                  ['Esc', 'cancel'],
+                ])}`,
+              );
+            } else {
+              listLines.push(
+                dialogKeys(theme, [
+                  ['↑ / ↓', 'move'],
+                  ['Space', 'select'],
+                  ['Enter', 'inspect'],
+                  ['X', 'delete'],
+                  ['Esc', 'close'],
+                ]),
+              );
+            }
+            return pane([tabs, '', ...listLines]);
+          },
+          log: (frame) => {
+            const { tabs, pane, contentWidth } = frame;
+            const task = tasks[selectedTask];
+            if (!task) return pane([tabs, '', 'No task sessions in this session.']);
+            const transcript = taskTranscript(task).flatMap((line) =>
+              wrapTextWithAnsi(line, contentWidth),
             );
-            const modelWidth = Math.max(10, Math.min(24, Math.floor((contentWidth - 2) / 3)));
-            const enabledWidth = 13;
-            const runtimeWidth = Math.max(
-              12,
-              contentWidth - 2 - nameWidth - 1 - modelWidth - 1 - enabledWidth - 1,
-            );
-            const runtimeFor = (agent: AgentDefinition): string => {
-              const parts: string[] = [];
-              if (agent.name === this.primaryAgent?.name) parts.push('★ primary');
-              const byState = (state: TaskState): number =>
-                [...this.tasks.values()].filter(
-                  (task) => task.agent === agent.name && task.state === state,
-                ).length;
-              const running = byState('running');
-              const queued = byState('queued');
-              if (running > 0) parts.push(`${running} running`);
-              if (queued > 0) parts.push(`${queued} queued`);
-              const rules = [...catalog.permissions, ...agent.permissions].length;
-              parts.push(rules > 0 ? `${rules} rules` : 'ask by default');
-              return parts.length > 0 ? parts.join(' · ') : '—';
-            };
+            const maxScroll = Math.max(0, transcript.length - INSPECTOR_BODY_LINES);
+            scroll = follow ? maxScroll : Math.min(scroll, maxScroll);
+            const shown = transcript.slice(scroll, scroll + INSPECTOR_BODY_LINES);
+            const duration = taskDuration(taskDetails(task));
+            const metrics = [
+              task.id,
+              task.toolCalls === undefined
+                ? undefined
+                : `${task.toolCalls} tool call${task.toolCalls === 1 ? '' : 's'}`,
+              duration,
+            ].filter(Boolean);
+            const usage = formatTaskUsage(task.usage);
             const lines = [
               tabs,
               '',
-              theme.fg(
-                'dim',
-                `  ${pad('Agent', nameWidth)} ${pad('Model', modelWidth)} ${pad(
-                  'Enabled',
-                  enabledWidth,
-                )} ${pad('Runtime', runtimeWidth)}`,
-              ),
+              `${theme.fg('accent', theme.bold(`@${task.agent}`))} ${theme.fg('text', task.description)}`,
+              `${taskState(theme, task)} ${theme.fg('dim', metrics.join(' · '))} ${theme.fg('dim', '·')} ${theme.fg(follow ? 'accent' : 'muted', `Follow: ${follow ? 'on' : 'off'}`)}`,
+              ...(usage ? [theme.fg('dim', usage)] : []),
+              '',
+              ...shown.map((line) => theme.fg('toolOutput', line)),
             ];
-            for (const [offset, agent] of shown.entries()) {
-              const index = start + offset;
-              const selected = index === selectedAgent;
-              const cursor = selected ? theme.fg('accent', '›') : ' ';
-              const disabled = agent.disabled;
-              const deleting = confirmingDeleteAgent === agent.name;
-              const inherited = !disabledOverrides.project.has(agent.name);
-              const enabled = inherited
-                ? `inherited ${disabled ? 'off' : 'on'}`
-                : disabled
-                  ? 'disabled'
-                  : 'enabled';
-              const color = deleting ? 'error' : disabled ? 'muted' : 'text';
-              const plainName = pad(`@${agent.name}`, nameWidth);
-              const name = deleting
-                ? theme.fg('error', plainName)
-                : disabled
-                  ? theme.fg('muted', plainName)
-                  : colorizeAgentText(agent.color, plainName, (agentColor, text) =>
-                      theme.fg(agentColor as Parameters<Theme['fg']>[0], text),
-                    );
-              const runtime = runtimeFor(agent);
-              const line = `${cursor} ${name} ${theme.fg(
-                color,
-                pad(agent.model ?? 'current model', modelWidth),
-              )} ${theme.fg(
-                deleting ? 'error' : disabled ? 'warning' : color,
-                pad(enabled, enabledWidth),
-              )} ${theme.fg(disabled ? 'muted' : 'dim', pad(runtime, runtimeWidth))}`;
-              lines.push(agent.name === this.primaryAgent?.name ? theme.bold(line) : line);
-            }
-            if (listedAgents.length === 0) {
-              lines.push(theme.fg('muted', `  No ${tab} agents configured.`));
-            }
-
-            const agent = listedAgents[selectedAgent];
-            if (agent) {
+            while (lines.length < INSPECTOR_BODY_LINES + 5) lines.push('');
+            if (transcript.length > INSPECTOR_BODY_LINES) {
               lines.push(
-                '',
-                theme.fg(agent.disabled ? 'muted' : 'text', agent.description ?? 'No description'),
+                theme.fg('dim', `${scroll + 1}–${scroll + shown.length} of ${transcript.length}`),
               );
-              const details = [
-                agent.source,
-                agent.variant ? `variant ${agent.variant}` : undefined,
-                agent.steps ? `${agent.steps} steps` : undefined,
-              ].filter(Boolean);
-              if (details.length > 0) lines.push(theme.fg('dim', details.join(' · ')));
-              const permissions = [...catalog.permissions, ...agent.permissions];
-              lines.push(theme.fg('dim', 'Permissions'));
-              if (permissions.length === 0) lines.push(`  ${theme.fg('muted', 'default: ask')}`);
-              for (const rule of permissions.slice(0, 4)) {
-                const color =
-                  rule.action === 'deny'
-                    ? 'error'
-                    : rule.action === 'allow'
-                      ? 'success'
-                      : 'warning';
-                lines.push(
-                  `  ${theme.fg('text', `${rule.permission}:${rule.pattern}`)} ${theme.fg('dim', '→')} ${theme.fg(color, rule.action)}`,
-                );
-              }
-              if (permissions.length > 4) {
-                lines.push(`  ${theme.fg('muted', `… ${permissions.length - 4} more`)}`);
-              }
-              const unsupported = Object.keys(agent.providerOptions);
-              if (agent.variant && !PI_THINKING_LEVELS.has(agent.variant)) {
-                unsupported.push(`variant=${agent.variant}`);
-              }
-              if (unsupported.length > 0) {
-                lines.push(
-                  `${theme.fg('dim', 'Unsupported RPC options:')} ${theme.fg('text', unsupported.join(', '))}`,
-                );
-              }
             }
-            if (catalog.diagnostics.length > 0) {
-              lines.push(theme.fg('error', 'Catalog diagnostics'));
-              for (const diagnostic of catalog.diagnostics.slice(0, 3)) {
-                lines.push(`  ${theme.fg('error', diagnostic)}`);
-              }
-            }
-            if (confirmingDeleteAgent) {
+            if (steering) {
+              const input =
+                steering.render(Math.max(2, contentWidth - visibleWidth('Steer ')))[0] ?? '';
+              lines.push(`${theme.fg('accent', 'Steer')} ${input.replace(/^>/, '›')}`);
+            } else if (task.state === 'queued' || task.state === 'running') {
               lines.push(
-                '',
-                theme.fg(
-                  'error',
-                  `Delete @${confirmingDeleteAgent}? This removes its project file.`,
-                ),
                 dialogKeys(theme, [
-                  ['Enter', 'confirm'],
-                  ['Esc', 'cancel'],
+                  ['Enter', 'steer'],
+                  ['F', 'follow'],
+                  ['Esc', 'tasks'],
                 ]),
               );
-            } else if (saving) {
-              lines.push('', theme.fg('dim', 'Saving…'));
             }
-            return pane(lines);
-          }
-
-          if (tab === 'help') {
+            return pane(lines.map((line) => truncateToWidth(line, contentWidth)));
+          },
+          help: (frame) => {
+            const { tabs, pane, contentWidth, pad } = frame;
             const shortcutWidth = Math.max(
               visibleWidth('Shortcut'),
               ...AGENTS_HELP_ROWS.map(([shortcut]) => visibleWidth(shortcut)),
@@ -1835,169 +2257,10 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               ),
             ];
             return pane(lines);
-          }
-
-          if (tab === 'tasks') {
-            const listLines: string[] = [];
-            if (tasks.length === 0) {
-              listLines.push('No task sessions in this session.');
-            } else {
-              const start = Math.max(0, Math.min(selectedTask - 5, tasks.length - 11));
-              const shown = tasks.slice(start, start + 11);
-              for (const [offset, task] of shown.entries()) {
-                const index = start + offset;
-                const cursor = index === selectedTask ? theme.fg('accent', '›') : ' ';
-                const selected = selectedTaskIds.has(task.id) ? theme.fg('accent', '✓') : ' ';
-                const indent = '  '.repeat(Math.max(0, task.depth - 1));
-                listLines.push(
-                  `${cursor} ${selected} ${indent}${taskState(theme, task)} ${theme.fg('accent', `@${task.agent}`)} ${theme.fg('text', task.description)} ${theme.fg('dim', task.id.slice(0, 8))}`,
-                );
-              }
-            }
-            const selectedCount = tasks.filter((task) => selectedTaskIds.has(task.id)).length;
-            if (selectedCount > 0) {
-              listLines.push('', theme.fg('dim', `${selectedCount} selected`));
-            }
-            listLines.push('');
-            if (pendingTaskAction) {
-              const count = pendingTaskAction.taskIds.length;
-              const label =
-                count === 1
-                  ? `Delete ${pendingTaskAction.taskIds[0]?.slice(0, 8) ?? 'task'}?`
-                  : `Delete ${count} selected task sessions?`;
-              listLines.push(
-                `${theme.fg('warning', label)} ${theme.fg('dim', 'enter confirm · esc cancel')}`,
-              );
-            } else {
-              listLines.push(
-                theme.fg('dim', '↑↓ move · space select · enter inspect · x delete · esc close'),
-              );
-            }
-            return pane([tabs, '', ...listLines]);
-          }
-
-          const task = tasks[selectedTask];
-          if (!task) return pane([tabs, '', 'No task sessions in this session.']);
-          const transcript = taskTranscript(task).flatMap((line) =>
-            wrapTextWithAnsi(line, contentWidth),
-          );
-          const maxScroll = Math.max(0, transcript.length - INSPECTOR_BODY_LINES);
-          scroll = follow ? maxScroll : Math.min(scroll, maxScroll);
-          const shown = transcript.slice(scroll, scroll + INSPECTOR_BODY_LINES);
-          const duration = taskDuration(taskDetails(task));
-          const metrics = [
-            task.id,
-            task.toolCalls === undefined
-              ? undefined
-              : `${task.toolCalls} tool call${task.toolCalls === 1 ? '' : 's'}`,
-            duration,
-          ].filter(Boolean);
-          const usage = formatTaskUsage(task.usage);
-          const lines = [
-            tabs,
-            '',
-            `${theme.fg('accent', theme.bold(`@${task.agent}`))} ${theme.fg('text', task.description)}`,
-            `${taskState(theme, task)} ${theme.fg('dim', metrics.join(' · '))} ${theme.fg('dim', '·')} ${theme.fg(follow ? 'accent' : 'muted', `Follow: ${follow ? 'on' : 'off'}`)}`,
-            ...(usage ? [theme.fg('dim', usage)] : []),
-            '',
-            ...shown.map((line) => theme.fg('toolOutput', line)),
-          ];
-          while (lines.length < INSPECTOR_BODY_LINES + 5) lines.push('');
-          if (transcript.length > INSPECTOR_BODY_LINES) {
-            lines.push(
-              theme.fg('dim', `${scroll + 1}–${scroll + shown.length} of ${transcript.length}`),
-            );
-          }
-          if (steering) {
-            const input =
-              steering.render(Math.max(2, contentWidth - visibleWidth('Steer ')))[0] ?? '';
-            lines.push(`${theme.fg('accent', 'Steer')} ${input.replace(/^>/, '›')}`);
-          } else if (task.state === 'queued' || task.state === 'running') {
-            lines.push(theme.fg('dim', 'Enter steer · F follow · Esc tasks'));
-          }
-          return pane(lines.map((line) => truncateToWidth(line, contentWidth)));
-        },
-        handleInput: (data: string) => {
-          if (saving) return;
-          if (confirmingDeleteAgent !== undefined) {
-            if (matchesKey(data, 'escape')) {
-              confirmingDeleteAgent = undefined;
-              tui.requestRender();
-              return;
-            }
-            if (matchesKey(data, 'return')) {
-              const name = confirmingDeleteAgent;
-              const agent = agents.find((candidate) => candidate.name === name);
-              confirmingDeleteAgent = undefined;
-              if (!agent) {
-                tui.requestRender();
-                return;
-              }
-              saving = true;
-              void deleteProjectAgent(ctx.cwd, agent)
-                .then(async (deleted) => {
-                  if (!deleted) return;
-                  await refreshAgentRuntime(name);
-                  ctx.ui.notify(`Deleted project agent ${name}`, 'info');
-                })
-                .catch((error: unknown) =>
-                  ctx.ui.notify(`Could not delete agent: ${formatError(error)}`, 'error'),
-                )
-                .finally(() => {
-                  saving = false;
-                  tui.requestRender();
-                });
-              return;
-            }
-            return;
-          }
-          if (steering) {
-            steering.handleInput(data);
-            tui.requestRender();
-            return;
-          }
-          if (matchesKey(data, 'tab')) {
-            const selectedName =
-              tab === 'primary' || tab === 'subagent'
-                ? agentsForTab()[selectedAgent]?.name
-                : undefined;
-            const tabs: readonly LandstripTab[] = [
-              'overview',
-              'settings',
-              'primary',
-              'subagent',
-              'tasks',
-              'log',
-              'help',
-            ];
-            const nextIndex = (tabs.indexOf(tab) + 1) % tabs.length;
-            tab = tabs[nextIndex]!;
-            if (tab === 'primary' || tab === 'subagent') {
-              const listedAgents = agentsForTab();
-              const preferredName =
-                selectedName ?? (tab === 'primary' ? this.primaryAgent?.name : undefined);
-              const nextSelected = preferredName
-                ? listedAgents.findIndex((agent) => agent.name === preferredName)
-                : 0;
-              selectedAgent = Math.max(
-                0,
-                Math.min(nextSelected < 0 ? 0 : nextSelected, listedAgents.length - 1),
-              );
-            }
-            if (tab === 'log' && tasks.length > 0) follow = true;
-            else follow = false;
-            scroll = 0;
-            confirmingDeleteAgent = undefined;
-            pendingTaskAction = undefined;
-            confirmingSandboxDisable = false;
-            settingEditor = undefined;
-            steering = undefined;
-            reloadAgents();
-            tui.requestRender();
-            return;
-          }
-
-          if (tab === 'overview') {
+          },
+        };
+        const handleTabInput: Record<LandstripTab, (data: string) => void> = {
+          overview: (data) => {
             if (confirmingSandboxDisable) {
               if (matchesKey(data, 'escape')) {
                 confirmingSandboxDisable = false;
@@ -2047,246 +2310,21 @@ export class SubagentRuntime implements CommandSubagentRuntime {
                 tui.requestRender();
               });
             return;
-          }
-
-          if (tab === 'settings') {
-            if (settingEditor) {
-              if (matchesKey(data, 'escape')) {
-                settingEditor = undefined;
-                tui.requestRender();
-                return;
-              }
-              if (matchesKey(data, 'backspace')) {
-                settingEditor.value =
-                  settingEditor.kind === 'maxSubagents' ? settingEditor.value.slice(0, -1) : '';
-                tui.requestRender();
-                return;
-              }
-              if (matchesKey(data, 'return')) {
-                const input = settingEditor.value.trim();
-                if (!projectTrusted) {
-                  ctx.ui.notify('Project settings require a trusted project', 'warning');
-                  return;
-                }
-                let save: Promise<void>;
-                let notifyMessage: string;
-                if (settingEditor.kind === 'maxSubagents') {
-                  if (input === '') {
-                    save = clearMaxSubagentsConfigForScope(ctx.cwd, 'project');
-                    notifyMessage = 'Project maxSubagents inherits Global';
-                  } else {
-                    if (!/^\d+$/.test(input)) {
-                      ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
-                      return;
-                    }
-                    const parsed = Number(input);
-                    if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > MAX_SUBAGENTS) {
-                      ctx.ui.notify(`Enter a whole number between 0 and ${MAX_SUBAGENTS}`, 'error');
-                      return;
-                    }
-                    save = setMaxSubagentsConfigForScope(ctx.cwd, parsed, 'project');
-                    notifyMessage = `Project maxSubagents = ${parsed}`;
-                  }
-                } else {
-                  if (input === '') {
-                    save = clearToolFilesystemPolicyConfigForScope(ctx.cwd, 'project');
-                    notifyMessage = 'Project toolFilesystemPolicy inherits Global';
-                  } else {
-                    if (input !== 'host' && input !== 'sandbox') {
-                      ctx.ui.notify('Enter host or sandbox', 'error');
-                      return;
-                    }
-                    const policy: ToolFilesystemPolicy = input;
-                    save = setToolFilesystemPolicyConfigForScope(ctx.cwd, policy, 'project');
-                    notifyMessage = `Project toolFilesystemPolicy = ${policy}`;
-                  }
-                }
-                const kind = settingEditor.kind;
-                saving = true;
-                settingEditor = undefined;
-                tui.requestRender();
-                void save
-                  .then(() => {
-                    if (kind === 'maxSubagents') {
-                      maxSubagentsSettings = loadMaxSubagentsSettings(ctx.cwd, projectTrusted);
-                      this.setMaxSubagents(
-                        maxSubagentsSettings.project ?? maxSubagentsSettings.global,
-                      );
-                    } else {
-                      policySettings = loadToolFilesystemPolicySettings(ctx.cwd, projectTrusted);
-                      this.toolFilesystemPolicy = policySettings.project ?? policySettings.global;
-                    }
-                    ctx.ui.notify(notifyMessage, 'info');
-                  })
-                  .catch((error: unknown) =>
-                    ctx.ui.notify(`Could not save setting: ${formatError(error)}`, 'error'),
-                  )
-                  .finally(() => {
-                    saving = false;
-                    tui.requestRender();
-                  });
-                return;
-              }
-              const kittyChar = decodeKittyPrintable(data);
-              const printable =
-                kittyChar ?? (data.length === 1 && !isControlChar(data) ? data : undefined);
-              if (printable === undefined) return;
-              if (settingEditor.kind === 'maxSubagents') {
-                if (!/^\d$/.test(printable)) return;
-                settingEditor.value += printable;
-              } else {
-                const lower = printable.toLowerCase();
-                if (lower !== 'h' && lower !== 's') return;
-                settingEditor.value = lower === 'h' ? 'host' : 'sandbox';
-              }
-              tui.requestRender();
+          },
+          settings: (data) => {
+            // Refuse activation up front so an untrusted project never opens an editor
+            // whose result would only be rejected on save.
+            if (!projectTrusted && (matchesKey(data, 'return') || data === ' ')) {
+              ctx.ui.notify('Project settings require a trusted project', 'warning');
               return;
             }
-            if (matchesKey(data, 'escape')) {
-              done(undefined);
-              return;
-            }
-            if (matchesKey(data, 'up')) selectedSetting = Math.max(0, selectedSetting - 1);
-            else if (matchesKey(data, 'down')) selectedSetting = Math.min(1, selectedSetting + 1);
-            else if (matchesKey(data, 'return')) {
-              if (!projectTrusted) {
-                ctx.ui.notify('Project settings require a trusted project', 'warning');
-                return;
-              }
-              if (selectedSetting === 0) {
-                settingEditor = {
-                  kind: 'maxSubagents',
-                  value:
-                    maxSubagentsSettings.project !== undefined
-                      ? String(maxSubagentsSettings.project)
-                      : '',
-                };
-              } else {
-                settingEditor = {
-                  kind: 'toolFilesystemPolicy',
-                  value: policySettings.project ?? policySettings.global,
-                };
-              }
-            } else return;
+            buildSettingsList(tui, theme, done).handleInput(data);
             tui.requestRender();
             return;
-          }
-
-          if (tab === 'primary' || tab === 'subagent') {
-            const listedAgents = agentsForTab();
-            const agent = listedAgents[selectedAgent];
-            if (matchesKey(data, 'escape')) {
-              done(undefined);
-              return;
-            }
-            if (matchesKey(data, 'up')) selectedAgent = Math.max(0, selectedAgent - 1);
-            else if (matchesKey(data, 'down') && listedAgents.length > 0) {
-              selectedAgent = Math.min(listedAgents.length - 1, selectedAgent + 1);
-            } else if (data.toLowerCase() === 'x' && agent && !saving) {
-              if (!projectTrusted || !canDeleteProjectAgent(ctx.cwd, agent)) {
-                ctx.ui.notify('Only project agent files can be deleted here', 'warning');
-                return;
-              }
-              confirmingDeleteAgent = agent.name;
-              tui.requestRender();
-              return;
-            } else if (data.toLowerCase() === 'e' && agent && !saving) {
-              if (!projectTrusted) {
-                ctx.ui.notify('Agent editing requires a trusted project', 'warning');
-                return;
-              }
-              saving = true;
-              void (async () => {
-                const document = prepareProjectAgentEditor(ctx.cwd, agent);
-                const edited = await ctx.ui.editor(document.title, document.content);
-                if (edited === undefined) return;
-                await document.save(edited);
-                await refreshAgentRuntime(agent.name);
-                ctx.ui.notify(`Updated project agent ${agent.name}`, 'info');
-              })()
-                .catch((error: unknown) =>
-                  ctx.ui.notify(`Could not edit agent: ${formatError(error)}`, 'error'),
-                )
-                .finally(() => {
-                  saving = false;
-                  tui.requestRender();
-                });
-              return;
-            } else if (data === ' ' && agent && !saving) {
-              if (!projectTrusted) {
-                ctx.ui.notify('Project settings require a trusted project', 'warning');
-                return;
-              }
-              const disabled = !agent.disabled;
-              saving = true;
-              void setAgentDisabledForScope(ctx.cwd, agent.name, disabled, 'project')
-                .then(async () => {
-                  await refreshAgentRuntime(agent.name);
-                  ctx.ui.notify(
-                    `${agent.name} ${disabled ? 'disabled' : 'enabled'} in project settings`,
-                    'info',
-                  );
-                })
-                .catch((error: unknown) =>
-                  ctx.ui.notify(`Could not update agent: ${formatError(error)}`, 'error'),
-                )
-                .finally(() => {
-                  saving = false;
-                  tui.requestRender();
-                });
-              return;
-            } else if (data.toLowerCase() === 'i' && agent && !saving) {
-              if (!projectTrusted) {
-                ctx.ui.notify('Project settings require a trusted project', 'warning');
-                return;
-              }
-              if (!disabledOverrides.project.has(agent.name)) return;
-              saving = true;
-              void clearAgentDisabledForScope(ctx.cwd, agent.name, 'project')
-                .then(async () => {
-                  await refreshAgentRuntime(agent.name);
-                  ctx.ui.notify(`${agent.name} now inherits its global state`, 'info');
-                })
-                .catch((error: unknown) =>
-                  ctx.ui.notify(`Could not update agent: ${formatError(error)}`, 'error'),
-                )
-                .finally(() => {
-                  saving = false;
-                  tui.requestRender();
-                });
-              return;
-            } else if (
-              tab === 'primary' &&
-              matchesKey(data, 'return') &&
-              agent &&
-              !agent.disabled &&
-              isPrimaryAgent(agent)
-            ) {
-              void this.selectPrimaryAgent(agent.name, ctx)
-                .then(() => tui.requestRender())
-                .catch((error: unknown) =>
-                  ctx.ui.notify(`Could not select primary agent: ${formatError(error)}`, 'error'),
-                );
-              return;
-            } else if (tab === 'primary' && matchesKey(data, 'return') && agent) {
-              ctx.ui.notify(
-                agent.disabled
-                  ? 'Enable this agent before setting it as primary'
-                  : 'This agent cannot be used as the primary agent',
-                'warning',
-              );
-              return;
-            } else return;
-            tui.requestRender();
-            return;
-          }
-
-          if (tab === 'help') {
-            if (matchesKey(data, 'escape')) done(undefined);
-            return;
-          }
-
-          if (tab === 'tasks') {
+          },
+          primary: handleAgentsInput,
+          subagent: handleAgentsInput,
+          tasks: (data) => {
             if (pendingTaskAction) {
               if (matchesKey(data, 'return')) {
                 const taskIds = pendingTaskAction.taskIds;
@@ -2331,90 +2369,190 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             } else return;
             tui.requestRender();
             return;
-          }
-
-          if (tab !== 'log') return;
-
-          const task = tasks[selectedTask];
-          if (!task) {
-            if (matchesKey(data, 'escape')) done(undefined);
-            return;
-          }
-          if (matchesKey(data, 'escape')) {
-            tab = 'tasks';
-            follow = false;
-            scroll = 0;
-          } else if (
-            matchesKey(data, 'return') &&
-            (task.state === 'queued' || task.state === 'running')
-          ) {
-            const input = new Input();
-            input.focused = true;
-            input.onEscape = () => {
-              steering = undefined;
-              tui.requestRender();
-            };
-            input.onSubmit = (value) => {
-              const message = value.trim();
-              if (!message) {
-                ctx.ui.notify('Steering message must not be empty', 'warning');
-                return;
-              }
-              steering = undefined;
-              void (async () => {
-                const running = this.running.get(task.id);
-                if (running) {
-                  await running.rpc.steer(message);
-                } else if (
-                  (task.state === 'queued' || task.state === 'running') &&
-                  this.runPromises.has(task.id)
-                ) {
-                  const pending = this.pendingSteers.get(task.id) ?? [];
-                  pending.push(message);
-                  this.pendingSteers.set(task.id, pending);
-                } else {
-                  throw new Error('Task is no longer active');
-                }
-                ctx.ui.notify(`Steered task ${task.id.slice(0, 8)}`, 'info');
-              })()
-                .catch((error: unknown) =>
-                  ctx.ui.notify(`Could not steer task: ${formatError(error)}`, 'error'),
-                )
-                .finally(() => tui.requestRender());
-              tui.requestRender();
-            };
-            steering = input;
-          } else if (data.toLowerCase() === 'f') {
-            follow = !follow;
-          } else if (!follow && matchesKey(data, 'up')) {
-            scroll = Math.max(0, scroll - 1);
-          } else if (!follow && matchesKey(data, 'down')) {
-            scroll += 1;
-          } else if (!follow && matchesKey(data, 'pageUp')) {
-            scroll = Math.max(0, scroll - INSPECTOR_BODY_LINES);
-          } else if (!follow && matchesKey(data, 'pageDown')) {
-            scroll += INSPECTOR_BODY_LINES;
-          } else if (!follow && matchesKey(data, 'home')) {
-            scroll = 0;
-          } else if (!follow && matchesKey(data, 'end')) {
-            scroll = Number.MAX_SAFE_INTEGER;
-          } else if (matchesKey(data, 'backspace')) {
-            const parentIndex = task.parentTaskId
-              ? tasks.findIndex((candidate) => candidate.id === task.parentTaskId)
-              : -1;
-            if (parentIndex >= 0) {
-              selectedTask = parentIndex;
-              follow = true;
-            } else {
+          },
+          log: (data) => {
+            const task = tasks[selectedTask];
+            if (!task) {
+              if (matchesKey(data, 'escape')) done(undefined);
+              return;
+            }
+            if (matchesKey(data, 'escape')) {
               tab = 'tasks';
               follow = false;
+              scroll = 0;
+            } else if (
+              matchesKey(data, 'return') &&
+              (task.state === 'queued' || task.state === 'running')
+            ) {
+              const input = new Input();
+              input.focused = true;
+              input.onEscape = () => {
+                steering = undefined;
+                tui.requestRender();
+              };
+              input.onSubmit = (value) => {
+                const message = value.trim();
+                if (!message) {
+                  ctx.ui.notify('Steering message must not be empty', 'warning');
+                  return;
+                }
+                steering = undefined;
+                void (async () => {
+                  const running = this.running.get(task.id);
+                  if (running) {
+                    await running.rpc.steer(message);
+                  } else if (
+                    (task.state === 'queued' || task.state === 'running') &&
+                    this.runPromises.has(task.id)
+                  ) {
+                    const pending = this.pendingSteers.get(task.id) ?? [];
+                    pending.push(message);
+                    this.pendingSteers.set(task.id, pending);
+                  } else {
+                    throw new Error('Task is no longer active');
+                  }
+                  ctx.ui.notify(`Steered task ${task.id.slice(0, 8)}`, 'info');
+                })()
+                  .catch((error: unknown) =>
+                    ctx.ui.notify(`Could not steer task: ${formatError(error)}`, 'error'),
+                  )
+                  .finally(() => tui.requestRender());
+                tui.requestRender();
+              };
+              steering = input;
+            } else if (data.toLowerCase() === 'f') {
+              follow = !follow;
+            } else if (!follow && matchesKey(data, 'up')) {
+              scroll = Math.max(0, scroll - 1);
+            } else if (!follow && matchesKey(data, 'down')) {
+              scroll += 1;
+            } else if (!follow && matchesKey(data, 'pageUp')) {
+              scroll = Math.max(0, scroll - INSPECTOR_BODY_LINES);
+            } else if (!follow && matchesKey(data, 'pageDown')) {
+              scroll += INSPECTOR_BODY_LINES;
+            } else if (!follow && matchesKey(data, 'home')) {
+              scroll = 0;
+            } else if (!follow && matchesKey(data, 'end')) {
+              scroll = Number.MAX_SAFE_INTEGER;
+            } else if (matchesKey(data, 'backspace')) {
+              const parentIndex = task.parentTaskId
+                ? tasks.findIndex((candidate) => candidate.id === task.parentTaskId)
+                : -1;
+              if (parentIndex >= 0) {
+                selectedTask = parentIndex;
+                follow = true;
+              } else {
+                tab = 'tasks';
+                follow = false;
+              }
+              scroll = 0;
+            } else return;
+            tui.requestRender();
+          },
+          help: (data) => {
+            if (matchesKey(data, 'escape')) done(undefined);
+            return;
+          },
+        };
+        return {
+          render: (width: number) => {
+            const contentWidth = Math.max(1, width - 2);
+            const pane = (lines: string[]) => [
+              paneTop(theme, width, 'Landstrip'),
+              ...lines.map((line) => paneRow(theme, width, line)),
+            ];
+            const pad = (value: string, cellWidth: number): string => {
+              const clipped = truncateToWidth(value, cellWidth);
+              return `${clipped}${' '.repeat(Math.max(0, cellWidth - visibleWidth(clipped)))}`;
+            };
+            const listValue = (values: readonly string[]): string => {
+              const value = values.join(', ') || 'none';
+              return truncateToWidth(value, Math.max(10, contentWidth - 20));
+            };
+            refreshTasks();
+            const tabs = dialogTabs(
+              theme,
+              TAB_ORDER.map((key) => TAB_LABELS[key]),
+              TAB_LABELS[tab],
+            );
+            return renderTab[tab]({ contentWidth, tabs, pane, pad, listValue });
+          },
+          handleInput: (data: string) => {
+            if (saving) return;
+            if (confirmingDeleteAgent !== undefined) {
+              if (matchesKey(data, 'escape')) {
+                confirmingDeleteAgent = undefined;
+                tui.requestRender();
+                return;
+              }
+              if (matchesKey(data, 'return')) {
+                const name = confirmingDeleteAgent;
+                const agent = agents.find((candidate) => candidate.name === name);
+                confirmingDeleteAgent = undefined;
+                if (!agent) {
+                  tui.requestRender();
+                  return;
+                }
+                saving = true;
+                void deleteProjectAgent(ctx.cwd, agent)
+                  .then(async (deleted) => {
+                    if (!deleted) return;
+                    await refreshAgentRuntime(name);
+                    ctx.ui.notify(`Deleted project agent ${name}`, 'info');
+                  })
+                  .catch((error: unknown) =>
+                    ctx.ui.notify(`Could not delete agent: ${formatError(error)}`, 'error'),
+                  )
+                  .finally(() => {
+                    saving = false;
+                    tui.requestRender();
+                  });
+                return;
+              }
+              return;
             }
-            scroll = 0;
-          } else return;
-          tui.requestRender();
-        },
-        invalidate() {},
-      }),
+            if (steering) {
+              steering.handleInput(data);
+              tui.requestRender();
+              return;
+            }
+            if (matchesKey(data, 'tab')) {
+              const selectedName =
+                tab === 'primary' || tab === 'subagent'
+                  ? agentsForTab()[selectedAgent]?.name
+                  : undefined;
+              const nextIndex = (TAB_ORDER.indexOf(tab) + 1) % TAB_ORDER.length;
+              tab = TAB_ORDER[nextIndex]!;
+              if (tab === 'primary' || tab === 'subagent') {
+                const listedAgents = agentsForTab();
+                const preferredName =
+                  selectedName ?? (tab === 'primary' ? this.primaryAgent?.name : undefined);
+                const nextSelected = preferredName
+                  ? listedAgents.findIndex((agent) => agent.name === preferredName)
+                  : 0;
+                selectedAgent = Math.max(
+                  0,
+                  Math.min(nextSelected < 0 ? 0 : nextSelected, listedAgents.length - 1),
+                );
+              }
+              if (tab === 'log' && tasks.length > 0) follow = true;
+              else follow = false;
+              scroll = 0;
+              confirmingDeleteAgent = undefined;
+              pendingTaskAction = undefined;
+              confirmingSandboxDisable = false;
+              settingsList = undefined;
+              steering = undefined;
+              reloadAgents();
+              tui.requestRender();
+              return;
+            }
+
+            handleTabInput[tab](data);
+          },
+          invalidate() {},
+        };
+      },
       {
         overlay: true,
         overlayOptions: { anchor: 'bottom-center', width: '100%', maxHeight: '70%' },
