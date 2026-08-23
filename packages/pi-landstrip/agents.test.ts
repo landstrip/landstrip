@@ -41,7 +41,7 @@ describe('landstrip agent configuration', () => {
   test('provides one default agent catalog with mode capabilities', () => {
     const catalog = loadAgentCatalog(temporaryDirectory(), temporaryDirectory());
 
-    expect(catalog.maxSubagents).toBe(1);
+    expect(catalog.maxSubagents).toBe(0);
     const agents = availableAgents(catalog);
     expect(agents.map((agent) => agent.name)).toEqual([
       'build',
@@ -248,7 +248,7 @@ describe('landstrip agent configuration', () => {
     });
 
     const catalog = loadAgentCatalog(cwd, agentDir, false);
-    expect(catalog.maxSubagents).toBe(1);
+    expect(catalog.maxSubagents).toBe(0);
     expect(catalog.agents.has('project')).toBe(false);
   });
 

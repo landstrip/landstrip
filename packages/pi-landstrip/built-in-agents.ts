@@ -2,7 +2,7 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 export const BUILT_IN_LANDSTRIP_CONFIG = {
-  maxSubagents: 1,
+  maxSubagents: 0,
   toolFilesystemPolicy: 'host',
   agent: {
     build: {
