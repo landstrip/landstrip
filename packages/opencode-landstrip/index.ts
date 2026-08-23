@@ -1025,10 +1025,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
     'permission.ask': async (input, output) => {
       const config = await activeConfig();
-      if (!config) {
-        output.status = 'allow';
-        return;
-      }
+      if (!config) return;
 
       const request = input as Record<string, unknown>;
       const permission = permissionType(request);

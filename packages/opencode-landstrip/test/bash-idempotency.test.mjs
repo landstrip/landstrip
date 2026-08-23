@@ -121,7 +121,7 @@ test('disabled sandbox reports its configuration state', async () => {
   });
 });
 
-test('disabled sandbox allows permissions without prompting', async () => {
+test('disabled sandbox preserves OpenCode permission prompts', async () => {
   await withPlugin({ enabled: false }, async ({ hooks }) => {
     const output = { status: 'ask' };
     await hooks['permission.ask'](
@@ -138,7 +138,7 @@ test('disabled sandbox allows permissions without prompting', async () => {
       output,
     );
 
-    assert.equal(output.status, 'allow');
+    assert.equal(output.status, 'ask');
   });
 });
 
