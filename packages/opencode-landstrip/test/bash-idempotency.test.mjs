@@ -142,7 +142,6 @@ test('disabled sandbox preserves OpenCode permission prompts', async () => {
   });
 });
 
-
 test('option-managed sandbox state cannot be overwritten', async () => {
   await withPlugin({ enabled: false }, async ({ tempDir }) => {
     const shared = await import(pathToFileURL(join(tempDir, 'shared.js')).href);
@@ -274,7 +273,7 @@ test('headless filesystem denials do not become session allowances', async () =>
   );
 });
 
-test('permission.ask can approve one edit call outside allowWrite', async () => {
+test('permission.ask approves every apply_patch path for one call and then expires them', async () => {
   await withPlugin(
     {
       enabled: true,
@@ -286,29 +285,37 @@ test('permission.ask can approve one edit call outside allowWrite', async () => 
       },
       network: { allowedDomains: ['*'], deniedDomains: [] },
     },
-    async ({ hooks, tempDir }) => {
-      const filepath = resolve(tempDir, '..', 'outside.txt');
+    async ({ hooks }) => {
+      const paths = ['../outside-a.txt', '../outside-b.txt'];
+      const patchText = `*** Begin Patch
+*** Add File: ${paths[0]}
++one
+*** Add File: ${paths[1]}
++two
+*** End Patch`;
+      const input = { callID: 'apply-patch-call', tool: 'apply_patch' };
+      const output = { args: { patchText } };
       const permissionOutput = { status: 'allow' };
 
       await hooks['permission.ask'](
         {
-          id: 'permission-edit',
+          id: 'permission-apply-patch',
           type: 'edit',
-          callID: 'edit-call',
+          patterns: paths,
+          callID: input.callID,
           sessionID: 'session',
           messageID: 'message',
-          title: 'Edit file',
-          metadata: { filepath },
+          title: 'Apply patch',
+          metadata: { filepath: paths.join(', ') },
           time: { created: 0 },
         },
         permissionOutput,
       );
 
       assert.equal(permissionOutput.status, 'ask');
-      await hooks['tool.execute.before'](
-        { callID: 'edit-call', tool: 'edit' },
-        { args: { path: filepath } },
-      );
+      await hooks['tool.execute.before'](input, output);
+      await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+      await assert.rejects(hooks['tool.execute.before'](input, output), /requires approval/);
     },
   );
 });

@@ -641,8 +641,12 @@ function evaluateToolPermissions(
   }
 
   if (tool === 'write' || tool === 'edit') {
-    const path = getToolPath(args);
-    return path ? [evaluateWritePermission(path, config, baseDirectory, effectiveAllowWrite)] : [];
+    const paths = Array.isArray(args.paths)
+      ? args.paths.filter((path): path is string => typeof path === 'string')
+      : [getToolPath(args)].filter((path): path is string => path !== undefined);
+    return paths.map((path) =>
+      evaluateWritePermission(path, config, baseDirectory, effectiveAllowWrite),
+    );
   }
 
   if (tool === 'apply_patch' && typeof args.patchText === 'string') {
@@ -676,12 +680,20 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     return `${callID}:${kind}:${resource}`;
   }
 
-  function rememberCallAllowance(
+  function rememberCallAllowances(
     callID: string | undefined,
-    decision: SandboxPermissionDecision,
+    approvals: readonly SandboxPermissionDecision[],
   ): void {
-    if (!callID || decision.status === 'deny') return;
-    callAllowances.add(allowanceKey(callID, decision.kind, decision.resource));
+    if (!callID) return;
+    for (const approval of approvals) {
+      callAllowances.add(allowanceKey(callID, approval.kind, approval.resource));
+    }
+  }
+
+  function clearCallAllowances(callID: string): void {
+    for (const key of callAllowances) {
+      if (key.startsWith(`${callID}:`)) callAllowances.delete(key);
+    }
   }
 
   function hasCallAllowance(callID: string, decision: SandboxPermissionDecision): boolean {
@@ -874,12 +886,9 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
   }
 
   async function cleanupBash(callID: string): Promise<void> {
+    clearCallAllowances(callID);
     const state = activeBash.get(callID);
     if (!state) return;
-
-    for (const key of callAllowances) {
-      if (key.startsWith(`${callID}:`)) callAllowances.delete(key);
-    }
 
     activeBash.delete(callID);
     if (state.stop) await state.stop().catch(() => undefined);
@@ -1044,7 +1053,10 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       const args: Record<string, unknown> = { ...metadata };
       if (permission === 'read') args.paths = patterns;
       if (permission === 'edit') {
-        args.path = typeof metadata.filepath === 'string' ? metadata.filepath : patterns[0];
+        args.paths =
+          patterns.length > 0
+            ? patterns
+            : [metadata.filepath].filter((path): path is string => typeof path === 'string');
       }
       if (permission === 'bash' && typeof args.command !== 'string') args.command = patterns[0];
       const decisions = evaluateToolPermissions(
@@ -1056,13 +1068,17 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
         effectiveAllowWrite,
       );
 
-      const decision =
-        decisions.find((item) => item.status === 'deny') ??
-        decisions.find((item) => item.status === 'ask');
-      if (!decision) return;
+      const denied = decisions.find((item) => item.status === 'deny');
+      if (denied) {
+        output.status = 'deny';
+        return;
+      }
 
-      output.status = decision.status;
-      rememberCallAllowance(callID, decision);
+      const approvals = decisions.filter((item) => item.status === 'ask');
+      if (approvals.length === 0) return;
+
+      output.status = 'ask';
+      rememberCallAllowances(callID, approvals);
     },
 
     'tool.execute.before': async (input, output) => {
@@ -1099,7 +1115,10 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     },
 
     'tool.execute.after': async (input, output) => {
-      if (input.tool !== 'bash') return;
+      if (input.tool !== 'bash') {
+        clearCallAllowances(input.callID);
+        return;
+      }
 
       const state = activeBash.get(input.callID);
       if (!state) {
