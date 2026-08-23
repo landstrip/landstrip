@@ -690,6 +690,39 @@ it('edits sandbox enabled state in the selected scope', async () => {
   rmSync(agentDir, { recursive: true, force: true });
 });
 
+it('refuses to load corrupt or invalid global and project sandbox.json', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-corrupt-load-'));
+  const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-corrupt-load-agent-'));
+  vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+  const callbacks = createLandstripIntegration({ registerBashTool: false }).sandboxCallbacks!;
+  const globalPath = join(agentDir, 'sandbox.json');
+
+  writeFileSync(globalPath, '{', 'utf8');
+  expect(() => callbacks.load(cwd, true)).toThrow(globalPath);
+
+  writeFileSync(globalPath, JSON.stringify({ network: { allowNetwork: 'false' } }), 'utf8');
+  expect(() => callbacks.load(cwd, true)).toThrow(/network\.allowNetwork must be a boolean/);
+
+  writeFileSync(globalPath, JSON.stringify({ enabld: false }), 'utf8');
+  expect(() => callbacks.load(cwd, true)).toThrow(/unknown sandbox field enabld/);
+
+  writeFileSync(globalPath, '{}', 'utf8');
+  const projectPath = join(cwd, '.pi', 'sandbox.json');
+  mkdirSync(join(cwd, '.pi'), { recursive: true });
+  writeFileSync(projectPath, '{', 'utf8');
+  expect(() => callbacks.load(cwd, true)).toThrow(projectPath);
+
+  writeFileSync(projectPath, JSON.stringify({ filesystem: { denyWrite: '/secret' } }), 'utf8');
+  expect(() => callbacks.load(cwd, true)).toThrow(/filesystem\.denyWrite must be an array/);
+
+  writeFileSync(projectPath, JSON.stringify({ filesystem: { denyWite: ['/secret'] } }), 'utf8');
+  expect(() => callbacks.load(cwd, true)).toThrow(/unknown sandbox field filesystem\.denyWite/);
+
+  vi.unstubAllEnvs();
+  rmSync(cwd, { recursive: true, force: true });
+  rmSync(agentDir, { recursive: true, force: true });
+});
+
 it('refuses to write over a corrupt sandbox.json', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-corrupt-sandbox-'));
   const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-corrupt-agent-'));

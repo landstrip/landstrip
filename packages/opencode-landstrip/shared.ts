@@ -103,57 +103,97 @@ export function list(values: string[]): string {
   return values.join(', ') || '(none)';
 }
 
-function stringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  return value.every((item) => typeof item === 'string') ? [...value] : undefined;
+function rejectUnknownFields(
+  value: Record<string, unknown>,
+  fields: readonly string[],
+  prefix = '',
+): void {
+  for (const field of Object.keys(value)) {
+    if (!fields.includes(field)) throw new Error(`unknown sandbox field ${prefix}${field}`);
+  }
+}
+
+function booleanValue(value: unknown, field: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'boolean') throw new Error(`${field} must be a boolean`);
+  return value;
+}
+
+function stringArray(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || [...value].some((item) => typeof item !== 'string')) {
+    throw new Error(`${field} must be an array of strings`);
+  }
+  return [...value];
 }
 
 function normalizeNetworkConfig(value: unknown): Partial<SandboxNetworkConfig> | undefined {
-  if (!isRecord(value)) return undefined;
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error('network must be an object');
+  rejectUnknownFields(
+    value,
+    [
+      'allowNetwork',
+      'allowLocalBinding',
+      'allowAllUnixSockets',
+      'allowUnixSockets',
+      'allowedDomains',
+      'deniedDomains',
+    ],
+    'network.',
+  );
 
   const config: Partial<SandboxNetworkConfig> = {};
-  if (typeof value.allowNetwork === 'boolean') config.allowNetwork = value.allowNetwork;
-  if (typeof value.allowLocalBinding === 'boolean')
-    config.allowLocalBinding = value.allowLocalBinding;
-  if (typeof value.allowAllUnixSockets === 'boolean')
-    config.allowAllUnixSockets = value.allowAllUnixSockets;
+  const allowNetwork = booleanValue(value.allowNetwork, 'network.allowNetwork');
+  if (allowNetwork !== undefined) config.allowNetwork = allowNetwork;
+  const allowLocalBinding = booleanValue(value.allowLocalBinding, 'network.allowLocalBinding');
+  if (allowLocalBinding !== undefined) config.allowLocalBinding = allowLocalBinding;
+  const allowAllUnixSockets = booleanValue(
+    value.allowAllUnixSockets,
+    'network.allowAllUnixSockets',
+  );
+  if (allowAllUnixSockets !== undefined) config.allowAllUnixSockets = allowAllUnixSockets;
 
-  const allowUnixSockets = stringArray(value.allowUnixSockets);
+  const allowUnixSockets = stringArray(value.allowUnixSockets, 'network.allowUnixSockets');
   if (allowUnixSockets) config.allowUnixSockets = allowUnixSockets;
 
-  const allowedDomains = stringArray(value.allowedDomains);
+  const allowedDomains = stringArray(value.allowedDomains, 'network.allowedDomains');
   if (allowedDomains) config.allowedDomains = allowedDomains;
 
-  const deniedDomains = stringArray(value.deniedDomains);
+  const deniedDomains = stringArray(value.deniedDomains, 'network.deniedDomains');
   if (deniedDomains) config.deniedDomains = deniedDomains;
 
   return config;
 }
 
 function normalizeFilesystemConfig(value: unknown): Partial<SandboxFilesystemConfig> | undefined {
-  if (!isRecord(value)) return undefined;
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error('filesystem must be an object');
+  rejectUnknownFields(value, ['denyRead', 'allowRead', 'allowWrite', 'denyWrite'], 'filesystem.');
 
   const config: Partial<SandboxFilesystemConfig> = {};
-  const denyRead = stringArray(value.denyRead);
+  const denyRead = stringArray(value.denyRead, 'filesystem.denyRead');
   if (denyRead) config.denyRead = denyRead;
 
-  const allowRead = stringArray(value.allowRead);
+  const allowRead = stringArray(value.allowRead, 'filesystem.allowRead');
   if (allowRead) config.allowRead = allowRead;
 
-  const allowWrite = stringArray(value.allowWrite);
+  const allowWrite = stringArray(value.allowWrite, 'filesystem.allowWrite');
   if (allowWrite) config.allowWrite = allowWrite;
 
-  const denyWrite = stringArray(value.denyWrite);
+  const denyWrite = stringArray(value.denyWrite, 'filesystem.denyWrite');
   if (denyWrite) config.denyWrite = denyWrite;
 
   return config;
 }
 
 export function normalizeConfig(value: unknown): SandboxConfigOverrides {
-  if (!isRecord(value)) return {};
+  if (!isRecord(value)) throw new Error('sandbox config must be an object');
+  rejectUnknownFields(value, ['enabled', 'network', 'filesystem']);
 
   const config: SandboxConfigOverrides = {};
-  if (typeof value.enabled === 'boolean') config.enabled = value.enabled;
+  const enabled = booleanValue(value.enabled, 'enabled');
+  if (enabled !== undefined) config.enabled = enabled;
 
   const network = normalizeNetworkConfig(value.network);
   if (network) config.network = network;
@@ -166,7 +206,9 @@ export function normalizeConfig(value: unknown): SandboxConfigOverrides {
 
 export function normalizeOptions(options: unknown): SandboxConfigOverrides {
   if (!isRecord(options)) return {};
-  return normalizeConfig(isRecord(options.config) ? options.config : options);
+  if (options.config === undefined) return normalizeConfig(options);
+  if (!isRecord(options.config)) throw new Error('config must be an object');
+  return normalizeConfig(options.config);
 }
 
 function mergeArray(base: string[], override?: string[]): string[] {
@@ -204,15 +246,16 @@ export function getConfigPaths(baseDirectory: string): { globalPath: string; pro
   };
 }
 
-// Returns `{}` when the file is absent and `null` when it exists but cannot be
-// parsed, so callers can refuse to overwrite a corrupted config.
-export function readConfigFile(configPath: string): SandboxConfigOverrides | null {
+export function readConfigFile(configPath: string): SandboxConfigOverrides {
   if (!existsSync(configPath)) return {};
 
   try {
     return normalizeConfig(JSON.parse(readFileSync(configPath, 'utf-8')));
-  } catch {
-    return null;
+  } catch (error) {
+    throw new Error(
+      `Could not load ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
   }
 }
 
@@ -229,17 +272,14 @@ export function loadConfig(
   }
 
   const templateConfig: SandboxConfig = JSON.parse(readFileSync(templatePath, 'utf-8'));
-  const globalOverrides = readConfigFile(globalPath) ?? {};
+  const globalOverrides = readConfigFile(globalPath);
   const baseConfig = deepMerge(templateConfig, globalOverrides);
 
-  return deepMerge(deepMerge(baseConfig, readConfigFile(projectPath) ?? {}), optionOverrides);
+  return deepMerge(deepMerge(baseConfig, readConfigFile(projectPath)), optionOverrides);
 }
 
 export function writeConfigFile(configPath: string, update: SandboxConfigOverrides): void {
   const current = readConfigFile(configPath);
-  if (current === null) {
-    throw new Error(`Config file ${configPath} is corrupted; refusing to overwrite`);
-  }
 
   const templateConfig: SandboxConfig = JSON.parse(
     readFileSync(join(packageDir, 'sandbox.json'), 'utf-8'),
@@ -500,8 +540,7 @@ export function sandboxConfigTarget(baseDirectory: string): {
   path: string;
 } {
   const { globalPath, projectPath } = getConfigPaths(baseDirectory);
-  const projectConfig = readConfigFile(projectPath);
-  const useProject = projectConfig !== null && projectConfig.enabled !== undefined;
+  const useProject = readConfigFile(projectPath).enabled !== undefined;
   return useProject
     ? { scope: 'project', path: projectPath }
     : { scope: 'global', path: globalPath };

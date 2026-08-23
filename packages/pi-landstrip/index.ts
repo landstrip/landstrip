@@ -48,6 +48,7 @@ import {
   formatLandstripTraps,
   isDenialTrap,
   isFilesystemTrap,
+  isRecord,
   isQueryTrap,
   parseLandstripTraps,
   canonicalizeGlobPattern,
@@ -143,6 +144,122 @@ interface SandboxConfigFile {
   network?: SandboxNetworkConfigFile;
   filesystem?: SandboxFilesystemConfigFile;
   windows?: SandboxWindowsConfigFile;
+}
+
+function requireSandboxObject(
+  value: unknown,
+  field: string,
+): asserts value is Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`${field} must be an object`);
+}
+
+function rejectUnknownSandboxFields(
+  value: Record<string, unknown>,
+  fields: readonly string[],
+  prefix = '',
+): void {
+  for (const field of Object.keys(value)) {
+    if (!fields.includes(field)) throw new Error(`unknown sandbox field ${prefix}${field}`);
+  }
+}
+
+function validateBooleanFields(
+  value: Record<string, unknown>,
+  fields: readonly string[],
+  prefix = '',
+): void {
+  for (const field of fields) {
+    if (value[field] !== undefined && typeof value[field] !== 'boolean') {
+      throw new Error(`${prefix}${field} must be a boolean`);
+    }
+  }
+}
+
+function validateStringArrayFields(
+  value: Record<string, unknown>,
+  fields: readonly string[],
+  prefix: string,
+): void {
+  for (const field of fields) {
+    const entry = value[field];
+    if (entry === undefined) continue;
+    if (!Array.isArray(entry) || [...entry].some((item) => typeof item !== 'string')) {
+      throw new Error(`${prefix}${field} must be an array of strings`);
+    }
+  }
+}
+
+function parseSandboxConfig(value: unknown): SandboxConfigFile {
+  requireSandboxObject(value, 'sandbox config');
+  rejectUnknownSandboxFields(value, ['enabled', 'shell', 'network', 'filesystem', 'windows']);
+  validateBooleanFields(value, ['enabled']);
+
+  if (value.shell !== undefined) {
+    requireSandboxObject(value.shell, 'shell');
+    rejectUnknownSandboxFields(value.shell, ['readAccess'], 'shell.');
+    if (
+      value.shell.readAccess !== undefined &&
+      value.shell.readAccess !== 'host' &&
+      value.shell.readAccess !== 'policy'
+    ) {
+      throw new Error('shell.readAccess must be host or policy');
+    }
+  }
+
+  if (value.network !== undefined) {
+    requireSandboxObject(value.network, 'network');
+    rejectUnknownSandboxFields(
+      value.network,
+      [
+        'allowNetwork',
+        'allowLocalBinding',
+        'allowAllUnixSockets',
+        'allowUnixSockets',
+        'allowedDomains',
+        'deniedDomains',
+      ],
+      'network.',
+    );
+    validateBooleanFields(
+      value.network,
+      ['allowNetwork', 'allowLocalBinding', 'allowAllUnixSockets'],
+      'network.',
+    );
+    validateStringArrayFields(
+      value.network,
+      ['allowUnixSockets', 'allowedDomains', 'deniedDomains'],
+      'network.',
+    );
+  }
+
+  if (value.filesystem !== undefined) {
+    requireSandboxObject(value.filesystem, 'filesystem');
+    rejectUnknownSandboxFields(
+      value.filesystem,
+      ['denyRead', 'allowRead', 'allowWrite', 'denyWrite'],
+      'filesystem.',
+    );
+    validateStringArrayFields(
+      value.filesystem,
+      ['denyRead', 'allowRead', 'allowWrite', 'denyWrite'],
+      'filesystem.',
+    );
+  }
+
+  if (value.windows !== undefined) {
+    requireSandboxObject(value.windows, 'windows');
+    rejectUnknownSandboxFields(value.windows, ['appContainerMode', 'allowLoopback'], 'windows.');
+    validateBooleanFields(value.windows, ['allowLoopback'], 'windows.');
+    if (
+      value.windows.appContainerMode !== undefined &&
+      value.windows.appContainerMode !== 'lpac' &&
+      value.windows.appContainerMode !== 'standard'
+    ) {
+      throw new Error('windows.appContainerMode must be lpac or standard');
+    }
+  }
+
+  return value as SandboxConfigFile;
 }
 
 export type SandboxConfigScope = 'global' | 'project';
@@ -253,26 +370,14 @@ function loadSandboxConfig(cwd: string, includeProject: boolean): SandboxConfig 
     writeFileSync(globalConfigPath, readFileSync(templatePath, 'utf-8'), 'utf-8');
   }
 
-  let globalConfig: SandboxConfig = JSON.parse(
-    readFileSync(join(packageDir, 'sandbox.json'), 'utf-8'),
+  const globalConfig = deepMerge(
+    JSON.parse(readFileSync(join(packageDir, 'sandbox.json'), 'utf-8')),
+    readOrEmptyConfig(globalConfigPath),
   );
-  try {
-    const override = JSON.parse(readFileSync(globalConfigPath, 'utf-8'));
-    globalConfig = deepMerge(globalConfig, override);
-  } catch (error) {
-    console.error(`Warning: Could not parse ${globalConfigPath}: ${error}`);
-  }
 
-  if (includeProject && existsSync(projectConfigPath)) {
-    try {
-      const projectConfig = JSON.parse(readFileSync(projectConfigPath, 'utf-8'));
-      return deepMerge(globalConfig, projectConfig);
-    } catch (error) {
-      console.error(`Warning: Could not parse ${projectConfigPath}: ${error}`);
-    }
-  }
-
-  return globalConfig;
+  return includeProject
+    ? deepMerge(globalConfig, readOrEmptyConfig(projectConfigPath))
+    : globalConfig;
 }
 
 function mergeArray(base: string[], override?: string[]): string[] {
@@ -383,10 +488,8 @@ function getConfigPaths(cwd: string): { globalPath: string; projectPath: string 
 function readOrEmptyConfig(configPath: string): SandboxConfigFile {
   if (!existsSync(configPath)) return {};
   try {
-    return JSON.parse(readFileSync(configPath, 'utf-8'));
+    return parseSandboxConfig(JSON.parse(readFileSync(configPath, 'utf-8')));
   } catch (error) {
-    // Never treat corrupt JSON as an empty object: writers that start from
-    // this helper would otherwise overwrite denyWrite/allowRead/etc. with {}.
     throw new Error(`${configPath}: ${formatError(error)}`);
   }
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 
@@ -15,10 +15,57 @@ async function loadShared() {
 
   const modulePath = join(tempDir, 'shared.js');
   await writeFile(modulePath, compiled);
+  await writeFile(join(tempDir, 'sandbox.json'), await readFile(join(packageRoot, 'sandbox.json')));
 
   const mod = await import(pathToFileURL(modulePath).href);
-  return { mod, cleanup: () => rm(tempDir, { force: true, recursive: true }) };
+  return { mod, tempDir, cleanup: () => rm(tempDir, { force: true, recursive: true }) };
 }
+
+test('sandbox config loading rejects malformed or invalid global and project files', async () => {
+  const { mod, tempDir, cleanup } = await loadShared();
+  const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
+
+  try {
+    process.env.HOME = join(tempDir, 'home');
+    process.env.USERPROFILE = process.env.HOME;
+    const project = join(tempDir, 'project');
+    const { globalPath, projectPath } = mod.getConfigPaths(project);
+
+    await mkdir(dirname(globalPath), { recursive: true });
+    await writeFile(globalPath, '{');
+    assert.throws(
+      () => mod.loadConfig(project, {}),
+      (error) => error instanceof Error && error.message.includes(globalPath),
+    );
+
+    await writeFile(globalPath, JSON.stringify({ network: { allowNetwork: 'false' } }));
+    assert.throws(() => mod.loadConfig(project, {}), /network\.allowNetwork must be a boolean/);
+
+    await writeFile(globalPath, JSON.stringify({ enabld: false }));
+    assert.throws(() => mod.loadConfig(project, {}), /unknown sandbox field enabld/);
+
+    await writeFile(globalPath, '{}');
+    await mkdir(dirname(projectPath), { recursive: true });
+    await writeFile(projectPath, '{');
+    assert.throws(
+      () => mod.loadConfig(project, {}),
+      (error) => error instanceof Error && error.message.includes(projectPath),
+    );
+
+    await writeFile(projectPath, JSON.stringify({ filesystem: { denyWrite: '/secret' } }));
+    assert.throws(() => mod.loadConfig(project, {}), /filesystem\.denyWrite must be an array/);
+
+    await writeFile(projectPath, JSON.stringify({ filesystem: { denyWite: ['/secret'] } }));
+    assert.throws(() => mod.loadConfig(project, {}), /unknown sandbox field filesystem\.denyWite/);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousUserProfile;
+    await cleanup();
+  }
+});
 
 // The server hook receives `{ type, pattern }` while the TUI receives
 // `{ permission, patterns }`; both must parse identically through shared.ts.
