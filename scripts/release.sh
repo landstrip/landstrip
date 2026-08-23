@@ -180,7 +180,7 @@ if (rootLock.packages['packages/landstrip']) {
     rootLock.packages['packages/landstrip'].optionalDependencies[packageName] = nextVersion;
   }
 }
-updateExtensionLock(rootLock);
+for (const packageName of platformDependencies) updateLockedPackage(rootLock, packageName);
 
 for (const packageDir of packageDirs) {
   const workspacePackage = rootLock.packages[packageDir];
