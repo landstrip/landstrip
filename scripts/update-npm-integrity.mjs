@@ -38,6 +38,9 @@ function updateLockedPackage(lock, packageName) {
   if (!lockedPackage) {
     throw new Error(`package-lock.json does not contain ${packageName}`);
   }
+  if (lockedPackage.link) {
+    return;
+  }
   if (lockedPackage.version !== version) {
     throw new Error(
       `${packageName} lock version ${lockedPackage.version} does not match ${version}`,
