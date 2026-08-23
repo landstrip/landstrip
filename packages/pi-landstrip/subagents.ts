@@ -68,7 +68,11 @@ import {
   prepareProjectAgentEditor,
 } from './agent-files.ts';
 import { dialogKeys, dialogTabs, paneRow, paneTop } from './box.ts';
-import { type CommandSubagentRuntime, registerLandstripCommands } from './commands.ts';
+import {
+  type CommandSubagentRuntime,
+  matchingTasksById,
+  registerLandstripCommands,
+} from './commands.ts';
 import {
   clearAgentDisabledForScope,
   clearMaxSubagentsConfigForScope,
@@ -1461,13 +1465,16 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       tab = 'log';
       follow = true;
     } else if (requested) {
-      selectedTask = tasks.findIndex(
-        (task) => task.id === requested || task.id.startsWith(requested),
-      );
-      if (selectedTask < 0) {
+      const matched = matchingTasksById(tasks, requested);
+      if (matched.length === 0) {
         ctx.ui.notify(`Unknown task session: ${requested}`, 'error');
         return;
       }
+      if (matched.length > 1) {
+        ctx.ui.notify(`Task ID prefix ${requested} matches ${matched.length} tasks`, 'error');
+        return;
+      }
+      selectedTask = tasks.findIndex((task) => task.id === matched[0]!.id);
       tab = 'log';
       follow = true;
     }

@@ -102,6 +102,14 @@ function taskItems(tasks: readonly TaskCommandRecord[], prefix: string): Complet
   }));
 }
 
+export function matchingTasksById(
+  tasks: readonly TaskCommandRecord[],
+  taskId: string,
+): TaskCommandRecord[] {
+  const exact = tasks.find((task) => task.id === taskId);
+  return exact ? [exact] : tasks.filter((task) => task.id.startsWith(taskId));
+}
+
 const SUBCOMMANDS: readonly Subcommand[] = [
   {
     name: 'status',
@@ -255,15 +263,16 @@ const SUBCOMMANDS: readonly Subcommand[] = [
           ctx.ui.notify('Task ID required to kill a task', 'error');
           return;
         }
-        const matched = runtime.getTasks().filter((task) => task.id.startsWith(taskId));
+        const matched = matchingTasksById(runtime.getTasks(), taskId);
         if (matched.length === 0) {
           ctx.ui.notify(`No task found matching ${taskId}`, 'error');
           return;
         }
-        const deleted = runtime.deleteTasks(
-          matched.map((task) => task.id),
-          ctx,
-        );
+        if (matched.length > 1) {
+          ctx.ui.notify(`Task ID prefix ${taskId} matches ${matched.length} tasks`, 'error');
+          return;
+        }
+        const deleted = runtime.deleteTasks([matched[0]!.id], ctx);
         ctx.ui.notify(`Killed ${deleted} task${deleted === 1 ? '' : 's'}`, 'info');
         return;
       }
@@ -348,8 +357,7 @@ export async function handleLandstripCommand(
 
   if (!command) {
     if (ctx.mode === 'tui') {
-      const directTask = runtime.getTasks().find((task) => task.id.startsWith(argv.raw));
-      await runtime.openLandstrip(directTask?.id ?? argv.raw, ctx);
+      await runtime.openLandstrip(argv.raw, ctx);
       return;
     }
     ctx.ui.notify(`Unknown Landstrip command: ${argv.raw}. Type /landstrip help.`, 'error');

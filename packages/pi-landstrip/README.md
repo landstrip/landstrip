@@ -64,9 +64,21 @@ project definitions.
 
 ## Commands and tasks
 
-- `/landstrip` opens the screen-wide bottom pane for sandbox settings, agent
-  settings, agents, and task sessions.
-- `Ctrl+Shift+A` cycles primary agents while Pi is idle.
+| Command                           | Action                                        |
+| --------------------------------- | --------------------------------------------- |
+| `/landstrip status`               | Show sandbox, primary-agent, and task status. |
+| `/landstrip settings`             | Manage concurrency and file-tool policy.      |
+| `/landstrip sandbox [on\|off]`    | Inspect or toggle OS isolation.               |
+| `/landstrip agents [@name]`       | List or select the primary agent.             |
+| `/landstrip subagents`            | List configured process subagents.            |
+| `/landstrip tasks [list]`         | List task sessions.                           |
+| `/landstrip tasks kill <task-id>` | Terminate one task session.                   |
+| `/landstrip logs [task-id]`       | Open task logs in the TUI.                    |
+| `/landstrip help`                 | Open command and shortcut help.               |
+
+In the TUI, bare `/landstrip` opens the management pane and a bare task ID opens
+its logs. Task IDs may be shortened only to a unique prefix. `Ctrl+Shift+A`
+cycles primary agents while Pi is idle.
 
 The `task` tool starts isolated workers. Set `background: true` to return
 immediately and use `task_id` to continue a saved task.

@@ -9,6 +9,7 @@ import {
   type CommandSubagentRuntime,
   getLandstripArgumentCompletions,
   handleLandstripCommand,
+  matchingTasksById,
 } from './commands.ts';
 import type { LandstripIntegration } from './index.ts';
 
@@ -113,6 +114,41 @@ test('tasks kill removes tasks by id prefix', async () => {
   );
   expect(deleted).toEqual(['abc12345-0000']);
   expect(notifications[0]).toBe('Killed 1 task');
+});
+
+test('task ID matching prefers an exact ID over ambiguous prefixes', () => {
+  const tasks = [
+    { id: 'abc', agent: 'coder', state: 'running' },
+    { id: 'abc12345', agent: 'tester', state: 'queued' },
+  ];
+
+  expect(matchingTasksById(tasks, 'abc')).toEqual([tasks[0]]);
+  expect(matchingTasksById(tasks, 'a')).toEqual(tasks);
+});
+
+test('tasks kill rejects an ambiguous ID prefix', async () => {
+  const notifications: string[] = [];
+  const deleted: string[] = [];
+  const runtime = makeRuntime({
+    getTasks: () => [
+      { id: 'abc12345-0000', agent: 'coder', state: 'running' },
+      { id: 'abc98765-0000', agent: 'tester', state: 'queued' },
+    ],
+    deleteTasks: (ids) => {
+      deleted.push(...ids);
+      return ids.length;
+    },
+  });
+
+  await handleLandstripCommand(
+    'tasks kill abc',
+    makeCtx(notifications),
+    runtime,
+    {} as LandstripIntegration,
+  );
+
+  expect(deleted).toEqual([]);
+  expect(notifications[0]).toBe('Task ID prefix abc matches 2 tasks');
 });
 
 test('help text is generated from the subcommand table', async () => {
