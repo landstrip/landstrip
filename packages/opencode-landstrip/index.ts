@@ -10,7 +10,7 @@ import { type AddressInfo, connect as connectNet, createServer } from 'node:net'
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
-import { startFilterProxy } from '@landstrip/landstrip/proxy';
+import { startFilterProxy } from '@landstrip/landstrip-api/proxy';
 
 import {
   type LandstripTrap,
@@ -799,7 +799,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     if (!version) {
       landstripCheck = {
         ok: false,
-        reason: `landstrip was not found. Reinstall with: npm install @landstrip/landstrip`,
+        reason: `landstrip was not found. Reinstall with: npm install @landstrip/landstrip-api`,
       };
       return landstripCheck;
     }
@@ -831,7 +831,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     if (!check?.ok) {
       const reason = check?.reason ?? 'Unknown Landstrip installation error';
       await notifyOnce(`broken-installation:${reason}`, reason, 'error');
-      throw new Error(`Broken @landstrip/landstrip installation: ${reason}`);
+      throw new Error(`Broken @landstrip/landstrip-api installation: ${reason}`);
     }
 
     if (!enabledNotified) {

@@ -8,7 +8,7 @@ import { dirname, join, parse } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
-import { binaryPath } from '@landstrip/landstrip';
+import { binaryPath } from '@landstrip/landstrip-api';
 import { describe, expect, it, vi } from 'vitest';
 
 import { RpcProcess, type RpcChildProcess, type RpcRecord } from './rpc-process.ts';

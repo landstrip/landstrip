@@ -8,7 +8,7 @@ import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
-import { binaryPath as installedLandstripBinaryPath } from '@landstrip/landstrip';
+import { binaryPath as installedLandstripBinaryPath } from '@landstrip/landstrip-api';
 
 import { installLandstripMock, packageRoot, transpile } from './helper.mjs';
 
@@ -212,13 +212,13 @@ test('external landstrip binary is refused', async () => {
 
       await assert.rejects(
         hooks['tool.execute.before']({ callID: 'external-binary-call', tool: 'bash' }, output),
-        /Broken @landstrip\/landstrip installation: Refusing to use landstrip binary/,
+        /Broken @landstrip\/landstrip-api installation: Refusing to use landstrip binary/,
       );
 
       assert.equal(output.args.command, 'git status --short');
       assert.match(
         messages.join('\n'),
-        /Refusing to use landstrip binary outside official @landstrip\/landstrip packages/,
+        /Refusing to use landstrip binary outside official @landstrip\/landstrip-api packages/,
       );
     },
     { externalBinary: true },

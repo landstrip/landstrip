@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 
-export { expandHomePath, isRecord } from '@landstrip/landstrip/shared';
+export { expandHomePath, isRecord } from '@landstrip/landstrip-api/shared';
 
 /** Expand OpenCode-style `{file:path}` tokens. Relative paths use baseDir. */
 export function expandFileReferences(text: string, baseDir: string): string {

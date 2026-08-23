@@ -48,7 +48,7 @@
     "ci:test": "npm test"
   },
   "dependencies": {
-    "@landstrip/landstrip": "^0.18.38",
+    "@landstrip/landstrip-api": "^0.18.38",
     "@opentui/solid": ">=0.3.4",
     "solid-js": "1.9.12"
   },

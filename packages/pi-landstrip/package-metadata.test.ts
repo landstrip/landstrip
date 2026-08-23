@@ -32,7 +32,7 @@ describe('package metadata', () => {
     const extensionPackage = readJson<PackageJson>(new URL('./package.json', import.meta.url));
     const extensionLock = readJson<PackageLock>(new URL('./package-lock.json', import.meta.url));
     const landstripPackage = readJson<PackageJson>(
-      new URL('../landstrip/package.json', import.meta.url),
+      new URL('../landstrip-api/package.json', import.meta.url),
     );
     const version = landstripPackage.version;
     const platformDependencies = Object.keys(landstripPackage.optionalDependencies ?? {});
@@ -40,14 +40,16 @@ describe('package metadata', () => {
     expect(extensionPackage.version).toBe(version);
     expect(extensionLock.version).toBe(version);
     expect(extensionLock.packages[''].version).toBe(version);
-    expect(extensionPackage.dependencies?.['@landstrip/landstrip']).toBe(`^${version}`);
-    expect(extensionLock.packages[''].dependencies?.['@landstrip/landstrip']).toBe(`^${version}`);
+    expect(extensionPackage.dependencies?.['@landstrip/landstrip-api']).toBe(`^${version}`);
+    expect(extensionLock.packages[''].dependencies?.['@landstrip/landstrip-api']).toBe(
+      `^${version}`,
+    );
 
-    for (const packageName of ['@landstrip/landstrip', ...platformDependencies]) {
+    for (const packageName of ['@landstrip/landstrip-api', ...platformDependencies]) {
       expectLockedPackage(extensionLock, packageName, version);
     }
     expect(
-      extensionLock.packages['node_modules/@landstrip/landstrip'].optionalDependencies,
+      extensionLock.packages['node_modules/@landstrip/landstrip-api'].optionalDependencies,
     ).toEqual(landstripPackage.optionalDependencies);
   });
 

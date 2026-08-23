@@ -55,7 +55,7 @@ function binaryPath(platform = process.platform, arch = process.arch) {
   } catch (error) {
     throw new Error(
       `The landstrip binary package ${value.packageName} is not installed. ` +
-        'Reinstall @landstrip/landstrip with optional dependencies enabled.'
+        'Reinstall @landstrip/landstrip-api with optional dependencies enabled.'
     );
   }
 

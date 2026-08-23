@@ -5,7 +5,7 @@ import {
   binaryPath,
   type LandstripControlResponse,
   type LandstripTrap,
-} from '@landstrip/landstrip';
+} from '@landstrip/landstrip-api';
 
 import {
   allowsAllDomains,
@@ -26,7 +26,7 @@ import {
   pathUnderDirectory,
   sessionAllows,
   sessionScopeFor,
-} from '@landstrip/landstrip/shared';
+} from '@landstrip/landstrip-api/shared';
 
 export {
   allowsAllDomains,
@@ -90,7 +90,7 @@ export interface SandboxConfigOverrides {
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
 const LANDSTRIP_PACKAGE_NAMES = new Set([
-  '@landstrip/landstrip',
+  '@landstrip/landstrip-api',
   '@landstrip/landstrip-darwin-arm64',
   '@landstrip/landstrip-darwin-x64',
   '@landstrip/landstrip-linux-x64',
@@ -321,7 +321,7 @@ export function landstripBinaryPath(): string {
     }
 
     throw new Error(
-      `Refusing to use landstrip binary outside official @landstrip/landstrip packages: ${filePath}`,
+      `Refusing to use landstrip binary outside official @landstrip/landstrip-api packages: ${filePath}`,
     );
   } catch (error) {
     _landstripBinaryPathError = error;

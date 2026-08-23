@@ -40,7 +40,7 @@ import {
   type LandstripControlResponse,
   type LandstripFilesystemTrap,
   type LandstripNetworkTrap,
-} from '@landstrip/landstrip';
+} from '@landstrip/landstrip-api';
 import {
   allowsAllDomains,
   controlResponseLine,
@@ -59,8 +59,8 @@ import {
   parseTrapLine,
   pathUnderDirectory,
   sessionScopeFor,
-} from '@landstrip/landstrip/shared';
-import { type ProxyPortRange, startFilterProxy } from '@landstrip/landstrip/proxy';
+} from '@landstrip/landstrip-api/shared';
+import { type ProxyPortRange, startFilterProxy } from '@landstrip/landstrip-api/proxy';
 
 export {
   controlResponseLine,

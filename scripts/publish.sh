@@ -93,10 +93,10 @@ prepare_npm_package_build() {
   host_pkg="$repo_root/npm/$host_platform"
   if [[ -d "$host_pkg" ]]; then
     $NPM install --prefix "$package_dir" --package-lock=false --ignore-scripts --no-save \
-      "$repo_root/packages/landstrip" "$host_pkg"
+      "$repo_root/packages/landstrip-api" "$host_pkg"
   else
     $NPM install --prefix "$package_dir" --package-lock=false --ignore-scripts --no-save \
-      "$repo_root/packages/landstrip"
+      "$repo_root/packages/landstrip-api"
   fi
 }
 
@@ -294,7 +294,7 @@ fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid version: $version"
 
 # npm packages are assembled from the tip tree; keep tip metadata on the tag.
-tip_version="$($NODE -p 'require("./packages/landstrip/package.json").version')"
+tip_version="$($NODE -p 'require("./packages/landstrip-api/package.json").version')"
 [[ "$version" == "$tip_version" ]] \
   || die "tag $version does not match tip package.json $tip_version"
 
@@ -328,7 +328,7 @@ else
   printf 'publishing tag %s (matches HEAD)\n' "$version"
 fi
 
-package_version="$($NODE -p "require('$cargo_root/packages/landstrip/package.json').version")"
+package_version="$($NODE -p "require('$cargo_root/packages/landstrip-api/package.json').version")"
 [[ "$version" == "$package_version" ]] \
   || die "tag $version package.json version is $package_version"
 
@@ -374,7 +374,7 @@ if ((${#missing[@]} > 0)); then
   die "run 'PACKAGE_STRICT=1 make package' before publish"
 fi
 
-npm_package_dirs+=("$repo_root/packages/landstrip")
+npm_package_dirs+=("$repo_root/packages/landstrip-api")
 for extension_dir in "${extension_dirs[@]}"; do
   npm_package_dirs+=("$repo_root/$extension_dir")
 done
@@ -389,10 +389,10 @@ for package_dir in "${npm_package_dirs[@]}"; do
   publish_npm_package "$package_dir"
 done
 
-package_names=("$($NODE -p 'require("./packages/landstrip/package.json").name')")
+package_names=("$($NODE -p 'require("./packages/landstrip-api/package.json").name')")
 while IFS= read -r package_name; do
   package_names+=("$package_name")
-done < <($NODE -p 'Object.keys(require("./packages/landstrip/package.json").optionalDependencies).join("\n")')
+done < <($NODE -p 'Object.keys(require("./packages/landstrip-api/package.json").optionalDependencies).join("\n")')
 for package_name in "${package_names[@]}"; do
   wait_for_npm_package "$package_name"
 done

@@ -6,7 +6,7 @@ import type { Readable, Writable } from 'node:stream';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 
-import { isRecord } from '@landstrip/landstrip/shared';
+import { isRecord } from '@landstrip/landstrip-api/shared';
 
 export const LANDSTRIP_CONTEXT_ENV = 'LANDSTRIP_CONTEXT';
 export const LANDSTRIP_RUNTIME_VERSION = 2;

@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { getShellConfig } from '@earendil-works/pi-coding-agent';
-import { binaryPath } from '@landstrip/landstrip';
+import { binaryPath } from '@landstrip/landstrip-api';
 import { expect, it } from 'vitest';
 
 import { createLandstripIntegration } from './index.ts';

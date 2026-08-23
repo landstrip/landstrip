@@ -15,21 +15,24 @@ function assertLockedPackage(lock, packageName, version) {
 test('package metadata matches the Landstrip release', () => {
   const extensionPackage = readJson(new URL('../package.json', import.meta.url));
   const extensionLock = readJson(new URL('../package-lock.json', import.meta.url));
-  const landstripPackage = readJson(new URL('../../landstrip/package.json', import.meta.url));
+  const landstripPackage = readJson(new URL('../../landstrip-api/package.json', import.meta.url));
   const version = landstripPackage.version;
   const platformDependencies = Object.keys(landstripPackage.optionalDependencies ?? {});
 
   assert.equal(extensionPackage.version, version);
   assert.equal(extensionLock.version, version);
   assert.equal(extensionLock.packages[''].version, version);
-  assert.equal(extensionPackage.dependencies?.['@landstrip/landstrip'], `^${version}`);
-  assert.equal(extensionLock.packages[''].dependencies?.['@landstrip/landstrip'], `^${version}`);
+  assert.equal(extensionPackage.dependencies?.['@landstrip/landstrip-api'], `^${version}`);
+  assert.equal(
+    extensionLock.packages[''].dependencies?.['@landstrip/landstrip-api'],
+    `^${version}`,
+  );
 
-  for (const packageName of ['@landstrip/landstrip', ...platformDependencies]) {
+  for (const packageName of ['@landstrip/landstrip-api', ...platformDependencies]) {
     assertLockedPackage(extensionLock, packageName, version);
   }
   assert.deepEqual(
-    extensionLock.packages['node_modules/@landstrip/landstrip'].optionalDependencies,
+    extensionLock.packages['node_modules/@landstrip/landstrip-api'].optionalDependencies,
     landstripPackage.optionalDependencies,
   );
 });

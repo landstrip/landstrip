@@ -35,7 +35,7 @@ import landstripExtension, {
   writeEnvFile,
 } from './index.ts';
 
-import { isPublicProxyAddress } from '@landstrip/landstrip/proxy';
+import { isPublicProxyAddress } from '@landstrip/landstrip-api/proxy';
 
 import { AsyncQueue, PermissionPromptCoordinator } from './util.ts';
 

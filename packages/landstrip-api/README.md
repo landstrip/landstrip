@@ -6,7 +6,7 @@ Seatbelt on macOS, and AppContainer or restricted users on Windows.
 ## Install
 
 ```sh
-npm install --save-dev @landstrip/landstrip
+npm install --save-dev @landstrip/landstrip-api
 npx landstrip run -p policy.json -- cargo test
 ```
 
@@ -60,7 +60,5 @@ make ci
 
 ## Licensing
 
-`@landstrip/landstrip` is licensed under the Apache 2.0 license and the GNU
-Lesser General Public License version 2.1 or later. See
-[LICENSE-APACHE-2.0](LICENSE-APACHE-2.0) and [LICENSE-LGPL-2.1](LICENSE-LGPL-2.1)
-for more information.
+`@landstrip/landstrip-api` is licensed under the Apache 2.0 license. See
+[LICENSE](LICENSE) for more information.
