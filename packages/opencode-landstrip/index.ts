@@ -34,7 +34,6 @@ import {
   parseLandstripTraps,
   permissionPatterns,
   permissionType,
-  sandboxSummary,
   readDiscoveryPort,
   trapSessionHelloLine,
 } from './shared.js';
@@ -718,26 +717,6 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     reportBlocked(decision);
   }
 
-  function pushCommandText(
-    input: { sessionID: string },
-    output: { parts: unknown[] },
-    text: string,
-  ): void {
-    output.parts.push({
-      type: 'text',
-      text,
-      id: '',
-      sessionID: input.sessionID,
-      messageID: '',
-    });
-  }
-
-  function buildSandboxSummary(config: SandboxConfig): string {
-    const { globalPath, projectPath } = getConfigPaths(directory);
-    const report = sandboxSummary(config, globalPath, projectPath);
-    return ['# Sandbox Configuration', '', report].join('\n');
-  }
-
   client.app
     ?.log?.({
       body: {
@@ -1173,50 +1152,6 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       }
 
       await cleanupBash(input.callID);
-    },
-
-    'command.execute.before': async (input, output) => {
-      // OpenCode strips the leading slash before dispatching commands, so the
-      // hook receives the bare name ("sandbox"); accept both forms so the
-      // handler matches whether invoked by name or via tui.executeCommand.
-      const command = input.command.trim().replace(/^\//, '');
-      if (command === 'sandbox') {
-        const config = loadConfig(directory, optionOverrides);
-        pushCommandText(input, output, buildSandboxSummary(config));
-        await client.tui
-          ?.showToast?.({
-            body: { title: 'Sandbox', message: `Config loaded for ${directory}`, variant: 'info' },
-          })
-          ?.catch?.(() => undefined);
-        return;
-      }
-
-      // Check domain and filesystem in user shell commands (commands starting with !)
-      if (input.command.startsWith('!')) {
-        const shellCommand = input.command.slice(1).trim();
-        const config = await activeConfig();
-        if (!config) return;
-
-        const effectiveAllowRead = config.filesystem.allowRead;
-        const effectiveAllowWrite = config.filesystem.allowWrite;
-
-        for (const path of extractCandidatePaths(shellCommand)) {
-          const readDecision = evaluateReadPermission(path, config, directory, effectiveAllowRead);
-          if (readDecision.status === 'deny') reportBlocked(readDecision);
-
-          const writeDecision = evaluateWritePermission(
-            path,
-            config,
-            directory,
-            effectiveAllowWrite,
-          );
-          if (writeDecision.status === 'deny') reportBlocked(writeDecision);
-        }
-
-        for (const decision of evaluateCommandDomains(shellCommand, config)) {
-          if (decision.status !== 'allow') reportBlocked(decision);
-        }
-      }
     },
 
     dispose: async () => {

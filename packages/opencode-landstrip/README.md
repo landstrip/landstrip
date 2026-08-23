@@ -20,8 +20,9 @@ OpenCode permissions authorize tool dispatch. Landstrip permissions authorize
 filesystem and network access. Agent approval never bypasses a sandbox hard
 denial, and requests without a live presenter are denied.
 
-`/landstrip` opens the bottom management pane to inspect or toggle the policy.
-Persistent approvals update `.opencode/sandbox.json` or
+OpenCode intentionally exposes one plugin slash command: `/landstrip`, which
+opens the bottom management pane. Pi-only agent and task subcommands are not
+available. Persistent approvals update `.opencode/sandbox.json` or
 `~/.config/opencode/sandbox.json`.
 
 ## Configuration

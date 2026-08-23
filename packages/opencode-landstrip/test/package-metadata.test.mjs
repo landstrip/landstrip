@@ -34,14 +34,16 @@ test('package metadata matches the Landstrip release', () => {
   );
 });
 
-test('registers a bottom Landstrip pane instead of a sandbox dialog', () => {
-  const source = readFileSync(new URL('../tui.ts', import.meta.url), 'utf8');
+test('registers the Landstrip pane without intercepting commands', () => {
+  const tuiSource = readFileSync(new URL('../tui.ts', import.meta.url), 'utf8');
+  const serverSource = readFileSync(new URL('../index.ts', import.meta.url), 'utf8');
 
-  assert.match(source, /slash: \{ name: 'landstrip' \}/);
-  assert.doesNotMatch(source, /slash: \{ name: 'sandbox' \}/);
-  assert.doesNotMatch(source, /DialogConfirm|ui\.dialog/);
-  assert.match(source, /app: \(\) => jsx\(LandstripPane/);
-  assert.match(source, /position: 'absolute',[\s\S]*bottom: 0,[\s\S]*left: 0,[\s\S]*right: 0/);
-  assert.match(source, /width: 22, children: label/);
-  assert.match(source, /Disable the sandbox\? Commands will run without OS isolation\./);
+  assert.match(tuiSource, /slash: \{ name: 'landstrip' \}/);
+  assert.doesNotMatch(tuiSource, /slash: \{ name: 'sandbox' \}/);
+  assert.doesNotMatch(tuiSource, /DialogConfirm|ui\.dialog/);
+  assert.match(tuiSource, /app: \(\) => jsx\(LandstripPane/);
+  assert.match(tuiSource, /position: 'absolute',[\s\S]*bottom: 0,[\s\S]*left: 0,[\s\S]*right: 0/);
+  assert.match(tuiSource, /width: 22, children: label/);
+  assert.match(tuiSource, /Disable the sandbox\? Commands will run without OS isolation\./);
+  assert.doesNotMatch(serverSource, /'command\.execute\.before'/);
 });
