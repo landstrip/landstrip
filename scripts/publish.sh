@@ -148,11 +148,12 @@ wait_for_npm_package() {
   local package_name="$1"
   local attempt
 
-  for attempt in {1..12}; do
+  printf '%s\n' "waiting for $package_name@$version to become available from npm"
+  for attempt in {1..60}; do
     if npm_package_exists "$package_name"; then
       return
     fi
-    sleep 5
+    sleep 10
   done
   die "$package_name@$version did not become available from npm"
 }
