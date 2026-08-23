@@ -61,7 +61,7 @@ restricted_user_setup=0
 
 cleanup_local_root() {
   if ((restricted_user_setup)); then
-    "target/debug/$binary" windows uninstall >/dev/null 2>&1 || true
+    "packages/landstrip/target/debug/$binary" windows uninstall >/dev/null 2>&1 || true
   fi
   [[ -z "${tarball:-}" ]] || rm -f "$tarball"
 }
@@ -75,13 +75,13 @@ if ((local_root)); then
   }
   binary="landstrip"
   [[ "$platform_package" == npm/win32-* ]] && binary="landstrip.exe"
-  cargo build --locked
+  cargo build --locked --manifest-path packages/landstrip/Cargo.toml
   mkdir -p "$platform_package/bin"
-  install -m 755 "target/debug/$binary" "$platform_package/bin/$binary"
+  install -m 755 "packages/landstrip/target/debug/$binary" "$platform_package/bin/$binary"
   trap cleanup_local_root EXIT
 
   if [[ "$platform_package" == npm/win32-* && "${CI:-}" == true ]]; then
-    "target/debug/$binary" windows install \
+    "packages/landstrip/target/debug/$binary" windows install \
       --restricted-accounts 2 --unrestricted-accounts 0
     restricted_user_setup=1
     export LANDSTRIP_TEST_RESTRICTED_USER=1
@@ -102,6 +102,6 @@ for package_dir in "${extension_dirs[@]}"; do
 done
 
 if ((restricted_user_setup)); then
-  "target/debug/$binary" windows uninstall
+  "packages/landstrip/target/debug/$binary" windows uninstall
   restricted_user_setup=0
 fi

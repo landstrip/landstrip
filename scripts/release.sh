@@ -34,8 +34,8 @@ done < <(scripts/test-extensions.sh --list)
 ((${#extension_dirs[@]} > 0)) || die "no extension workspaces found"
 
 release_files=(
-  Cargo.toml
-  Cargo.lock
+  packages/landstrip/Cargo.toml
+  packages/landstrip/Cargo.lock
   package.json
   package-lock.json
   packages/landstrip-api/package.json
@@ -45,7 +45,7 @@ release_files=(
   npm/linux-arm64/package.json
   npm/win32-x64/package.json
   npm/win32-arm64/package.json
-  man/man1/landstrip.1
+  packages/landstrip/man/man1/landstrip.1
 )
 for package_dir in "${extension_dirs[@]}"; do
   release_files+=("$package_dir/package.json" "$package_dir/package-lock.json")
@@ -91,7 +91,7 @@ git tag -s "$signing_check_tag" -m "landstrip release signing check" \
 git tag -d "$signing_check_tag" >/dev/null
 signing_check_tag=""
 
-core_ver="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' Cargo.toml | head -1)"
+core_ver="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' packages/landstrip/Cargo.toml | head -1)"
 [[ -n "$core_ver" ]] || die "cannot find version in Cargo.toml"
 version_parts "$core_ver"
 ver_gt "$next_a" "$next_b" "$next_c" "$VERSION_A" "$VERSION_B" "$VERSION_C" \
@@ -206,26 +206,32 @@ for (const packageDir of packageDirs) {
 fs.writeFileSync(rootLockPath, `${JSON.stringify(rootLock, null, 2)}\n`);
 NODE
 
-sed -E -i.bak "s/^([[:space:]]*version[[:space:]]*=[[:space:]]*)\"${core_ver//./\\.}\"/\1\"$next_ver\"/" Cargo.toml
-rm -f Cargo.toml.bak
-grep -q "^version = \"$next_ver\"" Cargo.toml \
+sed -E -i.bak "s/^([[:space:]]*version[[:space:]]*=[[:space:]]*)\"${core_ver//./\\.}\"/\1\"$next_ver\"/" packages/landstrip/Cargo.toml
+rm -f packages/landstrip/Cargo.toml.bak
+grep -q "^version = \"$next_ver\"" packages/landstrip/Cargo.toml \
   || die "failed to update version in Cargo.toml"
-cargo metadata --format-version 1 >/dev/null
-grep -A2 '^name = "landstrip"' Cargo.lock | grep -q "^version = \"$next_ver\"" \
+(
+  cd packages/landstrip
+  cargo metadata --format-version 1 >/dev/null
+)
+grep -A2 '^name = "landstrip"' packages/landstrip/Cargo.lock | grep -q "^version = \"$next_ver\"" \
   || die "failed to update version in Cargo.lock"
 
 date="$(LC_TIME=C date '+%B %e, %Y' | sed 's/  / /')"
-sed -E -i.bak "s/^\\.Dd .*/.Dd $date/" man/man1/landstrip.1
-rm -f man/man1/landstrip.1.bak
-grep -Fxq ".Dd $date" man/man1/landstrip.1 \
-  || die "failed to update man/man1/landstrip.1"
+sed -E -i.bak "s/^\\.Dd .*/.Dd $date/" packages/landstrip/man/man1/landstrip.1
+rm -f packages/landstrip/man/man1/landstrip.1.bak
+grep -Fxq ".Dd $date" packages/landstrip/man/man1/landstrip.1 \
+  || die "failed to update packages/landstrip/man/man1/landstrip.1"
 
 npm run ci:extensions:local
 
-cargo fmt --all --check
-cargo build --locked
-cargo test --all --locked
-cargo clippy --all-targets --locked -- -D warnings
+(
+  cd packages/landstrip
+  cargo fmt --all --check
+  cargo build --locked
+  cargo test --all --locked
+  cargo clippy --all-targets --locked -- -D warnings
+)
 
 git add -- "${release_files[@]}"
 git commit -s -m "Bump the version to $next_ver"

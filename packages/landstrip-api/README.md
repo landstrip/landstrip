@@ -22,7 +22,7 @@ landstrip policy resolve -p policy.json
 landstrip doctor
 ```
 
-Run `landstrip --help` or see [landstrip(1)](man/man1/landstrip.1) for the full
+Run `landstrip --help` or see [landstrip(1)](../landstrip/man/man1/landstrip.1) for the full
 command reference.
 
 ## Agent extensions

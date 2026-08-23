@@ -29,7 +29,7 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
 cd "$repo_root"
 
 printf '==> package target selection test\n'
-./scripts/package-target-test.sh
+./packages/landstrip/scripts/package-target-test.sh
 
 printf '==> sha256 sidecar test\n'
 ./scripts/sha256-test.sh
@@ -47,21 +47,25 @@ esac
 binary_name=landstrip
 [[ "$host_platform" == win32-* ]] && binary_name=landstrip.exe
 
-printf '==> cargo build\n'
-$CARGO build
+(
+  cd packages/landstrip
 
-printf '==> cargo test\n'
-$CARGO test
+  printf '==> cargo build\n'
+  $CARGO build
 
-printf '==> cargo clippy\n'
-$CARGO clippy --all-targets
+  printf '==> cargo test\n'
+  $CARGO test
 
-printf '==> cargo fmt --check\n'
-$CARGO fmt --check
+  printf '==> cargo clippy\n'
+  $CARGO clippy --all-targets
+
+  printf '==> cargo fmt --check\n'
+  $CARGO fmt --check
+)
 
 printf '==> stage host binary for npm/%s\n' "$host_platform"
 mkdir -p "npm/$host_platform/bin"
-cp "target/debug/$binary_name" "npm/$host_platform/bin/$binary_name"
+cp "packages/landstrip/target/debug/$binary_name" "npm/$host_platform/bin/$binary_name"
 chmod 755 "npm/$host_platform/bin/$binary_name" 2>/dev/null || true
 
 printf '==> npm install local platform package\n'
@@ -70,7 +74,7 @@ $NPM install --package-lock=false --ignore-scripts --no-save "./$tarball" "./npm
 rm -f "$tarball"
 $NODE packages/landstrip-api/bin/landstrip.js --version >/dev/null
 
-export PATH="$repo_root/target/debug:$PATH"
+export PATH="$repo_root/packages/landstrip/target/debug:$PATH"
 
 printf '==> extension checks\n'
 # test-extensions.sh --local-root rebuilds the host binary, npm-packs the
@@ -79,13 +83,16 @@ printf '==> extension checks\n'
 npm run ci:extensions:local
 
 if [[ -n "${CI_MSRV:-}" ]]; then
-  version="$(sed -n 's/^[[:space:]]*rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml)"
+  version="$(sed -n 's/^[[:space:]]*rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' packages/landstrip/Cargo.toml)"
   [[ -n "$version" ]] || die "no rust-version in Cargo.toml"
   printf '==> MSRV cargo +%s\n' "$version"
   require_command rustup
   rustup toolchain install "$version"
-  cargo +"$version" build
-  cargo +"$version" test
+  (
+    cd packages/landstrip
+    cargo +"$version" build
+    cargo +"$version" test
+  )
 fi
 
 printf 'local CI passed on %s\n' "$host_platform"

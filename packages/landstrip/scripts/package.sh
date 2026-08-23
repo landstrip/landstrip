@@ -22,8 +22,6 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=package-target.sh
 source "$script_dir/package-target.sh"
-# shellcheck source=sha256.sh
-source "$script_dir/sha256.sh"
 
 CARGO="${CARGO:-cargo}"
 RUSTC="${RUSTC:-rustc}"
@@ -55,6 +53,8 @@ fi
 
 repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
   || die "not inside a Git repository"
+# shellcheck source=../../../scripts/sha256.sh
+source "$repo_root/scripts/sha256.sh"
 cd "$repo_root"
 
 version="$("$NODE" -p "require('$repo_root/packages/landstrip-api/package.json').version")"
@@ -62,7 +62,7 @@ version="$("$NODE" -p "require('$repo_root/packages/landstrip-api/package.json')
 
 cargo_version="$(
   sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
-    "$repo_root/Cargo.toml" | head -1
+    "$repo_root/packages/landstrip/Cargo.toml" | head -1
 )"
 [[ "$version" == "$cargo_version" ]] \
   || die "package.json version $version does not match Cargo.toml $cargo_version"
@@ -70,7 +70,7 @@ rust_host_triple="$("$RUSTC" --print host-tuple)"
 [[ -n "$rust_host_triple" ]] || die "cannot determine rustc host triple"
 
 # Keep packaging builds out of the developer target tree.
-package_target_root="${CARGO_TARGET_DIR:-$repo_root/target/package}"
+package_target_root="${CARGO_TARGET_DIR:-$repo_root/packages/landstrip/target/package}"
 
 # platform|rust-triple|binary-name
 platforms=(
@@ -168,7 +168,7 @@ build_with_zigbuild() {
   zig_path="$(command -v "$ZIG")"
 
   (
-    cd "$repo_root" || exit 1
+    cd "$repo_root/packages/landstrip" || exit 1
     export CARGO_HOME="$cargo_home"
     export CARGO_TARGET_DIR="$target_dir"
     export CARGO_ZIGBUILD_ZIG_PATH="$zig_path"
@@ -182,7 +182,7 @@ build_native() {
   local target_dir="$package_target_root/$triple"
 
   (
-    cd "$repo_root" || exit 1
+    cd "$repo_root/packages/landstrip" || exit 1
     CARGO_TARGET_DIR="$target_dir" "$CARGO" build --release --target "$triple"
   )
 }

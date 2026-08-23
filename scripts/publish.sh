@@ -307,7 +307,8 @@ fi
 
 if [[ "$tag_commit" != "$head_commit" ]] \
   && ! git diff --quiet "$tag_commit" "$head_commit" -- \
-    Cargo.toml Cargo.lock rust-toolchain.toml src; then
+    packages/landstrip/Cargo.toml packages/landstrip/Cargo.lock \
+    rust-toolchain.toml packages/landstrip/src; then
   die "Rust package sources changed since tag $version"
 fi
 
@@ -321,7 +322,7 @@ if [[ "$tag_commit" != "$head_commit" ]]; then
   publish_worktree="$workdir/source"
   git worktree add --detach "$publish_worktree" "$tag_commit" \
     || die "cannot create worktree for tag $version"
-  [[ -f "$publish_worktree/Cargo.toml" ]] \
+  [[ -f "$publish_worktree/packages/landstrip/Cargo.toml" ]] \
     || die "worktree missing Cargo.toml: $publish_worktree"
   cargo_root="$publish_worktree"
 else
@@ -334,7 +335,7 @@ package_version="$($NODE -p "require('$cargo_root/packages/landstrip-api/package
 
 cargo_version="$(
   sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
-    "$cargo_root/Cargo.toml"
+    "$cargo_root/packages/landstrip/Cargo.toml"
 )"
 cargo_version="${cargo_version%%$'\n'*}"
 [[ "$version" == "$cargo_version" ]] \
@@ -384,7 +385,7 @@ for package_dir in "${npm_package_dirs[@]}"; do
   preflight_npm_package "$package_dir"
 done
 
-publish_cargo_package "$cargo_root"
+publish_cargo_package "$cargo_root/packages/landstrip"
 for package_dir in "${npm_package_dirs[@]}"; do
   publish_npm_package "$package_dir"
 done

@@ -1,7 +1,7 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /
+    directory: /packages/landstrip
     schedule:
       interval: weekly
     cooldown: # applies only to version-updates (security-updates will be suggested immediately)
