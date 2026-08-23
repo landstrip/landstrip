@@ -93,10 +93,10 @@ prepare_npm_package_build() {
   host_pkg="$repo_root/npm/$host_platform"
   if [[ -d "$host_pkg" ]]; then
     $NPM install --prefix "$package_dir" --package-lock=false --ignore-scripts --no-save \
-      "$repo_root" "$host_pkg"
+      "$repo_root/packages/landstrip" "$host_pkg"
   else
     $NPM install --prefix "$package_dir" --package-lock=false --ignore-scripts --no-save \
-      "$repo_root"
+      "$repo_root/packages/landstrip"
   fi
 }
 
