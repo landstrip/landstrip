@@ -142,6 +142,22 @@ test('disabled sandbox allows permissions without prompting', async () => {
   });
 });
 
+
+test('option-managed sandbox state cannot be overwritten', async () => {
+  await withPlugin({ enabled: false }, async ({ tempDir }) => {
+    const shared = await import(pathToFileURL(join(tempDir, 'shared.js')).href);
+    shared.loadConfig(tempDir, { enabled: false });
+    const configPath = shared.getConfigPaths(tempDir).globalPath;
+    const before = await readFile(configPath, 'utf8');
+
+    assert.throws(
+      () => shared.setSandboxConfigEnabled(tempDir, true, { enabled: false }),
+      /Sandbox state is managed by plugin options/,
+    );
+    assert.equal(await readFile(configPath, 'utf8'), before);
+  });
+});
+
 test('setSandboxConfigEnabled toggles persisted enabled and the server honors it', async () => {
   await withPlugin(
     {

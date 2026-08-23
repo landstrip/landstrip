@@ -549,7 +549,12 @@ export function sandboxConfigTarget(baseDirectory: string): {
 export function setSandboxConfigEnabled(
   baseDirectory: string,
   enabled: boolean,
+  optionOverrides: SandboxConfigOverrides = {},
 ): 'project' | 'global' {
+  if (optionOverrides.enabled !== undefined) {
+    throw new Error('Sandbox state is managed by plugin options');
+  }
+
   const target = sandboxConfigTarget(baseDirectory);
   writeConfigFile(target.path, { enabled });
   return target.scope;

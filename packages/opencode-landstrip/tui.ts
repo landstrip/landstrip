@@ -125,6 +125,7 @@ function selectedForeground(background: RGBA): RGBA {
 
 const tui: TuiPlugin = async (api, options, meta) => {
   const optionOverrides = normalizeOptions(options);
+  const enabledManagedByOptions = optionOverrides.enabled !== undefined;
 
   function LandstripPermissionPrompt(rawProps: Record<string, unknown>) {
     const props = rawProps as unknown as PermissionPromptProps<string>;
@@ -703,6 +704,15 @@ const tui: TuiPlugin = async (api, options, meta) => {
     setLandstripOpen(false);
   };
   const toggleLandstrip = () => {
+    if (enabledManagedByOptions) {
+      api.ui.toast({
+        title: 'Landstrip',
+        message: 'Sandbox state is managed by plugin options',
+        variant: 'warning',
+      });
+      return;
+    }
+
     const directory = api.state.path.directory || process.cwd();
     const config = loadConfig(directory, optionOverrides);
     if (config.enabled && !confirmingDisable()) {
@@ -711,7 +721,7 @@ const tui: TuiPlugin = async (api, options, meta) => {
     }
     setConfirmingDisable(false);
     const enabled = !config.enabled;
-    const scope = setSandboxConfigEnabled(directory, enabled);
+    const scope = setSandboxConfigEnabled(directory, enabled, optionOverrides);
     refreshSandboxStatus?.();
     api.ui.toast({
       title: 'Landstrip',
@@ -747,7 +757,13 @@ const tui: TuiPlugin = async (api, options, meta) => {
         const config = loadConfig(directory, optionOverrides);
         const target = sandboxConfigTarget(directory);
         const values = (items: readonly string[]) => items.join(', ') || 'none';
-        const status = config.enabled ? 'Active' : 'Disabled by configuration';
+        const status = enabledManagedByOptions
+          ? config.enabled
+            ? 'Active (plugin options)'
+            : 'Disabled by plugin options'
+          : config.enabled
+            ? 'Active'
+            : 'Disabled by configuration';
         return jsxs('box', {
           position: 'absolute',
           zIndex: 4000,
@@ -784,7 +800,14 @@ const tui: TuiPlugin = async (api, options, meta) => {
             row('Denied Reads', values(config.filesystem.denyRead)),
             row('Allowed Writes', values(config.filesystem.allowWrite)),
             row('Denied Writes', values(config.filesystem.denyWrite)),
-            row('Configuration Scope', target.scope === 'project' ? 'Project' : 'Global'),
+            row(
+              'Configuration Scope',
+              enabledManagedByOptions
+                ? 'Plugin options'
+                : target.scope === 'project'
+                  ? 'Project'
+                  : 'Global',
+            ),
             row('Configuration File', formatPath(target.path, directory)),
             jsx('box', { flexGrow: 1 }),
             jsx('text', {
@@ -794,7 +817,9 @@ const tui: TuiPlugin = async (api, options, meta) => {
               marginBottom: 1,
               children: confirmingDisable()
                 ? 'Disable the sandbox? Commands will run without OS isolation.  Enter confirm · Esc cancel'
-                : `Enter ${config.enabled ? 'disable' : 'enable'} · Esc close`,
+                : enabledManagedByOptions
+                  ? 'Sandbox state is managed by plugin options · Esc close'
+                  : `Enter ${config.enabled ? 'disable' : 'enable'} · Esc close`,
             }),
           ],
         });
