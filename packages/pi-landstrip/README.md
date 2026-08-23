@@ -86,4 +86,5 @@ In a running or queued task's log view, press `Enter` to send a steering message
 
 ## Licensing
 
-[Apache 2.0](../../LICENSE-APACHE-2.0).
+`pi-landstrip` is licensed under the Apache 2.0 license. See [LICENSE](LICENSE)
+for more information.

@@ -60,7 +60,9 @@ make ci
 
 ## Licensing
 
-`landstrip` uses [LGPL-2.1+](LICENSE-LGPL-2.1).
-
-The JavaScript wrapper and agent extensions use
-[Apache 2.0](LICENSE-APACHE-2.0).
+| Package                | License                    |
+| ---------------------- | -------------------------- |
+| `landstrip`            | LGPL 2.1+                  |
+| `@landstrip/landstrip` | Apache 2.0 and LGPL 2.1+   |
+| `opencode-landstrip`   | Apache 2.0                 |
+| `pi-landstrip`         | Apache 2.0                 |

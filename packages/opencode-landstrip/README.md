@@ -47,4 +47,5 @@ replaced through OpenCode's plugin API.
 
 ## Licensing
 
-[Apache 2.0](../../LICENSE-APACHE-2.0).
+`opencode-landstrip` is licensed under the Apache 2.0 license. See [LICENSE](LICENSE)
+for more information.
