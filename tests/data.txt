@@ -18,6 +18,8 @@ name=invalid proxy port reports an internal trap | os=linux,macos | policy={"net
 
 name=unrestricted read policy runs tool | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"]}} | cmd=%SHELL% -c 'printf ok' | status=0
 name=sysctl read permits uname | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"]}} | cmd=%SHELL% -c 'uname -s' | status=0
+name=setuid ps runs under Seatbelt | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=/bin/ps -p %PID% -o pid= | status=0
+name=process can signal child under Seatbelt | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'sleep 30 & child=$!; kill "$child"; wait "$child" || test $? -eq 143' | status=0
 name=restricted read permits executable launch | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/bin","/usr/bin"],"allowRead":["/lib","/lib64","/usr/lib","/etc/ld.so.cache"],"allowWrite":["/dev/null"]}} | cmd=/bin/true | status=0
 name=allowWrite permits configured root | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/ok.txt"; test -f "$1/ok.txt"' _ %TMP%/allowed | status=0
 name=allowWrite non-existent file permits creation of exact path | os=linux | setup=mkdir:allowed | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed/nonexistent.txt"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c ': > "$1/nonexistent.txt"; test -f "$1/nonexistent.txt"' _ %TMP%/allowed | status=0

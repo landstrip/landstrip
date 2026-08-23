@@ -2464,10 +2464,19 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         return {
           render: (width: number) => {
             const contentWidth = Math.max(1, width - 2);
-            const pane = (lines: string[]) => [
-              paneTop(theme, width, 'Landstrip'),
-              ...lines.map((line) => paneRow(theme, width, line)),
-            ];
+            const terminalRows = (tui as Partial<TUI>).terminal?.rows;
+            const paneHeight = terminalRows
+              ? Math.max(1, Math.floor(terminalRows * OVERLAY_HEIGHT_RATIO))
+              : undefined;
+            const pane = (lines: string[]) => {
+              const rows = [
+                paneTop(theme, width, 'Landstrip'),
+                ...lines.map((line) => paneRow(theme, width, line)),
+              ];
+              if (paneHeight === undefined) return rows;
+              while (rows.length < paneHeight) rows.push(paneRow(theme, width));
+              return rows.slice(0, paneHeight);
+            };
             const pad = (value: string, cellWidth: number): string => {
               const clipped = truncateToWidth(value, cellWidth);
               return `${clipped}${' '.repeat(Math.max(0, cellWidth - visibleWidth(clipped)))}`;
@@ -3145,6 +3154,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       const sessionWritePath =
         task.sessionDir ?? (task.sessionFile ? dirname(task.sessionFile) : undefined);
       if (!sessionWritePath) throw new Error('Subagent task has no session directory or file');
+      const authPath = join(agentDir, 'auth.json');
       const cliEntry = invocation.args[0] ?? invocation.command;
       const cliRoot = dependencyRoot(cliEntry) ?? dirname(dirname(cliEntry));
       const extensionRoot = dependencyRoot(packageDir);
@@ -3184,7 +3194,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             ].filter((path): path is string => path !== undefined),
           ),
         ],
-        writePaths: [sessionWritePath, temp],
+        writePaths: [sessionWritePath, temp, authPath, `${authPath}.lock`],
         signal,
       });
       if (signal.aborted) throw new Error('Task cancelled');

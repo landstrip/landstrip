@@ -91,7 +91,14 @@ fn render_profile(policy: &AccessPolicy) -> std::result::Result<String, fmt::Err
 
 fn render_process_rules(sb: &mut String) -> fmt::Result {
     writeln!(sb, "(allow process-exec)")?;
+    // Seatbelt blocks the setuid system ps binary unless it executes outside the sandbox.
+    writeln!(
+        sb,
+        "(allow process-exec (path \"/bin/ps\") (with no-sandbox))"
+    )?;
     writeln!(sb, "(allow process-fork)")?;
+    writeln!(sb, "(allow process-info* (target same-sandbox))")?;
+    writeln!(sb, "(allow signal (target same-sandbox))")?;
     writeln!(sb, "(allow sysctl-read)")
 }
 
