@@ -1428,11 +1428,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     type LandstripTab = 'overview' | 'settings' | 'primary' | 'subagent' | 'tasks' | 'log' | 'help';
     const TAB_ORDER: readonly LandstripTab[] = [
       'overview',
-      'settings',
       'primary',
       'subagent',
       'tasks',
       'log',
+      'settings',
       'help',
     ];
     const TAB_LABELS: Record<LandstripTab, string> = {

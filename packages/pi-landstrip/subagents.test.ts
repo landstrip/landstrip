@@ -1541,7 +1541,7 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(commandNames).toEqual(['landstrip']);
   const running = command?.('agents', ctx);
   const agents = component?.render(96).join('\n') ?? '';
-  expect(agents).toContain('Overview  Settings  [Primary]  Subagent  Tasks  Log  Help');
+  expect(agents).toContain('Overview  [Primary]  Subagent  Tasks  Log  Settings  Help');
   expect(agents).toContain('@build');
   expect(agents).toContain('@plan');
   expect(agents).not.toContain('@general');
@@ -1581,7 +1581,7 @@ test('inspects and navigates persisted child sessions without switching sessions
 
   component?.handleInput('\t');
   const subagents = component?.render(96).join('\n') ?? '';
-  expect(subagents).toContain('Primary  [Subagent]  Tasks  Log  Help');
+  expect(subagents).toContain('Primary  [Subagent]  Tasks  Log  Settings  Help');
   expect(subagents).toContain('@explore');
   expect(subagents).toContain('@general');
   expect(subagents).toContain('@review');
@@ -1738,29 +1738,8 @@ test('inspects and navigates persisted child sessions without switching sessions
   expect(component?.render(96).join('\n')).toContain('[Log]');
   component?.handleInput('\t');
 
-  const help = component?.render(96).join('\n') ?? '';
-  expect(help).toContain('Primary  Subagent  Tasks  Log  [Help]');
-  expect(help).toMatch(/Shortcut\s+Description/);
-  expect(help).toMatch(/X\s+Delete selected agent or task sessions/);
-  expect(help).toMatch(/Space\s+Toggle agent enabled or select task/);
-  expect(help).toMatch(/Backspace\s+Open parent task/);
-  expect(help).toMatch(/F\s+Toggle task log follow/);
-  expect(help).toMatch(/Page Up \/ Down\s+Scroll task output by page/);
-  expect(help).toMatch(/Home \/ End\s+Jump to task output boundary/);
-  expect(help).toMatch(/Enter\s+Activate: set primary, open log, steer, confirm/);
-
-  component?.handleInput('\t');
-  await vi.waitFor(() => {
-    expect(component?.render(96).join('\n')).toContain('[Overview]  Settings');
-  });
-  const sandboxPane = component?.render(96).join('\n') ?? '';
-  expect(sandboxPane).toContain('[Overview]  Settings');
-  expect(sandboxPane).toContain('Sandbox settings are unavailable.');
-  expect(sandboxPane).not.toContain('maxSubagents');
-
-  component?.handleInput('\t');
   const projectSettings = component?.render(96).join('\n') ?? '';
-  expect(projectSettings).toContain('Overview  [Settings]');
+  expect(projectSettings).toContain('Log  [Settings]  Help');
   // Unset project values render the effective Global one.
   expect(projectSettings).toMatch(/Maximum Subagents\s+1 \(global\)/);
   expect(projectSettings).toMatch(/Filesystem Tool Policy\s+host \(global\)/);
@@ -1832,6 +1811,28 @@ test('inspects and navigates persisted child sessions without switching sessions
     expect(component?.render(96).join('\n')).toMatch(/Filesystem Tool Policy\s+host \(global\)/);
   });
 
+  component?.handleInput('\t');
+
+  const help = component?.render(96).join('\n') ?? '';
+  expect(help).toContain('Tasks  Log  Settings  [Help]');
+  expect(help).toMatch(/Shortcut\s+Description/);
+  expect(help).toMatch(/X\s+Delete selected agent or task sessions/);
+  expect(help).toMatch(/Space\s+Toggle agent enabled or select task/);
+  expect(help).toMatch(/Backspace\s+Open parent task/);
+  expect(help).toMatch(/F\s+Toggle task log follow/);
+  expect(help).toMatch(/Page Up \/ Down\s+Scroll task output by page/);
+  expect(help).toMatch(/Home \/ End\s+Jump to task output boundary/);
+  expect(help).toMatch(/Enter\s+Activate: set primary, open log, steer, confirm/);
+
+  component?.handleInput('\t');
+  await vi.waitFor(() => {
+    expect(component?.render(96).join('\n')).toContain('[Overview]  Primary');
+  });
+  const sandboxPane = component?.render(96).join('\n') ?? '';
+  expect(sandboxPane).toContain('[Overview]  Primary');
+  expect(sandboxPane).toContain('Sandbox settings are unavailable.');
+  expect(sandboxPane).not.toContain('maxSubagents');
+
   component?.handleInput('\x1b');
   await running;
 
@@ -1899,7 +1900,7 @@ test('refuses to open a project setting editor when the project is untrusted', a
   } as unknown as ExtensionContext;
 
   const running = command?.('settings', ctx);
-  expect(component?.render(96).join('\n')).toContain('Overview  [Settings]');
+  expect(component?.render(96).join('\n')).toContain('Log  [Settings]  Help');
 
   component?.handleInput('\r');
   expect(warnings).toEqual(['Project settings require a trusted project']);
@@ -3247,7 +3248,7 @@ test('renders sandbox state in the settings pane and toggles it', async () => {
     overlayOptions: { anchor: 'bottom-center', width: '100%' },
   });
   const pane = component?.render(96).join('\n') ?? '';
-  expect(pane).toContain('[Overview]  Settings');
+  expect(pane).toContain('[Overview]  Primary');
   expect(pane).toContain('Active');
   expect(pane).toContain('proxied');
   expect(pane).toContain('example.com');
