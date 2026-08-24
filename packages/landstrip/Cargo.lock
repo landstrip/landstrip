@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "landstrip"
-version = "0.18.38"
+version = "0.18.39"
 dependencies = [
  "anyhow",
  "clap",
