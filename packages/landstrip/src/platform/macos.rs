@@ -94,7 +94,13 @@ fn render_process_rules(sb: &mut String) -> fmt::Result {
     // Seatbelt blocks the setuid system ps binary unless it executes outside the sandbox.
     writeln!(
         sb,
-        "(allow process-exec (path \"/bin/ps\") (with no-sandbox))"
+        "(allow process-exec (path \"/bin/ps\") (with no-sandbox))",
+    )?;
+    // `container system status` shells out to launchctl; seatbelt blocks it
+    // unless it executes outside the sandbox, same as ps.
+    writeln!(
+        sb,
+        "(allow process-exec (path \"/bin/launchctl\") (with no-sandbox))"
     )?;
     writeln!(sb, "(allow process-fork)")?;
     writeln!(sb, "(allow process-info* (target same-sandbox))")?;
@@ -124,6 +130,8 @@ fn render_mach_rules(sb: &mut String) -> fmt::Result {
     writeln!(sb, "  (global-name \"com.apple.lsd.mapdb\")")?;
     writeln!(sb, "  (global-name \"com.apple.PowerManagement.control\")")?;
     writeln!(sb, "  (global-name \"com.apple.securityd.xpc\")")?;
+    // apple/container CLI talks to its daemon over XPC.
+    writeln!(sb, "  (global-name \"com.apple.container.apiserver\")")?;
     writeln!(sb, "  (global-name \"com.apple.system.logger\")")?;
     writeln!(
         sb,
