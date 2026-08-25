@@ -97,7 +97,7 @@ function matchDepth(filePath: string, patterns: string[], baseDirectory: string)
   let depth = -1;
 
   for (const pattern of patterns) {
-    if (pattern.includes('*')) {
+    if (/[*?[\]]/.test(pattern)) {
       const absPattern = normalizePathForMatch(canonicalizeGlobPattern(pattern, baseDirectory));
       if (globToRegExp(absPattern).test(abs)) depth = Math.max(depth, pathDepth(abs));
     } else {
@@ -114,7 +114,7 @@ function matchDepth(filePath: string, patterns: string[], baseDirectory: string)
 
 function resolveFilesystemPatterns(patterns: string[], baseDirectory: string): string[] {
   return patterns.map((pattern) =>
-    pattern.includes('*')
+    /[*?[\]]/.test(pattern)
       ? canonicalizeGlobPattern(pattern, baseDirectory)
       : canonicalizePath(pattern, baseDirectory),
   );

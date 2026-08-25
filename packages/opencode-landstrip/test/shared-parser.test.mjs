@@ -125,6 +125,22 @@ test('path scopes use platform-native containment semantics', async () => {
   }
 });
 
+test('glob matching follows Rust UTF-8 byte semantics', async () => {
+  const { mod, cleanup } = await loadShared();
+  try {
+    assert.equal(mod.globToRegExp('?').test('é'), false);
+    assert.equal(mod.globToRegExp('??').test('é'), true);
+    assert.equal(mod.globToRegExp('[é]').test('é'), false);
+    assert.equal(mod.globToRegExp('[é][é]').test('é'), true);
+    assert.equal(mod.globToRegExp('é').test('é'), true);
+    assert.equal(mod.globToRegExp('file').test('file\n'), false);
+    assert.equal(mod.globToRegExp('**').test('line\nbreak'), true);
+    assert.equal(mod.globToRegExp('**/file').test('line\nbreak/file'), true);
+  } finally {
+    await cleanup();
+  }
+});
+
 test('trap session handshake rejects missing or malformed identities', async () => {
   const { mod, cleanup } = await loadShared();
   try {

@@ -230,7 +230,7 @@ function canonicalizePath(filePath, baseDirectory, seen = new Set()) {
 
 function canonicalizeGlobPattern(pattern, baseDirectory) {
   const expanded = expandPath(pattern, baseDirectory);
-  const wildcard = expanded.indexOf('*');
+  const wildcard = expanded.search(/[*?[\]]/);
   if (wildcard < 0) return canonicalizePath(expanded, baseDirectory);
 
   const prefix = expanded.slice(0, wildcard);
@@ -249,19 +249,65 @@ function normalizePathSeparators(path) {
 
 const globRegExpCache = new Map();
 
-// Translates an absolute glob pattern to a regular expression using standard
-// path semantics: `**` crosses directory boundaries (and `**/` may match zero
-// segments), while a single `*` is confined to one path segment.
+class ByteGlobRegExp extends RegExp {
+  exec(value) {
+    return super.exec(Buffer.from(String(value)).toString('latin1'));
+  }
+}
+
+// Translates an absolute glob pattern using the same UTF-8 byte semantics as
+// the Rust policy matcher: `**` crosses directories, `*` stays within one
+// segment, `?` matches one non-separator byte, and classes support byte ranges.
 function globToRegExp(globPattern) {
   const cached = globRegExpCache.get(globPattern);
   if (cached) return cached;
 
-  const escaped = globPattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*\*\/|\*\*|\*/g, (token) =>
-      token === '**/' ? '(?:.*/)?' : token === '**' ? '.*' : '[^/]*',
-    );
-  const result = new RegExp(`^${escaped}$`);
+  const pattern = Buffer.from(globPattern).toString('latin1');
+  let escaped = '';
+  for (let at = 0; at < pattern.length;) {
+    if (pattern.startsWith('**/', at)) {
+      escaped += '(?:[\\s\\S]*/)?';
+      at += 3;
+    } else if (pattern.startsWith('**', at)) {
+      escaped += '[\\s\\S]*';
+      at += 2;
+    } else if (pattern[at] === '*') {
+      escaped += '[^/]*';
+      at += 1;
+    } else if (pattern[at] === '?') {
+      escaped += '[^/]';
+      at += 1;
+    } else if (pattern[at] === '[') {
+      const end = pattern.indexOf(']', at + 1);
+      if (end < 0) {
+        escaped += '\\[';
+        at += 1;
+        continue;
+      }
+
+      const content = pattern.slice(at + 1, end);
+      const hex = (code) => `\\x${code.toString(16).padStart(2, '0')}`;
+      let characterClass = '';
+      for (let offset = 0; offset < content.length;) {
+        if (offset + 2 < content.length && content[offset + 1] === '-') {
+          const start = content.charCodeAt(offset);
+          const finish = content.charCodeAt(offset + 2);
+          if (start <= finish) characterClass += `${hex(start)}-${hex(finish)}`;
+          offset += 3;
+        } else {
+          characterClass += hex(content.charCodeAt(offset));
+          offset += 1;
+        }
+      }
+      escaped += characterClass ? `(?=[^/])[${characterClass}]` : '(?!)';
+      at = end + 1;
+    } else {
+      escaped += pattern[at].replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+      at += 1;
+    }
+  }
+
+  const result = new ByteGlobRegExp(`^${escaped}(?![\\s\\S])`);
   globRegExpCache.set(globPattern, result);
   return result;
 }

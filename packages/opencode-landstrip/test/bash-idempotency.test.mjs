@@ -522,7 +522,7 @@ test('deniedDomains override allowedDomains for bash permission', async () => {
   );
 });
 
-test('glob deny matches root and nested, single * stays in one segment', async () => {
+test('glob deny supports globstar, segment stars, ?, and character classes', async () => {
   await withPlugin(
     {
       enabled: true,
@@ -530,7 +530,7 @@ test('glob deny matches root and nested, single * stays in one segment', async (
         allowRead: ['.'],
         allowWrite: ['.'],
         denyRead: [],
-        denyWrite: ['**/.env', '*.kee'],
+        denyWrite: ['**/.env', '*.kee', 'file?.txt', '[ab].cls', '[d-f].cfg'],
       },
       network: { allowedDomains: ['*'], deniedDomains: [] },
     },
@@ -539,6 +539,9 @@ test('glob deny matches root and nested, single * stays in one segment', async (
         join(tempDir, '.env'),
         join(tempDir, 'config', '.env'),
         join(tempDir, 'a.kee'),
+        join(tempDir, 'file1.txt'),
+        join(tempDir, 'b.cls'),
+        join(tempDir, 'e.cfg'),
       ];
       for (const path of denied) {
         await assert.rejects(
@@ -551,12 +554,19 @@ test('glob deny matches root and nested, single * stays in one segment', async (
         );
       }
 
-      await assert.doesNotReject(
-        hooks['tool.execute.before'](
-          { callID: 'write-nested-kee', tool: 'write' },
-          { args: { path: join(tempDir, 'sub', 'a.kee') } },
-        ),
-      );
+      for (const path of [
+        join(tempDir, 'sub', 'a.kee'),
+        join(tempDir, 'file12.txt'),
+        join(tempDir, 'c.cls'),
+        join(tempDir, 'g.cfg'),
+      ]) {
+        await assert.doesNotReject(
+          hooks['tool.execute.before'](
+            { callID: `write-allowed-${path}`, tool: 'write' },
+            { args: { path } },
+          ),
+        );
+      }
     },
   );
 });
