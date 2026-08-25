@@ -127,6 +127,7 @@ test('propagates registered extensions and public context to workers', async () 
   expect(prepared?.readPaths.some((path) => path.endsWith('landstrip.json'))).toBe(true);
   expect(prepared?.writePaths.some((path) => path.endsWith('auth.json'))).toBe(true);
   expect(prepared?.writePaths.some((path) => path.endsWith('auth.json.lock'))).toBe(true);
+  expect(prepared?.writePaths.some((path) => path.endsWith('settings.json.lock'))).toBe(true);
   const toolsIndex = prepared?.args.indexOf('--tools') ?? -1;
   expect(prepared?.args[toolsIndex + 1]).toBe('read');
   const context = contextFromEnvironment({

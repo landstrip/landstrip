@@ -3180,6 +3180,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         task.sessionDir ?? (task.sessionFile ? dirname(task.sessionFile) : undefined);
       if (!sessionWritePath) throw new Error('Subagent task has no session directory or file');
       const authPath = join(agentDir, 'auth.json');
+      const settingsPath = join(agentDir, 'settings.json');
       const cliEntry = invocation.args[0] ?? invocation.command;
       const cliRoot = dependencyRoot(cliEntry) ?? dirname(dirname(cliEntry));
       const extensionRoot = dependencyRoot(packageDir);
@@ -3219,7 +3220,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             ].filter((path): path is string => path !== undefined),
           ),
         ],
-        writePaths: [sessionWritePath, temp, authPath, `${authPath}.lock`],
+        writePaths: [sessionWritePath, temp, authPath, `${authPath}.lock`, `${settingsPath}.lock`],
         signal,
       });
       if (signal.aborted) throw new Error('Task cancelled');
