@@ -1078,7 +1078,23 @@ test('runs a foreground task in an injected RPC worker', async () => {
       emit = listener;
       return () => {};
     },
-    async prompt() {
+    async prompt(promptText: string) {
+      if (promptText === 'Fail.' || promptText === 'Retry.') {
+        emit?.({
+          type: 'message_end',
+          message: {
+            role: 'assistant',
+            stopReason: 'error',
+            errorMessage: 'Quota reached',
+          },
+        });
+        if (promptText === 'Fail.') return;
+        emit?.({
+          type: 'message_end',
+          message: { role: 'assistant', stopReason: 'stop' },
+        });
+        return;
+      }
       emit?.({ type: 'tool_execution_start', toolCallId: 'tool-1', toolName: 'read' });
       emit?.({
         type: 'message_update',
@@ -1346,6 +1362,34 @@ test('runs a foreground task in an injected RPC worker', async () => {
   expect(lines?.join('\n')).toContain('Subagents  0 running · 1 queued');
   expect(lines?.join('\n')).toContain('@review  Review implementation');
   expect(widgets.at(-1)).toBeUndefined();
+
+  await expect(
+    taskTool?.execute(
+      'call-retry',
+      {
+        description: 'Retry review',
+        prompt: 'Retry.',
+        subagent_type: 'review',
+      },
+      undefined,
+      undefined,
+      ctx,
+    ),
+  ).resolves.toBeDefined();
+
+  await expect(
+    taskTool?.execute(
+      'call-2',
+      {
+        description: 'Fail review',
+        prompt: 'Fail.',
+        subagent_type: 'review',
+      },
+      undefined,
+      undefined,
+      ctx,
+    ),
+  ).rejects.toThrow('Quota reached');
 });
 
 test('inspects and navigates persisted child sessions without switching sessions', async () => {

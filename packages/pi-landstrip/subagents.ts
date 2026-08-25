@@ -2993,6 +2993,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       if (signal.aborted) throw new Error('Task cancelled');
       let turns = 0;
       let streamedText = '';
+      let workerError: string | undefined;
       worker.rpc.onEvent((event) => {
         if (event.type === 'message_update' && isRecord(event.assistantMessageEvent)) {
           const messageEvent = event.assistantMessageEvent;
@@ -3001,7 +3002,15 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             update(streamedText);
           }
         }
-        if (event.type === 'message_end') {
+        if (event.type === 'message_end' && isRecord(event.message)) {
+          if (event.message.role === 'assistant') {
+            workerError =
+              event.message.stopReason === 'error'
+                ? typeof event.message.errorMessage === 'string'
+                  ? event.message.errorMessage
+                  : 'Subagent model request failed'
+                : undefined;
+          }
           const usage = taskUsageFromMessage(event.message);
           if (usage) {
             task.usage = addTaskUsage(task.usage, usage);
@@ -3058,6 +3067,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           await worker.rpc.request('follow_up', { message: pendingPrompt });
         }
         const output = await promise;
+        if (workerError) throw new Error(workerError);
         if (signal.aborted) throw new Error('Task cancelled');
         task.state = 'completed';
         task.output = this.storeTaskText(task, output, 'output');
