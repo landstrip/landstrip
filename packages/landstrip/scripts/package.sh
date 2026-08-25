@@ -57,6 +57,9 @@ repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" \
 source "$repo_root/scripts/sha256.sh"
 cd "$repo_root"
 
+[[ -z "$(git status --porcelain)" ]] || die "working directory is not clean"
+package_commit="$(git rev-parse HEAD)"
+
 version="$("$NODE" -p "require('$repo_root/packages/landstrip-api/package.json').version")"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid package.json version: $version"
 
@@ -196,6 +199,18 @@ for platform in "${requested[@]}"; do
     needs_zigbuild=1
   fi
 done
+mkdir -p artifacts
+
+# Invalidate every platform so a subset or partial build cannot mix runs.
+for entry in "${platforms[@]}"; do
+  IFS='|' read -r platform _ binary <<<"$entry"
+  rm -f "npm/$platform/bin/$binary" \
+    "artifacts/${platform}.bin.sha256" \
+    "artifacts/${platform}.bin.sha256.tmp" \
+    "artifacts/${platform}.tar.gz" \
+    "artifacts/${platform}.tar.gz.sha256"
+done
+
 if ((needs_zigbuild)); then
   require_command "$CARGO_ZIGBUILD"
   require_command "$ZIG"
@@ -204,8 +219,6 @@ fi
 built=()
 skipped=()
 failed=()
-
-mkdir -p artifacts
 
 for platform in "${requested[@]}"; do
   entry="$(platform_entry "$platform")" \
@@ -271,9 +284,9 @@ for platform in "${requested[@]}"; do
   fi
 
   tar -C "$package_dir/bin" -czf "artifacts/${platform}.tar.gz" "$binary"
-  printf '%s\n' "$(sha256_digest "$package_dir/bin/$binary")" \
-    >"artifacts/${platform}.bin.sha256"
   write_sha256_sidecar "artifacts/${platform}.tar.gz"
+  write_binary_receipt "artifacts/${platform}.bin.sha256" \
+    "$package_dir/bin/$binary" "$version" "$package_commit"
   built+=("$platform")
   printf 'packaged %s -> npm/%s/bin/%s and artifacts/%s.tar.gz\n' \
     "$platform" "$platform" "$binary" "$platform"

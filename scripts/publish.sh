@@ -353,8 +353,8 @@ for platform in "${platforms[@]}"; do
     continue
   fi
 
-  [[ "$(sha256_digest "$source_bin")" == "$(<"$digest_file")" ]] \
-    || die "platform binary mismatch for $platform; rerun make package"
+  verify_binary_receipt "$digest_file" "$source_bin" "$version" "$head_commit" \
+    || die "stale or mismatched platform binary for $platform; rerun make package"
 
   package_dir="$workdir/packages/$platform"
   cp -a "npm/$platform" "$package_dir"

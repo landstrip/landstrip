@@ -43,4 +43,21 @@ if command -v sha256sum >/dev/null 2>&1; then
     || die "sha256sum -c rejected $asset.sha256"
 fi
 
+binary="$workdir/landstrip"
+receipt="$workdir/landstrip.bin.sha256"
+printf 'binary\n' >"$binary"
+write_binary_receipt "$receipt" "$binary" 1.2.3 abc123
+verify_binary_receipt "$receipt" "$binary" 1.2.3 abc123 \
+  || die "valid binary receipt was rejected"
+if verify_binary_receipt "$receipt" "$binary" 1.2.4 abc123; then
+  die "stale receipt version was accepted"
+fi
+if verify_binary_receipt "$receipt" "$binary" 1.2.3 def456; then
+  die "stale receipt commit was accepted"
+fi
+printf 'changed\n' >"$binary"
+if verify_binary_receipt "$receipt" "$binary" 1.2.3 abc123; then
+  die "mismatched binary was accepted"
+fi
+
 printf 'sha256 sidecar test passed\n'
