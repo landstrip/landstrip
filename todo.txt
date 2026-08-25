@@ -1,0 +1,5 @@
+x 2026-08-25 Prevent stale platform binaries and checksums from being published after partial release builds (packages/landstrip/scripts/package.sh:204-280; scripts/publish.sh:344-376) pri:A
+x 2026-08-25 Match Rust glob semantics for ?, character classes, and * in the shared TypeScript matcher and glob detection (packages/landstrip-api/lib/shared.js:231-266; packages/opencode-landstrip/index.ts:95-120) pri:B
+x 2026-08-25 Declare runtime-imported @opentui/core as an opencode-landstrip dependency instead of a devDependency (packages/opencode-landstrip/tui.ts:14; packages/opencode-landstrip/package.json:50-62) pri:B
+x 2026-08-25 Honor the configured NPM executable for extension CI instead of invoking literal npm (scripts/ci.sh:7-25,79-83) pri:C
+x 2026-08-25 Remove the unused direct @opentui/keymap devDependency from opencode-landstrip; no project source imports it (packages/opencode-landstrip/package.json:55-62) pri:C
