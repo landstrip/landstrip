@@ -248,7 +248,7 @@ function evaluateWritePermission(
   const allowDepth = matchDepth(filePath, effectiveAllowWrite, baseDirectory);
   const denyDepth = matchDepth(filePath, config.filesystem.denyWrite, baseDirectory);
 
-  if (denyDepth > allowDepth) {
+  if (denyDepth >= 0 && denyDepth >= allowDepth) {
     return {
       status: 'deny',
       kind: 'write',

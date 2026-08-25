@@ -623,6 +623,25 @@ test('deny overrides allow when a path matches both lists', async () => {
   );
 });
 
+test('denyWrite wins when allowWrite has the same pattern', async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: ['.'] },
+      network: { allowedDomains: ['*'], deniedDomains: [] },
+    },
+    async ({ hooks, tempDir }) => {
+      await assert.rejects(
+        hooks['tool.execute.before'](
+          { callID: 'write-equal-pattern', tool: 'write' },
+          { args: { path: join(tempDir, 'notes.txt') } },
+        ),
+        /write access denied/,
+      );
+    },
+  );
+});
+
 test('sandbox config files are write-protected by default', async () => {
   await withPlugin(
     {
