@@ -27,6 +27,14 @@ test('package metadata matches the Landstrip release', () => {
     extensionLock.packages[''].dependencies?.['@landstrip/landstrip-api'],
     `^${version}`,
   );
+  assert.equal(extensionPackage.dependencies?.['@opentui/core'], '>=0.3.4');
+  assert.equal(extensionPackage.devDependencies?.['@opentui/core'], undefined);
+  assert.equal(extensionPackage.devDependencies?.['@opentui/keymap'], undefined);
+  assert.equal(extensionLock.packages[''].dependencies?.['@opentui/core'], '>=0.3.4');
+  assert.equal(extensionLock.packages[''].devDependencies?.['@opentui/core'], undefined);
+  assert.equal(extensionLock.packages[''].devDependencies?.['@opentui/keymap'], undefined);
+  assert.equal(extensionLock.packages['node_modules/@opentui/core']?.dev, undefined);
+  assert.equal(extensionLock.packages['node_modules/@opentui/keymap'], undefined);
 
   for (const packageName of ['@landstrip/landstrip-api', ...platformDependencies]) {
     assertLockedPackage(extensionLock, packageName, version);
