@@ -52,7 +52,7 @@ impl std::str::FromStr for PolicyFormat {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct Settings {
     pub(crate) filesystem: SandboxFilesystem,
     pub(crate) network: SandboxNetwork,
@@ -66,7 +66,7 @@ impl Settings {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct SandboxFilesystem {
     #[serde(deserialize_with = "deserialize_paths")]
     pub(crate) allow_write: Vec<String>,
@@ -79,7 +79,7 @@ pub(crate) struct SandboxFilesystem {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct SandboxNetwork {
     pub(crate) allow_network: bool,
     pub(crate) allow_local_binding: bool,
@@ -99,7 +99,7 @@ pub(crate) enum AppContainerMode {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct SandboxWindows {
     pub(crate) app_container_mode: AppContainerMode,
     pub(crate) allow_loopback: bool,
