@@ -96,12 +96,6 @@ fn render_process_rules(sb: &mut String) -> fmt::Result {
         sb,
         "(allow process-exec (path \"/bin/ps\") (with no-sandbox))",
     )?;
-    // `container system status` shells out to launchctl; seatbelt blocks it
-    // unless it executes outside the sandbox, same as ps.
-    writeln!(
-        sb,
-        "(allow process-exec (path \"/bin/launchctl\") (with no-sandbox))"
-    )?;
     writeln!(sb, "(allow process-fork)")?;
     writeln!(sb, "(allow process-info* (target same-sandbox))")?;
     writeln!(sb, "(allow signal (target same-sandbox))")?;
