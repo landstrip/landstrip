@@ -171,26 +171,41 @@ export function isSupportedPiVersion(version: readonly number[]): boolean {
 }
 
 // Resolve the Pi package used by this extension import. Reading its
-// `package.json` instead of spawning `pi --version` avoids depending on
-// `process.argv[1]`, which is not the Pi CLI entry when Pi runs as an embedded
-// or extension host and would otherwise report the Node version instead.
+// `package.json` instead of spawning `pi --version` avoids reporting the Node
+// version when Pi runs as an embedded or extension host.
+function findPiPackage(entry: string): PiPackage | undefined {
+  let dir = dirname(realpathSync(entry));
+  for (;;) {
+    const pkgPath = join(dir, 'package.json');
+    if (existsSync(pkgPath)) {
+      const pkg = readPiPackage(pkgPath);
+      if (pkg) return pkg;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
 export function resolvePiPackage(): PiPackage | undefined {
   if (piPackageResolved) return cachedPiPackage;
   piPackageResolved = true;
 
-  try {
-    const entry = fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent'));
-    let dir = dirname(entry);
-    for (;;) {
-      const pkgPath = join(dir, 'package.json');
-      if (existsSync(pkgPath)) {
-        const pkg = readPiPackage(pkgPath);
-        if (pkg) return pkg;
-      }
-      const parent = dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
+  const argvEntry = process.argv[1];
+  if (argvEntry) {
+    try {
+      const pkg = findPiPackage(argvEntry);
+      if (pkg) return pkg;
+    } catch {
+      // Fall through when the process entry is not a filesystem path.
     }
+  }
+
+  try {
+    const pkg = findPiPackage(
+      fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent')),
+    );
+    if (pkg) return pkg;
   } catch {
     // Fall back to package discovery for runtimes without import.meta.resolve.
   }
@@ -3271,10 +3286,6 @@ export class SubagentRuntime implements CommandSubagentRuntime {
   }
 
   private piInvocation(): { command: string; args: string[] } {
-    const argvEntry = process.argv[1];
-    if (argvEntry && /(?:^|[/\\])cli\.(?:js|mjs|cjs|ts)$/.test(argvEntry)) {
-      return { command: process.execPath, args: [argvEntry] };
-    }
     const pkg = resolvePiPackage();
     if (!pkg) {
       throw new Error(
