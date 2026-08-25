@@ -72,8 +72,8 @@ cp "packages/landstrip/target/debug/$binary_name" "npm/$host_platform/bin/$binar
 chmod 755 "npm/$host_platform/bin/$binary_name" 2>/dev/null || true
 
 printf '==> npm install local platform package\n'
-tarball="$($NPM pack ./packages/landstrip-api --silent)"
-$NPM install --package-lock=false --ignore-scripts --no-save "./$tarball" "./npm/$host_platform"
+tarball="$("$NPM" pack ./packages/landstrip-api --silent)"
+"$NPM" install --package-lock=false --ignore-scripts --no-save "./$tarball" "./npm/$host_platform"
 rm -f "$tarball"
 $NODE packages/landstrip-api/bin/landstrip.js --version >/dev/null
 
@@ -83,7 +83,7 @@ printf '==> extension checks\n'
 # test-extensions.sh --local-root rebuilds the host binary, npm-packs the
 # meta package, installs each extension workspace, and runs its
 # ci:fmt / ci:lint / ci:check / ci:test scripts.
-npm run ci:extensions:local
+"$NPM" run ci:extensions:local
 
 if [[ -n "${CI_MSRV:-}" ]]; then
   version="$(sed -n 's/^[[:space:]]*rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' packages/landstrip/Cargo.toml)"

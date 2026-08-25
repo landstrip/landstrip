@@ -5,6 +5,7 @@
 set -euo pipefail
 
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--no-deprecation"
+NPM="${NPM:-npm}"
 
 list_extensions() {
   node <<'NODE'
@@ -67,7 +68,7 @@ cleanup_local_root() {
 }
 
 if ((local_root)); then
-  tarball="$(npm pack ./packages/landstrip-api --silent)"
+  tarball="$("$NPM" pack ./packages/landstrip-api --silent)"
   platform_package="npm/$(node -p '`${process.platform}-${process.arch}`')"
   [[ -d "$platform_package" ]] || {
     printf 'no local binary package for %s\n' "$platform_package" >&2
@@ -90,15 +91,15 @@ fi
 
 for package_dir in "${extension_dirs[@]}"; do
   if (( local_root )); then
-    npm install --prefix "$package_dir" --workspaces=false --package-lock=false \
+    "$NPM" install --prefix "$package_dir" --workspaces=false --package-lock=false \
       --ignore-scripts --no-save "./$tarball" "./$platform_package"
   else
-    npm ci --prefix "$package_dir" --workspaces=false --ignore-scripts
+    "$NPM" ci --prefix "$package_dir" --workspaces=false --ignore-scripts
   fi
-  npm --prefix "$package_dir" run ci:fmt
-  npm --prefix "$package_dir" run ci:lint
-  npm --prefix "$package_dir" run ci:check
-  npm --prefix "$package_dir" run ci:test
+  "$NPM" --prefix "$package_dir" run ci:fmt
+  "$NPM" --prefix "$package_dir" run ci:lint
+  "$NPM" --prefix "$package_dir" run ci:check
+  "$NPM" --prefix "$package_dir" run ci:test
 done
 
 if ((restricted_user_setup)); then
