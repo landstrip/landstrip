@@ -18,7 +18,6 @@ use crate::config::{AppContainerMode, SandboxFilesystem, SandboxNetwork, Sandbox
 use crate::error::{Error, PathIo};
 use crate::paths::{PathCoverage, normalize_path, normalize_path_lexically, normalize_roots};
 use anyhow::Result;
-use rayon::prelude::*;
 use serde::Serialize;
 use std::env;
 use std::fs;
@@ -469,7 +468,7 @@ fn lower_restricted_read_access(
     let mut denied = read_deny.to_vec();
     normalize_roots(&mut denied);
     let scanned = allowed
-        .par_iter()
+        .iter()
         .map(|root| scan_allowed_root(root, &denied, true, 0))
         .collect::<Result<Vec<RootScan>>>()?;
     let mut roots = Vec::new();
@@ -546,7 +545,7 @@ fn resolve_paths(
     home: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     let mut resolved: Vec<PathBuf> = paths
-        .par_iter()
+        .iter()
         .map(|path| {
             let path = resolve_sandbox_path(path, policy_base, home)?;
             let candidates = if path.to_string_lossy().bytes().any(is_glob_byte) {
