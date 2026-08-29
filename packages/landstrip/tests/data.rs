@@ -26,6 +26,7 @@ const ABSTRACT_UNIX_PROBE_ARG: &str = "--test-abstract-connect";
 const SIGNAL_OUTSIDE_PROBE_ARG: &str = "--test-signal-outside";
 const SIGNAL_THREAD_PROBE_ARG: &str = "--test-signal-thread";
 const IO_URING_PROBE_ARG: &str = "--test-io-uring";
+const DAEMON_PROBE_ARG: &str = "--test-daemon";
 
 fn main() {
     let mut args = std::env::args_os();
@@ -50,6 +51,9 @@ fn main() {
         }
         Some(value) if value == std::ffi::OsStr::new(IO_URING_PROBE_ARG) => {
             std::process::exit(io_uring_probe());
+        }
+        Some(value) if value == std::ffi::OsStr::new(DAEMON_PROBE_ARG) => {
+            std::process::exit(daemon_probe(args.next()));
         }
         _ => {}
     }
@@ -198,6 +202,7 @@ enum Net {
     SignalOutsideDenied,
     SignalThreadAllowed,
     IoUringDenied,
+    DaemonCleaned,
 }
 
 /// Fs action driven natively by the harness (no shell/tool can O_PATH portably).
@@ -589,6 +594,7 @@ fn parse_net(value: &str) -> Net {
         "signal-outside-denied" => Net::SignalOutsideDenied,
         "signal-thread-allowed" => Net::SignalThreadAllowed,
         "io-uring-denied" => Net::IoUringDenied,
+        "daemon-cleaned" => Net::DaemonCleaned,
         other => panic!("unknown net kind `{other}`"),
     }
 }
@@ -829,6 +835,7 @@ fn run_net(
         Net::SignalOutsideDenied => run_signal_outside_denied(ctx, format, policies),
         Net::SignalThreadAllowed => run_signal_thread_allowed(ctx, format, policies),
         Net::IoUringDenied => run_io_uring_denied(ctx, format, policies),
+        Net::DaemonCleaned => run_daemon_cleaned(ctx, format, policies, dir),
     }
 }
 
@@ -1224,6 +1231,136 @@ fn run_io_uring_denied(
     _policies: &[PathBuf],
 ) -> Result<(), String> {
     Err("io-uring-denied is linux-only".to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn daemon_probe(pid_file: Option<std::ffi::OsString>) -> i32 {
+    let Some(pid_file) = pid_file else {
+        return 2;
+    };
+    let mut ready = [0; 2];
+    // SAFETY: ready points to two writable file-descriptor slots.
+    if unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return 2;
+    }
+
+    // SAFETY: the probe is single-threaded and both children call _exit or pause.
+    let first = unsafe { libc::fork() };
+    if first == -1 {
+        return 2;
+    }
+    if first == 0 {
+        // SAFETY: these descriptors were returned by pipe2 above.
+        unsafe { libc::close(ready[0]) };
+        // SAFETY: setsid has no pointer preconditions.
+        if unsafe { libc::setsid() } == -1 {
+            // SAFETY: terminate without running duplicated cleanup.
+            unsafe { libc::_exit(2) };
+        }
+        // SAFETY: this process is still single-threaded.
+        let daemon = unsafe { libc::fork() };
+        if daemon != 0 {
+            // SAFETY: terminate the intermediate process after a successful or failed fork.
+            unsafe { libc::_exit(if daemon == -1 { 2 } else { 0 }) };
+        }
+
+        // Do not keep Command::output's pipes open after landstrip exits.
+        for fd in 0..=2 {
+            // SAFETY: close accepts any integer descriptor.
+            unsafe { libc::close(fd) };
+        }
+        // SAFETY: getpid has no preconditions.
+        let pid = unsafe { libc::getpid() };
+        if std::fs::write(pid_file, format!("{pid}\n")).is_err() {
+            // SAFETY: terminate without running duplicated cleanup.
+            unsafe { libc::_exit(2) };
+        }
+        let byte = [1_u8];
+        // SAFETY: ready[1] is open and byte points to one readable byte.
+        let _ = unsafe { libc::write(ready[1], byte.as_ptr().cast(), byte.len()) };
+        // SAFETY: close accepts the pipe descriptor and pause waits for cleanup's SIGKILL.
+        unsafe {
+            libc::close(ready[1]);
+            loop {
+                libc::pause();
+            }
+        }
+    }
+
+    // SAFETY: parent owns both pipe descriptors and the read buffer is valid.
+    unsafe { libc::close(ready[1]) };
+    let mut byte = [0_u8];
+    // SAFETY: ready[0] is open and byte points to one writable byte.
+    let synchronized = unsafe { libc::read(ready[0], byte.as_mut_ptr().cast(), byte.len()) } == 1;
+    // SAFETY: close accepts the pipe descriptor.
+    unsafe { libc::close(ready[0]) };
+    loop {
+        // SAFETY: first is this process's child and the status is intentionally discarded.
+        let waited = unsafe { libc::waitpid(first, std::ptr::null_mut(), 0) };
+        if waited == first {
+            break;
+        }
+        if waited == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return 2;
+        }
+    }
+    if synchronized { 23 } else { 2 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn daemon_probe(_pid_file: Option<std::ffi::OsString>) -> i32 {
+    2
+}
+
+#[cfg(target_os = "linux")]
+fn run_daemon_cleaned(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+    dir: &Path,
+) -> Result<(), String> {
+    let pid_file = dir.join("daemon.pid");
+    let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
+    let output = landstrip_net(ctx, format, policies)
+        .arg(exe)
+        .arg(DAEMON_PROBE_ARG)
+        .arg(&pid_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("daemon probe spawn: {e}"))?;
+    let pid = std::fs::read_to_string(&pid_file)
+        .map_err(|e| format!("read daemon pid: {e}"))?
+        .trim()
+        .parse::<i32>()
+        .map_err(|e| format!("parse daemon pid: {e}"))?;
+    let proc_path = PathBuf::from(format!("/proc/{pid}"));
+    if proc_path.exists() {
+        // Test hygiene on regressions: do not leave the probe daemon behind.
+        // SAFETY: pid came from the probe and SIGKILL has no pointer arguments.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        return Err(format!(
+            "daemonized descendant {pid} survived landstrip exit"
+        ));
+    }
+    if output.status.code() != Some(23) {
+        return Err(format!(
+            "foreground exit status not preserved; status={:?} output={}",
+            output.status,
+            merge(&output.stdout, &output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_daemon_cleaned(
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+    _dir: &Path,
+) -> Result<(), String> {
+    Err("daemon-cleaned is linux-only".to_owned())
 }
 
 /// Re-exec probe: connect to a host-created abstract Unix socket. Exit 0 when

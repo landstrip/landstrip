@@ -185,6 +185,9 @@ and
 .Sh EXIT STATUS
 .Cm run
 returns the sandboxed program's status.
+On Linux, policies that require a seccomp broker terminate and reap remaining
+descendants when that program exits; their background and daemonized processes
+do not outlive the invocation.
 Invalid policy validation and unhealthy
 doctor or status reports return 1. Other failures return 1 and usage errors
 return 2.

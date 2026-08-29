@@ -134,6 +134,80 @@ fn supervise_errno(errno: Errno) -> LandstripError {
     LandstripError::supervise(io::Error::from_raw_os_error(errno as i32))
 }
 
+fn child_subreaper() -> Result<bool> {
+    let mut enabled = 0;
+    // SAFETY: PR_GET_CHILD_SUBREAPER writes an integer to the supplied pointer.
+    if unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut enabled) } == -1 {
+        return Err(LandstripError::supervise(io::Error::last_os_error()).into());
+    }
+    Ok(enabled != 0)
+}
+
+fn set_child_subreaper(enabled: bool) -> Result<()> {
+    // SAFETY: PR_SET_CHILD_SUBREAPER only changes how orphaned descendants are reparented.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, i32::from(enabled), 0, 0, 0) } == -1 {
+        return Err(LandstripError::supervise(io::Error::last_os_error()).into());
+    }
+    Ok(())
+}
+
+fn child_pids() -> Result<Vec<Pid>> {
+    // /proc exposes the direct children adopted by this subreaper, including
+    // descendants that escaped the original process group with setsid(2).
+    let children =
+        fs::read_to_string("/proc/thread-self/children").map_err(LandstripError::supervise)?;
+    children
+        .split_whitespace()
+        .map(|pid| {
+            pid.parse::<i32>().map(Pid::from_raw).map_err(|error| {
+                LandstripError::supervise(io::Error::new(io::ErrorKind::InvalidData, error)).into()
+            })
+        })
+        .collect()
+}
+
+fn cleanup_descendants() -> Result<()> {
+    loop {
+        let children = child_pids()?;
+        if children.is_empty() {
+            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+                Err(Errno::ECHILD) => return Ok(()),
+                Ok(_) | Err(Errno::EINTR) => continue,
+                Err(error) => return Err(supervise_errno(error).into()),
+            }
+        }
+
+        // Signal the complete snapshot before reaping anything, so none of its
+        // PIDs can be reused between enumeration and kill(2).
+        let mut kill_error = None;
+        for child in children {
+            // SAFETY: child came from the kernel's direct-child list.
+            if unsafe { libc::kill(child.as_raw(), libc::SIGKILL) } == -1 {
+                let error = Errno::last();
+                if error != Errno::ESRCH && kill_error.is_none() {
+                    kill_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = kill_error {
+            return Err(supervise_errno(error).into());
+        }
+
+        loop {
+            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
+                Ok(_) | Err(Errno::EINTR) => {}
+                Err(error) => return Err(supervise_errno(error).into()),
+            }
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "broker setup and fork branches share one lifecycle"
+)]
 pub(super) fn run_broker(
     policy: &AccessPolicy,
     tool: &OsStr,
@@ -179,9 +253,22 @@ pub(super) fn run_broker(
 
     let filters = NetworkFilters::new(errno, io_uring, notify);
     let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::supervise)?;
+    let was_subreaper = child_subreaper()?;
+    if !was_subreaper {
+        set_child_subreaper(true)?;
+    }
 
-    // SAFETY: landstrip forks before spawning threads; the child either execs the tool or exits.
-    match unsafe { fork() }.map_err(supervise_errno)? {
+    // SAFETY: policy lowering is single-threaded; the child either execs the tool or exits.
+    let fork_result = match unsafe { fork() } {
+        Ok(result) => result,
+        Err(error) => {
+            if !was_subreaper {
+                set_child_subreaper(false)?;
+            }
+            return Err(supervise_errno(error).into());
+        }
+    };
+    match fork_result {
         ForkResult::Child => {
             drop(parent);
             let mut child_sock = child_sock;
@@ -233,28 +320,38 @@ pub(super) fn run_broker(
         }
         ForkResult::Parent { child } => {
             drop(child_sock);
-            match get_notify_fd(&parent)? {
-                NotifyStartup::Ready(notify) => {
-                    drop(parent);
-
-                    supervise_child(
+            let (result, notify) = match get_notify_fd(&parent) {
+                Ok(NotifyStartup::Ready(notify)) => {
+                    let result = supervise_child(
                         policy,
                         child,
                         notify.as_fd(),
                         &syscalls,
                         notify_filesystem,
                         trap_fd,
-                    )
+                    );
+                    (result, Some(notify))
                 }
-                NotifyStartup::Trap(trap) => {
-                    drop(parent);
+                Ok(NotifyStartup::Trap(trap)) => {
                     if let Some(trap_fd) = trap_fd {
                         trap_fd.write_json(&trap);
                     }
                     let _ = writeln!(io::stderr().lock(), "{trap}");
-                    Ok(1)
+                    (Ok(1), None)
                 }
-            }
+                Err(error) => (Err(error), None),
+            };
+            drop(parent);
+            let cleanup = cleanup_descendants();
+            let restore = if was_subreaper {
+                Ok(())
+            } else {
+                set_child_subreaper(false)
+            };
+            drop(notify);
+            cleanup?;
+            restore?;
+            result
         }
     }
 }

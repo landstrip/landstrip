@@ -82,6 +82,7 @@ name=session bus connect denied under allowNetwork | os=linux | setup=write:allo
 name=host abstract unix connect denied under allowNetwork | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=unix-abstract-denied
 name=cannot signal process outside sandbox | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=signal-outside-denied
 name=same-process thread signal still works | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=signal-thread-allowed
+name=daemonized descendants are killed | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%"]}} | net=daemon-cleaned
 
 # --- TCP connect policy ---
 
