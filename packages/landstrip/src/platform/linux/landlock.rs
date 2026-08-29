@@ -18,7 +18,7 @@ use nix::fcntl::{OFlag, open};
 use nix::sys::stat::{Mode, fstat};
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Landlock features handled by this module, pinned to the highest ABI the
 /// `landlock` crate understands (audit-logging controls only past ABI 6).
@@ -27,18 +27,7 @@ use std::path::{Path, PathBuf};
 /// assumption about what is actually available.
 const TARGET_ABI: ABI = ABI::V7;
 
-pub(super) fn enforce_access_policy(policy: &AccessPolicy) -> Result<()> {
-    enforce_access_policy_with(policy, true)
-}
-
-pub(super) fn enforce_broker_access_policy(policy: &AccessPolicy) -> Result<()> {
-    // Leave Read unhandled on the broker. Nested denyRead is mediated by seccomp;
-    // handling Read without Execute would still block execve of denyRead binaries
-    // because Landlock Execute is required for the open that feeds the loader.
-    enforce_access_policy_with(policy, false)
-}
-
-fn enforce_access_policy_with(policy: &AccessPolicy, restrict_read: bool) -> Result<()> {
+pub(super) fn enforce_access_policy(policy: &AccessPolicy, restrict_read: bool) -> Result<()> {
     let handled_access_fs = match &policy.read_access {
         ReadAccess::AllowRoots(_) if restrict_read => {
             AccessFs::from_write(TARGET_ABI) | read_access_fs()
@@ -179,7 +168,9 @@ fn add_path_rules(
     label: &str,
 ) -> Result<RulesetCreated> {
     for path in paths {
-        let fd = match open_path(path) {
+        let fd = match open(path, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty())
+            .map_err(io::Error::from)
+        {
             Ok(fd) => fd,
             Err(error) if error.is_opaque() => {
                 // Missing / unreachable targets must not promote the parent
@@ -226,10 +217,6 @@ fn add_network_rules(mut ruleset: RulesetCreated, policy: &AccessPolicy) -> Resu
     }
 
     Ok(ruleset)
-}
-
-fn open_path(path: &Path) -> io::Result<OwnedFd> {
-    open(path, OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty()).map_err(io::Error::from)
 }
 
 fn fd_is_dir(fd: &OwnedFd) -> Result<bool> {

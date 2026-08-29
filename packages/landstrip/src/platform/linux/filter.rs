@@ -10,7 +10,7 @@
 
 use super::seccomp::NotificationSyscalls;
 use crate::error::{Error as LandstripError, Mechanism};
-use crate::policy::{AccessPolicy, ReadAccess, UnixSocketAccess};
+use crate::policy::UnixSocketAccess;
 use anyhow::Result;
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
@@ -324,10 +324,6 @@ pub(super) fn add_unix_socket_filters(
     }
 
     Ok(())
-}
-
-pub(super) fn needs_filesystem_broker(policy: &AccessPolicy) -> bool {
-    !policy.write_roots.is_empty() || !matches!(policy.read_access, ReadAccess::Unrestricted)
 }
 
 #[derive(Clone, Copy)]

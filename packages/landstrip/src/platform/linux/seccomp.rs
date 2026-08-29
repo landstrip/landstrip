@@ -17,7 +17,7 @@
 //! those apart from sockets the child created itself.
 
 use super::filter::{NetworkFilters, build_errno_filter, build_io_uring_deny, build_notify_filter};
-use super::landlock::enforce_broker_access_policy;
+use super::landlock::enforce_access_policy;
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::paths::{
     PathCoverage, normalize_path, normalize_path_lexically, normalize_path_nofollow,
@@ -275,7 +275,10 @@ pub(super) fn run_broker(
             let mut handed_off = false;
 
             let result = (|| -> Result<()> {
-                enforce_broker_access_policy(policy)?;
+                // Leave Read unhandled on the broker. Nested denyRead is mediated by seccomp;
+                // handling Read without Execute would still block execve of denyRead binaries
+                // because Landlock Execute is required for the open that feeds the loader.
+                enforce_access_policy(policy, false)?;
 
                 {
                     let notify = filters.load_with_listener()?;
