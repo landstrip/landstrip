@@ -2,7 +2,6 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use crate::error::Error;
-use crate::policy::{AccessPolicy, resolve_policy};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -57,12 +56,6 @@ pub(crate) struct Settings {
     pub(crate) filesystem: SandboxFilesystem,
     pub(crate) network: SandboxNetwork,
     pub(crate) windows: SandboxWindows,
-}
-
-impl Settings {
-    pub(crate) fn resolve(&self, policy_base: &Path) -> Result<AccessPolicy> {
-        resolve_policy(&self.filesystem, &self.network, &self.windows, policy_base)
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -143,7 +136,9 @@ pub(crate) fn load_settings(
         merge_json(&mut merged, value);
     }
 
-    parse_settings(merged).context("policy")
+    serde_json::from_value(merged)
+        .map_err(parse_failed)
+        .context("policy")
 }
 
 /// Extra policy a sysadmin attaches to a specific tool's executable: a Unix
@@ -165,14 +160,6 @@ fn read_executable_policy(tool: &OsStr, format: PolicyFormat) -> Result<Option<V
         return Ok(None);
     };
 
-    parse_attached_policy(bytes, format, &exe)
-}
-
-fn parse_attached_policy(
-    bytes: Vec<u8>,
-    format: PolicyFormat,
-    exe: &Path,
-) -> Result<Option<Value>> {
     let document = String::from_utf8(bytes)
         .map_err(parse_failed)
         .with_context(|| format!("executable policy {}", exe.display()))?;
@@ -355,10 +342,6 @@ unsafe fn platform_getxattr(
     size: libc::size_t,
 ) -> libc::ssize_t {
     unsafe { libc::getxattr(path, name, value, size, 0, 0) }
-}
-
-fn parse_settings(document: Value) -> std::result::Result<Settings, Error> {
-    serde_json::from_value(document).map_err(parse_failed)
 }
 
 fn parse_failed(source: impl StdError + Send + Sync + 'static) -> Error {

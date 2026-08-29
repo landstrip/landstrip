@@ -58,8 +58,12 @@ pub(super) fn remove(name: &str) -> Result<()> {
     if status == NERR_Success || status == 2221 {
         return Ok(());
     }
-    Err(win32_error(status))
-        .with_context(|| format!("delete sandbox account {}", display_wide(&name)))
+    Err(win32_error(status)).with_context(|| {
+        format!(
+            "delete sandbox account {}",
+            String::from_utf16_lossy(&name[..name.len().saturating_sub(1)])
+        )
+    })
 }
 
 pub(super) fn lookup_sid(name: &str) -> Result<String> {
@@ -171,8 +175,4 @@ fn fill_random(buffer: &mut [u8]) -> Result<()> {
         bail!("BCryptGenRandom failed with NTSTATUS 0x{status:08x}");
     }
     Ok(())
-}
-
-fn display_wide(value: &[u16]) -> String {
-    String::from_utf16_lossy(&value[..value.len().saturating_sub(1)])
 }

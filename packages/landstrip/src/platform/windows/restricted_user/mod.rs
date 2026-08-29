@@ -8,7 +8,7 @@ mod account;
 mod broker;
 mod lease;
 mod manage;
-mod state;
+pub(super) mod state;
 mod wfp;
 mod worker;
 
@@ -25,7 +25,9 @@ use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 
-pub(super) use manage::{active_implementation, manage, status};
+pub(super) use manage::active_implementation;
+pub(crate) use manage::{manage, status};
+pub(crate) use worker::run as run_worker;
 
 pub(super) fn is_installed() -> Result<bool> {
     Ok(state::load_optional()?.is_some())
@@ -102,10 +104,6 @@ pub(super) fn execute(policy: &AccessPolicy, tool: &OsStr, args: &[OsString]) ->
     revoke_result?;
     clear_result?;
     Ok(exit_code.cast_signed())
-}
-
-pub(super) fn run_worker(request: &std::path::Path) -> Result<i32> {
-    worker::run(request)
 }
 
 pub(super) fn validate(policy: &AccessPolicy) -> Result<()> {

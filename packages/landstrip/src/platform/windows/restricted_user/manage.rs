@@ -44,12 +44,9 @@ pub(crate) fn manage(command: &WindowsCommand) -> Result<WindowsStatusReport> {
             proxy_port_high,
         } => {
             if !is_elevated()? {
-                elevate_install(
-                    *restricted_accounts,
-                    *unrestricted_accounts,
-                    *proxy_port_low,
-                    *proxy_port_high,
-                )?;
+                elevate(&format!(
+                    "windows install --restricted-accounts {restricted_accounts} --unrestricted-accounts {unrestricted_accounts} --proxy-port-range {proxy_port_low}-{proxy_port_high}"
+                ))?;
                 return status();
             }
             let _management_lock = NamedMutex::lock(MANAGEMENT_MUTEX)
@@ -64,7 +61,7 @@ pub(crate) fn manage(command: &WindowsCommand) -> Result<WindowsStatusReport> {
         WindowsCommand::Status => status(),
         WindowsCommand::Uninstall => {
             if !is_elevated()? {
-                elevate_uninstall()?;
+                elevate("windows uninstall")?;
                 return status();
             }
             let _management_lock = NamedMutex::lock(MANAGEMENT_MUTEX)
@@ -91,7 +88,7 @@ fn setup(
         .context("WFP filter count overflow")?;
     let mut wfp_filters = Vec::with_capacity(filter_count);
     for _ in 0..filter_count {
-        wfp_filters.push(wfp::generate_key()?);
+        wfp_filters.push(account::random_identifier(16)?);
     }
     let runner_path = install_runner()?;
 
@@ -100,8 +97,8 @@ fn setup(
         id,
         proxy_port_low,
         proxy_port_high,
-        wfp_provider: wfp::generate_key()?,
-        wfp_sublayer: wfp::generate_key()?,
+        wfp_provider: account::random_identifier(16)?,
+        wfp_sublayer: account::random_identifier(16)?,
         wfp_filters,
         complete: false,
         runner_path,
@@ -199,7 +196,7 @@ fn uninstall() -> Result<WindowsStatusReport> {
     Ok(WindowsStatusReport::app_container())
 }
 
-pub(in crate::platform::windows) fn status() -> Result<WindowsStatusReport> {
+pub(crate) fn status() -> Result<WindowsStatusReport> {
     let Some(installation) = state::load_optional()? else {
         return Ok(WindowsStatusReport::app_container());
     };
@@ -284,21 +281,6 @@ fn remove_runner(path: &Path) -> Result<()> {
         let _ = fs::remove_dir(directory);
     }
     Ok(())
-}
-
-fn elevate_install(
-    restricted_accounts: u16,
-    unrestricted_accounts: u16,
-    proxy_port_low: u16,
-    proxy_port_high: u16,
-) -> Result<()> {
-    elevate(&format!(
-        "windows install --restricted-accounts {restricted_accounts} --unrestricted-accounts {unrestricted_accounts} --proxy-port-range {proxy_port_low}-{proxy_port_high}"
-    ))
-}
-
-fn elevate_uninstall() -> Result<()> {
-    elevate("windows uninstall")
 }
 
 fn elevate(parameters: &str) -> Result<()> {

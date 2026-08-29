@@ -20,8 +20,6 @@ mod windows;
 use crate::outcome::DoctorReport;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::outcome::SandboxImplementation;
-#[cfg(target_os = "windows")]
-use crate::outcome::WindowsStatusReport;
 
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
@@ -43,7 +41,7 @@ pub(crate) use linux::execute;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::execute;
 #[cfg(target_os = "windows")]
-pub(crate) use windows::execute;
+pub(crate) use windows::{execute, manage as manage_windows, run_worker};
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::getsockopt_int;
@@ -68,16 +66,6 @@ pub(crate) fn validate(policy: &crate::policy::AccessPolicy) -> anyhow::Result<(
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
     Err(crate::error::Error::PlatformUnsupported.into())
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn manage_windows(command: &WindowsCommand) -> anyhow::Result<WindowsStatusReport> {
-    windows::manage(command)
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn run_worker(request: &std::path::Path) -> anyhow::Result<i32> {
-    windows::run_worker(request)
 }
 
 #[cfg(target_os = "linux")]

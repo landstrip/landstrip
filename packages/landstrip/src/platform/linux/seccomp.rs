@@ -124,11 +124,6 @@ fn syscall_i32(value: u64) -> i32 {
     syscall_u32(value).cast_signed()
 }
 
-/// Reinterpret a syscall argument register as its signed 64-bit C type.
-fn syscall_i64(value: u64) -> i64 {
-    value.cast_signed()
-}
-
 /// A syscall that failed while supervising the sandboxed child.
 fn supervise_errno(errno: Errno) -> LandstripError {
     LandstripError::supervise(io::Error::from_raw_os_error(errno as i32))
@@ -1313,12 +1308,6 @@ fn create_path(path: &Path) -> PathBuf {
     }
 }
 
-fn path_exists(path: &Path) -> SysResult<bool> {
-    path.try_exists().map_err(|error| BrokerError::SystemCall {
-        errno: error.raw_os_error().unwrap_or(libc::EIO),
-    })
-}
-
 fn open_flag_names(flags: i32) -> Vec<&'static str> {
     let mut names = Vec::new();
     match flags & libc::O_ACCMODE {
@@ -1518,7 +1507,13 @@ fn handle_openat(
         let lexical = normalize_path_lexically(&raw);
         let reason = policy.write_reason(&resolved, &lexical, true);
         if let Some(reason) = reason {
-            if flags & libc::O_CREAT == 0 && !path_exists(&resolved)? {
+            if flags & libc::O_CREAT == 0
+                && !resolved
+                    .try_exists()
+                    .map_err(|error| BrokerError::SystemCall {
+                        errno: error.raw_os_error().unwrap_or(libc::EIO),
+                    })?
+            {
                 return Err(BrokerError::SystemCall {
                     errno: libc::ENOENT,
                 });
@@ -1542,7 +1537,12 @@ fn handle_openat(
         }
     }
     if wants_read && let Some(reason) = policy.read_reason(&resolved) {
-        if !path_exists(&resolved)? {
+        if !resolved
+            .try_exists()
+            .map_err(|error| BrokerError::SystemCall {
+                errno: error.raw_os_error().unwrap_or(libc::EIO),
+            })?
+        {
             return Err(BrokerError::SystemCall {
                 errno: libc::ENOENT,
             });
@@ -2142,7 +2142,7 @@ impl Grant {
                 MutationOp::Symlink { target }
             }
             MutationSyscall::Truncate => MutationOp::Truncate {
-                length: syscall_i64(args[1]),
+                length: args[1].cast_signed(),
             },
             MutationSyscall::Fchmodat | MutationSyscall::Fchmodat2 => MutationOp::Chmod {
                 mode: syscall_u32(args[2]),
@@ -2738,12 +2738,6 @@ fn resolve_child_path(pid: Pid, dirfd: i32, path: &Path) -> SysResult<PathBuf> {
     Ok(dir_path.join(path))
 }
 
-fn sockopt(fd: RawFd, level: libc::c_int, name: libc::c_int) -> SysResult<i32> {
-    super::getsockopt_int(fd, level, name).map_err(|error| BrokerError::SystemCall {
-        errno: error.raw_os_error().unwrap_or(0),
-    })
-}
-
 fn send_fd(socket: &UnixStream, fd: BorrowedFd<'_>) -> Result<()> {
     let byte = [0_u8];
     let iov = [IoSlice::new(&byte)];
@@ -2861,9 +2855,21 @@ struct SocketInfo {
 impl SocketInfo {
     fn read(fd: RawFd) -> SysResult<Self> {
         Ok(Self {
-            domain: sockopt(fd, libc::SOL_SOCKET, libc::SO_DOMAIN)?,
-            ty: sockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE)?,
-            proto: sockopt(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL)?,
+            domain: super::getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_DOMAIN).map_err(
+                |error| BrokerError::SystemCall {
+                    errno: error.raw_os_error().unwrap_or(0),
+                },
+            )?,
+            ty: super::getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE).map_err(|error| {
+                BrokerError::SystemCall {
+                    errno: error.raw_os_error().unwrap_or(0),
+                }
+            })?,
+            proto: super::getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL).map_err(
+                |error| BrokerError::SystemCall {
+                    errno: error.raw_os_error().unwrap_or(0),
+                },
+            )?,
         })
     }
 

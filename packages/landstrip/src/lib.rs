@@ -11,6 +11,7 @@
 //! structured outcomes and traps.
 
 mod cli;
+pub use cli::execute;
 pub(crate) mod config;
 pub(crate) mod error;
 pub(crate) mod outcome;
@@ -20,7 +21,3 @@ pub(crate) mod policy;
 pub(crate) mod trap;
 #[cfg(unix)]
 pub(crate) mod trap_fd;
-
-pub fn execute() {
-    cli::execute();
-}

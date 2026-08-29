@@ -3,7 +3,6 @@
 
 //! Persistent Windows Filtering Platform rules for restricted sandbox accounts.
 
-use super::account;
 use super::state::{Account, Installation, NetworkMode};
 use super::{OwnedSecurityDescriptor, ToWideNul};
 use anyhow::{Context, Result, bail};
@@ -33,10 +32,10 @@ use windows_sys::core::GUID;
 const IPPROTO_TCP: u8 = 6;
 const FILTER_WEIGHT_BLOCK: u8 = 0;
 const FILTER_WEIGHT_PERMIT: u8 = 15;
-
-pub(super) fn generate_key() -> Result<String> {
-    account::random_identifier(16)
-}
+const NOT_FOUND_STATUSES: [u32; 2] = [
+    FWP_E_FILTER_NOT_FOUND.cast_unsigned(),
+    FWP_E_NOT_FOUND.cast_unsigned(),
+];
 
 pub(super) fn install(installation: &Installation) -> Result<()> {
     let engine = Engine::open()?;
@@ -76,21 +75,24 @@ pub(super) fn uninstall(installation: &Installation) -> Result<()> {
 
     for key in installation.wfp_filters.iter().rev() {
         let key = parse_key(key)?;
-        allow_not_found(
+        ensure_success_or(
             unsafe { FwpmFilterDeleteByKey0(engine.handle, &raw const key) },
             "FwpmFilterDeleteByKey0",
+            &NOT_FOUND_STATUSES,
         )?;
     }
 
     let sublayer = parse_key(&installation.wfp_sublayer)?;
-    allow_not_found(
+    ensure_success_or(
         unsafe { FwpmSubLayerDeleteByKey0(engine.handle, &raw const sublayer) },
         "FwpmSubLayerDeleteByKey0",
+        &NOT_FOUND_STATUSES,
     )?;
     let provider = parse_key(&installation.wfp_provider)?;
-    allow_not_found(
+    ensure_success_or(
         unsafe { FwpmProviderDeleteByKey0(engine.handle, &raw const provider) },
         "FwpmProviderDeleteByKey0",
+        &NOT_FOUND_STATUSES,
     )?;
 
     transaction.commit()?;
@@ -316,9 +318,10 @@ fn add_filter(
         effectiveWeight: empty_value(),
     };
     let mut id = 0;
-    ensure_success(
+    ensure_success_or(
         unsafe { FwpmFilterAdd0(engine, &raw const filter, ptr::null_mut(), &raw mut id) },
         "FwpmFilterAdd0",
+        &[],
     )
 }
 
@@ -379,7 +382,7 @@ impl Engine {
             kernelMode: 0,
         };
         let mut handle = ptr::null_mut();
-        ensure_success(
+        ensure_success_or(
             unsafe {
                 FwpmEngineOpen0(
                     ptr::null(),
@@ -390,6 +393,7 @@ impl Engine {
                 )
             },
             "FwpmEngineOpen0",
+            &[],
         )?;
         Ok(Self { handle })
     }
@@ -412,9 +416,10 @@ struct Transaction<'a> {
 
 impl<'a> Transaction<'a> {
     fn begin(engine: &'a Engine) -> Result<Self> {
-        ensure_success(
+        ensure_success_or(
             unsafe { FwpmTransactionBegin0(engine.handle, 0) },
             "FwpmTransactionBegin0",
+            &[],
         )?;
         Ok(Self {
             engine,
@@ -423,9 +428,10 @@ impl<'a> Transaction<'a> {
     }
 
     fn commit(mut self) -> Result<()> {
-        ensure_success(
+        ensure_success_or(
             unsafe { FwpmTransactionCommit0(self.engine.handle) },
             "FwpmTransactionCommit0",
+            &[],
         )?;
         self.committed = true;
         Ok(())
@@ -440,21 +446,6 @@ impl Drop for Transaction<'_> {
             }
         }
     }
-}
-
-fn ensure_success(result: u32, operation: &str) -> Result<()> {
-    ensure_success_or(result, operation, &[])
-}
-
-fn allow_not_found(result: u32, operation: &str) -> Result<()> {
-    ensure_success_or(
-        result,
-        operation,
-        &[
-            FWP_E_FILTER_NOT_FOUND.cast_unsigned(),
-            FWP_E_NOT_FOUND.cast_unsigned(),
-        ],
-    )
 }
 
 fn ensure_success_or(result: u32, operation: &str, allowed: &[u32]) -> Result<()> {

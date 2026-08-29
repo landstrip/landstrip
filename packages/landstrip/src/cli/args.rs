@@ -238,10 +238,22 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
 
     let command = match cli.command {
         CliCommand::Run(args) => Command::Run(run_command(args)?),
-        CliCommand::Policy(args) => Command::Policy(policy_command(args)),
+        CliCommand::Policy(args) => Command::Policy(match args.command {
+            PolicyAction::Validate(args) => PolicyCommand::Validate(policy_request(args)),
+            PolicyAction::Resolve(args) => PolicyCommand::Resolve(policy_request(args)),
+        }),
         CliCommand::Doctor => Command::Doctor,
         #[cfg(target_os = "windows")]
-        CliCommand::Windows(args) => Command::Windows(windows_command(args)),
+        CliCommand::Windows(args) => Command::Windows(match args.command {
+            WindowsAction::Install(args) => WindowsCommand::Install {
+                restricted_accounts: args.restricted_accounts,
+                unrestricted_accounts: args.unrestricted_accounts,
+                proxy_port_low: args.proxy_port_range.low,
+                proxy_port_high: args.proxy_port_range.high,
+            },
+            WindowsAction::Status => WindowsCommand::Status,
+            WindowsAction::Uninstall => WindowsCommand::Uninstall,
+        }),
     };
 
     Ok(ParseOutcome::Invocation(Invocation {
@@ -270,31 +282,10 @@ fn run_command(args: RunArgs) -> Result<RunCommand, Error> {
     })
 }
 
-fn policy_command(args: PolicyArgs) -> PolicyCommand {
-    match args.command {
-        PolicyAction::Validate(args) => PolicyCommand::Validate(policy_request(args)),
-        PolicyAction::Resolve(args) => PolicyCommand::Resolve(policy_request(args)),
-    }
-}
-
 fn policy_request(args: PolicyRequestArgs) -> PolicyRequest {
     PolicyRequest {
         policy: args.policy,
         tool: args.tool,
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_command(args: WindowsArgs) -> WindowsCommand {
-    match args.command {
-        WindowsAction::Install(args) => WindowsCommand::Install {
-            restricted_accounts: args.restricted_accounts,
-            unrestricted_accounts: args.unrestricted_accounts,
-            proxy_port_low: args.proxy_port_range.low,
-            proxy_port_high: args.proxy_port_range.high,
-        },
-        WindowsAction::Status => WindowsCommand::Status,
-        WindowsAction::Uninstall => WindowsCommand::Uninstall,
     }
 }
 

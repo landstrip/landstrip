@@ -82,7 +82,7 @@ pub(super) fn write_request(
     result
 }
 
-pub(super) fn run(path: &Path) -> Result<i32> {
+pub(crate) fn run(path: &Path) -> Result<i32> {
     let bytes = fs::read(path).context("read restricted-user worker request")?;
     let request: Request =
         serde_json::from_slice(&bytes).context("parse restricted-user worker request")?;
@@ -106,7 +106,13 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
     harden_worker_objects()?;
     let restricted_token = create_restricted_token()?;
 
-    let command_line = command_line(tool, args)?;
+    let command_line = join_command_line(tool, args, |arg| {
+        let arg = arg
+            .to_str()
+            .context("restricted-user command line is not valid Unicode")?;
+        quote_command_text(arg)
+            .map_err(|_| anyhow::anyhow!("restricted-user command line contains an interior NUL"))
+    })?;
     let mut command_line = command_line.to_wide_nul();
     let cwd = cwd.to_wide_nul();
     validate_environment(environment)?;
@@ -156,7 +162,13 @@ fn create_restricted_token() -> Result<OwnedHandle> {
     // the privilege-stripping, which defends the DACL against
     // SeBackupPrivilege / SeRestorePrivilege bypass. An empty restricting-SID
     // list (count 0, pointer NULL) is the textbook-valid minimal call.
-    let process_token = worker_process_token()?;
+    let process_token = current_process_token(TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY)
+        .map_err(|source| {
+            LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                format!("OpenProcessToken: {source}"),
+            )
+        })?;
     let mut restricted_token = ptr::null_mut();
     let ok = unsafe {
         CreateRestrictedToken(
@@ -249,18 +261,14 @@ fn validate_environment(environment: &[u16]) -> Result<()> {
     Ok(())
 }
 
-fn worker_process_token() -> Result<OwnedHandle> {
-    current_process_token(TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY).map_err(|source| {
-        LandstripError::sandbox_setup(
-            Mechanism::Windowsuser,
-            format!("OpenProcessToken: {source}"),
-        )
-        .into()
-    })
-}
-
 fn verify_current_sid(expected: &str) -> Result<()> {
-    let token = worker_process_token()?;
+    let token = current_process_token(TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY)
+        .map_err(|source| {
+            LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                format!("OpenProcessToken: {source}"),
+            )
+        })?;
     let user = token_user(token.as_raw_handle()).map_err(|source| {
         LandstripError::sandbox_setup(
             Mechanism::Windowsuser,
@@ -277,14 +285,4 @@ fn verify_current_sid(expected: &str) -> Result<()> {
         bail!("restricted-user worker account SID does not match request");
     }
     Ok(())
-}
-
-fn command_line(tool: &OsStr, args: &[OsString]) -> Result<String> {
-    join_command_line(tool, args, |arg| {
-        let arg = arg
-            .to_str()
-            .context("restricted-user command line is not valid Unicode")?;
-        quote_command_text(arg)
-            .map_err(|_| anyhow::anyhow!("restricted-user command line contains an interior NUL"))
-    })
 }

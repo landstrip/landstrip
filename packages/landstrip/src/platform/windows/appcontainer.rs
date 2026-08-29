@@ -525,14 +525,21 @@ fn grant_root_access(granted: &mut GrantedAccess, path: &Path, access: u32) -> R
     // ancestor ACEs local to avoid propagating inheritable entries.
     let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
     for ancestor in path.ancestors().skip(1) {
-        grant_path_access(ancestor, granted.sid, ancestor_access, false, false)?;
+        set_appcontainer_path_access(
+            ancestor,
+            granted.sid,
+            ancestor_access,
+            GRANT_ACCESS,
+            false,
+            false,
+        )?;
         granted.paths.push(GrantedPath {
             path: ancestor.to_path_buf(),
             propagate: false,
         });
     }
 
-    grant_path_access(path, granted.sid, access, true, true)?;
+    set_appcontainer_path_access(path, granted.sid, access, GRANT_ACCESS, true, true)?;
     granted.paths.push(GrantedPath {
         path: path.to_path_buf(),
         propagate: true,
@@ -553,19 +560,16 @@ struct GrantedAccess {
 impl Drop for GrantedAccess {
     fn drop(&mut self) {
         for granted in self.paths.iter().rev() {
-            let _ = revoke_path_access(&granted.path, self.sid, granted.propagate);
+            let _ = set_appcontainer_path_access(
+                &granted.path,
+                self.sid,
+                0,
+                REVOKE_ACCESS,
+                false,
+                granted.propagate,
+            );
         }
     }
-}
-
-fn grant_path_access(
-    path: &Path,
-    sid: PSID,
-    access: u32,
-    inherit: bool,
-    propagate: bool,
-) -> Result<()> {
-    set_appcontainer_path_access(path, sid, access, GRANT_ACCESS, inherit, propagate)
 }
 
 fn deny_subtree_access(granted: &mut GrantedAccess, path: &Path, access: u32) -> Result<()> {
@@ -575,10 +579,6 @@ fn deny_subtree_access(granted: &mut GrantedAccess, path: &Path, access: u32) ->
         propagate: true,
     });
     Ok(())
-}
-
-fn revoke_path_access(path: &Path, sid: PSID, propagate: bool) -> Result<()> {
-    set_appcontainer_path_access(path, sid, 0, REVOKE_ACCESS, false, propagate)
 }
 
 fn set_appcontainer_path_access(
@@ -764,7 +764,10 @@ fn create_process_in_appcontainer(
     const MITIGATION_POLICY: u64 = (1u64 << 32)  // DisableExtensionPoints
         | (1u64 << 48)  // FontDisable
         | (1u64 << 52); // ImageLoadNoRemote
-    let command_line = command_line(tool, args)?;
+    let command_line = join_command_line(tool, args, |arg| {
+        quote_command_text(&arg.to_string_lossy())
+            .map_err(|message| LandstripError::launch(tool, message))
+    })?;
     let mut startup_info = unsafe { mem::zeroed::<STARTUPINFOEXW>() };
     startup_info.StartupInfo.cb = u32::try_from(mem::size_of::<STARTUPINFOEXW>())
         .map_err(|_| LandstripError::IntegerTooLarge)?;
@@ -1045,18 +1048,6 @@ impl NetworkCapabilities {
     fn count(&self) -> u32 {
         u32::try_from(self.entries.len()).unwrap_or(0)
     }
-}
-
-fn command_line(tool: &OsStr, args: &[OsString]) -> Result<String> {
-    join_command_line(tool, args, |arg| {
-        quote_command_text(&arg.to_string_lossy())
-            .map_err(|message| tool_encoding_error(tool, message))
-    })
-    .map_err(Into::into)
-}
-
-fn tool_encoding_error(tool: &OsStr, message: &'static str) -> LandstripError {
-    LandstripError::launch(tool, message)
 }
 
 fn hresult_value(hr: i32) -> u32 {

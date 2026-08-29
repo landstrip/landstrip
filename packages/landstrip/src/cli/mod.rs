@@ -20,7 +20,7 @@ use std::error::Error as StdError;
 use std::io::{self, Write};
 use std::process;
 
-pub(crate) fn execute() {
+pub fn execute() {
     let invocation = match parse_cli() {
         Ok(ParseOutcome::Invocation(invocation)) => invocation,
         Ok(ParseOutcome::Display(text)) => {
@@ -84,22 +84,17 @@ fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
 fn run(command: &RunCommand) -> Result<CommandOutcome> {
     let policy = load_policy(&command.policy, Some(command.tool.as_os_str()))?;
     platform::validate(&policy)?;
-    execute_run(&policy, command).map(CommandOutcome::Exit)
-}
-
-#[cfg(unix)]
-fn execute_run(policy: &AccessPolicy, command: &RunCommand) -> Result<i32> {
-    platform::execute(
-        policy,
+    #[cfg(unix)]
+    let result = platform::execute(
+        &policy,
         &command.tool,
         &command.tool_args,
         command.trap_fd.as_ref(),
-    )
-}
+    );
+    #[cfg(not(unix))]
+    let result = platform::execute(&policy, &command.tool, &command.tool_args);
 
-#[cfg(not(unix))]
-fn execute_run(policy: &AccessPolicy, command: &RunCommand) -> Result<i32> {
-    platform::execute(policy, &command.tool, &command.tool_args)
+    result.map(CommandOutcome::Exit)
 }
 
 fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
@@ -108,18 +103,15 @@ fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
             validate_requested_policy(request).map(CommandOutcome::PolicyValidated)
         }
         PolicyCommand::Resolve(request) => {
-            let policy = load_requested_policy(request)?;
+            let policy = load_policy(&request.policy, request.tool.as_deref())?;
             Ok(CommandOutcome::PolicyResolved(policy))
         }
     }
 }
 
-fn load_requested_policy(request: &PolicyRequest) -> Result<AccessPolicy> {
-    load_policy(&request.policy, request.tool.as_deref())
-}
-
 fn validate_requested_policy(request: &PolicyRequest) -> Result<PolicyValidationReport> {
-    let result = load_requested_policy(request).and_then(|policy| platform::validate(&policy));
+    let result = load_policy(&request.policy, request.tool.as_deref())
+        .and_then(|policy| platform::validate(&policy));
     policy_validation_report(result)
 }
 
@@ -154,7 +146,12 @@ fn load_policy(input: &PolicyInput, tool: Option<&std::ffi::OsStr>) -> Result<Ac
     let cwd = std::env::current_dir()?;
     log::debug!("cli: cwd: {}", cwd.display());
     let settings = load_settings(&input.paths, format, tool)?;
-    settings.resolve(&cwd)
+    crate::policy::resolve_policy(
+        &settings.filesystem,
+        &settings.network,
+        &settings.windows,
+        &cwd,
+    )
 }
 
 fn exit_with_error(error: &anyhow::Error) -> ! {

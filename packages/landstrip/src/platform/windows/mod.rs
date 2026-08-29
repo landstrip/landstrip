@@ -3,13 +3,12 @@
 
 //! Windows sandbox implementations.
 
-use super::WindowsCommand;
-
 mod appcontainer;
 mod restricted_user;
 
+pub(crate) use restricted_user::{manage, run_worker, status};
+
 use crate::error::{Error, Mechanism};
-use crate::outcome::WindowsStatusReport;
 use crate::policy::AccessPolicy;
 use anyhow::Result;
 use std::ffi::{OsStr, OsString, c_void};
@@ -569,16 +568,4 @@ pub(crate) fn validate(policy: &AccessPolicy) -> Result<()> {
         restricted_user::validate(policy)?;
     }
     Ok(())
-}
-
-pub(crate) fn manage(command: &WindowsCommand) -> Result<WindowsStatusReport> {
-    restricted_user::manage(command)
-}
-
-pub(crate) fn run_worker(request: &std::path::Path) -> Result<i32> {
-    restricted_user::run_worker(request)
-}
-
-pub(crate) fn status() -> Result<WindowsStatusReport> {
-    restricted_user::status()
 }
