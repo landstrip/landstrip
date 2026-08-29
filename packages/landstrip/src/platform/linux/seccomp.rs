@@ -156,7 +156,8 @@ pub(super) fn run_broker(
     ensure_notification_supported()?;
 
     let syscalls = NotificationSyscalls::new();
-    let errno = build_errno_filter(&syscalls, needs_network, unix_sockets)?;
+    let restricted = !policy.network_access.is_unrestricted();
+    let errno = build_errno_filter(&syscalls, restricted, unix_sockets)?;
     let io_uring = Some(build_io_uring_deny(&syscalls)?);
 
     let mut notify_syscalls: Vec<i64> = Vec::new();
@@ -2945,6 +2946,9 @@ pub(super) struct NotificationSyscalls {
     pub(super) bind: i64,
     pub(super) connect: i64,
     pub(super) socket: i64,
+    pub(super) sendto: i64,
+    pub(super) sendmsg: i64,
+    pub(super) sendmmsg: i64,
     pub(super) io_uring_setup: i64,
     pub(super) io_uring_enter: i64,
     pub(super) io_uring_register: i64,
@@ -2961,6 +2965,9 @@ impl NotificationSyscalls {
             bind: libc::SYS_bind,
             connect: libc::SYS_connect,
             socket: libc::SYS_socket,
+            sendto: libc::SYS_sendto,
+            sendmsg: libc::SYS_sendmsg,
+            sendmmsg: libc::SYS_sendmmsg,
             io_uring_setup: libc::SYS_io_uring_setup,
             io_uring_enter: libc::SYS_io_uring_enter,
             io_uring_register: libc::SYS_io_uring_register,

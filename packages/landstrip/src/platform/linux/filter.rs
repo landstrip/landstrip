@@ -45,6 +45,7 @@ pub(super) fn build_errno_filter(
     if needs_network {
         add_socket_family_filter(&mut errno_rules, syscalls.socket)?;
         add_unix_socket_filters(&mut errno_rules, syscalls.socket, unix_sockets)?;
+        add_network_bypass_filters(&mut errno_rules, syscalls)?;
     }
     if errno_rules.is_empty() {
         return Ok(None);
@@ -259,6 +260,32 @@ fn add_conditional_rule(
     let rule = SeccompRule::new(conditions)
         .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?;
     rules.entry(syscall).or_default().push(rule);
+
+    Ok(())
+}
+
+fn add_network_bypass_filters(rules: &mut RuleMap, syscalls: &NotificationSyscalls) -> Result<()> {
+    let fastopen =
+        u64::try_from(libc::MSG_FASTOPEN).map_err(|_| LandstripError::IntegerTooLarge)?;
+    for (syscall, flags) in [
+        (syscalls.sendto, 3),
+        (syscalls.sendmsg, 2),
+        (syscalls.sendmmsg, 3),
+    ] {
+        add_conditional_rule(
+            rules,
+            syscall,
+            vec![
+                SeccompCondition::new(
+                    flags,
+                    SeccompCmpArgLen::Dword,
+                    SeccompCmpOp::MaskedEq(fastopen),
+                    fastopen,
+                )
+                .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?,
+            ],
+        )?;
+    }
 
     Ok(())
 }
