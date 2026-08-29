@@ -152,6 +152,17 @@ instead permits only the proxy range selected during installation.
 .It Linux
 Landlock enforces filesystem roots and a seccomp broker handles network and
 query traps.
+Sandboxed processes cannot use
+.Xr io_uring_setup 2 ,
+.Xr io_uring_enter 2 ,
+or
+.Xr io_uring_register 2 .
+Blocking these syscall entry points prevents ring creation and syscall-driven
+submission or reconfiguration.
+An already-active ring created with
+.Dv IORING_SETUP_SQPOLL
+and supplied by another process is outside this boundary because it can consume
+submissions directly from shared memory.
 .It macOS
 Seatbelt enforces a profile fixed at process startup.
 .It Windows

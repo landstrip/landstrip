@@ -16,7 +16,7 @@
 //! are denied by Landlock scope on ABI 6+ (Linux 6.12+); the broker cannot tell
 //! those apart from sockets the child created itself.
 
-use super::filter::{NetworkFilters, build_errno_filter, build_notify_filter};
+use super::filter::{NetworkFilters, build_errno_filter, build_io_uring_deny, build_notify_filter};
 use super::landlock::enforce_broker_access_policy;
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::paths::{
@@ -157,6 +157,7 @@ pub(super) fn run_broker(
 
     let syscalls = NotificationSyscalls::new();
     let errno = build_errno_filter(&syscalls, needs_network, unix_sockets)?;
+    let io_uring = Some(build_io_uring_deny(&syscalls)?);
 
     let mut notify_syscalls: Vec<i64> = Vec::new();
     if notify_bind {
@@ -175,7 +176,7 @@ pub(super) fn run_broker(
         Some(build_notify_filter(&notify_syscalls)?)
     };
 
-    let filters = NetworkFilters::new(errno, notify);
+    let filters = NetworkFilters::new(errno, io_uring, notify);
     let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::supervise)?;
 
     // SAFETY: landstrip forks before spawning threads; the child either execs the tool or exits.
@@ -2944,6 +2945,9 @@ pub(super) struct NotificationSyscalls {
     pub(super) bind: i64,
     pub(super) connect: i64,
     pub(super) socket: i64,
+    pub(super) io_uring_setup: i64,
+    pub(super) io_uring_enter: i64,
+    pub(super) io_uring_register: i64,
     openat: i64,
     openat2: i64,
     open: Option<i64>,
@@ -2957,6 +2961,9 @@ impl NotificationSyscalls {
             bind: libc::SYS_bind,
             connect: libc::SYS_connect,
             socket: libc::SYS_socket,
+            io_uring_setup: libc::SYS_io_uring_setup,
+            io_uring_enter: libc::SYS_io_uring_enter,
+            io_uring_register: libc::SYS_io_uring_register,
             openat: libc::SYS_openat,
             openat2: libc::SYS_openat2,
             open: legacy_syscall::OPEN,

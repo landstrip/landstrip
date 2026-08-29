@@ -25,6 +25,7 @@ const TRUNCATE_PROBE_ARG: &str = "--test-truncate";
 const ABSTRACT_UNIX_PROBE_ARG: &str = "--test-abstract-connect";
 const SIGNAL_OUTSIDE_PROBE_ARG: &str = "--test-signal-outside";
 const SIGNAL_THREAD_PROBE_ARG: &str = "--test-signal-thread";
+const IO_URING_PROBE_ARG: &str = "--test-io-uring";
 
 fn main() {
     let mut args = std::env::args_os();
@@ -46,6 +47,9 @@ fn main() {
         }
         Some(value) if value == std::ffi::OsStr::new(SIGNAL_THREAD_PROBE_ARG) => {
             std::process::exit(signal_thread_probe());
+        }
+        Some(value) if value == std::ffi::OsStr::new(IO_URING_PROBE_ARG) => {
+            std::process::exit(io_uring_probe());
         }
         _ => {}
     }
@@ -193,6 +197,7 @@ enum Net {
     UnixAbstractDenied,
     SignalOutsideDenied,
     SignalThreadAllowed,
+    IoUringDenied,
 }
 
 /// Fs action driven natively by the harness (no shell/tool can O_PATH portably).
@@ -583,6 +588,7 @@ fn parse_net(value: &str) -> Net {
         "unix-abstract-denied" => Net::UnixAbstractDenied,
         "signal-outside-denied" => Net::SignalOutsideDenied,
         "signal-thread-allowed" => Net::SignalThreadAllowed,
+        "io-uring-denied" => Net::IoUringDenied,
         other => panic!("unknown net kind `{other}`"),
     }
 }
@@ -822,6 +828,7 @@ fn run_net(
         Net::UnixAbstractDenied => run_unix_abstract_denied(ctx, format, policies),
         Net::SignalOutsideDenied => run_signal_outside_denied(ctx, format, policies),
         Net::SignalThreadAllowed => run_signal_thread_allowed(ctx, format, policies),
+        Net::IoUringDenied => run_io_uring_denied(ctx, format, policies),
     }
 }
 
@@ -1174,6 +1181,49 @@ fn run_self_probe(
         output.status,
         merge(&output.stdout, &output.stderr).trim()
     ))
+}
+
+#[cfg(target_os = "linux")]
+fn io_uring_probe() -> i32 {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_setup,
+            1_u32,
+            std::ptr::null::<libc::c_void>(),
+        )
+    };
+    i32::from(result != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn io_uring_probe() -> i32 {
+    2
+}
+
+#[cfg(target_os = "linux")]
+fn run_io_uring_denied(
+    ctx: &Context,
+    format: PolicyFormat,
+    policies: &[PathBuf],
+) -> Result<(), String> {
+    run_self_probe(
+        ctx,
+        format,
+        policies,
+        IO_URING_PROBE_ARG,
+        None,
+        "io_uring probe spawn",
+        "io_uring setup not denied",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_io_uring_denied(
+    _ctx: &Context,
+    _format: PolicyFormat,
+    _policies: &[PathBuf],
+) -> Result<(), String> {
+    Err("io-uring-denied is linux-only".to_owned())
 }
 
 /// Re-exec probe: connect to a host-created abstract Unix socket. Exit 0 when

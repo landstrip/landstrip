@@ -54,31 +54,59 @@ pub(super) fn build_errno_filter(
     build_filter(errno_rules, SeccompAction::Errno(eafnosupport)).map(Some)
 }
 
+/// `io_uring` can issue network and filesystem operations without re-entering
+/// brokered syscalls. Deny every entry point with `EPERM` in a separate program
+/// because seccompiler binds one action per filter.
+pub(super) fn build_io_uring_deny(syscalls: &NotificationSyscalls) -> Result<BpfProgram> {
+    let mut rules = RuleMap::new();
+    rules.insert(syscalls.io_uring_setup, Vec::new());
+    rules.insert(syscalls.io_uring_enter, Vec::new());
+    rules.insert(syscalls.io_uring_register, Vec::new());
+    let eperm = u32::try_from(libc::EPERM).map_err(|_| LandstripError::IntegerTooLarge)?;
+    build_filter(rules, SeccompAction::Errno(eperm))
+}
+
 pub(super) fn network_filter(
     unix_sockets: UnixSocketFilter,
     needs_network: bool,
 ) -> Result<NetworkFilters> {
     let syscalls = NotificationSyscalls::new();
     let errno = build_errno_filter(&syscalls, needs_network, unix_sockets)?;
+    let io_uring = needs_network
+        .then(|| build_io_uring_deny(&syscalls))
+        .transpose()?;
     Ok(NetworkFilters {
         errno,
+        io_uring,
         notify: None,
     })
 }
 
 pub(super) struct NetworkFilters {
     errno: Option<BpfProgram>,
+    io_uring: Option<BpfProgram>,
     notify: Option<BpfProgram>,
 }
 
 impl NetworkFilters {
-    pub(super) fn new(errno: Option<BpfProgram>, notify: Option<BpfProgram>) -> Self {
-        Self { errno, notify }
+    pub(super) fn new(
+        errno: Option<BpfProgram>,
+        io_uring: Option<BpfProgram>,
+        notify: Option<BpfProgram>,
+    ) -> Self {
+        Self {
+            errno,
+            io_uring,
+            notify,
+        }
     }
 
     pub(super) fn load(&self) -> Result<()> {
         if let Some(errno) = &self.errno {
             load_program(errno, 0)?;
+        }
+        if let Some(io_uring) = &self.io_uring {
+            load_program(io_uring, 0)?;
         }
         if let Some(notify) = &self.notify {
             load_program(notify, 0)?;
@@ -90,6 +118,9 @@ impl NetworkFilters {
     pub(super) fn load_with_listener(&self) -> Result<OwnedFd> {
         if let Some(errno) = &self.errno {
             load_program(errno, 0)?;
+        }
+        if let Some(io_uring) = &self.io_uring {
+            load_program(io_uring, 0)?;
         }
         let notify = self.notify.as_ref().ok_or_else(|| {
             LandstripError::sandbox_setup(Mechanism::Seccomp, "notify filter missing")

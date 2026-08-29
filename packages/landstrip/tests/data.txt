@@ -67,6 +67,7 @@ name=stdin yaml policy runs tool | os=linux,macos | format=yaml | stdin_policy=t
 name=default network denies TCP listener | os=linux,macos | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=listener-denied
 name=allowLocalBinding permits localhost listener | os=linux,macos | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=listener-allowed
 name=allowNetwork permits localhost listener | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=listener-allowed
+name=allowNetwork still denies io_uring setup | os=linux | policy={"network":{"allowNetwork":true}} | net=io-uring-denied
 
 # --- unix domain sockets (macOS) ---
 
