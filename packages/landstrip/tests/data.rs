@@ -22,6 +22,7 @@ const DATA: &str = include_str!("data.txt");
 const OPATH_PROBE_ARG: &str = "--test-opath";
 const FUTIMENS_PROBE_ARG: &str = "--test-futimens";
 const TRUNCATE_PROBE_ARG: &str = "--test-truncate";
+const EXCLUSIVE_OPEN_PROBE_ARG: &str = "--test-exclusive-open";
 const FD_METADATA_PROBE_ARG: &str = "--test-fd-metadata";
 const ABSTRACT_UNIX_PROBE_ARG: &str = "--test-abstract-connect";
 const SIGNAL_OUTSIDE_PROBE_ARG: &str = "--test-signal-outside";
@@ -40,6 +41,9 @@ fn main() {
         }
         Some(value) if value == std::ffi::OsStr::new(TRUNCATE_PROBE_ARG) => {
             std::process::exit(truncate_probe(args.next()));
+        }
+        Some(value) if value == std::ffi::OsStr::new(EXCLUSIVE_OPEN_PROBE_ARG) => {
+            std::process::exit(exclusive_open_probe(args.next()));
         }
         Some(value) if value == std::ffi::OsStr::new(FD_METADATA_PROBE_ARG) => {
             std::process::exit(fd_metadata_probe(args.next(), args.next()));
@@ -223,6 +227,8 @@ enum Fs {
     },
     /// truncate(2) of `path`; `allowed` selects the expected result.
     Truncate { path: String, allowed: bool },
+    /// Exclusive creation of an existing `path`; success means `EEXIST` preserved its contents.
+    ExclusiveOpen { path: String, allowed: bool },
 }
 
 struct Case {
@@ -641,6 +647,10 @@ fn parse_fs(value: &str) -> Fs {
             path: path.to_owned(),
             allowed,
         },
+        "exclusive-open" => Fs::ExclusiveOpen {
+            path: path.to_owned(),
+            allowed,
+        },
         _ => panic!("unknown fs kind `{kind}`"),
     }
 }
@@ -662,6 +672,7 @@ fn run_fs(
             allowed,
         } => (FD_METADATA_PROBE_ARG, path, allowed, Some(operation)),
         Fs::Truncate { path, allowed } => (TRUNCATE_PROBE_ARG, path, allowed, None),
+        Fs::ExclusiveOpen { path, allowed } => (EXCLUSIVE_OPEN_PROBE_ARG, path, allowed, None),
     };
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
     let mut command = landstrip_net(ctx, format, policies);
@@ -802,6 +813,43 @@ fn fd_metadata_probe(
     _path: Option<std::ffi::OsString>,
     _operation: Option<std::ffi::OsString>,
 ) -> i32 {
+    2
+}
+
+#[cfg(target_os = "linux")]
+fn exclusive_open_probe(path: Option<std::ffi::OsString>) -> i32 {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(path) = path else {
+        return 2;
+    };
+    let Ok(c_path) = std::ffi::CString::new(path.as_bytes()) else {
+        return 2;
+    };
+    // SAFETY: c_path is NUL-terminated and the mode is valid for O_CREAT.
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd >= 0 {
+        // SAFETY: open returned a new descriptor.
+        unsafe { libc::close(fd) };
+        return 1;
+    }
+    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+        return 1;
+    }
+    match std::fs::read(path) {
+        Ok(contents) if contents == b"keep\n" => 0,
+        _ => 1,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exclusive_open_probe(_path: Option<std::ffi::OsString>) -> i32 {
     2
 }
 

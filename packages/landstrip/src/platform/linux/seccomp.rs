@@ -1550,13 +1550,7 @@ fn handle_openat(
         let lexical = normalize_path_lexically(&raw);
         let reason = policy.write_reason(&resolved, &lexical, true);
         if let Some(reason) = reason {
-            if flags & libc::O_CREAT == 0
-                && !resolved
-                    .try_exists()
-                    .map_err(|error| BrokerError::SystemCall {
-                        errno: error.raw_os_error().unwrap_or(libc::EIO),
-                    })?
-            {
+            if flags & libc::O_CREAT == 0 && !resolved.try_exists()? {
                 return Err(BrokerError::SystemCall {
                     errno: libc::ENOENT,
                 });
@@ -1580,12 +1574,7 @@ fn handle_openat(
         }
     }
     if wants_read && let Some(reason) = policy.read_reason(&resolved) {
-        if !resolved
-            .try_exists()
-            .map_err(|error| BrokerError::SystemCall {
-                errno: error.raw_os_error().unwrap_or(libc::EIO),
-            })?
-        {
+        if !resolved.try_exists()? {
             return Err(BrokerError::SystemCall {
                 errno: libc::ENOENT,
             });
@@ -3023,7 +3012,12 @@ struct OpenGrant {
 impl OpenGrant {
     fn new(resolved: &Path, flags: i32, mode: u32) -> std::result::Result<Self, i32> {
         let kind = match open_path(resolved, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) {
-            Ok(handle) => OpenKind::Reopen(handle),
+            Ok(handle) => {
+                if flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
+                    return Err(libc::EEXIST);
+                }
+                OpenKind::Reopen(handle)
+            }
             Err(libc::ENOENT) => OpenKind::Create {
                 anchor: Anchor::new(resolved)?,
                 mode,
