@@ -4,7 +4,7 @@
 mod args;
 
 use self::args::{
-    Command, Invocation, ParseOutcome, PolicyCommand, PolicyInput, PolicyRequest, RunCommand,
+    Command, Invocation, ParseOutcome, PolicyCommand, PolicyInput, RunCommand,
     parse_cli,
 };
 use crate::config::{PolicyFormat, load_settings};
@@ -100,7 +100,9 @@ fn run(command: &RunCommand) -> Result<CommandOutcome> {
 fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
     match command {
         PolicyCommand::Validate(request) => {
-            validate_requested_policy(request).map(CommandOutcome::PolicyValidated)
+            let result = load_policy(&request.policy, request.tool.as_deref())
+                .and_then(|policy| platform::validate(&policy));
+            policy_validation_report(result).map(CommandOutcome::PolicyValidated)
         }
         PolicyCommand::Resolve(request) => {
             let policy = load_policy(&request.policy, request.tool.as_deref())?;
@@ -109,15 +111,9 @@ fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
     }
 }
 
-fn validate_requested_policy(request: &PolicyRequest) -> Result<PolicyValidationReport> {
-    let result = load_policy(&request.policy, request.tool.as_deref())
-        .and_then(|policy| platform::validate(&policy));
-    policy_validation_report(result)
-}
-
 fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport> {
     match result {
-        Ok(()) => Ok(PolicyValidationReport::Valid),
+        Ok(()) => Ok(PolicyValidationReport::valid()),
         Err(error) => {
             let Some(engine_error) = find_engine_error(&error) else {
                 return Err(error);
@@ -133,7 +129,7 @@ fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport
                 rendered_message
             };
 
-            Ok(PolicyValidationReport::Invalid(PolicyValidationError {
+            Ok(PolicyValidationReport::invalid(PolicyValidationError {
                 code,
                 message,
             }))

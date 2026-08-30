@@ -202,25 +202,25 @@ pub(crate) fn status() -> Result<WindowsStatusReport> {
     };
 
     let (accounts_healthy, runner_healthy) = installation_health(&installation);
-    Ok(WindowsStatusReport::RestrictedUser {
-        version: installation.version,
-        complete: installation.complete,
-        restricted_accounts: installation
+    Ok(WindowsStatusReport::restricted_user(
+        installation.version,
+        installation.complete,
+        installation
             .accounts
             .iter()
             .filter(|account| account.network_mode == NetworkMode::Restricted)
             .count(),
-        unrestricted_accounts: installation
+        installation
             .accounts
             .iter()
             .filter(|account| account.network_mode == NetworkMode::Unrestricted)
             .count(),
-        proxy_port_low: installation.proxy_port_low,
-        proxy_port_high: installation.proxy_port_high,
-        runner: installation.runner_path,
+        installation.proxy_port_low,
+        installation.proxy_port_high,
+        installation.runner_path,
         runner_healthy,
         accounts_healthy,
-    })
+    ))
 }
 
 pub(in crate::platform::windows) fn active_implementation() -> Result<&'static str> {

@@ -90,18 +90,18 @@ pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
 pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
     let status = windows::status()?;
     let platform = std::env::consts::OS;
-    let implementation = status.active();
-    Ok(if status.healthy() {
-        DoctorReport::Healthy {
-            platform,
-            implementation,
-        }
+    let implementation = status.active;
+    let ok = status.healthy;
+    let error = if ok {
+        None
     } else {
-        DoctorReport::Unhealthy {
-            platform,
-            implementation,
-            error: "restricted-user installation is unhealthy".to_owned(),
-        }
+        Some("restricted-user installation is unhealthy".to_owned())
+    };
+    Ok(DoctorReport {
+        ok,
+        platform,
+        implementation,
+        error,
     })
 }
 
@@ -116,15 +116,14 @@ fn doctor_report(
     result: anyhow::Result<()>,
 ) -> DoctorReport {
     let platform = std::env::consts::OS;
-    match result {
-        Ok(()) => DoctorReport::Healthy {
-            platform,
-            implementation,
-        },
-        Err(error) => DoctorReport::Unhealthy {
-            platform,
-            implementation,
-            error: format!("{error:#}"),
-        },
+    let (ok, error) = match result {
+        Ok(()) => (true, None),
+        Err(error) => (false, Some(format!("{error:#}"))),
+    };
+    DoctorReport {
+        ok,
+        platform,
+        implementation,
+        error,
     }
 }

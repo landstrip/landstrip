@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use crate::policy::AccessPolicy;
-use serde::{Serialize, Serializer};
+use serde::Serialize;
 use std::io::{self, Write};
 #[cfg(target_os = "windows")]
 use std::path::PathBuf;
@@ -23,89 +23,91 @@ pub(crate) enum SandboxImplementation {
     RestrictedUser,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct PolicyValidationError {
     pub(crate) code: &'static str,
     pub(crate) message: String,
 }
 
-#[derive(Debug)]
-pub(crate) enum PolicyValidationReport {
-    Valid,
-    Invalid(PolicyValidationError),
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PolicyValidationReport {
+    pub(crate) valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<PolicyValidationError>,
 }
 
-impl Serialize for PolicyValidationReport {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Report<'a> {
-            valid: bool,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            error: Option<&'a PolicyValidationError>,
+impl PolicyValidationReport {
+    pub(crate) fn valid() -> Self {
+        Self {
+            valid: true,
+            error: None,
         }
+    }
 
-        let (valid, error) = match self {
-            Self::Valid => (true, None),
-            Self::Invalid(error) => (false, Some(error)),
-        };
-        Report { valid, error }.serialize(serializer)
+    pub(crate) fn invalid(error: PolicyValidationError) -> Self {
+        Self {
+            valid: false,
+            error: Some(error),
+        }
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum DoctorReport {
-    Healthy {
-        platform: &'static str,
-        implementation: SandboxImplementation,
-    },
-    Unhealthy {
-        platform: &'static str,
-        implementation: SandboxImplementation,
-        error: String,
-    },
-}
-
-impl Serialize for DoctorReport {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Report<'a> {
-            ok: bool,
-            platform: &'static str,
-            implementation: SandboxImplementation,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            error: Option<&'a str>,
-        }
-
-        let report = match self {
-            Self::Healthy {
-                platform,
-                implementation,
-            } => Report {
-                ok: true,
-                platform,
-                implementation: *implementation,
-                error: None,
-            },
-            Self::Unhealthy {
-                platform,
-                implementation,
-                error,
-            } => Report {
-                ok: false,
-                platform,
-                implementation: *implementation,
-                error: Some(error),
-            },
-        };
-        report.serialize(serializer)
-    }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct DoctorReport {
+    pub(crate) ok: bool,
+    pub(crate) platform: &'static str,
+    pub(crate) implementation: SandboxImplementation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
 }
 
 #[cfg(target_os = "windows")]
-#[derive(Debug)]
-pub(crate) enum WindowsStatusReport {
-    AppContainer,
-    RestrictedUser {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WindowsStatusReport {
+    pub(crate) active: SandboxImplementation,
+    pub(crate) installed: bool,
+    pub(crate) healthy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) restricted_accounts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unrestricted_accounts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) proxy_port_low: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) proxy_port_high: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) runner: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) runner_healthy: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) accounts_healthy: Option<bool>,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsStatusReport {
+    pub(crate) fn app_container() -> Self {
+        Self {
+            active: SandboxImplementation::AppContainer,
+            installed: false,
+            healthy: true,
+            version: None,
+            complete: None,
+            restricted_accounts: None,
+            unrestricted_accounts: None,
+            proxy_port_low: None,
+            proxy_port_high: None,
+            runner: None,
+            runner_healthy: None,
+            accounts_healthy: None,
+        }
+    }
+
+    pub(crate) fn restricted_user(
         version: u32,
         complete: bool,
         restricted_accounts: usize,
@@ -115,105 +117,21 @@ pub(crate) enum WindowsStatusReport {
         runner: PathBuf,
         runner_healthy: bool,
         accounts_healthy: bool,
-    },
-}
-
-#[cfg(target_os = "windows")]
-impl WindowsStatusReport {
-    pub(crate) fn app_container() -> Self {
-        Self::AppContainer
-    }
-
-    pub(crate) fn active(&self) -> SandboxImplementation {
-        match self {
-            Self::AppContainer => SandboxImplementation::AppContainer,
-            Self::RestrictedUser { .. } => SandboxImplementation::RestrictedUser,
+    ) -> Self {
+        Self {
+            active: SandboxImplementation::RestrictedUser,
+            installed: true,
+            healthy: complete && accounts_healthy && runner_healthy,
+            version: Some(version),
+            complete: Some(complete),
+            restricted_accounts: Some(restricted_accounts),
+            unrestricted_accounts: Some(unrestricted_accounts),
+            proxy_port_low: Some(proxy_port_low),
+            proxy_port_high: Some(proxy_port_high),
+            runner: Some(runner),
+            runner_healthy: Some(runner_healthy),
+            accounts_healthy: Some(accounts_healthy),
         }
-    }
-
-    pub(crate) fn healthy(&self) -> bool {
-        match self {
-            Self::AppContainer => true,
-            Self::RestrictedUser {
-                complete,
-                runner_healthy,
-                accounts_healthy,
-                ..
-            } => *complete && *accounts_healthy && *runner_healthy,
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl Serialize for WindowsStatusReport {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Report<'a> {
-            active: SandboxImplementation,
-            installed: bool,
-            healthy: bool,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            version: Option<u32>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            complete: Option<bool>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            restricted_accounts: Option<usize>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            unrestricted_accounts: Option<usize>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            proxy_port_low: Option<u16>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            proxy_port_high: Option<u16>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            runner: Option<&'a PathBuf>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            runner_healthy: Option<bool>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            accounts_healthy: Option<bool>,
-        }
-
-        let report = match self {
-            Self::AppContainer => Report {
-                active: self.active(),
-                installed: false,
-                healthy: self.healthy(),
-                version: None,
-                complete: None,
-                restricted_accounts: None,
-                unrestricted_accounts: None,
-                proxy_port_low: None,
-                proxy_port_high: None,
-                runner: None,
-                runner_healthy: None,
-                accounts_healthy: None,
-            },
-            Self::RestrictedUser {
-                version,
-                complete,
-                restricted_accounts,
-                unrestricted_accounts,
-                proxy_port_low,
-                proxy_port_high,
-                runner,
-                runner_healthy,
-                accounts_healthy,
-            } => Report {
-                active: self.active(),
-                installed: true,
-                healthy: self.healthy(),
-                version: Some(*version),
-                complete: Some(*complete),
-                restricted_accounts: Some(*restricted_accounts),
-                unrestricted_accounts: Some(*unrestricted_accounts),
-                proxy_port_low: Some(*proxy_port_low),
-                proxy_port_high: Some(*proxy_port_high),
-                runner: Some(runner),
-                runner_healthy: Some(*runner_healthy),
-                accounts_healthy: Some(*accounts_healthy),
-            },
-        };
-        report.serialize(serializer)
     }
 }
 
@@ -231,12 +149,10 @@ impl CommandOutcome {
     pub(crate) fn exit_code(&self) -> i32 {
         match self {
             Self::Exit(code) => *code,
-            Self::PolicyValidated(report) => {
-                i32::from(!matches!(report, PolicyValidationReport::Valid))
-            }
-            Self::Doctor(report) => i32::from(!matches!(report, DoctorReport::Healthy { .. })),
+            Self::PolicyValidated(report) => i32::from(!report.valid),
+            Self::Doctor(report) => i32::from(!report.ok),
             #[cfg(target_os = "windows")]
-            Self::Windows(report) => i32::from(!report.healthy()),
+            Self::Windows(report) => i32::from(!report.healthy),
             Self::PolicyResolved(_) => 0,
         }
     }
