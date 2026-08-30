@@ -16,7 +16,9 @@
 //! are denied by Landlock scope on ABI 6+ (Linux 6.12+); the broker cannot tell
 //! those apart from sockets the child created itself.
 
-use super::filter::{NetworkFilters, build_errno_filter, build_io_uring_deny, build_notify_filter};
+use super::filter::{
+    build_errno_filter, build_io_uring_deny, build_notify_filter, load_filters,
+};
 use super::landlock::enforce_access_policy;
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::paths::{
@@ -261,8 +263,7 @@ pub(super) fn run_broker(
         Some(build_notify_filter(&notify_syscalls)?)
     };
 
-    let filters = NetworkFilters::new(errno, io_uring, notify);
-    let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::supervise)?;
+        let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::supervise)?;
     let was_subreaper = child_subreaper()?;
     if !was_subreaper {
         set_child_subreaper(true)?;
@@ -291,7 +292,11 @@ pub(super) fn run_broker(
                 enforce_access_policy(policy, false)?;
 
                 {
-                    let notify = filters.load_with_listener()?;
+                    let notify = load_filters(
+                        errno.as_ref(),
+                        io_uring.as_ref(),
+                        notify.as_ref(),
+                    )?;
 
                     let notify = fcntl(notify.as_fd(), FcntlArg::F_DUPFD_CLOEXEC(0))
                         .map_err(supervise_errno)?;
@@ -2890,24 +2895,37 @@ struct SocketInfo {
     proto: i32,
 }
 
+fn getsockopt_int(fd: i32, level: i32, name: i32) -> std::io::Result<i32> {
+    // SAFETY: getsockopt writes a scalar into value; len bounds the storage.
+    let mut value: i32 = 0;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of_val(&value)).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "socket option size exceeds socklen_t",
+        )
+    })?;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            name,
+            (&raw mut value).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(value)
+    }
+}
+
 impl SocketInfo {
     fn read(fd: RawFd) -> SysResult<Self> {
         Ok(Self {
-            domain: super::getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_DOMAIN).map_err(
-                |error| BrokerError::SystemCall {
-                    errno: error.raw_os_error().unwrap_or(0),
-                },
-            )?,
-            ty: super::getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE).map_err(|error| {
-                BrokerError::SystemCall {
-                    errno: error.raw_os_error().unwrap_or(0),
-                }
-            })?,
-            proto: super::getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL).map_err(
-                |error| BrokerError::SystemCall {
-                    errno: error.raw_os_error().unwrap_or(0),
-                },
-            )?,
+            domain: getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_DOMAIN)?,
+            ty: getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE)?,
+            proto: getsockopt_int(fd, libc::SOL_SOCKET, libc::SO_PROTOCOL)?,
         })
     }
 

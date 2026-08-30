@@ -67,70 +67,24 @@ pub(super) fn build_io_uring_deny(syscalls: &NotificationSyscalls) -> Result<Bpf
     build_filter(rules, SeccompAction::Errno(eperm))
 }
 
-pub(super) fn network_filter(
-    unix_sockets: UnixSocketFilter,
-    needs_network: bool,
-) -> Result<NetworkFilters> {
-    let syscalls = NotificationSyscalls::new();
-    let errno = build_errno_filter(&syscalls, needs_network, unix_sockets)?;
-    let io_uring = needs_network
-        .then(|| build_io_uring_deny(&syscalls))
-        .transpose()?;
-    Ok(NetworkFilters {
-        errno,
-        io_uring,
-        notify: None,
-    })
-}
-
-pub(super) struct NetworkFilters {
-    errno: Option<BpfProgram>,
-    io_uring: Option<BpfProgram>,
-    notify: Option<BpfProgram>,
-}
-
-impl NetworkFilters {
-    pub(super) fn new(
-        errno: Option<BpfProgram>,
-        io_uring: Option<BpfProgram>,
-        notify: Option<BpfProgram>,
-    ) -> Self {
-        Self {
-            errno,
-            io_uring,
-            notify,
-        }
+pub(super) fn load_filters(
+    errno: Option<&BpfProgram>,
+    io_uring: Option<&BpfProgram>,
+    notify: Option<&BpfProgram>,
+) -> Result<OwnedFd> {
+    if let Some(errno) = errno {
+        load_program(errno, 0)?;
     }
-
-    pub(super) fn load(&self) -> Result<()> {
-        if let Some(errno) = &self.errno {
-            load_program(errno, 0)?;
-        }
-        if let Some(io_uring) = &self.io_uring {
-            load_program(io_uring, 0)?;
-        }
-        if let Some(notify) = &self.notify {
-            load_program(notify, 0)?;
-        }
-
-        Ok(())
+    if let Some(io_uring) = io_uring {
+        load_program(io_uring, 0)?;
     }
+    let notify = notify.ok_or_else(|| {
+        LandstripError::sandbox_setup(Mechanism::Seccomp, "notify filter missing")
+    })?;
 
-    pub(super) fn load_with_listener(&self) -> Result<OwnedFd> {
-        if let Some(errno) = &self.errno {
-            load_program(errno, 0)?;
-        }
-        if let Some(io_uring) = &self.io_uring {
-            load_program(io_uring, 0)?;
-        }
-        let notify = self.notify.as_ref().ok_or_else(|| {
-            LandstripError::sandbox_setup(Mechanism::Seccomp, "notify filter missing")
-        })?;
-
-        let listener = load_program(notify, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)?
-            .ok_or_else(|| LandstripError::sandbox_setup(Mechanism::Seccomp, "listener missing"))?;
-        Ok(listener)
-    }
+    let listener = load_program(notify, libc::SECCOMP_FILTER_FLAG_NEW_LISTENER)?
+        .ok_or_else(|| LandstripError::sandbox_setup(Mechanism::Seccomp, "listener missing"))?;
+    Ok(listener)
 }
 
 pub(super) fn build_filter(rules: RuleMap, match_action: SeccompAction) -> Result<BpfProgram> {
