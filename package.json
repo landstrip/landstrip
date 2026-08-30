@@ -1,6 +1,6 @@
 {
   "name": "landstrip-monorepo",
-  "version": "0.18.41",
+  "version": "0.18.42",
   "private": true,
   "description": "Monorepo for Landstrip sandbox and extensions",
   "license": "Apache-2.0 AND LGPL-2.1-or-later",

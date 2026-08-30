@@ -1,6 +1,6 @@
 {
   "name": "pi-landstrip",
-  "version": "0.18.41",
+  "version": "0.18.42",
   "description": "Sandboxed Bash and process-backed agents for Pi",
   "keywords": [
     "landstrip",
@@ -39,7 +39,7 @@
     "ci:test": "npm run test"
   },
   "dependencies": {
-    "@landstrip/landstrip-api": "^0.18.41",
+    "@landstrip/landstrip-api": "^0.18.42",
     "jsonc-parser": "^3.3.1",
     "minimatch": "^10.2.5",
     "yaml": "^2.9.0"
