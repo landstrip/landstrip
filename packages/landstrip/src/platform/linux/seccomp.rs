@@ -321,8 +321,10 @@ pub(super) fn run_broker(
                     .find_map(<dyn std::error::Error + 'static>::downcast_ref::<LandstripError>)
                     .map_or_else(|| Trap::internal(format!("{error:#}")), Trap::from);
                 if handed_off || send_trap(&mut child_sock, &trap).is_err() {
-                    if let Some(trap_fd) = trap_fd {
-                        trap_fd.write(&trap);
+                    if let Some(trap_fd) = trap_fd
+                        && let Err(error) = trap_fd.write(&trap)
+                    {
+                        log::debug!("trap fd write failed: {error}");
                     }
                     trap.emit();
                 }
@@ -346,8 +348,10 @@ pub(super) fn run_broker(
                     (result, Some(notify))
                 }
                 Ok(NotifyStartup::Trap(trap)) => {
-                    if let Some(trap_fd) = trap_fd {
-                        trap_fd.write_json(&trap);
+                    if let Some(trap_fd) = trap_fd
+                        && let Err(error) = trap_fd.write_json(&trap)
+                    {
+                        log::debug!("trap fd write failed: {error}");
                     }
                     let _ = writeln!(io::stderr().lock(), "{trap}");
                     (Ok(1), None)
@@ -397,7 +401,10 @@ fn supervise_child(
     trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
     let mut denials = Denials::new(trap_fd);
-    let query_enabled = trap_fd.is_some_and(TrapFd::is_socket);
+    let mut trap_fd = trap_fd
+        .filter(|trap_fd| trap_fd.is_stream_socket())
+        .map(AsFd::as_fd);
+    let query_enabled = trap_fd.is_some();
     let mount_namespace =
         NamespaceId::try_from(Path::new("/proc/self/ns/mnt")).map_err(LandstripError::supervise)?;
     let mut ctx = NotificationContext {
@@ -407,9 +414,7 @@ fn supervise_child(
         query_enabled,
         mount_namespace,
     };
-    let mut trap_fd = trap_fd
-        .filter(|trap_fd| trap_fd.is_socket())
-        .map(AsFd::as_fd);
+
     let mut pending_queries: std::collections::HashMap<u64, PendingQuery> =
         std::collections::HashMap::new();
     let mut control_buffer: Vec<u8> = Vec::new();
@@ -455,11 +460,12 @@ fn supervise_child(
                         notify_fd,
                     ));
             if dead {
-                // The launcher closed or errored the trap fd. Any deferred query
+                // The launcher closed, errored, or violated the trap-fd protocol. Any deferred query
                 // is unanswerable: deny it with EACCES so the child's syscall
                 // resumes instead of hanging, and stop polling the fd so the loop
                 // does not spin on a dead socket.
                 deny_all_pending(&mut pending_queries, notify_fd);
+                denials.trap_fd = None;
                 trap_fd = None;
                 ctx.query_enabled = false;
             }
@@ -490,8 +496,26 @@ fn supervise_child(
                     return Err(source);
                 }
             }
-            HandleResult::Pending(query_id, grant) => {
-                pending_queries.insert(query_id, PendingQuery { request, grant });
+            HandleResult::Pending(decision) => {
+                if let Err(error) = denials.write(&decision.trap) {
+                    log::debug!("trap query write failed: {error}");
+                    deny_all_pending(&mut pending_queries, notify_fd);
+                    denials.trap_fd = None;
+                    trap_fd = None;
+                    ctx.query_enabled = false;
+                    respond_notification(
+                        notify_fd,
+                        notification_error(request.id, -LandstripError::DENIAL_ERRNO),
+                    )?;
+                } else {
+                    pending_queries.insert(
+                        decision.query_id,
+                        PendingQuery {
+                            request,
+                            grant: decision.grant,
+                        },
+                    );
+                }
             }
             HandleResult::AddFd(grant) => {
                 // grant_open opens the path in the broker and completes the
@@ -593,10 +617,8 @@ impl<'a> Denials<'a> {
         }
     }
 
-    fn write(&self, trap: &Trap) {
-        if let Some(trap_fd) = self.trap_fd {
-            trap_fd.write(trap);
-        }
+    fn write(&self, trap: &Trap) -> io::Result<()> {
+        self.trap_fd.map_or(Ok(()), |trap_fd| trap_fd.write(trap))
     }
 
     fn record(&mut self, denial: Denial) {
@@ -605,15 +627,19 @@ impl<'a> Denials<'a> {
         }
     }
 
-    fn emit(&self, status: WaitStatus) -> i32 {
+    fn emit(self, status: WaitStatus) -> i32 {
         let code = exit_code(status);
-        for denial in self
-            .pending
-            .iter()
+        let Self { trap_fd, pending, .. } = self;
+        for denial in pending
+            .into_iter()
             .filter(|denial| code != 0 || denial.report_on_success())
         {
-            let trap = denial.clone().into_trap();
-            self.write(&trap);
+            let trap = denial.into_trap();
+            if let Some(trap_fd) = trap_fd
+                && let Err(error) = trap_fd.write(&trap)
+            {
+                log::debug!("trap fd write failed: {error}");
+            }
             trap.emit();
         }
         code
@@ -630,7 +656,7 @@ enum HandleResult {
     // is checked immediately before dispatch.
     RunMutation(MutationGrant),
     RunSocket(SocketGrant),
-    Pending(u64, Option<Grant>),
+    Pending(QueryDecision),
 }
 
 /// Immutable context shared across notification handling for a supervised child.
@@ -726,10 +752,7 @@ fn handle_notification(
         }
         Ok(NotificationResult::Open(grant)) => HandleResult::AddFd(grant),
         Ok(NotificationResult::Mutation(grant)) => HandleResult::RunMutation(grant),
-        Ok(NotificationResult::Query(decision)) => {
-            denials.write(&decision.trap);
-            HandleResult::Pending(decision.query_id, decision.grant)
-        }
+        Ok(NotificationResult::Query(decision)) => HandleResult::Pending(decision),
         Err(error) => {
             let errno = error.errno();
             HandleResult::Respond(notification_error(request.id, -errno.abs()))
@@ -2377,7 +2400,7 @@ fn process_control_responses(
             "linux: control buffer exceeded {CONTROL_BUFFER_MAX} bytes with no newline; dropping"
         );
         buffer.clear();
-        return false;
+        return true;
     }
 
     // The trap fd is a stream socket, so a read may split a response across
@@ -2395,10 +2418,10 @@ fn process_control_responses(
         }
         let Ok(response): std::result::Result<ControlResponse, _> = serde_json::from_slice(line)
         else {
-            continue;
+            return true;
         };
         let Ok(query_id) = response.query_id.parse::<u64>() else {
-            continue;
+            return true;
         };
         if let Some(pending) = pending_queries.remove(&query_id) {
             let id = pending.request.id;

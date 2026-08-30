@@ -4,8 +4,7 @@
 mod args;
 
 use self::args::{
-    Command, Invocation, ParseOutcome, PolicyCommand, PolicyInput, RunCommand,
-    parse_cli,
+    Command, Invocation, ParseOutcome, PolicyCommand, PolicyInput, RunCommand, parse_cli,
 };
 use crate::config::{PolicyFormat, load_settings};
 use crate::error::Error;
@@ -25,11 +24,11 @@ pub fn execute() {
         Ok(ParseOutcome::Invocation(invocation)) => invocation,
         Ok(ParseOutcome::Display(text)) => {
             if let Err(error) = io::stdout().lock().write_all(text.as_bytes()) {
-                exit_with_error(&error.into());
+                exit_with_error(&error.into(), None);
             }
             return;
         }
-        Err(error) => exit_with_error(&error.into()),
+        Err(error) => exit_with_error(&error.into(), None),
     };
     init_logging(invocation.debug);
 
@@ -38,23 +37,18 @@ pub fn execute() {
         Command::Run(command) => command.trap_fd.as_ref(),
         _ => None,
     };
+    #[cfg(not(unix))]
+    let trap_fd = None;
+
     let outcome = match dispatch(&invocation) {
         Ok(outcome) => outcome,
-        Err(error) => {
-            #[cfg(unix)]
-            exit_with_trap_fd(&error, trap_fd);
-            #[cfg(not(unix))]
-            exit_with_error(&error);
-        }
+        Err(error) => exit_with_error(&error, trap_fd),
     };
     if let Err(error) = outcome
         .write_to(&mut io::stdout().lock())
         .map_err(anyhow::Error::from)
     {
-        #[cfg(unix)]
-        exit_with_trap_fd(&error, trap_fd);
-        #[cfg(not(unix))]
-        exit_with_error(&error);
+        exit_with_error(&error, trap_fd);
     }
     let exit_code = outcome.exit_code();
     if exit_code != 0 {
@@ -150,18 +144,21 @@ fn load_policy(input: &PolicyInput, tool: Option<&std::ffi::OsStr>) -> Result<Ac
     )
 }
 
-fn exit_with_error(error: &anyhow::Error) -> ! {
+#[cfg(unix)]
+fn exit_with_error(error: &anyhow::Error, trap_fd: Option<&TrapFd>) -> ! {
     let (trap, exit_code) = error_trap(error);
+    if let Some(trap_fd) = trap_fd
+        && let Err(error) = trap_fd.write(&trap)
+    {
+        log::debug!("trap fd write failed: {error}");
+    }
     trap.emit();
     process::exit(exit_code)
 }
 
-#[cfg(unix)]
-fn exit_with_trap_fd(error: &anyhow::Error, trap_fd: Option<&TrapFd>) -> ! {
+#[cfg(not(unix))]
+fn exit_with_error(error: &anyhow::Error, _trap_fd: Option<&()>) -> ! {
     let (trap, exit_code) = error_trap(error);
-    if let Some(trap_fd) = trap_fd {
-        trap_fd.write(&trap);
-    }
     trap.emit();
     process::exit(exit_code)
 }
