@@ -27,28 +27,6 @@ impl PolicyFormat {
     }
 }
 
-impl std::fmt::Display for PolicyFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Json => f.write_str("json"),
-            Self::Yaml => f.write_str("yaml"),
-        }
-    }
-}
-
-impl std::str::FromStr for PolicyFormat {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "json" => Ok(Self::Json),
-            "yaml" | "yml" => Ok(Self::Yaml),
-            _ => Err(Error::Usage {
-                message: format!("unsupported policy format: {s}"),
-            }),
-        }
-    }
-}
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]

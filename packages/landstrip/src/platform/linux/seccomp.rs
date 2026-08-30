@@ -107,15 +107,30 @@ impl BrokerError {
     }
 }
 
+impl From<Errno> for BrokerError {
+    fn from(errno: Errno) -> Self {
+        Self::SystemCall {
+            errno: errno as i32,
+        }
+    }
+}
+
+impl From<io::Error> for BrokerError {
+    fn from(error: io::Error) -> Self {
+        Self::SystemCall {
+            errno: error.raw_os_error().unwrap_or(libc::EIO),
+        }
+    }
+}
+
 /// Recover the low 32 bits of a syscall argument register as an unsigned C
 /// argument. Seccomp exposes every register as `u64`, including 32-bit values.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "syscall argument registers are zero- or sign-extended u64 in seccomp_notif"
+)]
 fn syscall_u32(value: u64) -> u32 {
-    let bytes = value.to_ne_bytes();
-    if cfg!(target_endian = "little") {
-        u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-    } else {
-        u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
-    }
+    value as u32
 }
 
 /// Recover the low 32 bits of a syscall argument register as a signed C

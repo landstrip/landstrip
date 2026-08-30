@@ -199,6 +199,16 @@ fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> seccompiler::sock_filter {
     seccompiler::sock_filter { code, jt, jf, k }
 }
 
+fn seccomp_cond(
+    arg: u8,
+    len: SeccompCmpArgLen,
+    op: SeccompCmpOp,
+    val: u64,
+) -> Result<SeccompCondition> {
+    SeccompCondition::new(arg, len, op, val)
+        .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source).into())
+}
+
 fn load_program(program: &BpfProgram, flags: libc::c_ulong) -> Result<Option<OwnedFd>> {
     if program.is_empty() {
         return Err(LandstripError::sandbox_setup(Mechanism::Seccomp, "empty program").into());
@@ -265,15 +275,12 @@ fn add_network_bypass_filters(rules: &mut RuleMap, syscalls: &NotificationSyscal
         add_conditional_rule(
             rules,
             syscall,
-            vec![
-                SeccompCondition::new(
-                    flags,
-                    SeccompCmpArgLen::Dword,
-                    SeccompCmpOp::MaskedEq(fastopen),
-                    fastopen,
-                )
-                .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?,
-            ],
+            vec![seccomp_cond(
+                flags,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(fastopen),
+                fastopen,
+            )?],
         )?;
     }
 
@@ -307,15 +314,13 @@ pub(super) fn add_unix_socket_filters(
             rules,
             socket,
             vec![
-                SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)
-                    .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?,
-                SeccompCondition::new(
+                seccomp_cond(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)?,
+                seccomp_cond(
                     1,
                     SeccompCmpArgLen::Dword,
                     SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
                     dgram,
-                )
-                .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?,
+                )?,
             ],
         )?;
     }
@@ -356,17 +361,13 @@ pub(super) fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Resu
                 rules,
                 socket,
                 vec![
-                    SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)
-                        .map_err(|source| {
-                            LandstripError::sandbox_setup(Mechanism::Seccomp, source)
-                        })?,
-                    SeccompCondition::new(
+                    seccomp_cond(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)?,
+                    seccomp_cond(
                         1,
                         SeccompCmpArgLen::Dword,
                         SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
                         ty,
-                    )
-                    .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?,
+                    )?,
                 ],
             )?;
         }
@@ -376,21 +377,14 @@ pub(super) fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Resu
                 rules,
                 socket,
                 vec![
-                    SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)
-                        .map_err(|source| {
-                            LandstripError::sandbox_setup(Mechanism::Seccomp, source)
-                        })?,
-                    SeccompCondition::new(
+                    seccomp_cond(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)?,
+                    seccomp_cond(
                         1,
                         SeccompCmpArgLen::Dword,
                         SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
                         stream,
-                    )
-                    .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?,
-                    SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, proto)
-                        .map_err(|source| {
-                            LandstripError::sandbox_setup(Mechanism::Seccomp, source)
-                        })?,
+                    )?,
+                    seccomp_cond(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, proto)?,
                 ],
             )?;
         }
@@ -399,17 +393,14 @@ pub(super) fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Resu
             rules,
             socket,
             vec![
-                SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)
-                    .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?,
-                SeccompCondition::new(
+                seccomp_cond(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)?,
+                seccomp_cond(
                     1,
                     SeccompCmpArgLen::Dword,
                     SeccompCmpOp::MaskedEq(SOCK_TYPE_MASK),
                     stream,
-                )
-                .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?,
-                SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Gt, tcp)
-                    .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?,
+                )?,
+                seccomp_cond(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Gt, tcp)?,
             ],
         )?;
     }
@@ -419,10 +410,7 @@ pub(super) fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Resu
         add_conditional_rule(
             rules,
             socket,
-            vec![
-                SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)
-                    .map_err(|source| LandstripError::sandbox_setup(Mechanism::Seccomp, source))?,
-            ],
+            vec![seccomp_cond(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)?],
         )?;
     }
 

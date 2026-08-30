@@ -26,32 +26,33 @@ pub(crate) fn execute(
     args: &[OsString],
     trap_fd: Option<&TrapFd>,
 ) -> Result<i32> {
-    let profile = render_profile(policy)
-        .map_err(|source| Error::sandbox_setup(Mechanism::Seatbelt, source))?;
+    let profile = render_profile(policy).map_err(seatbelt_error)?;
     apply_profile(&profile)?;
-    close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd).as_slice())
-        .map_err(|source| Error::sandbox_setup(Mechanism::Seatbelt, source))?;
+    close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd).as_slice()).map_err(seatbelt_error)?;
     let error = Command::new(tool).args(args).exec();
     Err(Error::launch(tool, error).into())
 }
 
 pub(crate) fn doctor() -> Result<()> {
-    let operation = CString::new("file-read-data")
-        .map_err(|source| Error::sandbox_setup(Mechanism::Seatbelt, source))?;
+    let operation = CString::new("file-read-data").map_err(seatbelt_error)?;
     let result =
         unsafe { ffi::sandbox_check(libc::getpid(), operation.as_ptr(), SANDBOX_FILTER_NONE) };
     if result < 0 {
-        return Err(Error::sandbox_setup(Mechanism::Seatbelt, io::Error::last_os_error()).into());
+        return Err(seatbelt_error(io::Error::last_os_error()));
     }
     Ok(())
 }
 
+fn seatbelt_error(source: impl Into<crate::error::Cause>) -> anyhow::Error {
+    Error::sandbox_setup(Mechanism::Seatbelt, source).into()
+}
+
 fn apply_profile(profile: &str) -> Result<()> {
     let profile = CString::new(profile).map_err(|source| {
-        Error::sandbox_setup(
-            Mechanism::Seatbelt,
-            format!("profile: interior nul at offset {}", source.nul_position()),
-        )
+        seatbelt_error(format!(
+            "profile: interior nul at offset {}",
+            source.nul_position()
+        ))
     })?;
     let mut errorbuf = ptr::null_mut();
 
@@ -61,7 +62,7 @@ fn apply_profile(profile: &str) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(Error::sandbox_setup(Mechanism::Seatbelt, take_sandbox_error(errorbuf)).into())
+        Err(seatbelt_error(take_sandbox_error(errorbuf)))
     }
 }
 

@@ -48,9 +48,7 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
         while !existing.as_os_str().is_empty() {
             if let Ok(canonical) = fs::canonicalize(&existing) {
                 let mut result = canonical;
-                for component in missing.into_iter().rev() {
-                    result.push(component);
-                }
+                result.extend(missing.into_iter().rev());
                 return result;
             }
             if let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) {

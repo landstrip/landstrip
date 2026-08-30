@@ -255,14 +255,8 @@ impl NetworkAccess {
         match self {
             Self::Unrestricted => false,
             Self::Restricted {
-                connect_tcp_ports,
-                bind,
-                unix_socket_access,
-            } => {
-                matches!(bind, TcpBindAccess::Localhost)
-                    || !connect_tcp_ports.is_empty()
-                    || unix_socket_access.needs_broker()
-            }
+                connect_tcp_ports, ..
+            } => self.needs_bind_broker() || !connect_tcp_ports.is_empty(),
         }
     }
 }
@@ -463,22 +457,11 @@ fn lower_restricted_read_access(
     read_deny: &[PathBuf],
     _read_denied_roots: &mut Vec<PathBuf>,
 ) -> Result<(ReadAccess, Vec<PathBuf>)> {
-    let mut allowed = vec![PathBuf::from("/")];
-    normalize_roots(&mut allowed);
     let mut denied = read_deny.to_vec();
     normalize_roots(&mut denied);
-    let scanned = allowed
-        .iter()
-        .map(|root| scan_allowed_root(root, &denied, true, 0))
-        .collect::<Result<Vec<RootScan>>>()?;
-    let mut roots = Vec::new();
-    let mut symlinks = Vec::new();
-    for scan in scanned {
-        roots.extend(scan.roots);
-        symlinks.extend(scan.symlinks);
-    }
-    normalize_roots(&mut roots);
-    normalize_roots(&mut symlinks);
+    let scan = scan_allowed_root(Path::new("/"), &denied, true, 0)?;
+    let mut roots = scan.roots;
+    let mut symlinks = scan.symlinks;
 
     // The seccomp broker enforces nested denials under explicit allow roots.
     for allow in read_allow {
@@ -487,6 +470,7 @@ fn lower_restricted_read_access(
         }
     }
     normalize_roots(&mut roots);
+    normalize_roots(&mut symlinks);
     Ok((ReadAccess::AllowRoots(roots), symlinks))
 }
 
@@ -544,30 +528,22 @@ fn resolve_paths(
     policy_base: &Path,
     home: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
-    let mut resolved: Vec<PathBuf> = paths
-        .iter()
-        .map(|path| {
-            let path = resolve_sandbox_path(path, policy_base, home)?;
-            let candidates = if path.to_string_lossy().bytes().any(is_glob_byte) {
-                let matches = expand_glob_path(&path)?;
-                if matches.is_empty() && fs::symlink_metadata(&path).is_ok() {
-                    vec![path]
-                } else {
-                    matches
-                }
+    let mut resolved = Vec::new();
+    for path in paths {
+        let path = resolve_sandbox_path(path, policy_base, home)?;
+        if path.to_string_lossy().bytes().any(is_glob_byte) {
+            let matches = expand_glob_path(&path)?;
+            if matches.is_empty() && fs::symlink_metadata(&path).is_ok() {
+                push_path_variants(&mut resolved, &path);
             } else {
-                vec![path]
-            };
-            let mut resolved = Vec::new();
-            for candidate in &candidates {
-                push_path_variants(&mut resolved, candidate);
+                for candidate in &matches {
+                    push_path_variants(&mut resolved, candidate);
+                }
             }
-            Ok(resolved)
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+        } else {
+            push_path_variants(&mut resolved, &path);
+        }
+    }
 
     normalize_roots(&mut resolved);
 
@@ -603,9 +579,7 @@ fn resolve_deny_paths(
                 }
             }
         } else {
-            let mut variants = Vec::new();
-            push_path_variants(&mut variants, &resolved);
-            concrete.extend(variants);
+            push_path_variants(&mut concrete, &resolved);
         }
     }
 

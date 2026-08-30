@@ -239,8 +239,8 @@ fn parse_from(program: OsString, args: Vec<OsString>) -> Result<ParseOutcome, Er
     let command = match cli.command {
         CliCommand::Run(args) => Command::Run(run_command(args)?),
         CliCommand::Policy(args) => Command::Policy(match args.command {
-            PolicyAction::Validate(args) => PolicyCommand::Validate(policy_request(args)),
-            PolicyAction::Resolve(args) => PolicyCommand::Resolve(policy_request(args)),
+            PolicyAction::Validate(args) => PolicyCommand::Validate(args.into()),
+            PolicyAction::Resolve(args) => PolicyCommand::Resolve(args.into()),
         }),
         CliCommand::Doctor => Command::Doctor,
         #[cfg(target_os = "windows")]
@@ -282,10 +282,12 @@ fn run_command(args: RunArgs) -> Result<RunCommand, Error> {
     })
 }
 
-fn policy_request(args: PolicyRequestArgs) -> PolicyRequest {
-    PolicyRequest {
-        policy: args.policy,
-        tool: args.tool,
+impl From<PolicyRequestArgs> for PolicyRequest {
+    fn from(args: PolicyRequestArgs) -> Self {
+        Self {
+            policy: args.policy,
+            tool: args.tool,
+        }
     }
 }
 
