@@ -23,6 +23,7 @@ const OPATH_PROBE_ARG: &str = "--test-opath";
 const FUTIMENS_PROBE_ARG: &str = "--test-futimens";
 const TRUNCATE_PROBE_ARG: &str = "--test-truncate";
 const EXCLUSIVE_OPEN_PROBE_ARG: &str = "--test-exclusive-open";
+const OPENAT2_PROBE_ARG: &str = "--test-openat2";
 const FD_METADATA_PROBE_ARG: &str = "--test-fd-metadata";
 const ABSTRACT_UNIX_PROBE_ARG: &str = "--test-abstract-connect";
 const SIGNAL_OUTSIDE_PROBE_ARG: &str = "--test-signal-outside";
@@ -44,6 +45,9 @@ fn main() {
         }
         Some(value) if value == std::ffi::OsStr::new(EXCLUSIVE_OPEN_PROBE_ARG) => {
             std::process::exit(exclusive_open_probe(args.next()));
+        }
+        Some(value) if value == std::ffi::OsStr::new(OPENAT2_PROBE_ARG) => {
+            std::process::exit(openat2_probe(args.next(), args.next()));
         }
         Some(value) if value == std::ffi::OsStr::new(FD_METADATA_PROBE_ARG) => {
             std::process::exit(fd_metadata_probe(args.next(), args.next()));
@@ -229,6 +233,12 @@ enum Fs {
     Truncate { path: String, allowed: bool },
     /// Exclusive creation of an existing `path`; success means `EEXIST` preserved its contents.
     ExclusiveOpen { path: String, allowed: bool },
+    /// Native openat2 semantic probe; `allowed` selects the expected result.
+    Openat2 {
+        operation: String,
+        path: String,
+        allowed: bool,
+    },
 }
 
 struct Case {
@@ -651,6 +661,13 @@ fn parse_fs(value: &str) -> Fs {
             path: path.to_owned(),
             allowed,
         },
+        "openat2-beneath" | "openat2-in-root" | "openat2-no-symlinks" | "openat2-short" => {
+            Fs::Openat2 {
+                operation: kind.to_owned(),
+                path: path.to_owned(),
+                allowed,
+            }
+        }
         _ => panic!("unknown fs kind `{kind}`"),
     }
 }
@@ -673,6 +690,11 @@ fn run_fs(
         } => (FD_METADATA_PROBE_ARG, path, allowed, Some(operation)),
         Fs::Truncate { path, allowed } => (TRUNCATE_PROBE_ARG, path, allowed, None),
         Fs::ExclusiveOpen { path, allowed } => (EXCLUSIVE_OPEN_PROBE_ARG, path, allowed, None),
+        Fs::Openat2 {
+            operation,
+            path,
+            allowed,
+        } => (OPENAT2_PROBE_ARG, path, allowed, Some(operation)),
     };
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
     let mut command = landstrip_net(ctx, format, policies);
@@ -850,6 +872,127 @@ fn exclusive_open_probe(path: Option<std::ffi::OsString>) -> i32 {
 
 #[cfg(not(target_os = "linux"))]
 fn exclusive_open_probe(_path: Option<std::ffi::OsString>) -> i32 {
+    2
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct TestOpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn test_openat2(
+    dirfd: libc::c_int,
+    path: &std::ffi::CStr,
+    how: &TestOpenHow,
+    size: usize,
+) -> Result<std::os::fd::OwnedFd, i32> {
+    use std::os::fd::FromRawFd;
+
+    // SAFETY: path and how remain valid for the duration of the syscall.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd,
+            path.as_ptr(),
+            std::ptr::from_ref(how),
+            size,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
+    }
+    let fd = i32::try_from(fd).map_err(|_| libc::EBADF)?;
+    // SAFETY: openat2 returned a new owned descriptor.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn openat2_probe(path: Option<std::ffi::OsString>, operation: Option<std::ffi::OsString>) -> i32 {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (Some(path), Some(operation)) = (path, operation) else {
+        return 2;
+    };
+    let Ok(c_path) = std::ffi::CString::new(path.as_bytes()) else {
+        return 2;
+    };
+    let readonly = 0_u64;
+    match operation.to_str() {
+        Some("openat2-no-symlinks") => test_openat2(
+            libc::AT_FDCWD,
+            &c_path,
+            &TestOpenHow {
+                flags: readonly,
+                mode: 0,
+                resolve: 0x04,
+            },
+            24,
+        )
+        .map_or_else(|errno| i32::from(errno != libc::ELOOP), |_| 1),
+        Some("openat2-short") => test_openat2(
+            libc::AT_FDCWD,
+            &c_path,
+            &TestOpenHow {
+                flags: readonly,
+                mode: 0,
+                resolve: 0,
+            },
+            16,
+        )
+        .map_or_else(|errno| i32::from(errno != libc::EINVAL), |_| 1),
+        Some("openat2-beneath") => {
+            let Ok(dir) = std::fs::File::open(&path) else {
+                return 2;
+            };
+            test_openat2(
+                dir.as_raw_fd(),
+                c"../outside.txt",
+                &TestOpenHow {
+                    flags: readonly,
+                    mode: 0,
+                    resolve: 0x08,
+                },
+                24,
+            )
+            .map_or_else(|errno| i32::from(errno != libc::EXDEV), |_| 1)
+        }
+        Some("openat2-in-root") => {
+            let Ok(dir) = std::fs::File::open(&path) else {
+                return 2;
+            };
+            let opened = test_openat2(
+                dir.as_raw_fd(),
+                c"/inside.txt",
+                &TestOpenHow {
+                    flags: readonly,
+                    mode: 0,
+                    resolve: 0x10,
+                },
+                24,
+            );
+            match opened {
+                Ok(fd) => {
+                    let mut file = std::fs::File::from(fd);
+                    let mut contents = String::new();
+                    i32::from(file.read_to_string(&mut contents).is_err() || contents != "inside\n")
+                }
+                Err(_) => 1,
+            }
+        }
+        _ => 2,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn openat2_probe(_path: Option<std::ffi::OsString>, _operation: Option<std::ffi::OsString>) -> i32 {
     2
 }
 

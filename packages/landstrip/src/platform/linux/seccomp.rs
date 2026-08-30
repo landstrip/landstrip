@@ -59,6 +59,8 @@ const USER_NOTIF_FLAG_CONTINUE: u32 = 1 << 0;
 // fchmodat2 (Linux 6.6+) is 452 on every landstrip target. libc only exports the
 // constant on some arches, so pin the number here for portable mediation.
 const SYS_FCHMODAT2: i64 = 452;
+const OPEN_HOW_SIZE: usize = 24;
+const RESOLVE_IN_ROOT: u64 = 0x10;
 
 nix::ioctl_readwrite!(
     seccomp_notif_recv,
@@ -1382,6 +1384,15 @@ fn create_bits(flags: i32) -> i32 {
 struct Open {
     flags: i32,
     mode: u32,
+    resolve: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
 }
 
 impl Open {
@@ -1395,6 +1406,7 @@ impl Open {
         Ok(Self {
             flags,
             mode: syscall_u32(args[mode_arg]),
+            resolve: 0,
         })
     }
 
@@ -1405,30 +1417,85 @@ impl Open {
         let args = &request.data.args;
         let addr = usize::try_from(args[2]).map_err(|_| BrokerError::BadAddress)?;
         let size = usize::try_from(args[3]).map_err(|_| BrokerError::InvalidAddress)?;
+        if size < OPEN_HOW_SIZE {
+            return Err(BrokerError::InvalidAddress);
+        }
+        if size > page_size()? {
+            return Err(BrokerError::SystemCall { errno: libc::E2BIG });
+        }
         if addr == 0 {
             return Err(BrokerError::BadAddress);
         }
-        let want = size.min(24);
-        let mut buf = [0u8; 24];
-        let mut local = [IoSliceMut::new(&mut buf[..want])];
+
+        let mut buf = vec![0_u8; size];
+        let mut local = [IoSliceMut::new(&mut buf)];
         let target = [RemoteIoVec {
             base: addr,
-            len: want,
+            len: size,
         }];
-        let n = process_vm_readv(pid, &mut local, &target).map_err(|error| {
-            BrokerError::SystemCall {
-                errno: error as i32,
-            }
-        })?;
-        if n < 16 {
+        let copied = process_vm_readv(pid, &mut local, &target)?;
+        if copied != size {
             return Err(BrokerError::BadAddress);
         }
-        let flags = u64::from_ne_bytes(buf[0..8].try_into().map_err(|_| BrokerError::BadAddress)?);
-        let mode = u64::from_ne_bytes(buf[8..16].try_into().map_err(|_| BrokerError::BadAddress)?);
+        if buf[OPEN_HOW_SIZE..].iter().any(|byte| *byte != 0) {
+            return Err(BrokerError::SystemCall { errno: libc::E2BIG });
+        }
+
+        let how = OpenHow {
+            flags: u64::from_ne_bytes(buf[0..8].try_into().map_err(|_| BrokerError::BadAddress)?),
+            mode: u64::from_ne_bytes(buf[8..16].try_into().map_err(|_| BrokerError::BadAddress)?),
+            resolve: u64::from_ne_bytes(
+                buf[16..24]
+                    .try_into()
+                    .map_err(|_| BrokerError::BadAddress)?,
+            ),
+        };
+        validate_open_how(&how)?;
         Ok(Self {
-            flags: i32::try_from(flags).map_err(|_| BrokerError::InvalidAddress)?,
-            mode: u32::try_from(mode).map_err(|_| BrokerError::InvalidAddress)?,
+            flags: i32::try_from(how.flags).map_err(|_| BrokerError::InvalidAddress)?,
+            mode: u32::try_from(how.mode).map_err(|_| BrokerError::InvalidAddress)?,
+            resolve: how.resolve,
         })
+    }
+}
+
+fn page_size() -> SysResult<usize> {
+    // SAFETY: sysconf reads process configuration and does not dereference pointers.
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if value <= 0 {
+        return Err(BrokerError::SystemCall { errno: libc::EIO });
+    }
+    usize::try_from(value).map_err(|_| BrokerError::InvalidAddress)
+}
+
+fn openat2_fd(
+    dirfd: RawFd,
+    path: &std::ffi::CStr,
+    how: &OpenHow,
+) -> std::result::Result<OwnedFd, i32> {
+    // SAFETY: path and how point to initialized objects for the duration of the syscall.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd,
+            path.as_ptr(),
+            ptr::from_ref(how),
+            OPEN_HOW_SIZE,
+        )
+    };
+    if fd < 0 {
+        return Err(Errno::last() as i32);
+    }
+    let fd = RawFd::try_from(fd).map_err(|_| libc::EBADF)?;
+    // SAFETY: openat2 returned a new owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn validate_open_how(how: &OpenHow) -> SysResult<()> {
+    match openat2_fd(libc::AT_FDCWD, c"", how) {
+        Err(libc::ENOENT) => Ok(()),
+        Err(errno) => Err(BrokerError::SystemCall { errno }),
+        Ok(_) => Err(BrokerError::SystemCall { errno: libc::EIO }),
     }
 }
 
@@ -1502,18 +1569,20 @@ fn deny_open(
     Err(BrokerError::PolicyDenied)
 }
 
-fn handle_openat(
-    policy: &AccessPolicy,
-    request: &libc::seccomp_notif,
-    denials: &mut Denials<'_>,
-    query_enabled: bool,
-    next_query_id: &mut u64,
-) -> SysResult<NotificationResult> {
+struct OpenRequest {
+    pid: Pid,
+    dirfd: RawFd,
+    path: PathBuf,
+    flags: i32,
+    mode: u32,
+    resolve: u64,
+    syscall: &'static str,
+}
+
+fn read_open_request(request: &libc::seccomp_notif) -> SysResult<OpenRequest> {
     let nr = i64::from(request.data.nr);
     let openat2 = nr == libc::SYS_openat2;
     let legacy_open = matches!(legacy_syscall::OPEN, Some(open) if open == nr);
-    // open(2): path/flags/mode at 0/1/2 with implicit AT_FDCWD.
-    // openat(2)/openat2(2): dirfd/path/... at 0/1/...
     let dirfd = if legacy_open {
         libc::AT_FDCWD
     } else {
@@ -1523,25 +1592,61 @@ fn handle_openat(
     let path_ptr =
         usize::try_from(request.data.args[path_arg]).map_err(|_| BrokerError::BadAddress)?;
     let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
-    let Open { flags, mode } = if openat2 {
+    let Open {
+        flags,
+        mode,
+        resolve,
+    } = if openat2 {
         Open::from_how(request, pid)?
     } else {
         Open::from_args(request, legacy_open)?
     };
-    let syscall_name = if openat2 {
+    let syscall = if openat2 {
         "openat2"
     } else if legacy_open {
         "open"
     } else {
         "openat"
     };
+    let path = read_child_path(pid, path_ptr)?;
+    Ok(OpenRequest {
+        pid,
+        dirfd,
+        path,
+        flags,
+        mode,
+        resolve,
+        syscall,
+    })
+}
 
-    let Some(path) = read_child_path(pid, path_ptr)? else {
-        return Ok(NotificationResult::Continue);
+fn handle_openat(
+    policy: &AccessPolicy,
+    request: &libc::seccomp_notif,
+    denials: &mut Denials<'_>,
+    query_enabled: bool,
+    next_query_id: &mut u64,
+) -> SysResult<NotificationResult> {
+    let OpenRequest {
+        pid,
+        dirfd,
+        path,
+        flags,
+        mode,
+        resolve,
+        syscall,
+    } = read_open_request(request)?;
+
+    let (raw, resolved, openat2_grant) = if resolve != 0 {
+        let (raw, resolved, grant) =
+            OpenGrant::new_openat2(pid, dirfd, &path, flags, mode, resolve)
+                .map_err(|errno| BrokerError::SystemCall { errno })?;
+        (raw, resolved, Some(grant))
+    } else {
+        let raw = resolve_child_path(pid, dirfd, &path)?;
+        let resolved = normalize_path(&raw);
+        (raw, resolved, None)
     };
-
-    let raw = resolve_child_path(pid, dirfd, &path)?;
-    let resolved = normalize_path(&raw);
     let wants_write = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0;
     let reports_write = flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) != 0;
     let wants_read = flags & libc::O_WRONLY == 0;
@@ -1560,7 +1665,7 @@ fn handle_openat(
                     operation: TrapOperation::Write,
                     path: resolved,
                     requested_path: path,
-                    syscall: syscall_name,
+                    syscall,
                     flags,
                     mode,
                     reason,
@@ -1584,7 +1689,7 @@ fn handle_openat(
                 operation: TrapOperation::Read,
                 path: resolved,
                 requested_path: path,
-                syscall: syscall_name,
+                syscall,
                 flags,
                 mode,
                 reason,
@@ -1597,23 +1702,15 @@ fn handle_openat(
         );
     }
 
-    // fget() rejects FMODE_PATH descriptors (fs/file.c), so
-    // SECCOMP_IOCTL_NOTIF_ADDFD fails with EBADF for an O_PATH fd and the
-    // child would see a spurious EACCES. An O_PATH handle grants no data
-    // access — every dereferencing operation goes through its own brokered
-    // syscall — and Landlock does not restrict O_PATH opens, so after the
-    // policy checks above let the child's syscall re-execute natively.
     if flags & libc::O_PATH != 0 {
         return Ok(NotificationResult::Continue);
     }
 
-    // Re-running openat in the child via CONTINUE would reopen the classic
-    // seccomp-user-notification TOCTOU (a sibling can swap the path after the
-    // broker's policy check). Landlock cannot express denyWrite holes under an
-    // allowWrite root, so pin every allowed open — read or write — with an
-    // OpenGrant and inject the broker's fd via SECCOMP_ADDFD.
-    let grant = OpenGrant::new(&resolved, flags, mode)
-        .map_err(|errno| BrokerError::SystemCall { errno })?;
+    let grant = match openat2_grant {
+        Some(grant) => grant,
+        None => OpenGrant::new(&resolved, flags, mode)
+            .map_err(|errno| BrokerError::SystemCall { errno })?,
+    };
     Ok(NotificationResult::Open(grant))
 }
 
@@ -1955,10 +2052,7 @@ fn handle_mutation(
         };
         let path_ptr =
             usize::try_from(request.data.args[*path_arg]).map_err(|_| BrokerError::BadAddress)?;
-        let Some(path) = read_child_path(pid, path_ptr)? else {
-            slots.push(None);
-            continue;
-        };
+        let path = read_child_path(pid, path_ptr)?;
         let raw = resolve_child_path(pid, dirfd, &path)?;
         // mkdir -p intentionally invokes mkdir for each existing path component.
         // Return the syscall's EEXIST result without prompting instead of treating
@@ -2309,18 +2403,13 @@ fn read_child_bytes(pid: Pid, ptr: u64, size: u64) -> SysResult<Vec<u8>> {
     Ok(buf)
 }
 
-fn read_child_path(pid: Pid, path_ptr: usize) -> SysResult<Option<PathBuf>> {
+fn read_child_path(pid: Pid, path_ptr: usize) -> SysResult<PathBuf> {
     if path_ptr == 0 {
-        return Ok(None);
+        return Err(BrokerError::BadAddress);
     }
 
     let buf = read_child_string(pid, path_ptr, libc::PATH_MAX as usize)?;
-    let path = OsStr::from_bytes(&buf);
-    if path.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(PathBuf::from(path)))
+    Ok(PathBuf::from(OsStr::from_bytes(&buf)))
 }
 
 fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>> {
@@ -2726,8 +2815,23 @@ fn broker_open(grant: &OpenGrant) -> std::result::Result<OwnedFd, i32> {
         }
         // Create within the pinned parent; O_NOFOLLOW blocks a symlink swapped
         // into the final name from redirecting the create.
-        OpenKind::Create { anchor, mode } => {
+        OpenKind::Create {
+            anchor,
+            mode,
+            resolve,
+        } => {
             let flags = create_bits(grant.flags);
+            if *resolve != 0 {
+                return openat2_fd(
+                    anchor.dir.as_raw_fd(),
+                    &anchor.name,
+                    &OpenHow {
+                        flags: u64::try_from(flags).map_err(|_| libc::EINVAL)?,
+                        mode: u64::from(*mode),
+                        resolve: *resolve,
+                    },
+                );
+            }
             // SAFETY: name is NUL-terminated and resolved relative to the pinned parent.
             let fd = unsafe {
                 libc::openat(
@@ -3021,11 +3125,124 @@ impl OpenGrant {
             Err(libc::ENOENT) => OpenKind::Create {
                 anchor: Anchor::new(resolved)?,
                 mode,
+                resolve: 0,
             },
             Err(errno) => return Err(errno),
         };
         Ok(Self { flags, kind })
     }
+
+    fn new_openat2(
+        pid: Pid,
+        dirfd: RawFd,
+        path: &Path,
+        flags: i32,
+        mode: u32,
+        resolve: u64,
+    ) -> std::result::Result<(PathBuf, PathBuf, Self), i32> {
+        let base = if path.is_absolute() && resolve & RESOLVE_IN_ROOT == 0 {
+            None
+        } else {
+            Some(open_child_dirfd(pid, dirfd)?)
+        };
+        let base_fd = base.as_ref().map_or(libc::AT_FDCWD, AsRawFd::as_raw_fd);
+        let raw = match &base {
+            Some(base) => {
+                let base = open_fd_path(base.as_fd())?;
+                if path.is_absolute() {
+                    base.join(path.strip_prefix("/").map_err(|_| libc::EINVAL)?)
+                } else {
+                    base.join(path)
+                }
+            }
+            None => path.to_path_buf(),
+        };
+        let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+        let no_follow = flags & (libc::O_NOFOLLOW | libc::O_EXCL) != 0;
+        let pin_flags = libc::O_PATH
+            | libc::O_CLOEXEC
+            | (flags & libc::O_DIRECTORY)
+            | if no_follow { libc::O_NOFOLLOW } else { 0 };
+        let pin_how = OpenHow {
+            flags: u64::try_from(pin_flags).map_err(|_| libc::EINVAL)?,
+            mode: 0,
+            resolve,
+        };
+
+        match openat2_fd(base_fd, &path, &pin_how) {
+            Ok(handle) => {
+                if flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
+                    return Err(libc::EEXIST);
+                }
+                let resolved = open_fd_path(handle.as_fd())?;
+                Ok((
+                    raw,
+                    resolved,
+                    Self {
+                        flags,
+                        kind: OpenKind::Reopen(handle),
+                    },
+                ))
+            }
+            Err(libc::ENOENT) if flags & libc::O_CREAT != 0 => {
+                let source = Path::new(OsStr::from_bytes(path.to_bytes()));
+                if source.as_os_str().as_bytes().ends_with(b"/") {
+                    return Err(libc::ENOENT);
+                }
+                let parent = source.parent().ok_or(libc::ENOENT)?;
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                let name = CString::new(source.file_name().ok_or(libc::ENOENT)?.as_bytes())
+                    .map_err(|_| libc::EINVAL)?;
+                let parent =
+                    CString::new(parent.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+                let parent_handle = openat2_fd(
+                    base_fd,
+                    &parent,
+                    &OpenHow {
+                        flags: u64::try_from(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                            .map_err(|_| libc::EINVAL)?,
+                        mode: 0,
+                        resolve,
+                    },
+                )?;
+                let resolved =
+                    open_fd_path(parent_handle.as_fd())?.join(OsStr::from_bytes(name.to_bytes()));
+                Ok((
+                    raw,
+                    resolved,
+                    Self {
+                        flags,
+                        kind: OpenKind::Create {
+                            anchor: Anchor {
+                                dir: parent_handle,
+                                name,
+                            },
+                            mode,
+                            resolve,
+                        },
+                    },
+                ))
+            }
+            Err(errno) => Err(errno),
+        }
+    }
+}
+
+fn open_child_dirfd(pid: Pid, dirfd: RawFd) -> std::result::Result<OwnedFd, i32> {
+    if dirfd == libc::AT_FDCWD {
+        let cwd = Path::new("/proc").join(pid.to_string()).join("cwd");
+        return open_path(&cwd, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC);
+    }
+    duplicate_target_fd(pid, dirfd).map_err(|error| error.errno())
+}
+
+fn open_fd_path(fd: BorrowedFd<'_>) -> std::result::Result<PathBuf, i32> {
+    fs::read_link(Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string()))
+        .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
 }
 
 enum OpenKind {
@@ -3034,7 +3251,11 @@ enum OpenKind {
     Reopen(OwnedFd),
     /// The target did not exist; create it within the pinned parent. `O_NOFOLLOW`
     /// is added so a symlink swapped into the name cannot redirect the create.
-    Create { anchor: Anchor, mode: u32 },
+    Create {
+        anchor: Anchor,
+        mode: u32,
+        resolve: u64,
+    },
 }
 
 struct MutationGrant {
