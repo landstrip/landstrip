@@ -118,11 +118,6 @@ function formatPath(input: string, base: string): string {
   return absolute;
 }
 
-function selectedForeground(background: RGBA): RGBA {
-  const luminance = 0.2126 * background.r + 0.7152 * background.g + 0.0722 * background.b;
-  return luminance > 0.5 ? RGBA.fromInts(0, 0, 0) : RGBA.fromInts(255, 255, 255);
-}
-
 const tui: TuiPlugin = async (api, options, meta) => {
   const optionOverrides = normalizeOptions(options);
   const enabledManagedByOptions = optionOverrides.enabled !== undefined;
@@ -176,7 +171,10 @@ const tui: TuiPlugin = async (api, options, meta) => {
         },
         children: jsx('text', {
           get fg() {
-            return selected() === index ? selectedForeground(theme.warning) : theme.textMuted;
+            if (selected() !== index) return theme.textMuted;
+            const background = theme.warning;
+            const luminance = 0.2126 * background.r + 0.7152 * background.g + 0.0722 * background.b;
+            return luminance > 0.5 ? RGBA.fromInts(0, 0, 0) : RGBA.fromInts(255, 255, 255);
           },
           children: option.label,
         }),
@@ -333,14 +331,11 @@ const tui: TuiPlugin = async (api, options, meta) => {
     );
   }
 
-  function currentRouteSessionID(): string | undefined {
-    const route = api.route.current;
-    if (route.name !== 'session' || !route.params) return undefined;
-    return typeof route.params.sessionID === 'string' ? route.params.sessionID : undefined;
-  }
-
   function pump(): void {
-    const routeSessionID = currentRouteSessionID();
+    const route = api.route.current;
+    if (route.name !== 'session' || !route.params) return;
+    const routeSessionID =
+      typeof route.params.sessionID === 'string' ? route.params.sessionID : undefined;
     if (!routeSessionID) return;
 
     const active = activeEntry();
@@ -360,8 +355,8 @@ const tui: TuiPlugin = async (api, options, meta) => {
     if (index === -1) return;
     const [next] = queue.splice(index, 1);
     if (!next) return;
-    if (next.kind === 'fs-query') showFsQuery(next);
-    else showNetworkQuery(next);
+    activeId = next.id;
+    setActiveEntry(next);
   }
 
   function enqueueEntry(entry: QueueEntry): void {
@@ -505,10 +500,6 @@ const tui: TuiPlugin = async (api, options, meta) => {
     }
   }
 
-  function showFsQuery(entry: FsQueryEntry): void {
-    activeId = entry.id;
-    setActiveEntry(entry);
-  }
   function resolveNetworkQuery(entry: NetworkQueryEntry, choice: NetworkQueryChoice): void {
     if (resolved.has(entry.id)) return;
     const action = choice === 'deny' ? 'deny' : 'allow';
@@ -531,11 +522,6 @@ const tui: TuiPlugin = async (api, options, meta) => {
       liveQueries.delete(entry);
       finishActive(entry.id);
     }
-  }
-
-  function showNetworkQuery(entry: NetworkQueryEntry): void {
-    activeId = entry.id;
-    setActiveEntry(entry);
   }
 
   // Query-response socket server (Linux-only — landstrip's socket protocol lives

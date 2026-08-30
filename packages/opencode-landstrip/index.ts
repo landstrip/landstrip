@@ -74,11 +74,6 @@ const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 const DISCOVERY_CONNECT_TIMEOUT_MS = 250;
 
-function configuredShellPath(config: unknown): string | undefined {
-  if (!isRecord(config)) return undefined;
-  return typeof config.shell === 'string' ? config.shell : undefined;
-}
-
 function normalizePathForMatch(filePath: string): string {
   return process.platform === 'win32' ? normalizePathSeparators(filePath).toLowerCase() : filePath;
 }
@@ -310,12 +305,6 @@ function evaluateCommandDomains(
   );
 }
 
-function landstripVersion(): string | null {
-  const result = spawnSync(landstripBinaryPath(), ['--version'], { encoding: 'utf-8' });
-  if (result.status !== 0) return null;
-  return result.stdout.trim();
-}
-
 function parseVersion(version: string): [number, number, number] | null {
   const match = version.match(/\b(\d+)\.(\d+)\.(\d+)\b/);
   if (!match) return null;
@@ -492,12 +481,6 @@ function trapPortAcceptsConnections(port: number): Promise<boolean> {
   });
 }
 
-async function readLiveDiscoveryPort(baseDirectory: string): Promise<number | null> {
-  const port = readDiscoveryPort(baseDirectory);
-  if (port === null) return null;
-  return (await trapPortAcceptsConnections(port)) ? port : null;
-}
-
 function buildWrappedCommand(
   policyPath: string,
   shell: string,
@@ -540,10 +523,6 @@ function isGeneratedWrappedCommand(command: string): boolean {
     command.includes(` ${shellQuote('-p')} `) &&
     command.includes('opencode-landstrip-')
   );
-}
-
-function landstripDescription(description: string): string {
-  return description.endsWith(' (landstrip)') ? description : `${description} (landstrip)`;
 }
 
 function splitShellQuotedArgs(command: string): string[] {
@@ -597,10 +576,6 @@ function getToolPath(args: Record<string, unknown>): string | undefined {
   return typeof filePath === 'string' ? filePath : undefined;
 }
 
-function getSearchPath(args: Record<string, unknown>): string {
-  return typeof args.path === 'string' ? args.path : '.';
-}
-
 function extractPatchPaths(patchText: string): string[] {
   const paths: string[] = [];
 
@@ -636,7 +611,8 @@ function evaluateToolPermissions(
   }
 
   if (tool === 'glob' || tool === 'grep' || tool === 'list') {
-    return [evaluateReadPermission(getSearchPath(args), config, baseDirectory, effectiveAllowRead)];
+    const searchPath = typeof args.path === 'string' ? args.path : '.';
+    return [evaluateReadPermission(searchPath, config, baseDirectory, effectiveAllowRead)];
   }
 
   if (tool === 'write' || tool === 'edit') {
@@ -679,16 +655,6 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     return `${callID}:${kind}:${resource}`;
   }
 
-  function rememberCallAllowances(
-    callID: string | undefined,
-    approvals: readonly SandboxPermissionDecision[],
-  ): void {
-    if (!callID) return;
-    for (const approval of approvals) {
-      callAllowances.add(allowanceKey(callID, approval.kind, approval.resource));
-    }
-  }
-
   function clearCallAllowances(callID: string): void {
     for (const key of callAllowances) {
       if (key.startsWith(`${callID}:`)) callAllowances.delete(key);
@@ -710,11 +676,6 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       })
       ?.catch?.(() => undefined);
     throw errorWithConfigPaths(directory, decision.message);
-  }
-
-  function enforcePermission(callID: string, decision: SandboxPermissionDecision): void {
-    if (decision.status === 'allow' || hasCallAllowance(callID, decision)) return;
-    reportBlocked(decision);
   }
 
   client.app
@@ -787,7 +748,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
     let version: string | null;
     try {
-      version = landstripVersion();
+      const result = spawnSync(landstripBinaryPath(), ['--version'], { encoding: 'utf-8' });
+      version = result.status === 0 ? result.stdout.trim() : null;
     } catch (error) {
       landstripCheck = {
         ok: false,
@@ -889,8 +851,9 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     const normalizedSessionID = sessionID?.trim() || undefined;
 
     const rewriteDescription = (): void => {
-      if (typeof args.description === 'string')
-        args.description = landstripDescription(args.description);
+      if (typeof args.description === 'string' && !args.description.endsWith(' (landstrip)')) {
+        args.description = `${args.description} (landstrip)`;
+      }
     };
 
     const existing = activeBash.get(callID);
@@ -965,9 +928,11 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
     // The TUI owns interactive query handling. Fall back to an in-process
     // broker when no TUI endpoint or session identity is available.
     const interactiveSessionID = normalizedSessionID ?? '';
+    const discoveredPort =
+      process.platform === 'linux' && interactiveSessionID ? readDiscoveryPort(directory) : null;
     const tuiTrapPort =
-      process.platform === 'linux' && interactiveSessionID
-        ? await readLiveDiscoveryPort(directory)
+      discoveredPort !== null && (await trapPortAcceptsConnections(discoveredPort))
+        ? discoveredPort
         : null;
     const trapServer =
       tuiTrapPort === null
@@ -1008,7 +973,9 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
   const hooks: Hooks = {
     config: async (config) => {
-      configuredShell = configuredShellPath(config);
+      const value: unknown = config;
+      configuredShell =
+        isRecord(value) && typeof value.shell === 'string' ? value.shell : undefined;
     },
 
     'permission.ask': async (input, output) => {
@@ -1057,7 +1024,11 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
       if (approvals.length === 0) return;
 
       output.status = 'ask';
-      rememberCallAllowances(callID, approvals);
+      if (callID) {
+        for (const approval of approvals) {
+          callAllowances.add(allowanceKey(callID, approval.kind, approval.resource));
+        }
+      }
     },
 
     'tool.execute.before': async (input, output) => {
@@ -1080,7 +1051,8 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
         config.filesystem.allowWrite,
       );
       for (const decision of decisions) {
-        enforcePermission(input.callID, decision);
+        if (decision.status === 'allow' || hasCallAllowance(input.callID, decision)) continue;
+        reportBlocked(decision);
       }
     },
 
