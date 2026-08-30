@@ -10,7 +10,7 @@ use crate::policy::DenialReason;
 use serde::Serialize;
 use std::error::Error as StdError;
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -52,6 +52,22 @@ pub(crate) struct SuggestedGrant {
     pub(crate) allow_read: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) allow_write: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl SuggestedGrant {
+    fn from_operation(operation: TrapOperation, path: &str) -> Self {
+        match operation {
+            TrapOperation::Read => Self {
+                allow_read: Some(path.to_owned()),
+                allow_write: None,
+            },
+            TrapOperation::Write => Self {
+                allow_read: None,
+                allow_write: Some(path.to_owned()),
+            },
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -151,9 +167,9 @@ pub(crate) enum Trap {
     Filesystem(Box<FilesystemTrap>),
     #[cfg(target_os = "linux")]
     Network(Box<NetworkTrap>),
-    Launch(Box<LaunchTrap>),
-    Usage(Box<UsageTrap>),
-    Internal(Box<InternalTrap>),
+    Launch(LaunchTrap),
+    Usage(UsageTrap),
+    Internal(InternalTrap),
 }
 
 impl Trap {
@@ -168,25 +184,16 @@ impl Trap {
             reason,
             process,
         } = denial;
-        let path = path.to_string_lossy().into_owned();
+        let path = path.to_string_lossy();
         let requested_path = requested_path.to_string_lossy().into_owned();
-        let suggested_grant = match operation {
-            TrapOperation::Read => SuggestedGrant {
-                allow_read: Some(path.clone()),
-                allow_write: None,
-            },
-            TrapOperation::Write => SuggestedGrant {
-                allow_read: None,
-                allow_write: Some(path.clone()),
-            },
-        };
+        let suggested_grant = SuggestedGrant::from_operation(operation, &path);
         let (state, query_id) = TrapState::from_query_id(query_id);
         Self::Filesystem(Box::new(FilesystemTrap {
             code: Error::FilesystemDenied.code(),
             state,
             query_id,
             operation,
-            path,
+            path: path.into_owned(),
             requested_path,
             syscall,
             errno: "EACCES",
@@ -222,11 +229,11 @@ impl Trap {
 
     /// The trap for a failure the landstrip code space does not name.
     pub(crate) fn internal(message: String) -> Self {
-        Self::Internal(Box::new(InternalTrap {
+        Self::Internal(InternalTrap {
             code: INTERNAL_ERROR,
             mechanism: None,
             message,
-        }))
+        })
     }
 
     pub(crate) fn emit(&self) {
@@ -234,36 +241,56 @@ impl Trap {
     }
 }
 
-impl From<&Error> for Trap {
-    fn from(error: &Error) -> Self {
+impl From<Error> for Trap {
+    fn from(error: Error) -> Self {
+        let code = error.code();
+        let errno = error.errno();
         match error {
-            Error::Usage { message } => Self::Usage(Box::new(UsageTrap {
-                code: error.code(),
-                message: message.clone(),
-            })),
-            Error::LaunchFailed { tool, source } => Self::Launch(Box::new(LaunchTrap {
-                code: error.code(),
+            Error::Usage { message } => Self::Usage(UsageTrap { code, message }),
+            Error::LaunchFailed { tool, source } => Self::Launch(LaunchTrap {
+                code,
                 program: tool.to_string_lossy().into_owned(),
-                errno: error.errno().and_then(errno_name),
+                errno: errno.and_then(errno_name),
                 message: source.to_string(),
-            })),
-            Error::SandboxSetupFailed { mechanism, .. } => Self::Internal(Box::new(InternalTrap {
-                code: error.code(),
-                mechanism: Some(*mechanism),
-                message: message(error),
-            })),
-            _ => Self::Internal(Box::new(InternalTrap {
-                code: error.code(),
+            }),
+            Error::SandboxSetupFailed { mechanism, .. } => Self::Internal(InternalTrap {
+                code,
+                mechanism: Some(mechanism),
+                message: message(&error),
+            }),
+            _ => Self::Internal(InternalTrap {
+                code,
                 mechanism: None,
-                message: message(error),
-            })),
+                message: message(&error),
+            }),
         }
     }
 }
 
-impl From<Error> for Trap {
-    fn from(error: Error) -> Self {
-        Self::from(&error)
+impl From<&Error> for Trap {
+    fn from(error: &Error) -> Self {
+        match error {
+            Error::Usage { message } => Self::Usage(UsageTrap {
+                code: error.code(),
+                message: message.clone(),
+            }),
+            Error::LaunchFailed { tool, source } => Self::Launch(LaunchTrap {
+                code: error.code(),
+                program: tool.to_string_lossy().into_owned(),
+                errno: error.errno().and_then(errno_name),
+                message: source.to_string(),
+            }),
+            Error::SandboxSetupFailed { mechanism, .. } => Self::Internal(InternalTrap {
+                code: error.code(),
+                mechanism: Some(*mechanism),
+                message: message(error),
+            }),
+            _ => Self::Internal(InternalTrap {
+                code: error.code(),
+                mechanism: None,
+                message: message(error),
+            }),
+        }
     }
 }
 
@@ -291,7 +318,7 @@ fn message(error: &Error) -> String {
         if !message.is_empty() {
             message.push_str(": ");
         }
-        message.push_str(&source.to_string());
+        let _ = write!(message, "{source}");
         cause = source.source();
     }
 
