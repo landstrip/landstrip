@@ -2838,15 +2838,7 @@ fn run_fchmodat(
         (Some(target), c"".as_ptr(), flags | libc::AT_EMPTY_PATH)
     };
     let target_fd = target.as_ref().map_or(dir, AsRawFd::as_raw_fd);
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_fchmodat2,
-            target_fd,
-            target_name,
-            mode,
-            target_flags,
-        )
-    };
+    let rc = unsafe { libc::syscall(SYS_FCHMODAT2, target_fd, target_name, mode, target_flags) };
     Ok(if rc < 0 { -1 } else { 0 })
 }
 
@@ -3574,7 +3566,7 @@ impl FdMutation {
             Self::Chmod { mode } => unsafe { libc::fchmod(target, *mode) },
             Self::Chown { uid, gid } => unsafe { libc::fchown(target, *uid, *gid) },
             Self::ChmodAt { mode, flags } => unsafe {
-                let rc = libc::syscall(libc::SYS_fchmodat2, target, c"".as_ptr(), *mode, *flags);
+                let rc = libc::syscall(SYS_FCHMODAT2, target, c"".as_ptr(), *mode, *flags);
                 if rc < 0 { -1 } else { 0 }
             },
             Self::ChownAt { uid, gid, flags } => unsafe {
