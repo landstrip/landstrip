@@ -47,12 +47,6 @@ function listMarkdownFiles(root: string): string[] {
   return results;
 }
 
-function agentNameFromPath(dir: string, filePath: string): string {
-  const relativePath = relative(dir, filePath).split(sep).join('/');
-  const extension = extname(relativePath);
-  return extension.length > 0 ? relativePath.slice(0, -extension.length) : relativePath;
-}
-
 function parseFrontmatter(content: string): { data: ConfigObject; body: string } {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n([\s\S]*))?$/);
   if (!match) return { data: {}, body: content };
@@ -152,7 +146,9 @@ export function loadPiMarkdownAgents(options: {
       try {
         const content = readFileSync(filePath, 'utf8');
         const raw = parseMarkdownAgentRaw(content);
-        const name = agentNameFromPath(directory.path, filePath);
+        const relativePath = relative(directory.path, filePath).split(sep).join('/');
+        const extension = extname(relativePath);
+        const name = extension.length > 0 ? relativePath.slice(0, -extension.length) : relativePath;
         if (!name) {
           diagnostics.push(`${filePath}: agent name is empty`);
           continue;

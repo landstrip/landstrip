@@ -13,7 +13,7 @@ import {
   loadMaxSubagentsSettings,
   loadToolFilesystemPolicySettings,
 } from './config.ts';
-import type { LandstripIntegration, SandboxOverview } from './index.ts';
+import type { LandstripIntegration } from './index.ts';
 
 export interface CommandSubagentRuntime {
   getTasks(): TaskCommandRecord[];
@@ -83,13 +83,6 @@ function parseArgv(args: string): Argv {
   };
 }
 
-function sandboxOverview(
-  ctx: CommandContext,
-  integration: LandstripIntegration,
-): SandboxOverview | undefined {
-  return integration.sandboxCallbacks?.overview?.(ctx.cwd, isProjectTrusted(ctx));
-}
-
 /** An {@link AutocompleteItem} that is fuzzy-matched against something other than its label. */
 type Completion = AutocompleteItem & { readonly search?: string };
 
@@ -116,7 +109,7 @@ const SUBCOMMANDS: readonly Subcommand[] = [
     summary: 'Inspect sandbox & agent runtime status',
     pane: (argv) => (argv.rest ? undefined : 'overview'),
     run: (_argv, { ctx, runtime, integration }) => {
-      const overview = sandboxOverview(ctx, integration);
+      const overview = integration.sandboxCallbacks?.overview?.(ctx.cwd, isProjectTrusted(ctx));
       const sandbox = !overview
         ? 'unavailable'
         : !overview.enabled
@@ -142,14 +135,16 @@ const SUBCOMMANDS: readonly Subcommand[] = [
     name: 'sandbox',
     summary: 'Inspect or toggle sandbox OS isolation',
     pane: (argv, { ctx, integration }) =>
-      !argv.rest && sandboxOverview(ctx, integration) ? 'overview' : undefined,
+      !argv.rest && integration.sandboxCallbacks?.overview?.(ctx.cwd, isProjectTrusted(ctx))
+        ? 'overview'
+        : undefined,
     complete: () => [
       { value: 'sandbox on', label: 'on', description: 'Enable OS sandbox isolation' },
       { value: 'sandbox off', label: 'off', description: 'Disable OS sandbox isolation' },
     ],
     run: async (argv, { ctx, integration }) => {
       const callbacks = integration.sandboxCallbacks;
-      const overview = sandboxOverview(ctx, integration);
+      const overview = integration.sandboxCallbacks?.overview?.(ctx.cwd, isProjectTrusted(ctx));
       if (!callbacks || !overview) {
         ctx.ui.notify('Sandbox controls are unavailable', 'warning');
         return;
@@ -207,19 +202,22 @@ const SUBCOMMANDS: readonly Subcommand[] = [
     complete: (_argv, { runtime, ctx }) => {
       if (!runtime || !ctx) return [];
       try {
-        return visibleAgents(runtime.getAgentCatalog(ctx)).map((agent) => ({
-          value: `agents @${agent.name}`,
-          label: `@${agent.name}`,
-          description:
-            agent.description ?? (agent.model ? `Model: ${agent.model}` : 'Primary agent'),
-        }));
+        return [...runtime.getAgentCatalog(ctx).agents.values()]
+          .filter((agent) => !agent.hidden)
+          .map((agent) => ({
+            value: `agents @${agent.name}`,
+            label: `@${agent.name}`,
+            description:
+              agent.description ?? (agent.model ? `Model: ${agent.model}` : 'Primary agent'),
+          }));
       } catch {
         return [];
       }
     },
     run: async (argv, { ctx, runtime }) => {
       if (!argv.rest) {
-        const names = visibleAgents(runtime.getAgentCatalog(ctx))
+        const names = [...runtime.getAgentCatalog(ctx).agents.values()]
+          .filter((agent) => !agent.hidden)
           .map((agent) => `@${agent.name}`)
           .join(', ');
         ctx.ui.notify(`Available agents: ${names || 'none'}`, 'info');
@@ -236,7 +234,8 @@ const SUBCOMMANDS: readonly Subcommand[] = [
     summary: 'Inspect configured process subagents',
     pane: (argv) => (argv.rest ? undefined : 'subagent'),
     run: (_argv, { ctx, runtime }) => {
-      const names = visibleAgents(runtime.getAgentCatalog(ctx))
+      const names = [...runtime.getAgentCatalog(ctx).agents.values()]
+        .filter((agent) => !agent.hidden)
         .filter((agent) => agent.mode === 'subagent')
         .map((agent) => `@${agent.name}`)
         .join(', ');
@@ -308,10 +307,6 @@ const SUBCOMMANDS: readonly Subcommand[] = [
     },
   },
 ];
-
-function visibleAgents(catalog: AgentCatalog) {
-  return [...catalog.agents.values()].filter((agent) => !agent.hidden);
-}
 
 /** Descriptions are prose and would dilute matching, so only the typed text counts. */
 function itemText(item: Completion): string {

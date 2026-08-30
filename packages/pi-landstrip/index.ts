@@ -449,15 +449,11 @@ function windowsStatus(): WindowsStatus {
   return status;
 }
 
-function activeWindowsImplementation(): WindowsImplementation {
-  return windowsStatus().active;
-}
-
 function shouldStartProxy(config: SandboxConfig): boolean {
   if (config.network.allowNetwork) return false;
   return (
     process.platform !== 'win32' ||
-    activeWindowsImplementation() === 'restrictedUser' ||
+    windowsStatus().active === 'restrictedUser' ||
     config.windows.allowLoopback
   );
 }
@@ -481,10 +477,6 @@ function restrictedUserProxyPortRange(): ProxyPortRange | undefined {
   return { low: status.proxyPortLow!, high: status.proxyPortHigh! };
 }
 
-function getConfigPaths(cwd: string): { globalPath: string; projectPath: string } {
-  return getPiConfigPaths(cwd, 'sandbox.json');
-}
-
 function readOrEmptyConfig(configPath: string): SandboxConfigFile {
   if (!existsSync(configPath)) return {};
   try {
@@ -503,7 +495,7 @@ function getSandboxConfigWriteTarget(
   cwd: string,
   includeProject = true,
 ): { scope: SandboxConfigScope; path: string } {
-  const { globalPath, projectPath } = getConfigPaths(cwd);
+  const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
   return includeProject
     ? { scope: 'project', path: projectPath }
     : { scope: 'global', path: globalPath };
@@ -514,7 +506,7 @@ async function writeSandboxConfigEnabled(
   enabled: boolean | undefined,
   scope: SandboxConfigScope,
 ): Promise<void> {
-  const paths = getConfigPaths(cwd);
+  const paths = getPiConfigPaths(cwd, 'sandbox.json');
   const path = scope === 'project' ? paths.projectPath : paths.globalPath;
   await withFileMutationQueue(path, async () => {
     const config = readOrEmptyConfig(path);
@@ -528,7 +520,7 @@ function loadSandboxEnabledSettings(
   cwd: string,
   includeProject: boolean,
 ): { global: boolean; project?: boolean } {
-  const { projectPath } = getConfigPaths(cwd);
+  const { projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
   const global = loadSandboxConfig(cwd, false).enabled;
   if (!includeProject || !existsSync(projectPath)) return { global };
   const project = readOrEmptyConfig(projectPath).enabled;
@@ -548,43 +540,6 @@ async function addConfigValue(
     writeValues(config, [...existing, value]);
     writeConfigFile(configPath, config);
   });
-}
-
-function addDomainToConfig(configPath: string, domain: string): Promise<void> {
-  return addConfigValue(
-    configPath,
-    domain,
-    (config) => config.network?.allowedDomains ?? [],
-    (config, allowedDomains) => {
-      config.network = {
-        ...config.network,
-        allowedDomains,
-        deniedDomains: config.network?.deniedDomains ?? [],
-      };
-    },
-  );
-}
-
-function addReadPathToConfig(configPath: string, pathToAdd: string): Promise<void> {
-  return addConfigValue(
-    configPath,
-    pathToAdd,
-    (config) => config.filesystem?.allowRead ?? [],
-    (config, allowRead) => {
-      config.filesystem = { ...config.filesystem, allowRead };
-    },
-  );
-}
-
-function addWritePathToConfig(configPath: string, pathToAdd: string): Promise<void> {
-  return addConfigValue(
-    configPath,
-    pathToAdd,
-    (config) => config.filesystem?.allowWrite ?? [],
-    (config, allowWrite) => {
-      config.filesystem = { ...config.filesystem, allowWrite };
-    },
-  );
 }
 
 function mergeAllowances(base: string[], session: string[], execution?: string[]): string[] {
@@ -850,19 +805,6 @@ async function showPermissionPrompt(
   return option.action;
 }
 
-function promptDomainBlock(
-  ctx: ExtensionContext,
-  domain: string,
-  signal?: AbortSignal,
-): Promise<PermissionChoice> {
-  return showPermissionPrompt(
-    ctx,
-    `Network blocked: "${domain}" is not in the allowed domains list`,
-    PERMISSION_OPTIONS,
-    signal,
-  );
-}
-
 function promptReadBlock(
   ctx: ExtensionContext,
   filePath: string,
@@ -873,54 +815,6 @@ function promptReadBlock(
     ? `Read blocked: "${filePath}" is in denyRead (${reason})`
     : `Read blocked: "${filePath}" is not in allowRead`;
   return showPermissionPrompt(ctx, title, PERMISSION_OPTIONS, signal);
-}
-
-function promptWriteBlock(
-  ctx: ExtensionContext,
-  filePath: string,
-  signal?: AbortSignal,
-): Promise<PermissionChoice> {
-  return showPermissionPrompt(
-    ctx,
-    `Write blocked: "${filePath}" is not in allowWrite`,
-    PERMISSION_OPTIONS,
-    signal,
-  );
-}
-
-function promptFilesystemToolBlock(
-  ctx: ExtensionContext,
-  accesses: readonly FilesystemToolAccess[],
-  authorizationNote: string | undefined,
-  signal?: AbortSignal,
-): Promise<PermissionChoice> {
-  const paths = accesses.map(({ operation, path }) => `${operation}: ${path}`).join('\n');
-  const note = authorizationNote ? `\n\n${authorizationNote}` : '';
-  return showPermissionPrompt(
-    ctx,
-    `Filesystem policy blocked this tool call:\n${paths}${note}`,
-    PERMISSION_OPTIONS,
-    signal,
-  );
-}
-
-// The broker knows only address:port, and no sandbox field can express a grant
-// for one non-loopback endpoint: allowedDomains is enforced by the proxy,
-// allowLocalBinding grants all loopback endpoints, and allowNetwork disables
-// network enforcement. So a non-loopback connection is granted for the session
-// or not at all.
-function promptNetworkBlock(
-  ctx: ExtensionContext,
-  operation: string,
-  target: string,
-  signal?: AbortSignal,
-): Promise<PermissionChoice> {
-  return showPermissionPrompt(
-    ctx,
-    `Network blocked: ${operation} "${target}"`,
-    NETWORK_PERMISSION_OPTIONS,
-    signal,
-  );
 }
 
 // Write the full environment to a temporary shell file.
@@ -1149,12 +1043,6 @@ function createLandstripIntegrationWithPrompts(
     return loadSandboxConfig(cwd, projectConfigTrusted);
   }
 
-  function createPlainBashTool(cwd: string): LandstripBashTool {
-    return createBashToolDefinition(cwd, {
-      shellPath: SettingsManager.create(cwd).getShellPath(),
-    });
-  }
-
   let sandboxEnabled = false;
   let sandboxReady = false;
   let sandboxState: LandstripSandboxState = 'unavailable';
@@ -1308,25 +1196,6 @@ function createLandstripIntegrationWithPrompts(
     return [...workerExtensions].map(([id, extension]) => ({ id, entry: extension.entry }));
   }
 
-  function resetSessionAllowances(): void {
-    sessionAllowedDomains.length = 0;
-    sessionAllowedReadPaths.length = 0;
-    sessionAllowedWritePaths.length = 0;
-    sessionAllowedTargets.length = 0;
-    unsandboxedWorkerWarningShown = false;
-  }
-
-  function getEffectiveAllowedDomains(
-    config: SandboxConfig,
-    allowances?: ExecutionAllowances,
-  ): string[] {
-    return mergeAllowances(
-      config.network.allowedDomains,
-      sessionAllowedDomains,
-      allowances?.domains,
-    );
-  }
-
   function getEffectiveAllowRead(
     config: SandboxConfig,
     cwd: string,
@@ -1409,9 +1278,23 @@ function createLandstripIntegrationWithPrompts(
     cwd: string,
     allowances?: ExecutionAllowances,
   ): Promise<void> {
-    const { globalPath, projectPath } = getConfigPaths(cwd);
-    if (choice === 'project') await addDomainToConfig(projectPath, domain);
-    if (choice === 'global') await addDomainToConfig(globalPath, domain);
+    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+    const configPath =
+      choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
+    if (configPath) {
+      await addConfigValue(
+        configPath,
+        domain,
+        (config) => config.network?.allowedDomains ?? [],
+        (config, allowedDomains) => {
+          config.network = {
+            ...config.network,
+            allowedDomains,
+            deniedDomains: config.network?.deniedDomains ?? [],
+          };
+        },
+      );
+    }
     const target = choice === 'once' ? allowances?.domains : sessionAllowedDomains;
     if (target && !target.includes(domain)) target.push(domain);
   }
@@ -1437,10 +1320,20 @@ function createLandstripIntegrationWithPrompts(
     cwd: string,
     allowances?: ExecutionAllowances,
   ): Promise<void> {
-    const { globalPath, projectPath } = getConfigPaths(cwd);
+    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
     const scope = sessionScopeFor(filePath, cwd);
-    if (choice === 'project') await addReadPathToConfig(projectPath, scope);
-    if (choice === 'global') await addReadPathToConfig(globalPath, scope);
+    const configPath =
+      choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
+    if (configPath) {
+      await addConfigValue(
+        configPath,
+        scope,
+        (config) => config.filesystem?.allowRead ?? [],
+        (config, allowRead) => {
+          config.filesystem = { ...config.filesystem, allowRead };
+        },
+      );
+    }
     const target = choice === 'once' ? allowances?.readPaths : sessionAllowedReadPaths;
     if (target && !target.includes(scope)) target.push(scope);
     noteScope(ctx, 'Read', choice, filePath, scope);
@@ -1453,10 +1346,20 @@ function createLandstripIntegrationWithPrompts(
     cwd: string,
     allowances?: ExecutionAllowances,
   ): Promise<void> {
-    const { globalPath, projectPath } = getConfigPaths(cwd);
+    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
     const scope = sessionScopeFor(filePath, cwd);
-    if (choice === 'project') await addWritePathToConfig(projectPath, scope);
-    if (choice === 'global') await addWritePathToConfig(globalPath, scope);
+    const configPath =
+      choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
+    if (configPath) {
+      await addConfigValue(
+        configPath,
+        scope,
+        (config) => config.filesystem?.allowWrite ?? [],
+        (config, allowWrite) => {
+          config.filesystem = { ...config.filesystem, allowWrite };
+        },
+      );
+    }
     const target = choice === 'once' ? allowances?.writePaths : sessionAllowedWritePaths;
     if (target && !target.includes(scope)) target.push(scope);
     noteScope(ctx, 'Write', choice, filePath, scope);
@@ -1524,10 +1427,12 @@ function createLandstripIntegrationWithPrompts(
               )
             : shouldPromptForWrite(access.path, getEffectiveAllowWrite(config), ctx.cwd),
         );
-        const choice = await promptFilesystemToolBlock(
+        const paths = blocked.map(({ operation, path }) => `${operation}: ${path}`).join('\n');
+        const note = options.authorizationNote ? `\n\n${options.authorizationNote}` : '';
+        const choice = await showPermissionPrompt(
           ctx,
-          blocked,
-          options.authorizationNote,
+          `Filesystem policy blocked this tool call:\n${paths}${note}`,
+          PERMISSION_OPTIONS,
           promptSignal,
         );
         if (choice === 'abort' || promptSignal.aborted) {
@@ -1556,7 +1461,12 @@ function createLandstripIntegrationWithPrompts(
     const current = (): boolean | undefined => {
       const config = loadConfig(cwd);
       if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
-      if (domainMatchesAny(domain, getEffectiveAllowedDomains(config, allowances))) return true;
+      const allowedDomains = mergeAllowances(
+        config.network.allowedDomains,
+        sessionAllowedDomains,
+        allowances?.domains,
+      );
+      if (domainMatchesAny(domain, allowedDomains)) return true;
       return undefined;
     };
     if (!ctx.hasUI) return current() ?? false;
@@ -1564,7 +1474,12 @@ function createLandstripIntegrationWithPrompts(
     return permissionPrompts.resolve(
       current,
       async (promptSignal) => {
-        const choice = await promptDomainBlock(ctx, domain, promptSignal);
+        const choice = await showPermissionPrompt(
+          ctx,
+          `Network blocked: "${domain}" is not in the allowed domains list`,
+          PERMISSION_OPTIONS,
+          promptSignal,
+        );
         if (choice === 'abort' || promptSignal.aborted) return false;
         await applyDomainChoice(choice, domain, cwd, allowances);
         return true;
@@ -1675,6 +1590,11 @@ function createLandstripIntegrationWithPrompts(
     promptOnBlock: boolean,
     signal?: AbortSignal,
   ): Promise<TrapQueryResult> {
+    // The broker knows only address:port, and no sandbox field can express a grant
+    // for one non-loopback endpoint: allowedDomains is enforced by the proxy,
+    // allowLocalBinding grants all loopback endpoints, and allowNetwork disables
+    // network enforcement. So a non-loopback connection is granted for the session
+    // or not at all.
     if (!isFilesystemTrap(trap)) {
       const key = `${trap.operation}\u0000${trap.target}`;
       const current = (): TrapQueryResult | undefined =>
@@ -1688,7 +1608,12 @@ function createLandstripIntegrationWithPrompts(
       return permissionPrompts.resolve(
         current,
         async (promptSignal) => {
-          const choice = await promptNetworkBlock(ctx, trap.operation, trap.target, promptSignal);
+          const choice = await showPermissionPrompt(
+            ctx,
+            `Network blocked: ${trap.operation} "${trap.target}"`,
+            NETWORK_PERMISSION_OPTIONS,
+            promptSignal,
+          );
           if (choice === 'abort' || promptSignal.aborted)
             return { action: 'deny', reason: 'rejected' };
           const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
@@ -1734,7 +1659,12 @@ function createLandstripIntegrationWithPrompts(
                   : undefined,
                 promptSignal,
               )
-            : await promptWriteBlock(ctx, path, promptSignal);
+            : await showPermissionPrompt(
+                ctx,
+                `Write blocked: "${path}" is not in allowWrite`,
+                PERMISSION_OPTIONS,
+                promptSignal,
+              );
         if (choice === 'abort' || promptSignal.aborted)
           return { action: 'deny', reason: 'rejected' };
         if (trap.operation === 'read') {
@@ -2440,7 +2370,7 @@ function createLandstripIntegrationWithPrompts(
     ): Promise<AgentToolResult<BashToolDetails | undefined> | null> => {
       if (!ctx.hasUI) return null;
 
-      const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
+      const { globalPath, projectPath } = getPiConfigPaths(ctx.cwd, 'sandbox.json');
       const current = (): boolean | undefined => {
         const config = loadConfig(ctx.cwd);
         if (
@@ -2478,7 +2408,12 @@ function createLandstripIntegrationWithPrompts(
                     : undefined,
                   promptSignal,
                 )
-              : await promptWriteBlock(ctx, blockedPath, promptSignal);
+              : await showPermissionPrompt(
+                  ctx,
+                  `Write blocked: "${blockedPath}" is not in allowWrite`,
+                  PERMISSION_OPTIONS,
+                  promptSignal,
+                );
           if (choice === 'abort' || promptSignal.aborted) return false;
           if (operation === 'read') {
             await applyReadChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
@@ -2594,7 +2529,7 @@ function createLandstripIntegrationWithPrompts(
     if (process.platform !== 'win32') return;
     let implementation: WindowsImplementation;
     try {
-      implementation = activeWindowsImplementation();
+      implementation = windowsStatus().active;
     } catch (error) {
       notify(ctx, formatError(error), 'error');
       return;
@@ -2622,8 +2557,7 @@ function createLandstripIntegrationWithPrompts(
     const dot = theme.fg('success', '●');
     const label = theme.fg('text', 'Sandbox');
 
-    const windowsImplementation =
-      process.platform === 'win32' ? activeWindowsImplementation() : undefined;
+    const windowsImplementation = process.platform === 'win32' ? windowsStatus().active : undefined;
     let networkLabel: string;
     let networkColor: 'warning' | 'accent';
     if (config.network.allowNetwork) {
@@ -2723,7 +2657,9 @@ function createLandstripIntegrationWithPrompts(
   }
 
   function createBashTool(cwd: string): LandstripBashTool {
-    const localBash = createPlainBashTool(cwd);
+    const localBash = createBashToolDefinition(cwd, {
+      shellPath: SettingsManager.create(cwd).getShellPath(),
+    });
 
     return {
       ...localBash,
@@ -2786,7 +2722,11 @@ function createLandstripIntegrationWithPrompts(
     pi.on('session_start', async (_event, ctx) => {
       activeContext = ctx;
       permissionPrompts.reset();
-      resetSessionAllowances();
+      sessionAllowedDomains.length = 0;
+      sessionAllowedReadPaths.length = 0;
+      sessionAllowedWritePaths.length = 0;
+      sessionAllowedTargets.length = 0;
+      unsandboxedWorkerWarningShown = false;
       const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
       projectConfigTrusted = trustContext.isProjectTrusted?.() ?? false;
       if (getNoSandboxFlag()) {
@@ -2831,9 +2771,8 @@ function createLandstripIntegrationWithPrompts(
 
   function sandboxOverview(cwd: string, includeProject: boolean): SandboxOverview {
     const config = loadSandboxConfig(cwd, includeProject);
-    const { globalPath, projectPath } = getConfigPaths(cwd);
-    const windowsImplementation =
-      process.platform === 'win32' ? activeWindowsImplementation() : undefined;
+    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+    const windowsImplementation = process.platform === 'win32' ? windowsStatus().active : undefined;
     return {
       enabled: config.enabled,
       running: sandboxEnabled && sandboxReady,

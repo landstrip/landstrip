@@ -55,17 +55,8 @@ function valueAtPath(root: unknown, path: JsonPath): unknown {
   return value;
 }
 
-function configKindForPath(path: string): LandstripConfigKind {
-  return basename(path) === 'landstrip.json' ? 'dedicated' : 'settings';
-}
-
 function agentJsonPath(kind: LandstripConfigKind, name: string): JsonPath {
   return kind === 'settings' ? ['landstrip', 'agent', name] : ['agent', name];
-}
-
-function editorSnippet(name: string, raw: ConfigObject, kind: LandstripConfigKind): string {
-  const agent = { agent: { [name]: raw } };
-  return `${JSON.stringify(kind === 'settings' ? { landstrip: agent } : agent, null, 2)}\n`;
 }
 
 function parseEditorSnippet(
@@ -197,23 +188,18 @@ function relocateGlobalPrompt(raw: ConfigObject, agent: AgentDefinition): Config
   return { ...raw, prompt: expandFileReferences(raw.prompt, dirname(agent.origin.path)) };
 }
 
-function safeRelative(root: string, path: string): string | undefined {
-  const value = relative(root, path);
-  return value && value !== '..' && !value.startsWith(`..${sep}`) ? value : undefined;
-}
-
 function projectMarkdownPath(cwd: string, agentDir: string, agent: AgentDefinition): string {
   const origin = agent.origin!;
   if (origin.source === 'local' && origin.path) return origin.path;
   if (origin.kind === 'pi-markdown' && origin.path) {
-    const suffix = safeRelative(join(agentDir, 'agents'), origin.path) ?? `${agent.name}.md`;
+    const relativePath = relative(join(agentDir, 'agents'), origin.path);
+    const suffix =
+      relativePath && relativePath !== '..' && !relativePath.startsWith(`..${sep}`)
+        ? relativePath
+        : `${agent.name}.md`;
     return join(cwd, '.pi', 'agents', suffix);
   }
   throw new Error(`Agent ${agent.name} has no Markdown source`);
-}
-
-function projectConfigTarget(cwd: string, agentDir: string): LandstripConfigTarget {
-  return getLandstripConfigTarget(cwd, 'project', agentDir);
 }
 
 function assertProjectConfigTarget(
@@ -221,15 +207,10 @@ function assertProjectConfigTarget(
   agentDir: string,
   target: LandstripConfigTarget,
 ): void {
-  const current = projectConfigTarget(cwd, agentDir);
+  const current = getLandstripConfigTarget(cwd, 'project', agentDir);
   if (current.path !== target.path || current.kind !== target.kind) {
     throw new Error('Landstrip project configuration source changed while updating it');
   }
-}
-
-function projectConfigHasAgent(cwd: string, name: string, agentDir: string): boolean {
-  const target = projectConfigTarget(cwd, agentDir);
-  return readAgentNode(target.path, target.kind, name) !== undefined;
 }
 
 export function canDeleteProjectAgent(
@@ -238,7 +219,8 @@ export function canDeleteProjectAgent(
   agentDir = getAgentDir(),
 ): boolean {
   try {
-    if (projectConfigHasAgent(cwd, agent.name, agentDir)) return true;
+    const target = getLandstripConfigTarget(cwd, 'project', agentDir);
+    if (readAgentNode(target.path, target.kind, agent.name) !== undefined) return true;
   } catch {
     return false;
   }
@@ -251,7 +233,7 @@ export async function deleteProjectAgent(
   agent: AgentDefinition,
   agentDir = getAgentDir(),
 ): Promise<boolean> {
-  const target = projectConfigTarget(cwd, agentDir);
+  const target = getLandstripConfigTarget(cwd, 'project', agentDir);
   const containers: readonly JsonPath[] =
     target.kind === 'settings' ? [['landstrip', 'agent'], ['landstrip']] : [['agent']];
   const deletedOverride = await deleteJsonNode(
@@ -294,17 +276,27 @@ export function prepareProjectAgentEditor(
   const sourcePath = origin?.path;
   const sourceRaw =
     origin?.kind === 'config' && sourcePath
-      ? readAgentNode(sourcePath, configKindForPath(sourcePath), agent.name)
+      ? readAgentNode(
+          sourcePath,
+          basename(sourcePath) === 'landstrip.json' ? 'dedicated' : 'settings',
+          agent.name,
+        )
       : undefined;
   const raw = relocateGlobalPrompt(
     sourceRaw ? sourceRaw : agent.raw ? { ...agent.raw } : normalizedAgentRaw(agent),
     agent,
   );
-  const target = projectConfigTarget(cwd, agentDir);
+  const target = getLandstripConfigTarget(cwd, 'project', agentDir);
 
   return {
     title: `Edit @${agent.name}`,
-    content: editorSnippet(agent.name, raw, target.kind),
+    content: `${JSON.stringify(
+      target.kind === 'settings'
+        ? { landstrip: { agent: { [agent.name]: raw } } }
+        : { agent: { [agent.name]: raw } },
+      null,
+      2,
+    )}\n`,
     async save(content) {
       const edited = parseEditorSnippet(content, agent.name, target.kind);
       validateAgentRaw(agent.name, edited);

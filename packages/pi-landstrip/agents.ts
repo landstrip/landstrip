@@ -77,10 +77,6 @@ function normalizeAbsolutePath(value: string): string {
   return /^(?:[A-Za-z]:[\\/]|\\\\)/.test(value) ? value.replaceAll('\\', '/') : value;
 }
 
-function expandPattern(pattern: string): string {
-  return normalizeAbsolutePath(expandHomePath(pattern));
-}
-
 function permissionEntries(permission: string, value: unknown): PermissionRule[] {
   if (value === 'allow' || value === 'ask' || value === 'deny') {
     return [{ permission, pattern: '*', action: value }];
@@ -92,7 +88,7 @@ function permissionEntries(permission: string, value: unknown): PermissionRule[]
     if (action !== 'allow' && action !== 'ask' && action !== 'deny') {
       throw new Error(`permission ${permission} pattern ${pattern} has an invalid action`);
     }
-    return { permission, pattern: expandPattern(pattern), action };
+    return { permission, pattern: normalizeAbsolutePath(expandHomePath(pattern)), action };
   });
 }
 

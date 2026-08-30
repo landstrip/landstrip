@@ -82,13 +82,6 @@ export function isAgentColor(value: string): boolean {
   return OPENCODE_THEME_COLORS.has(value);
 }
 
-function hexFg(hex: string, text: string): string {
-  const r = Number.parseInt(hex.slice(1, 3), 16);
-  const g = Number.parseInt(hex.slice(3, 5), 16);
-  const b = Number.parseInt(hex.slice(5, 7), 16);
-  return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`;
-}
-
 /** Color text with an agent color (hex or OpenCode theme name). */
 export function colorizeAgentText(
   color: string | undefined,
@@ -97,7 +90,12 @@ export function colorizeAgentText(
   fallback = 'accent',
 ): string {
   if (!color) return themeFg ? themeFg(fallback, text) : text;
-  if (color.startsWith('#')) return hexFg(color, text);
+  if (color.startsWith('#')) {
+    const r = Number.parseInt(color.slice(1, 3), 16);
+    const g = Number.parseInt(color.slice(3, 5), 16);
+    const b = Number.parseInt(color.slice(5, 7), 16);
+    return `\x1b[38;2;${r};${g};${b}m${text}\x1b[39m`;
+  }
   if (themeFg) return themeFg(THEME_COLOR_ALIASES[color] ?? fallback, text);
   const ansi = NAMED_COLOR_ANSI[color];
   return ansi ? `${ansi}${text}\x1b[39m` : text;

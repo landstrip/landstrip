@@ -67,10 +67,6 @@ interface LandstripConfigSource extends LandstripConfigTarget {
 const LANDSTRIP_KEYS = ['maxSubagents', 'agent', 'permission', 'toolFilesystemPolicy'] as const;
 const JSON_FORMAT = { formattingOptions: { insertSpaces: true, tabSize: 2, eol: '\n' } };
 
-function isLandstripKey(key: string): key is (typeof LANDSTRIP_KEYS)[number] {
-  return (LANDSTRIP_KEYS as readonly string[]).includes(key);
-}
-
 function ensureFinalNewline(content: string): string {
   return content.endsWith('\n') ? content : `${content}\n`;
 }
@@ -115,7 +111,9 @@ function parseLandstripConfig(
   const label = kind === 'settings' ? 'landstrip' : 'configuration';
   if (!isRecord(value)) throw new Error(`${path}: ${label} must be a JSON object`);
   for (const key of Object.keys(value)) {
-    if (!isLandstripKey(key)) throw new Error(`${path}: ${label} has an unknown field ${key}`);
+    if (!(LANDSTRIP_KEYS as readonly string[]).includes(key)) {
+      throw new Error(`${path}: ${label} has an unknown field ${key}`);
+    }
   }
 
   const field = (name: string): string => (kind === 'settings' ? `landstrip.${name}` : name);

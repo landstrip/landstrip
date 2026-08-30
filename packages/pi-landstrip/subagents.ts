@@ -526,12 +526,6 @@ function extractCwdFromTaskJsonFile(filePath: string): {
   }
 }
 
-function defaultSessionDirForCwd(cwd: string, agentDir = getAgentDir()): string {
-  const resolvedCwd = resolve(cwd);
-  const safePath = `--${resolvedCwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
-  return join(agentDir, 'sessions', safePath);
-}
-
 function isSubagentSessionDirForCwd(parentSessionDir: string, targetCwd: string): boolean {
   const files = findFilesRecursively(parentSessionDir);
   if (files.length === 0) {
@@ -539,7 +533,8 @@ function isSubagentSessionDirForCwd(parentSessionDir: string, targetCwd: string)
   }
 
   const resolvedTarget = resolve(targetCwd);
-  const targetSessionDir = resolve(defaultSessionDirForCwd(targetCwd));
+  const safePath = `--${resolvedTarget.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+  const targetSessionDir = resolve(join(getAgentDir(), 'sessions', safePath));
   let hasTargetCwd = false;
   let hasOtherCwd = false;
 
@@ -613,10 +608,6 @@ function taskProgress(task: TaskRecord): string[] {
   if (duration) progress.push(duration);
   if (task.retryAttempt) progress.push(`retry ${task.retryAttempt}`);
   return progress;
-}
-
-function taskOutput(details: TaskDetails, fallback: string): string {
-  return details.error ?? details.output ?? fallback;
 }
 
 function workerDialogTitle(task: TaskRecord, title: string): string {
@@ -2730,7 +2721,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         if (usage) metrics.push(usage);
         if (metrics.length > 0) text += `\n${theme.fg('dim', metrics.join(' · '))}`;
 
-        const output = taskOutput(details, '');
+        const output = details.error ?? details.output ?? '';
         if (output) {
           const lines = output.trimEnd().split('\n');
           const shown = expanded ? lines : lines.slice(0, 3);
