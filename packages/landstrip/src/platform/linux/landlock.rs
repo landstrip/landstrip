@@ -58,9 +58,7 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy, restrict_read: bool) 
     ruleset = ruleset
         .scope(Scope::AbstractUnixSocket | Scope::Signal)
         .map_err(landlock_error)?;
-    let mut created = ruleset
-        .create()
-        .map_err(landlock_error)?;
+    let mut created = ruleset.create().map_err(landlock_error)?;
 
     created = add_path_rules(
         created,
@@ -77,9 +75,7 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy, restrict_read: bool) 
         created = add_network_rules(created, policy)?;
     }
 
-    let status = created
-        .restrict_self()
-        .map_err(landlock_error)?;
+    let status = created.restrict_self().map_err(landlock_error)?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => {}
         RulesetStatus::PartiallyEnforced => log::debug!(

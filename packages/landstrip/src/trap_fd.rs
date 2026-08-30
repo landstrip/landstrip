@@ -244,4 +244,3 @@ fn write_without_sigpipe(fd: RawFd, line: &[u8]) -> io::Result<usize> {
         write_result
     }
 }
-

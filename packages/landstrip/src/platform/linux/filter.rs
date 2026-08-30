@@ -380,7 +380,12 @@ pub(super) fn add_socket_family_filter(rules: &mut RuleMap, socket: i64) -> Resu
         add_conditional_rule(
             rules,
             socket,
-            vec![seccomp_cond(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain)?],
+            vec![seccomp_cond(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                domain,
+            )?],
         )?;
     }
 

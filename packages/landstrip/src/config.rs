@@ -27,7 +27,6 @@ impl PolicyFormat {
     }
 }
 
-
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Settings {

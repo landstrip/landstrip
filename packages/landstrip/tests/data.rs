@@ -389,6 +389,7 @@ impl Case {
                     let (rel, mode) = rest.split_once(':').unwrap_or((rest, "0"));
                     set_mode(&dir.join(resolver.subst(rel)), mode)?;
                 }
+                "xattr" => set_xattr(&dir.join(resolver.subst(rest)))?,
                 "symlink" => {
                     let (target, link) = rest.split_once(':').unwrap_or((rest, ""));
                     make_symlink(&resolver.subst(target), &dir.join(resolver.subst(link)))?;
@@ -648,7 +649,10 @@ fn parse_fs(value: &str) -> Fs {
             path: path.to_owned(),
             allowed,
         },
-        "legacy-utimes" | "x32-fchmod" => Fs::FdMetadata {
+        "chmod-empty" | "chmod-null" | "fchmod" | "fchmodat2-empty" | "fchmodat2-invalid"
+        | "fchmodat2-nofollow" | "fchown" | "fchownat-cwd-empty" | "fchownat-empty"
+        | "fchownat-invalid" | "fremovexattr" | "fsetxattr" | "fsetxattr-overlong"
+        | "legacy-utimes" | "lremovexattr" | "utimensat-invalid" | "x32-fchmod" => Fs::FdMetadata {
             operation: kind.to_owned(),
             path: path.to_owned(),
             allowed,
@@ -794,23 +798,101 @@ fn fd_metadata_probe(
     let Ok(file) = std::fs::File::open(&path) else {
         return 1;
     };
-    let Ok(_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return 2;
     };
+    let name = c"user.landstrip-test";
+    let value = b"value";
     let rc = match operation.to_str() {
-        Some("legacy-utimes") => {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            unsafe {
+        Some("fchmod") => unsafe { libc::fchmod(file.as_raw_fd(), 0o600) },
+        Some("fchmodat2-empty") => unsafe {
+            libc::syscall(
+                libc::SYS_fchmodat2,
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                0o600,
+                libc::AT_EMPTY_PATH,
+            ) as i32
+        },
+        Some("fchmodat2-invalid") => {
+            let rc = unsafe {
                 libc::syscall(
-                    libc::SYS_utimes,
-                    _path.as_ptr(),
-                    std::ptr::null::<libc::timeval>(),
-                ) as i32
+                    libc::SYS_fchmodat2,
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    0o600,
+                    0x4000_0000_i32,
+                )
+            };
+            return i32::from(
+                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
+            );
+        }
+        Some("fchmodat2-nofollow") => {
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_fchmodat2,
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    0o600,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            return i32::from(
+                rc != -1
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP),
+            );
+        }
+        Some("fchown") => unsafe {
+            libc::fchown(file.as_raw_fd(), libc::geteuid(), libc::getegid())
+        },
+        Some("fchownat-empty") => unsafe {
+            libc::fchownat(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                libc::geteuid(),
+                libc::getegid(),
+                libc::AT_EMPTY_PATH,
+            )
+        },
+        Some("fchownat-cwd-empty") => unsafe {
+            if libc::fchdir(file.as_raw_fd()) != 0 {
+                return 1;
             }
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            {
-                -1
-            }
+            libc::fchownat(
+                libc::AT_FDCWD,
+                c"".as_ptr(),
+                libc::geteuid(),
+                libc::getegid(),
+                libc::AT_EMPTY_PATH,
+            )
+        },
+        Some("fchownat-invalid") => {
+            let rc = unsafe {
+                libc::fchownat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    libc::geteuid(),
+                    libc::getegid(),
+                    0x4000_0000_i32,
+                )
+            };
+            return i32::from(
+                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
+            );
+        }
+        Some("utimensat-invalid") => {
+            let rc = unsafe {
+                libc::utimensat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    0x4000_0000_i32,
+                )
+            };
+            return i32::from(
+                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
+            );
         }
         Some("x32-fchmod") => {
             #[cfg(target_arch = "x86_64")]
@@ -824,7 +906,58 @@ fn fd_metadata_probe(
                 -1
             }
         }
-        Some("fchmod") => unsafe { libc::fchmod(file.as_raw_fd(), 0o600) },
+        Some("fsetxattr") => unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        },
+        Some("fsetxattr-overlong") => {
+            let name = std::ffi::CString::new(vec![b'x'; 256]).unwrap();
+            let rc = unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            return i32::from(
+                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ERANGE),
+            );
+        }
+        Some("fremovexattr") => unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) },
+        Some("lremovexattr") => unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) },
+        Some("legacy-utimes") => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe {
+                libc::syscall(
+                    libc::SYS_utimes,
+                    path.as_ptr(),
+                    std::ptr::null::<libc::timeval>(),
+                ) as i32
+            }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                -1
+            }
+        }
+        Some("chmod-null") => {
+            let rc = unsafe { libc::chmod(std::ptr::null(), 0o600) };
+            return i32::from(
+                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EFAULT),
+            );
+        }
+        Some("chmod-empty") => {
+            let rc = unsafe { libc::chmod(c"".as_ptr(), 0o600) };
+            return i32::from(
+                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT),
+            );
+        }
         _ => return 2,
     };
     if rc == 0 { 0 } else { 1 }
@@ -835,6 +968,29 @@ fn fd_metadata_probe(
     _path: Option<std::ffi::OsString>,
     _operation: Option<std::ffi::OsString>,
 ) -> i32 {
+    2
+}
+
+#[cfg(target_os = "linux")]
+fn truncate_probe(path: Option<std::ffi::OsString>) -> i32 {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(path) = path else {
+        return 2;
+    };
+    let Ok(path) = std::ffi::CString::new(path.as_bytes()) else {
+        return 2;
+    };
+    // SAFETY: path is NUL-terminated and length is nonnegative.
+    if unsafe { libc::truncate(path.as_ptr(), 1) } == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn truncate_probe(_path: Option<std::ffi::OsString>) -> i32 {
     2
 }
 
@@ -993,29 +1149,6 @@ fn openat2_probe(path: Option<std::ffi::OsString>, operation: Option<std::ffi::O
 
 #[cfg(not(target_os = "linux"))]
 fn openat2_probe(_path: Option<std::ffi::OsString>, _operation: Option<std::ffi::OsString>) -> i32 {
-    2
-}
-
-#[cfg(target_os = "linux")]
-fn truncate_probe(path: Option<std::ffi::OsString>) -> i32 {
-    use std::os::unix::ffi::OsStrExt;
-
-    let Some(path) = path else {
-        return 2;
-    };
-    let Ok(path) = std::ffi::CString::new(path.as_bytes()) else {
-        return 2;
-    };
-    // SAFETY: path is NUL-terminated and length is nonnegative.
-    if unsafe { libc::truncate(path.as_ptr(), 1) } == 0 {
-        0
-    } else {
-        1
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn truncate_probe(_path: Option<std::ffi::OsString>) -> i32 {
     2
 }
 
@@ -1950,6 +2083,35 @@ fn set_mode(path: &Path, mode: &str) -> Result<(), String> {
 
 #[cfg(not(unix))]
 fn set_mode(_path: &Path, _mode: &str) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_xattr(path: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "xattr path contains NUL".to_owned())?;
+    let name = c"user.landstrip-test";
+    let value = b"value";
+    let rc = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!("setxattr: {}", std::io::Error::last_os_error()))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_xattr(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 

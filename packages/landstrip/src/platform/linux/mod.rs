@@ -14,7 +14,6 @@ use anyhow::{Context, Result};
 use seccomp::ensure_notification_supported;
 use std::ffi::{OsStr, OsString};
 
-
 pub(crate) fn doctor() -> Result<()> {
     Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)

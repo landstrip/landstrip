@@ -16,9 +16,7 @@
 //! are denied by Landlock scope on ABI 6+ (Linux 6.12+); the broker cannot tell
 //! those apart from sockets the child created itself.
 
-use super::filter::{
-    build_errno_filter, build_io_uring_deny, build_notify_filter, load_filters,
-};
+use super::filter::{build_errno_filter, build_io_uring_deny, build_notify_filter, load_filters};
 use super::landlock::enforce_access_policy;
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::paths::{
@@ -257,15 +255,20 @@ pub(super) fn run_broker(
     }
     if notify_filesystem {
         notify_syscalls.extend(syscalls.filesystem_syscalls());
-        notify_syscalls.extend(MUTATION_SYSCALLS.iter().filter_map(|spec| spec.nr));
     }
+    notify_syscalls.extend(
+        MUTATION_SYSCALLS
+            .iter()
+            .filter(|spec| notify_filesystem || !spec.landlock_backed)
+            .filter_map(|spec| spec.nr),
+    );
     let notify = if notify_syscalls.is_empty() {
         None
     } else {
         Some(build_notify_filter(&notify_syscalls)?)
     };
 
-        let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::supervise)?;
+    let (parent, child_sock) = UnixStream::pair().map_err(LandstripError::supervise)?;
     let was_subreaper = child_subreaper()?;
     if !was_subreaper {
         set_child_subreaper(true)?;
@@ -294,11 +297,7 @@ pub(super) fn run_broker(
                 enforce_access_policy(policy, false)?;
 
                 {
-                    let notify = load_filters(
-                        errno.as_ref(),
-                        io_uring.as_ref(),
-                        notify.as_ref(),
-                    )?;
+                    let notify = load_filters(errno.as_ref(), io_uring.as_ref(), notify.as_ref())?;
 
                     let notify = fcntl(notify.as_fd(), FcntlArg::F_DUPFD_CLOEXEC(0))
                         .map_err(supervise_errno)?;
@@ -399,6 +398,10 @@ struct ControlResponse {
     action: ControlAction,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "query delivery failure handling must update supervisor state atomically"
+)]
 fn supervise_child(
     policy: &AccessPolicy,
     child: Pid,
@@ -421,7 +424,6 @@ fn supervise_child(
         query_enabled,
         mount_namespace,
     };
-
     let mut pending_queries: std::collections::HashMap<u64, PendingQuery> =
         std::collections::HashMap::new();
     let mut control_buffer: Vec<u8> = Vec::new();
@@ -636,7 +638,9 @@ impl<'a> Denials<'a> {
 
     fn emit(self, status: WaitStatus) -> i32 {
         let code = exit_code(status);
-        let Self { trap_fd, pending, .. } = self;
+        let Self {
+            trap_fd, pending, ..
+        } = self;
         for denial in pending
             .into_iter()
             .filter(|denial| code != 0 || denial.report_on_success())
@@ -696,9 +700,7 @@ impl TryFrom<&Path> for NamespaceId {
 impl NamespaceId {
     fn verify(self, pid: u32) -> SysResult<()> {
         let path = Path::new("/proc").join(pid.to_string()).join("ns/mnt");
-        let actual = Self::try_from(path.as_path()).map_err(|error| BrokerError::SystemCall {
-            errno: error.raw_os_error().unwrap_or(libc::EIO),
-        })?;
+        let actual = Self::try_from(path.as_path())?;
         if actual != self {
             return Err(BrokerError::PolicyDenied);
         }
@@ -740,7 +742,11 @@ fn handle_notification(
     } else if ctx.notify_filesystem && ctx.syscalls.is_handle_syscall(syscall) {
         // name_to_handle_at / open_by_handle_at bypass path mediation. Deny hard.
         Err(BrokerError::PolicyDenied)
-    } else if ctx.notify_filesystem {
+    } else if ctx.notify_filesystem
+        || MUTATION_SYSCALLS
+            .iter()
+            .any(|spec| !spec.landlock_backed && spec.nr == Some(syscall))
+    {
         handle_mutation(
             ctx.policy,
             request,
@@ -889,7 +895,11 @@ fn network_query(
     let qid = *next_query_id;
     *next_query_id += 1;
     let trap = Trap::network(operation, target, process_context(pid), Some(qid));
-    let grant = Grant::socket(socket.sock, socket.addr, call);
+    let grant = Grant::Socket(SocketGrant {
+        sock: socket.sock,
+        addr: socket.addr,
+        call,
+    });
     NotificationResult::query(qid, trap, Some(grant))
 }
 
@@ -1085,10 +1095,7 @@ fn unix_path_target(pid: u32, addr: &[u8]) -> SysResult<Option<(PathBuf, bool)>>
         Ok(Some((create_path(path), false)))
     } else {
         let pid = i32::try_from(pid).map_err(|_| BrokerError::InvalidAddress)?;
-        let cwd =
-            fs::read_link(format!("/proc/{pid}/cwd")).map_err(|error| BrokerError::SystemCall {
-                errno: error.raw_os_error().unwrap_or(libc::EIO),
-            })?;
+        let cwd = fs::read_link(format!("/proc/{pid}/cwd"))?;
         Ok(Some((create_path(&cwd.join(path)), true)))
     }
 }
@@ -1223,10 +1230,7 @@ fn read_target_addr(pid: Pid, target_addr: usize, addr_len: usize) -> SysResult<
         base: target_addr,
         len: addr_len,
     }];
-    if process_vm_readv(pid, &mut local, &target).map_err(|error| BrokerError::SystemCall {
-        errno: error as i32,
-    })? != addr_len
-    {
+    if process_vm_readv(pid, &mut local, &target)? != addr_len {
         return Err(BrokerError::BadAddress);
     }
 
@@ -1237,9 +1241,7 @@ fn thread_group_leader(pid: Pid) -> SysResult<Pid> {
     let status_path = Path::new("/proc")
         .join(pid.as_raw().to_string())
         .join("status");
-    let status = fs::read_to_string(status_path).map_err(|error| BrokerError::SystemCall {
-        errno: error.raw_os_error().unwrap_or(libc::EIO),
-    })?;
+    let status = fs::read_to_string(status_path)?;
     let line = status
         .lines()
         .find(|line| line.starts_with("Tgid:"))
@@ -1266,30 +1268,16 @@ fn duplicate_target_fd(pid: Pid, fd: RawFd) -> SysResult<OwnedFd> {
         Ok(pidfd) => pidfd,
         Err(Errno::EINVAL | Errno::ENOSYS) => match open_pidfd(pid, 0) {
             Ok(pidfd) => pidfd,
-            Err(Errno::EINVAL) => open_pidfd(thread_group_leader(pid)?, 0).map_err(|error| {
-                BrokerError::SystemCall {
-                    errno: error as i32,
-                }
-            })?,
-            Err(error) => {
-                return Err(BrokerError::SystemCall {
-                    errno: error as i32,
-                });
-            }
+            Err(Errno::EINVAL) => open_pidfd(thread_group_leader(pid)?, 0)?,
+            Err(error) => return Err(error.into()),
         },
-        Err(error) => {
-            return Err(BrokerError::SystemCall {
-                errno: error as i32,
-            });
-        }
+        Err(error) => return Err(error.into()),
     };
 
     // SAFETY: pidfd_getfd copies scalar arguments and returns a duplicated fd.
     let target = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
     if target < 0 {
-        return Err(BrokerError::SystemCall {
-            errno: Errno::last() as i32,
-        });
+        return Err(Errno::last().into());
     }
 
     // SAFETY: pidfd_getfd returned a new owned descriptor.
@@ -1332,9 +1320,7 @@ fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> SysResult
         )
     };
     if rc < 0 {
-        Err(BrokerError::SystemCall {
-            errno: Errno::last() as i32,
-        })
+        Err(Errno::last().into())
     } else {
         Ok(i64::from(rc))
     }
@@ -1380,7 +1366,7 @@ fn create_bits(flags: i32) -> i32 {
     flags | libc::O_NOFOLLOW | libc::O_CLOEXEC
 }
 
-// The open flags and creation mode an open syscall requested.
+// The open flags, creation mode, and openat2 resolution constraints a syscall requested.
 struct Open {
     flags: i32,
     mode: u32,
@@ -1396,8 +1382,6 @@ struct OpenHow {
 }
 
 impl Open {
-    // openat passes flags and mode as scalar arguments at args[2]/args[3].
-    // legacy open(2) uses the same layout at args[1]/args[2].
     fn from_args(request: &libc::seccomp_notif, legacy_open: bool) -> SysResult<Self> {
         let args = &request.data.args;
         let flags_arg = if legacy_open { 1 } else { 2 };
@@ -1410,9 +1394,6 @@ impl Open {
         })
     }
 
-    // openat2 passes a struct open_how { u64 flags; u64 mode; u64 resolve; } by
-    // pointer; only the first two fields matter. The kernel requires size >= 24,
-    // but read just the bytes we use.
     fn from_how(request: &libc::seccomp_notif, pid: Pid) -> SysResult<Self> {
         let args = &request.data.args;
         let addr = usize::try_from(args[2]).map_err(|_| BrokerError::BadAddress)?;
@@ -1608,11 +1589,10 @@ fn read_open_request(request: &libc::seccomp_notif) -> SysResult<OpenRequest> {
     } else {
         "openat"
     };
-    let path = read_child_path(pid, path_ptr)?;
     Ok(OpenRequest {
         pid,
         dirfd,
-        path,
+        path: read_nonempty_child_path(pid, path_ptr)?,
         flags,
         mode,
         resolve,
@@ -1702,10 +1682,21 @@ fn handle_openat(
         );
     }
 
+    // fget() rejects FMODE_PATH descriptors (fs/file.c), so
+    // SECCOMP_IOCTL_NOTIF_ADDFD fails with EBADF for an O_PATH fd and the
+    // child would see a spurious EACCES. An O_PATH handle grants no data
+    // access — every dereferencing operation goes through its own brokered
+    // syscall — and Landlock does not restrict O_PATH opens, so after the
+    // policy checks above let the child's syscall re-execute natively.
     if flags & libc::O_PATH != 0 {
         return Ok(NotificationResult::Continue);
     }
 
+    // Re-running openat in the child via CONTINUE would reopen the classic
+    // seccomp-user-notification TOCTOU (a sibling can swap the path after the
+    // broker's policy check). Landlock cannot express denyWrite holes under an
+    // allowWrite root, so pin every allowed open — read or write — with an
+    // OpenGrant and inject the broker's fd via SECCOMP_ADDFD.
     let grant = match openat2_grant {
         Some(grant) => grant,
         None => OpenGrant::new(&resolved, flags, mode)
@@ -1757,12 +1748,16 @@ enum MutationSyscall {
     Mkdirat,
     Mknodat,
     Truncate,
+    Fchmod,
     Fchmodat,
     Fchmodat2,
+    Fchown,
     Fchownat,
     Utimensat,
+    Fsetxattr,
     Setxattr,
     Lsetxattr,
+    Fremovexattr,
     Removexattr,
     Lremovexattr,
     Rename,
@@ -1798,7 +1793,7 @@ impl MutationSyscall {
             | Self::Lremovexattr
             | Self::Link => true,
             Self::Fchownat => flag(4),
-            Self::Fchmodat | Self::Fchmodat2 | Self::Utimensat => flag(3),
+            Self::Fchmodat2 | Self::Utimensat => flag(3),
             // linkat(2) links the symlink itself unless AT_SYMLINK_FOLLOW is set;
             // link(2) has no flags and never dereferences.
             Self::Linkat => !follow(4),
@@ -1808,6 +1803,11 @@ impl MutationSyscall {
             | Self::Mkdirat
             | Self::Mknodat
             | Self::Truncate
+            | Self::Fchmodat
+            | Self::Fchmod
+            | Self::Fchown
+            | Self::Fsetxattr
+            | Self::Fremovexattr
             | Self::Setxattr
             | Self::Removexattr
             | Self::Rename
@@ -1889,6 +1889,18 @@ const MUTATION_SYSCALLS: &[Syscall] = &[
         landlock_backed: true,
     },
     Syscall {
+        nr: Some(libc::SYS_fchmod),
+        kind: MutationSyscall::Fchmod,
+        paths: &[],
+        landlock_backed: false,
+    },
+    Syscall {
+        nr: Some(libc::SYS_fchown),
+        kind: MutationSyscall::Fchown,
+        paths: &[],
+        landlock_backed: false,
+    },
+    Syscall {
         nr: Some(libc::SYS_fchmodat),
         kind: MutationSyscall::Fchmodat,
         paths: &[(Some(0), 1)],
@@ -1912,6 +1924,18 @@ const MUTATION_SYSCALLS: &[Syscall] = &[
         nr: Some(libc::SYS_utimensat),
         kind: MutationSyscall::Utimensat,
         paths: &[(Some(0), 1)],
+        landlock_backed: false,
+    },
+    Syscall {
+        nr: Some(libc::SYS_fsetxattr),
+        kind: MutationSyscall::Fsetxattr,
+        paths: &[],
+        landlock_backed: false,
+    },
+    Syscall {
+        nr: Some(libc::SYS_fremovexattr),
+        kind: MutationSyscall::Fremovexattr,
+        paths: &[],
         landlock_backed: false,
     },
     Syscall {
@@ -2024,6 +2048,24 @@ fn reparent_read_denial(
     dest_readable.then_some((0, reason, TrapOperation::Read))
 }
 
+fn validate_mutation_flags(kind: MutationSyscall, args: &[u64; 6]) -> SysResult<()> {
+    let flags = match kind {
+        MutationSyscall::Fchmodat2 | MutationSyscall::Utimensat => syscall_i32(args[3]),
+        MutationSyscall::Fchownat => syscall_i32(args[4]),
+        _ => return Ok(()),
+    };
+    if flags & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) != 0 {
+        return Err(BrokerError::SystemCall {
+            errno: libc::EINVAL,
+        });
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "mutation path checks and grant construction share one policy decision"
+)]
 fn handle_mutation(
     policy: &AccessPolicy,
     request: &libc::seccomp_notif,
@@ -2035,8 +2077,11 @@ fn handle_mutation(
     let Some(spec) = MUTATION_SYSCALLS.iter().find(|s| s.nr == Some(syscall)) else {
         return Ok(NotificationResult::Continue);
     };
-    if spec.kind == MutationSyscall::Utimensat && request.data.args[1] == 0 {
-        return handle_fd_utimensat(policy, request, denials, query_enabled, next_query_id);
+    validate_mutation_flags(spec.kind, &request.data.args)?;
+    if spec.paths.is_empty()
+        || (spec.kind == MutationSyscall::Utimensat && request.data.args[1] == 0)
+    {
+        return handle_fd_mutation(policy, spec, request, denials, query_enabled, next_query_id);
     }
 
     let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
@@ -2053,17 +2098,24 @@ fn handle_mutation(
         let path_ptr =
             usize::try_from(request.data.args[*path_arg]).map_err(|_| BrokerError::BadAddress)?;
         let path = read_child_path(pid, path_ptr)?;
+        if empty_path_uses_fd(spec.kind, &request.data.args, &path)? {
+            return handle_fd_mutation(
+                policy,
+                spec,
+                request,
+                denials,
+                query_enabled,
+                next_query_id,
+            );
+        }
         let raw = resolve_child_path(pid, dirfd, &path)?;
-        // mkdir -p intentionally invokes mkdir for each existing path component.
-        // Return the syscall's EEXIST result without prompting instead of treating
-        // an operation that cannot mutate the filesystem as a permission request.
+        // Preserve mkdir -p's EEXIST result without prompting for a non-mutation.
         if spec.kind.is_mkdir() && mkdir_target_exists(&raw) {
             return Err(BrokerError::SystemCall {
                 errno: libc::EEXIST,
             });
         }
-        // No-follow ops act on the link itself: canonicalize the parent but keep
-        // the final component so the policy gates the symlink, not its target.
+        // Gate no-follow operations on the link rather than its target.
         let resolved = if no_follow {
             normalize_path_nofollow(&raw)
         } else {
@@ -2082,12 +2134,8 @@ fn handle_mutation(
     denial = denial.or_else(|| reparent_read_denial(policy, spec, &slots));
 
     let Some((index, reason, operation)) = denial else {
-        // Allowed mutations still race under CONTINUE when denyWrite sits under
-        // an allowWrite root (Landlock cannot express those holes). Fulfill the
-        // op in the broker whenever any denyWrite list is present; otherwise
-        // landlock-backed ops may CONTINUE under the child's write roots.
-        // Reparenting also races when denyRead sits under an allowWrite root:
-        // CONTINUE would let link/rename alias a swapped-in secret.
+        // Broker operations where Landlock cannot represent denyWrite holes.
+        // Pin reparenting too, so it cannot expose a swapped-in denyRead source.
         let must_pin = !policy.write_denied_roots.is_empty()
             || !policy.write_denied_patterns.is_empty()
             || !policy.write_denied_links.is_empty()
@@ -2146,12 +2194,26 @@ fn handle_mutation(
     ))
 }
 
-/// Mediate the fd-only form used by `futimens(3)`, which glibc issues as
-/// `utimensat(fd, NULL, times, 0)`. Pin the child's descriptor before checking
-/// policy so another thread cannot swap its fd-table entry between the check
-/// and the brokered timestamp update.
-fn handle_fd_utimensat(
+fn mutation_target_fd(pid: Pid, child_fd: RawFd, kind: MutationSyscall) -> SysResult<OwnedFd> {
+    let at_cwd = child_fd == libc::AT_FDCWD
+        && matches!(kind, MutationSyscall::Fchmodat2 | MutationSyscall::Fchownat);
+    if child_fd < 0 && !at_cwd {
+        return Err(BrokerError::BadFileDescriptor);
+    }
+    if !at_cwd {
+        return duplicate_target_fd(pid, child_fd);
+    }
+
+    let cwd = Path::new("/proc")
+        .join(pid.as_raw().to_string())
+        .join("cwd");
+    open_path(&cwd, libc::O_PATH | libc::O_CLOEXEC)
+        .map_err(|errno| BrokerError::SystemCall { errno })
+}
+
+fn handle_fd_mutation(
     policy: &AccessPolicy,
+    spec: &Syscall,
     request: &libc::seccomp_notif,
     denials: &mut Denials<'_>,
     query_enabled: bool,
@@ -2159,31 +2221,63 @@ fn handle_fd_utimensat(
 ) -> SysResult<NotificationResult> {
     let args = &request.data.args;
     let pid = Pid::from_raw(i32::try_from(request.pid).map_err(|_| BrokerError::InvalidAddress)?);
-    if syscall_i32(args[3]) != 0 {
+    if spec.kind == MutationSyscall::Utimensat && syscall_i32(args[3]) != 0 {
         return Err(BrokerError::SystemCall {
             errno: libc::EINVAL,
         });
     }
 
-    let child_fd = syscall_i32(args[0]);
-    if child_fd < 0 {
-        return Err(BrokerError::BadFileDescriptor);
-    }
-
-    let target = duplicate_target_fd(pid, child_fd)?;
-    let requested_path = fs::read_link(
-        Path::new("/proc/self/fd").join(target.as_raw_fd().to_string()),
-    )
-    .map_err(|error| BrokerError::SystemCall {
-        errno: error.raw_os_error().unwrap_or(libc::EIO),
-    })?;
-    let times = read_child_times(pid, args[2])?;
-    let resolved = normalize_path(&requested_path);
+    let target = mutation_target_fd(pid, syscall_i32(args[0]), spec.kind)?;
+    let requested_path =
+        fs::read_link(Path::new("/proc/self/fd").join(target.as_raw_fd().to_string()))?;
+    let mutation = match spec.kind {
+        MutationSyscall::Fchmod => FdMutation::Chmod {
+            mode: syscall_u32(args[1]),
+        },
+        MutationSyscall::Fchmodat2 => FdMutation::ChmodAt {
+            mode: syscall_u32(args[2]),
+            flags: syscall_i32(args[3]),
+        },
+        MutationSyscall::Fchown => FdMutation::Chown {
+            uid: syscall_u32(args[1]),
+            gid: syscall_u32(args[2]),
+        },
+        MutationSyscall::Fchownat => FdMutation::ChownAt {
+            uid: syscall_u32(args[2]),
+            gid: syscall_u32(args[3]),
+            flags: syscall_i32(args[4]),
+        },
+        MutationSyscall::Utimensat => FdMutation::Utimes {
+            times: read_child_times(pid, args[2])?,
+        },
+        MutationSyscall::Fsetxattr => FdMutation::SetXattr {
+            name: read_child_xattr_name(pid, args[1])?,
+            value: read_child_bytes(pid, args[2], args[3])?,
+            flags: syscall_i32(args[4]),
+        },
+        MutationSyscall::Fremovexattr => FdMutation::RemoveXattr {
+            name: read_child_xattr_name(pid, args[1])?,
+        },
+        _ => {
+            return Err(BrokerError::SystemCall {
+                errno: libc::EINVAL,
+            });
+        }
+    };
+    let no_follow = match spec.kind {
+        MutationSyscall::Fchmodat2 => syscall_i32(args[3]) & libc::AT_SYMLINK_NOFOLLOW != 0,
+        MutationSyscall::Fchownat => syscall_i32(args[4]) & libc::AT_SYMLINK_NOFOLLOW != 0,
+        _ => false,
+    };
+    let resolved = if no_follow {
+        normalize_path_nofollow(&requested_path)
+    } else {
+        normalize_path(&requested_path)
+    };
     let lexical = normalize_path_lexically(&requested_path);
     let reason = policy.write_reason(&resolved, &lexical, true);
-
     let operation = MutationGrant {
-        op: MutationOp::UtimesFd { target, times },
+        op: MutationOp::Fd { target, mutation },
         anchors: Vec::new(),
         no_follow: false,
     };
@@ -2196,7 +2290,7 @@ fn handle_fd_utimensat(
         operation: TrapOperation::Write,
         path: resolved,
         requested_path,
-        syscall: MutationSyscall::Utimensat.into(),
+        syscall: spec.kind.into(),
         flags: Vec::new(),
         reason,
         process: process_context(request.pid),
@@ -2216,10 +2310,6 @@ fn handle_fd_utimensat(
 }
 
 impl Grant {
-    fn socket(sock: OwnedFd, addr: Vec<u8>, call: SocketAddrCall) -> Grant {
-        Grant::Socket(SocketGrant { sock, addr, call })
-    }
-
     fn mutation(
         spec: &Syscall,
         request: &libc::seccomp_notif,
@@ -2232,6 +2322,10 @@ impl Grant {
             MutationSyscall::Creat => {
                 return creat_grant(slots, syscall_u32(args[1]));
             }
+            MutationSyscall::Fchmod
+            | MutationSyscall::Fchown
+            | MutationSyscall::Fsetxattr
+            | MutationSyscall::Fremovexattr => return Ok(None),
             MutationSyscall::Mkdirat => MutationOp::Mkdir {
                 mode: syscall_u32(args[2]),
             },
@@ -2270,15 +2364,20 @@ impl Grant {
             MutationSyscall::Truncate => MutationOp::Truncate {
                 length: args[1].cast_signed(),
             },
-            MutationSyscall::Fchmodat | MutationSyscall::Fchmodat2 => MutationOp::Chmod {
+            MutationSyscall::Fchmodat => MutationOp::Chmod {
                 mode: syscall_u32(args[2]),
+            },
+            MutationSyscall::Fchmodat2 => MutationOp::ChmodAt {
+                mode: syscall_u32(args[2]),
+                flags: syscall_i32(args[3]),
             },
             MutationSyscall::Chmod => MutationOp::Chmod {
                 mode: syscall_u32(args[1]),
             },
-            MutationSyscall::Fchownat => MutationOp::Chown {
+            MutationSyscall::Fchownat => MutationOp::ChownAt {
                 uid: syscall_u32(args[2]),
                 gid: syscall_u32(args[3]),
+                flags: syscall_i32(args[4]),
             },
             MutationSyscall::Chown | MutationSyscall::Lchown => MutationOp::Chown {
                 uid: syscall_u32(args[1]),
@@ -2286,22 +2385,17 @@ impl Grant {
             },
             MutationSyscall::Utimensat => MutationOp::Utimes {
                 times: read_child_times(pid, args[2])?,
+                flags: syscall_i32(args[3]),
             },
-            MutationSyscall::Setxattr | MutationSyscall::Lsetxattr => {
-                let Some(name) = read_child_target(pid, args[1])? else {
-                    return Ok(None);
-                };
-                MutationOp::SetXattr {
-                    name,
-                    value: read_child_bytes(pid, args[2], args[3])?,
-                    flags: syscall_i32(args[4]),
-                }
-            }
+            MutationSyscall::Setxattr | MutationSyscall::Lsetxattr => MutationOp::SetXattr {
+                name: read_child_xattr_name(pid, args[1])?,
+                value: read_child_bytes(pid, args[2], args[3])?,
+                flags: syscall_i32(args[4]),
+            },
             MutationSyscall::Removexattr | MutationSyscall::Lremovexattr => {
-                let Some(name) = read_child_target(pid, args[1])? else {
-                    return Ok(None);
-                };
-                MutationOp::RemoveXattr { name }
+                MutationOp::RemoveXattr {
+                    name: read_child_xattr_name(pid, args[1])?,
+                }
             }
         };
 
@@ -2345,6 +2439,24 @@ fn read_child_target(pid: Pid, ptr: u64) -> SysResult<Option<CString>> {
         .map_err(|_| BrokerError::InvalidAddress)
 }
 
+fn read_child_xattr_name(pid: Pid, ptr: u64) -> SysResult<CString> {
+    const XATTR_NAME_MAX: usize = 255;
+
+    let addr = usize::try_from(ptr).map_err(|_| BrokerError::BadAddress)?;
+    if addr == 0 {
+        return Err(BrokerError::BadAddress);
+    }
+    let buf = match read_child_string(pid, addr, XATTR_NAME_MAX + 1) {
+        Err(BrokerError::NameTooLong) => {
+            return Err(BrokerError::SystemCall {
+                errno: libc::ERANGE,
+            });
+        }
+        result => result?,
+    };
+    CString::new(buf).map_err(|_| BrokerError::BadAddress)
+}
+
 // Read utimensat's two timespecs from the child; a null pointer means "now".
 fn read_child_times(pid: Pid, ptr: u64) -> SysResult<Option<[libc::timespec; 2]>> {
     let addr = usize::try_from(ptr).map_err(|_| BrokerError::BadAddress)?;
@@ -2361,10 +2473,7 @@ fn read_child_times(pid: Pid, ptr: u64) -> SysResult<Option<[libc::timespec; 2]>
     let bytes = unsafe { std::slice::from_raw_parts_mut(times.as_mut_ptr().cast::<u8>(), len) };
     let mut local = [IoSliceMut::new(bytes)];
     let target = [RemoteIoVec { base: addr, len }];
-    let n =
-        process_vm_readv(pid, &mut local, &target).map_err(|error| BrokerError::SystemCall {
-            errno: error as i32,
-        })?;
+    let n = process_vm_readv(pid, &mut local, &target)?;
     if n < len {
         return Err(BrokerError::BadAddress);
     }
@@ -2392,10 +2501,7 @@ fn read_child_bytes(pid: Pid, ptr: u64, size: u64) -> SysResult<Vec<u8>> {
     let mut buf = vec![0_u8; len];
     let mut local = [IoSliceMut::new(&mut buf)];
     let target = [RemoteIoVec { base: addr, len }];
-    let n =
-        process_vm_readv(pid, &mut local, &target).map_err(|error| BrokerError::SystemCall {
-            errno: error as i32,
-        })?;
+    let n = process_vm_readv(pid, &mut local, &target)?;
     if n != len {
         return Err(BrokerError::BadAddress);
     }
@@ -2412,6 +2518,34 @@ fn read_child_path(pid: Pid, path_ptr: usize) -> SysResult<PathBuf> {
     Ok(PathBuf::from(OsStr::from_bytes(&buf)))
 }
 
+fn read_nonempty_child_path(pid: Pid, path_ptr: usize) -> SysResult<PathBuf> {
+    let path = read_child_path(pid, path_ptr)?;
+    if path.as_os_str().is_empty() {
+        return Err(BrokerError::SystemCall {
+            errno: libc::ENOENT,
+        });
+    }
+    Ok(path)
+}
+
+fn empty_path_uses_fd(kind: MutationSyscall, args: &[u64; 6], path: &Path) -> SysResult<bool> {
+    if !path.as_os_str().is_empty() {
+        return Ok(false);
+    }
+    let flags = match kind {
+        MutationSyscall::Fchmodat2 => syscall_i32(args[3]),
+        MutationSyscall::Fchownat => syscall_i32(args[4]),
+        _ => 0,
+    };
+    if flags & libc::AT_EMPTY_PATH != 0 {
+        Ok(true)
+    } else {
+        Err(BrokerError::SystemCall {
+            errno: libc::ENOENT,
+        })
+    }
+}
+
 fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>> {
     let mut buf = vec![0_u8; max_len];
     let mut local = [IoSliceMut::new(&mut buf)];
@@ -2419,10 +2553,7 @@ fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>
         base: addr,
         len: max_len,
     }];
-    let n =
-        process_vm_readv(pid, &mut local, &target).map_err(|error| BrokerError::SystemCall {
-            errno: error as i32,
-        })?;
+    let n = process_vm_readv(pid, &mut local, &target)?;
     if n == 0 {
         return Err(BrokerError::BadAddress);
     }
@@ -2466,18 +2597,16 @@ fn process_control_responses(
         return true;
     }
     if n < 0 {
-        // Permanent read error; leave the fd alone and let the next poll retry.
-        // Fd death is observed via POLLHUP/POLLERR on the control fd.
-        return false;
+        return io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock;
     }
     let Ok(n) = usize::try_from(n) else {
-        return false;
+        return true;
     };
     buffer.extend_from_slice(&chunk[..n]);
 
     // Bound memory against a misbehaving or hostile launcher that never sends a
-    // newline: drop a run-on partial response and keep going rather than grow
-    // without limit. Well-formed responses are newline-terminated and small.
+    // newline. A run-on response makes the control channel unusable, so fail it
+    // rather than grow memory without limit.
     if buffer.len() > CONTROL_BUFFER_MAX {
         log::warn!(
             "linux: control buffer exceeded {CONTROL_BUFFER_MAX} bytes with no newline; dropping"
@@ -2538,7 +2667,7 @@ fn process_control_responses(
 }
 
 // Deny every deferred query with EACCES and clear the map. Used when the
-// control channel is gone (launcher closed or errored the trap fd) so the
+// control channel is unusable so the child's suspended syscalls resume instead
 // child's suspended syscalls resume instead of hanging forever. Expired
 // notification ids are skipped, matching the per-response path.
 fn deny_all_pending(
@@ -2608,24 +2737,8 @@ fn grant_socket(notify_fd: BorrowedFd<'_>, id: u64, grant: &SocketGrant) {
 }
 
 fn run_mutation(grant: &MutationGrant) -> std::result::Result<(), i32> {
-    if let MutationOp::UtimesFd { target, times } = &grant.op {
-        let times = times.as_ref().map_or(ptr::null(), |value| value.as_ptr());
-        // SAFETY: target is a duplicated descriptor for the blocked task's open
-        // file description. A null pathname selects the fd-only utimensat form.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_utimensat,
-                target.as_raw_fd(),
-                ptr::null::<libc::c_char>(),
-                times,
-                0,
-            )
-        };
-        return if rc < 0 {
-            Err(Errno::last() as i32)
-        } else {
-            Ok(())
-        };
+    if let MutationOp::Fd { target, mutation } = &grant.op {
+        return mutation.run(target.as_raw_fd());
     }
 
     let at = grant.anchors.first().ok_or(libc::EINVAL)?;
@@ -2681,6 +2794,7 @@ fn run_mutation(grant: &MutationGrant) -> std::result::Result<(), i32> {
             let (_fd, path) = pin_target(at)?;
             unsafe { libc::chmod(path.as_ptr(), *mode) }
         }
+        MutationOp::ChmodAt { mode, flags } => run_fchmodat(grant, at, *mode, *flags)?,
         MutationOp::Chown { uid, gid } => {
             if grant.no_follow {
                 // Act on the link itself; the parent dir fd is already pinned.
@@ -2690,34 +2804,131 @@ fn run_mutation(grant: &MutationGrant) -> std::result::Result<(), i32> {
                 unsafe { libc::chown(path.as_ptr(), *uid, *gid) }
             }
         }
-        MutationOp::Utimes { times } => {
+        MutationOp::ChownAt { uid, gid, flags } => run_fchownat(grant, at, *uid, *gid, *flags)?,
+        MutationOp::Utimes { times, flags } => {
             let ptr = times.as_ref().map_or(ptr::null(), |t| t.as_ptr());
             if grant.no_follow {
-                unsafe { libc::utimensat(dir, name, ptr, libc::AT_SYMLINK_NOFOLLOW) }
+                unsafe { libc::utimensat(dir, name, ptr, *flags) }
             } else {
                 let (_fd, path) = pin_target(at)?;
-                unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), ptr, 0) }
+                unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), ptr, *flags) }
             }
         }
-        MutationOp::UtimesFd { .. } => return Err(libc::EINVAL),
+        MutationOp::Fd { .. } => return Err(libc::EINVAL),
         MutationOp::SetXattr { name, value, flags } => {
-            let (_fd, path) = pin_target(at)?;
-            unsafe {
-                libc::setxattr(
-                    path.as_ptr(),
-                    name.as_ptr(),
-                    value.as_ptr().cast(),
-                    value.len(),
-                    *flags,
-                )
-            }
+            run_setxattr(grant, at, name, value, *flags)?
         }
-        MutationOp::RemoveXattr { name } => {
-            let (_fd, path) = pin_target(at)?;
-            unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) }
-        }
+        MutationOp::RemoveXattr { name } => run_removexattr(grant, at, name)?,
     };
     check(rc)
+}
+
+fn run_fchmodat(
+    grant: &MutationGrant,
+    at: &Anchor,
+    mode: u32,
+    flags: i32,
+) -> std::result::Result<i32, i32> {
+    let dir = at.dir.as_raw_fd();
+    let name = at.name.as_ptr();
+    let (target, target_name, target_flags) = if grant.no_follow {
+        (None, name, flags)
+    } else {
+        let (target, _) = pin_target(at)?;
+        (Some(target), c"".as_ptr(), flags | libc::AT_EMPTY_PATH)
+    };
+    let target_fd = target.as_ref().map_or(dir, AsRawFd::as_raw_fd);
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_fchmodat2,
+            target_fd,
+            target_name,
+            mode,
+            target_flags,
+        )
+    };
+    Ok(if rc < 0 { -1 } else { 0 })
+}
+
+fn run_fchownat(
+    grant: &MutationGrant,
+    at: &Anchor,
+    uid: u32,
+    gid: u32,
+    flags: i32,
+) -> std::result::Result<i32, i32> {
+    if grant.no_follow {
+        return Ok(unsafe {
+            libc::fchownat(at.dir.as_raw_fd(), at.name.as_ptr(), uid, gid, flags)
+        });
+    }
+
+    let (target, _) = pin_target(at)?;
+    Ok(unsafe {
+        libc::fchownat(
+            target.as_raw_fd(),
+            c"".as_ptr(),
+            uid,
+            gid,
+            flags | libc::AT_EMPTY_PATH,
+        )
+    })
+}
+
+fn mutation_xattr_path(
+    grant: &MutationGrant,
+    at: &Anchor,
+) -> std::result::Result<(Option<OwnedFd>, CString), i32> {
+    if grant.no_follow {
+        Ok((None, anchor_path(at)?))
+    } else {
+        let (target, path) = pin_target(at)?;
+        Ok((Some(target), path))
+    }
+}
+
+fn run_setxattr(
+    grant: &MutationGrant,
+    at: &Anchor,
+    name: &CString,
+    value: &[u8],
+    flags: i32,
+) -> std::result::Result<i32, i32> {
+    let (_target, path) = mutation_xattr_path(grant, at)?;
+    Ok(unsafe {
+        if grant.no_follow {
+            libc::lsetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                flags,
+            )
+        } else {
+            libc::setxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                flags,
+            )
+        }
+    })
+}
+
+fn run_removexattr(
+    grant: &MutationGrant,
+    at: &Anchor,
+    name: &CString,
+) -> std::result::Result<i32, i32> {
+    let (_target, path) = mutation_xattr_path(grant, at)?;
+    Ok(unsafe {
+        if grant.no_follow {
+            libc::lremovexattr(path.as_ptr(), name.as_ptr())
+        } else {
+            libc::removexattr(path.as_ptr(), name.as_ptr())
+        }
+    })
 }
 
 fn check(rc: libc::c_int) -> std::result::Result<(), i32> {
@@ -2747,6 +2958,12 @@ fn pin_target(at: &Anchor) -> std::result::Result<(OwnedFd, CString), i32> {
     let path =
         CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).map_err(|_| libc::EINVAL)?;
     Ok((fd, path))
+}
+
+fn anchor_path(at: &Anchor) -> std::result::Result<CString, i32> {
+    let mut path = format!("/proc/self/fd/{}/", at.dir.as_raw_fd()).into_bytes();
+    path.extend_from_slice(at.name.as_bytes());
+    CString::new(path).map_err(|_| libc::EINVAL)
 }
 
 fn open_path(path: &Path, flags: i32) -> std::result::Result<OwnedFd, i32> {
@@ -2859,10 +3076,7 @@ fn resolve_child_path(pid: Pid, dirfd: i32, path: &Path) -> SysResult<PathBuf> {
     }
 
     if dirfd == libc::AT_FDCWD {
-        let cwd =
-            fs::read_link(format!("/proc/{pid}/cwd")).map_err(|error| BrokerError::SystemCall {
-                errno: error.raw_os_error().unwrap_or(libc::EIO),
-            })?;
+        let cwd = fs::read_link(format!("/proc/{pid}/cwd"))?;
         return Ok(cwd.join(path));
     }
 
@@ -3293,15 +3507,55 @@ enum MutationOp {
     Chmod {
         mode: u32,
     },
+    ChmodAt {
+        mode: u32,
+        flags: i32,
+    },
     Chown {
         uid: u32,
         gid: u32,
     },
+    ChownAt {
+        uid: u32,
+        gid: u32,
+        flags: i32,
+    },
     Utimes {
         times: Option<[libc::timespec; 2]>,
+        flags: i32,
     },
-    UtimesFd {
+    Fd {
         target: OwnedFd,
+        mutation: FdMutation,
+    },
+    SetXattr {
+        name: CString,
+        value: Vec<u8>,
+        flags: i32,
+    },
+    RemoveXattr {
+        name: CString,
+    },
+}
+
+enum FdMutation {
+    Chmod {
+        mode: u32,
+    },
+    ChmodAt {
+        mode: u32,
+        flags: i32,
+    },
+    Chown {
+        uid: u32,
+        gid: u32,
+    },
+    ChownAt {
+        uid: u32,
+        gid: u32,
+        flags: i32,
+    },
+    Utimes {
         times: Option<[libc::timespec; 2]>,
     },
     SetXattr {
@@ -3312,6 +3566,37 @@ enum MutationOp {
     RemoveXattr {
         name: CString,
     },
+}
+
+impl FdMutation {
+    fn run(&self, target: RawFd) -> std::result::Result<(), i32> {
+        let rc = match self {
+            Self::Chmod { mode } => unsafe { libc::fchmod(target, *mode) },
+            Self::Chown { uid, gid } => unsafe { libc::fchown(target, *uid, *gid) },
+            Self::ChmodAt { mode, flags } => unsafe {
+                let rc = libc::syscall(libc::SYS_fchmodat2, target, c"".as_ptr(), *mode, *flags);
+                if rc < 0 { -1 } else { 0 }
+            },
+            Self::ChownAt { uid, gid, flags } => unsafe {
+                libc::fchownat(target, c"".as_ptr(), *uid, *gid, *flags)
+            },
+            Self::Utimes { times } => {
+                let times = times.as_ref().map_or(ptr::null(), |value| value.as_ptr());
+                unsafe { libc::futimens(target, times) }
+            }
+            Self::SetXattr { name, value, flags } => unsafe {
+                libc::fsetxattr(
+                    target,
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    *flags,
+                )
+            },
+            Self::RemoveXattr { name } => unsafe { libc::fremovexattr(target, name.as_ptr()) },
+        };
+        check(rc)
+    }
 }
 
 struct PendingQuery {
