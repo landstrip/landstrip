@@ -57,13 +57,20 @@ pub(super) fn build_errno_filter(
 }
 
 /// `io_uring` can issue network and filesystem operations without re-entering
-/// brokered syscalls. Deny every entry point with `EPERM` in a separate program
+/// brokered syscalls. Legacy timestamp syscalls also bypass Landlock and the
+/// pathname broker. Deny these entry points with `EPERM` in a separate program
 /// because seccompiler binds one action per filter.
 pub(super) fn build_io_uring_deny(syscalls: &NotificationSyscalls) -> Result<BpfProgram> {
     let mut rules = RuleMap::new();
     rules.insert(syscalls.io_uring_setup, Vec::new());
     rules.insert(syscalls.io_uring_enter, Vec::new());
     rules.insert(syscalls.io_uring_register, Vec::new());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        rules.insert(libc::SYS_utime, Vec::new());
+        rules.insert(libc::SYS_utimes, Vec::new());
+        rules.insert(libc::SYS_futimesat, Vec::new());
+    }
     let eperm = u32::try_from(libc::EPERM).map_err(|_| LandstripError::IntegerTooLarge)?;
     build_filter(rules, SeccompAction::Errno(eperm))
 }

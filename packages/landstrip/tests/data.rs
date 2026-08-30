@@ -632,7 +632,7 @@ fn parse_fs(value: &str) -> Fs {
             path: path.to_owned(),
             allowed,
         },
-        "x32-fchmod" => Fs::FdMetadata {
+        "legacy-utimes" | "x32-fchmod" => Fs::FdMetadata {
             operation: kind.to_owned(),
             path: path.to_owned(),
             allowed,
@@ -765,6 +765,20 @@ fn fd_metadata_probe(
         return 2;
     };
     let rc = match operation.to_str() {
+        Some("legacy-utimes") => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            unsafe {
+                libc::syscall(
+                    libc::SYS_utimes,
+                    _path.as_ptr(),
+                    std::ptr::null::<libc::timeval>(),
+                ) as i32
+            }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                -1
+            }
+        }
         Some("x32-fchmod") => {
             #[cfg(target_arch = "x86_64")]
             unsafe {
