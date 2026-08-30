@@ -27,6 +27,7 @@ const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
 const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
 const AUDIT_ARCH_RISCV64: u32 = 0xC000_00F3;
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 #[repr(C)]
 struct SockFilterProg {
@@ -107,10 +108,12 @@ pub(super) fn build_filter(rules: RuleMap, match_action: SeccompAction) -> Resul
 }
 
 pub(super) fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
-    let mut program = BpfProgram::with_capacity(syscalls.len() * 2 + 5);
+    let mut program = BpfProgram::with_capacity(syscalls.len() * 2 + 7);
     let load = u16::try_from(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS)
         .map_err(|_| LandstripError::IntegerTooLarge)?;
     let jump_eq = u16::try_from(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K)
+        .map_err(|_| LandstripError::IntegerTooLarge)?;
+    let jump_ge = u16::try_from(libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K)
         .map_err(|_| LandstripError::IntegerTooLarge)?;
     let ret =
         u16::try_from(libc::BPF_RET | libc::BPF_K).map_err(|_| LandstripError::IntegerTooLarge)?;
@@ -130,6 +133,12 @@ pub(super) fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
     program.push(bpf_stmt(ret, libc::SECCOMP_RET_KILL_PROCESS));
 
     program.push(bpf_stmt(load, SECCOMP_DATA_NR_OFFSET));
+    if arch == AUDIT_ARCH_X86_64 {
+        // x32 shares the x86-64 audit architecture but uses a distinct ABI that
+        // this broker does not decode. Reject it rather than bypassing mediation.
+        program.push(bpf_jump(jump_ge, X32_SYSCALL_BIT, 0, 1));
+        program.push(bpf_stmt(ret, libc::SECCOMP_RET_KILL_PROCESS));
+    }
     for syscall in syscalls {
         let syscall = u32::try_from(*syscall).map_err(|_| LandstripError::IntegerTooLarge)?;
         program.push(bpf_jump(jump_eq, syscall, 0, 1));

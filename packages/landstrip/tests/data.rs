@@ -22,6 +22,7 @@ const DATA: &str = include_str!("data.txt");
 const OPATH_PROBE_ARG: &str = "--test-opath";
 const FUTIMENS_PROBE_ARG: &str = "--test-futimens";
 const TRUNCATE_PROBE_ARG: &str = "--test-truncate";
+const FD_METADATA_PROBE_ARG: &str = "--test-fd-metadata";
 const ABSTRACT_UNIX_PROBE_ARG: &str = "--test-abstract-connect";
 const SIGNAL_OUTSIDE_PROBE_ARG: &str = "--test-signal-outside";
 const SIGNAL_THREAD_PROBE_ARG: &str = "--test-signal-thread";
@@ -39,6 +40,9 @@ fn main() {
         }
         Some(value) if value == std::ffi::OsStr::new(TRUNCATE_PROBE_ARG) => {
             std::process::exit(truncate_probe(args.next()));
+        }
+        Some(value) if value == std::ffi::OsStr::new(FD_METADATA_PROBE_ARG) => {
+            std::process::exit(fd_metadata_probe(args.next(), args.next()));
         }
         Some(value) if value == std::ffi::OsStr::new(ABSTRACT_UNIX_PROBE_ARG) => {
             std::process::exit(abstract_connect_probe(args.next()));
@@ -211,6 +215,12 @@ enum Fs {
     OPath { path: String, allowed: bool },
     /// fd-only utimensat of `path`; `allowed` selects the expected result.
     UtimensatFd { path: String, allowed: bool },
+    /// fd-based metadata mutation of `path`; `allowed` selects the expected result.
+    FdMetadata {
+        operation: String,
+        path: String,
+        allowed: bool,
+    },
     /// truncate(2) of `path`; `allowed` selects the expected result.
     Truncate { path: String, allowed: bool },
 }
@@ -599,19 +609,12 @@ fn parse_net(value: &str) -> Net {
     }
 }
 
-/// `fs=opath:<path>:<allowed|denied>` — O_PATH directory open of <path>,
-/// `fs=utimensat-fd:<path>:<allowed|denied>` — fd-only timestamp update, or
-/// `fs=truncate:<path>:<allowed|denied>` — truncate(2) of <path>.
+/// `fs=<operation>:<path>:<allowed|denied>`, where operation is one of
+/// `opath`, `utimensat-fd`, fd metadata calls, or `truncate`.
 fn parse_fs(value: &str) -> Fs {
-    let (spec, kind) = if let Some(spec) = value.strip_prefix("opath:") {
-        (spec, "opath")
-    } else if let Some(spec) = value.strip_prefix("utimensat-fd:") {
-        (spec, "utimensat-fd")
-    } else if let Some(spec) = value.strip_prefix("truncate:") {
-        (spec, "truncate")
-    } else {
-        panic!("unknown fs kind `{value}`");
-    };
+    let (kind, spec) = value
+        .split_once(':')
+        .unwrap_or_else(|| panic!("fs action `{value}` lacks an operation"));
     let (path, want) = spec
         .rsplit_once(':')
         .unwrap_or_else(|| panic!("fs action `{value}` lacks a result marker"));
@@ -620,21 +623,25 @@ fn parse_fs(value: &str) -> Fs {
         "denied" => false,
         other => panic!("unknown fs result `{other}`"),
     };
-    if kind == "opath" {
-        Fs::OPath {
+    match kind {
+        "opath" => Fs::OPath {
             path: path.to_owned(),
             allowed,
-        }
-    } else if kind == "utimensat-fd" {
-        Fs::UtimensatFd {
+        },
+        "utimensat-fd" => Fs::UtimensatFd {
             path: path.to_owned(),
             allowed,
-        }
-    } else {
-        Fs::Truncate {
+        },
+        "x32-fchmod" => Fs::FdMetadata {
+            operation: kind.to_owned(),
             path: path.to_owned(),
             allowed,
-        }
+        },
+        "truncate" => Fs::Truncate {
+            path: path.to_owned(),
+            allowed,
+        },
+        _ => panic!("unknown fs kind `{kind}`"),
     }
 }
 
@@ -646,16 +653,23 @@ fn run_fs(
     policies: &[PathBuf],
     resolver: &Resolver,
 ) -> Result<(), String> {
-    let (marker, path, allowed) = match fs {
-        Fs::OPath { path, allowed } => (OPATH_PROBE_ARG, path, allowed),
-        Fs::UtimensatFd { path, allowed } => (FUTIMENS_PROBE_ARG, path, allowed),
-        Fs::Truncate { path, allowed } => (TRUNCATE_PROBE_ARG, path, allowed),
+    let (marker, path, allowed, operation) = match fs {
+        Fs::OPath { path, allowed } => (OPATH_PROBE_ARG, path, allowed, None),
+        Fs::UtimensatFd { path, allowed } => (FUTIMENS_PROBE_ARG, path, allowed, None),
+        Fs::FdMetadata {
+            operation,
+            path,
+            allowed,
+        } => (FD_METADATA_PROBE_ARG, path, allowed, Some(operation)),
+        Fs::Truncate { path, allowed } => (TRUNCATE_PROBE_ARG, path, allowed, None),
     };
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-    let output = landstrip_net(ctx, format, policies)
-        .arg(exe)
-        .arg(marker)
-        .arg(resolver.subst(path))
+    let mut command = landstrip_net(ctx, format, policies);
+    command.arg(exe).arg(marker).arg(resolver.subst(path));
+    if let Some(operation) = operation {
+        command.arg(operation);
+    }
+    let output = command
         .output()
         .map_err(|e| format!("spawn fs probe: {e}"))?;
     if output.status.success() != *allowed {
@@ -731,6 +745,49 @@ fn futimens_probe(path: Option<std::ffi::OsString>) -> i32 {
 
 #[cfg(not(target_os = "linux"))]
 fn futimens_probe(_path: Option<std::ffi::OsString>) -> i32 {
+    2
+}
+
+#[cfg(target_os = "linux")]
+fn fd_metadata_probe(
+    path: Option<std::ffi::OsString>,
+    operation: Option<std::ffi::OsString>,
+) -> i32 {
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+
+    let (Some(path), Some(operation)) = (path, operation) else {
+        return 2;
+    };
+    let Ok(file) = std::fs::File::open(&path) else {
+        return 1;
+    };
+    let Ok(_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return 2;
+    };
+    let rc = match operation.to_str() {
+        Some("x32-fchmod") => {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let _ = libc::syscall(libc::SYS_fchmod | 0x4000_0000, file.as_raw_fd(), 0o600);
+                // Returning means the BPF filter did not reject the x32 ABI.
+                return 0;
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                -1
+            }
+        }
+        Some("fchmod") => unsafe { libc::fchmod(file.as_raw_fd(), 0o600) },
+        _ => return 2,
+    };
+    if rc == 0 { 0 } else { 1 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fd_metadata_probe(
+    _path: Option<std::ffi::OsString>,
+    _operation: Option<std::ffi::OsString>,
+) -> i32 {
     2
 }
 
