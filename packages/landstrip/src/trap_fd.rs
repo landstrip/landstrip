@@ -62,6 +62,14 @@ impl TrapFd {
         self.write_all(line.as_bytes())
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn write_json(&self, json: &str) -> io::Result<()> {
+        let mut line = String::with_capacity(json.len() + 1);
+        line.push_str(json);
+        line.push('\n');
+        self.write_all(line.as_bytes())
+    }
+
     fn write_all(&self, line: &[u8]) -> io::Result<()> {
         if self.is_stream_socket() {
             let result = write_socket_trap_fd(self.as_raw_fd(), line);
