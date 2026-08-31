@@ -56,8 +56,10 @@ function splitHostPort(target, defaultPort) {
   return { host: target, port: defaultPort };
 }
 
-function denyProxyRequest(client, status = '403 Forbidden') {
-  client.write(`HTTP/1.1 ${status}\r\nContent-Length: 0\r\n\r\n`);
+function denyProxyRequest(client, status = '403 Forbidden', body) {
+  const bodyStr = body ? String(body) : '';
+  const bodyBuf = Buffer.from(bodyStr);
+  client.write(`HTTP/1.1 ${status}\r\nContent-Length: ${bodyBuf.length}\r\n\r\n${bodyBuf}`);
   client.end();
 }
 
@@ -139,10 +141,10 @@ function startFilterProxy(options) {
       },
     );
     trackUpstream(upstream, client, () => settled);
-    upstream.once('error', () => {
+    upstream.once('error', (err) => {
       if (settled) return;
       settled = true;
-      denyProxyRequest(client, '502 Bad Gateway');
+      denyProxyRequest(client, '502 Bad Gateway', err?.message || 'Bad Gateway');
     });
   }
 
@@ -211,10 +213,10 @@ function startFilterProxy(options) {
       pipeSockets(client, upstream, rest);
     });
     trackUpstream(upstream, client, () => settled);
-    upstream.once('error', () => {
+    upstream.once('error', (err) => {
       if (settled) return;
       settled = true;
-      denyProxyRequest(client, '502 Bad Gateway');
+      denyProxyRequest(client, '502 Bad Gateway', err?.message || 'Bad Gateway');
     });
   }
 
@@ -259,7 +261,7 @@ function startFilterProxy(options) {
         method?.toUpperCase() === 'CONNECT' && target
           ? handleConnect(client, target, rest)
           : handleHttp(client, header, rest);
-      task.catch(() => denyProxyRequest(client, '502 Bad Gateway'));
+      task.catch((err) => denyProxyRequest(client, '502 Bad Gateway', err?.message || 'Bad Gateway'));
     });
   }
 
