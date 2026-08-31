@@ -68,6 +68,10 @@ function isPublicProxyAddress(address, family = isIP(address)) {
 }
 
 async function resolveProxyEndpoint(host) {
+  // URL.hostname getter doesn't strip brackets from IPv6 address literals,
+  // we have to strip them here so lookup would work
+  host = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+
   const literalFamily = isIP(host);
   if (literalFamily === 4 || literalFamily === 6) {
     if (!isPublicProxyAddress(host, literalFamily)) {
