@@ -243,27 +243,7 @@ impl Trap {
 
 impl From<Error> for Trap {
     fn from(error: Error) -> Self {
-        let code = error.code();
-        let errno = error.errno();
-        match error {
-            Error::Usage { message } => Self::Usage(UsageTrap { code, message }),
-            Error::LaunchFailed { tool, source } => Self::Launch(LaunchTrap {
-                code,
-                program: tool.to_string_lossy().into_owned(),
-                errno: errno.and_then(errno_name),
-                message: source.to_string(),
-            }),
-            Error::SandboxSetupFailed { mechanism, .. } => Self::Internal(InternalTrap {
-                code,
-                mechanism: Some(mechanism),
-                message: message(&error),
-            }),
-            _ => Self::Internal(InternalTrap {
-                code,
-                mechanism: None,
-                message: message(&error),
-            }),
-        }
+        Self::from(&error)
     }
 }
 
