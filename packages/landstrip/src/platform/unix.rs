@@ -20,11 +20,7 @@ pub(crate) fn close_inherited_fds(excluded: &[RawFd]) -> io::Result<()> {
         set_cloexec(fd)?;
     }
 
-    #[cfg(target_os = "linux")]
-    close_inherited_except(excluded)?;
-    #[cfg(target_os = "macos")]
-    close_inherited_except(excluded);
-    Ok(())
+    close_inherited_except(excluded)
 }
 
 fn set_cloexec(fd: RawFd) -> io::Result<()> {
@@ -83,37 +79,27 @@ fn close_range(first: u32, last: u32) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn close_inherited_except(excluded: &[RawFd]) {
+fn close_inherited_except(excluded: &[RawFd]) -> io::Result<()> {
     const FALLBACK_FD_LIMIT: RawFd = 1_048_576;
 
-    if let Ok(mut entries) = std::fs::read_dir("/dev/fd") {
-        let mut fds = Vec::new();
-        for entry in entries.by_ref().flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            let Ok(fd) = name.parse::<RawFd>() else {
-                continue;
-            };
-            if fd >= FIRST_INHERITED_FD {
-                fds.push(fd);
-            }
-        }
-
-        drop(entries);
+    if let Ok(entries) = std::fs::read_dir("/dev/fd") {
+        let mut fds: Vec<RawFd> = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<RawFd>().ok())
+            .filter(|&fd| fd >= FIRST_INHERITED_FD)
+            .collect();
 
         fds.sort_unstable();
-        fds.dedup();
         for fd in fds {
             close_fd(fd, excluded);
         }
-        return;
+        return Ok(());
     }
 
     for fd in FIRST_INHERITED_FD..open_fd_limit(FALLBACK_FD_LIMIT) {
         close_fd(fd, excluded);
     }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
