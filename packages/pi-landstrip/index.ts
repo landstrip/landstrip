@@ -988,6 +988,8 @@ export interface LandstripRpcWorkerOptions extends LandstripProcessOptions {
   readonly env: NodeJS.ProcessEnv;
   readonly readPaths: readonly string[];
   readonly writePaths: readonly string[];
+  /** Domains the worker may reach through the filter proxy without prompting. */
+  readonly domains?: readonly string[];
 }
 
 export interface LandstripRpcWorkerLaunch extends LandstripPreparedProcess {
@@ -1787,7 +1789,7 @@ function createLandstripIntegrationWithPrompts(
       return prepareUnsandboxedRpcWorker(options);
     }
     const allowances: ExecutionAllowances = {
-      domains: [],
+      domains: [...(options.domains ?? [])],
       readPaths: [...options.readPaths],
       writePaths: [...options.writePaths],
       targets: [],

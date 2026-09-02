@@ -41,6 +41,7 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from '@earendil-works/pi-tui';
+import { canonicalizeHost } from '@landstrip/landstrip-api/shared';
 import { Type } from 'typebox';
 
 import {
@@ -707,6 +708,29 @@ function dependencyRoot(path: string): string | undefined {
   const marker = `${sep}node_modules${sep}`;
   const index = path.lastIndexOf(marker);
   return index < 0 ? undefined : path.slice(0, index + marker.length - 1);
+}
+
+function endpointHost(baseUrl: string | undefined): string | undefined {
+  if (!baseUrl) return undefined;
+  try {
+    return canonicalizeHost(new URL(baseUrl).hostname) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Model API domain the worker may reach without a permission prompt. */
+function modelEndpointDomains(ctx: ExtensionContext, selectedModel: string): string[] {
+  const models = ctx.modelRegistry?.getAll() ?? [];
+  const qualified = models.find((model) => `${model.provider}/${model.id}` === selectedModel);
+  // An unqualified model name is only trusted when it matches exactly one entry.
+  const byId = models.filter((model) => model.id === selectedModel);
+  const registered = qualified ?? (byId.length === 1 ? byId[0] : undefined);
+  const activeName = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+  const active =
+    selectedModel === activeName || selectedModel === ctx.model?.id ? ctx.model : undefined;
+  const host = endpointHost(registered?.baseUrl ?? active?.baseUrl);
+  return host ? [host] : [];
 }
 
 function agentBootstrapPaths(agentDir: string): string[] {
@@ -3189,6 +3213,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           TEMP: temp,
         },
         ctx,
+        domains: modelEndpointDomains(ctx, model),
         readPaths: [
           ...new Set(
             [

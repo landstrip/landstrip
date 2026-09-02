@@ -45,6 +45,7 @@ test('propagates registered extensions and public context to workers', async () 
         env: NodeJS.ProcessEnv;
         readPaths: readonly string[];
         writePaths: readonly string[];
+        domains?: readonly string[];
       }
     | undefined;
   const integration = {
@@ -84,7 +85,14 @@ test('propagates registered extensions and public context to workers', async () 
   privateRuntime.validatePiInvocation = () => undefined;
   const ctx = {
     cwd,
-    model: { provider: 'test', id: 'model' },
+    model: { provider: 'test', id: 'model', baseUrl: 'https://api.test.example/v1' },
+    modelRegistry: {
+      getAll: () => [
+        { provider: 'other', id: 'provider-model', baseUrl: 'https://api.other.example' },
+        { provider: 'local', id: 'local-model', baseUrl: 'http://[0:0:0:0:0:0:0:1]:11434/v1' },
+        { provider: 'invalid', id: 'invalid-model', baseUrl: 'not a url' },
+      ],
+    },
     ui: { notify() {} },
     sessionManager: { getSessionId: () => 'root-session' },
   } as unknown as ExtensionContext;
@@ -109,6 +117,7 @@ test('propagates registered extensions and public context to workers', async () 
         hidden: false,
         permissions: [],
         providerOptions: {},
+        model: 'other/provider-model',
       },
       [
         { permission: '*', pattern: '*', action: 'allow' },
@@ -125,6 +134,7 @@ test('propagates registered extensions and public context to workers', async () 
   expect(prepared?.readPaths).toContain(extensionEntry);
   expect(prepared?.readPaths).toContain(cwd);
   expect(prepared?.readPaths.some((path) => path.endsWith('landstrip.json'))).toBe(true);
+  expect(prepared?.domains).toEqual(['api.other.example']);
   expect(prepared?.writePaths.some((path) => path.endsWith('auth.json'))).toBe(true);
   expect(prepared?.writePaths.some((path) => path.endsWith('auth.json.lock'))).toBe(true);
   expect(prepared?.writePaths.some((path) => path.endsWith('settings.json.lock'))).toBe(true);
