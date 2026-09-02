@@ -627,7 +627,7 @@ fn parse_net(value: &str) -> Net {
 }
 
 /// `fs=<operation>:<path>:<allowed|denied>`, where operation is one of
-/// `opath`, `utimensat-fd`, fd metadata calls, or `truncate`.
+/// `opath`, `utimensat-fd`, fd metadata calls, `truncate`, or an open probe.
 fn parse_fs(value: &str) -> Fs {
     let (kind, spec) = value
         .split_once(':')
@@ -665,13 +665,15 @@ fn parse_fs(value: &str) -> Fs {
             path: path.to_owned(),
             allowed,
         },
-        "openat2-beneath" | "openat2-in-root" | "openat2-no-symlinks" | "openat2-short" => {
-            Fs::Openat2 {
-                operation: kind.to_owned(),
-                path: path.to_owned(),
-                allowed,
-            }
-        }
+        "open-nofollow"
+        | "openat2-beneath"
+        | "openat2-in-root"
+        | "openat2-no-symlinks"
+        | "openat2-short" => Fs::Openat2 {
+            operation: kind.to_owned(),
+            path: path.to_owned(),
+            allowed,
+        },
         _ => panic!("unknown fs kind `{kind}`"),
     }
 }
@@ -1082,6 +1084,126 @@ fn openat2_probe(path: Option<std::ffi::OsString>, operation: Option<std::ffi::O
     };
     let readonly = 0_u64;
     match operation.to_str() {
+        Some("open-nofollow") => {
+            use std::os::fd::FromRawFd;
+
+            let source = std::path::Path::new(&path);
+            let (Some(parent), Some(name)) = (source.parent(), source.file_name()) else {
+                return 2;
+            };
+            let parent_path = parent.to_path_buf();
+            let Ok(parent) = std::fs::File::open(parent) else {
+                return 2;
+            };
+            let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
+                return 2;
+            };
+            let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+            let failed_with_eloop = |fd| {
+                if fd >= 0 {
+                    // SAFETY: a nonnegative open result is an owned descriptor.
+                    unsafe { libc::close(fd) };
+                    return false;
+                }
+                std::io::Error::last_os_error().raw_os_error() == Some(libc::ELOOP)
+            };
+
+            // SAFETY: c_path is NUL-terminated.
+            let open_eloop = failed_with_eloop(unsafe { libc::open(c_path.as_ptr(), flags) });
+            // SAFETY: parent owns a valid directory fd and name is NUL-terminated.
+            let openat_eloop = failed_with_eloop(unsafe {
+                libc::openat(parent.as_raw_fd(), name.as_ptr(), flags)
+            });
+            let how = TestOpenHow {
+                flags: u64::try_from(flags).expect("open flags fit u64"),
+                mode: 0,
+                resolve: 0,
+            };
+            if !open_eloop
+                || !openat_eloop
+                || !matches!(
+                    test_openat2(parent.as_raw_fd(), &name, &how, 24),
+                    Err(libc::ELOOP)
+                )
+            {
+                return 1;
+            }
+
+            let beneath = TestOpenHow {
+                resolve: 0x08,
+                ..how
+            };
+            if !matches!(
+                test_openat2(parent.as_raw_fd(), &name, &beneath, 24),
+                Err(libc::ELOOP)
+            ) {
+                return 1;
+            }
+
+            // O_PATH|O_NOFOLLOW validly opens the link itself.
+            // SAFETY: c_path is NUL-terminated.
+            let link_fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if link_fd < 0 {
+                return 1;
+            }
+            // SAFETY: open returned a new owned descriptor.
+            let link_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(link_fd) };
+            // SAFETY: stat points to initialized storage and link_fd is valid.
+            let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+            if unsafe { libc::fstat(link_fd.as_raw_fd(), std::ptr::addr_of_mut!(stat)) } != 0
+                || stat.st_mode & libc::S_IFMT != libc::S_IFLNK
+            {
+                return 1;
+            }
+
+            let mut trailing = path.as_bytes().to_vec();
+            trailing.push(b'/');
+            let Ok(trailing) = std::ffi::CString::new(trailing) else {
+                return 2;
+            };
+            // A trailing slash requires the terminal directory symlink to be followed.
+            // SAFETY: trailing is NUL-terminated.
+            let trailing_fd = unsafe { libc::open(trailing.as_ptr(), flags | libc::O_DIRECTORY) };
+            if trailing_fd < 0 {
+                return 1;
+            }
+            // SAFETY: open returned a new owned descriptor.
+            drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(trailing_fd) });
+
+            // A trailing slash resolves the final component as a directory, so
+            // a dangling link, a file, and a create all fail as the kernel says.
+            let errno_of = |name: &str, flags: i32| -> i32 {
+                let mut target = parent_path.as_os_str().as_bytes().to_vec();
+                target.extend_from_slice(name.as_bytes());
+                let Ok(target) = std::ffi::CString::new(target) else {
+                    return 0;
+                };
+                // SAFETY: target is NUL-terminated.
+                let fd = unsafe { libc::open(target.as_ptr(), flags, 0o600) };
+                if fd >= 0 {
+                    // SAFETY: a nonnegative open result is an owned descriptor.
+                    unsafe { libc::close(fd) };
+                    return 0;
+                }
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO)
+            };
+            let directory = flags | libc::O_DIRECTORY;
+            if errno_of("/dangling/", directory) != libc::ENOENT
+                || errno_of("/file-link/", directory) != libc::ENOTDIR
+                || errno_of("/file/", libc::O_RDONLY) != libc::ENOTDIR
+                || errno_of("/new-file/", libc::O_CREAT | libc::O_WRONLY) != libc::EISDIR
+            {
+                return 1;
+            }
+            0
+        }
         Some("openat2-no-symlinks") => test_openat2(
             libc::AT_FDCWD,
             &c_path,

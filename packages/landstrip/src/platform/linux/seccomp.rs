@@ -1487,6 +1487,7 @@ struct OpenDenial {
     syscall: &'static str,
     flags: i32,
     mode: u32,
+    grant: Option<OpenGrant>,
     reason: DenialReason,
     pid: u32,
     report: bool,
@@ -1509,6 +1510,7 @@ fn deny_open(
         syscall,
         flags,
         mode,
+        grant,
         reason,
         pid,
         ..
@@ -1516,10 +1518,17 @@ fn deny_open(
     if query_enabled {
         let query_id = *next_query_id;
         *next_query_id += 1;
-        let grant = Some(Grant::Open(
-            OpenGrant::new(&path, flags, mode)
-                .map_err(|errno| BrokerError::SystemCall { errno })?,
-        ));
+        // SECCOMP_ADDFD rejects an O_PATH descriptor, so an approved O_PATH
+        // query carries no grant and lets the child's syscall re-execute.
+        let grant = if flags & libc::O_PATH != 0 {
+            None
+        } else {
+            Some(Grant::Open(match grant {
+                Some(grant) => grant,
+                None => OpenGrant::new(&path, flags, mode)
+                    .map_err(|errno| BrokerError::SystemCall { errno })?,
+            }))
+        };
         return Ok(NotificationResult::query(
             query_id,
             Trap::filesystem(
@@ -1617,15 +1626,35 @@ fn handle_openat(
         syscall,
     } = read_open_request(request)?;
 
-    let (raw, resolved, openat2_grant) = if resolve != 0 {
+    let (raw, resolved, open_grant) = if resolve != 0 {
         let (raw, resolved, grant) =
             OpenGrant::new_openat2(pid, dirfd, &path, flags, mode, resolve)
                 .map_err(|errno| BrokerError::SystemCall { errno })?;
         (raw, resolved, Some(grant))
     } else {
         let raw = resolve_child_path(pid, dirfd, &path)?;
-        let resolved = normalize_path(&raw);
-        (raw, resolved, None)
+        // A trailing slash resolves the final component as a directory, and
+        // O_NOFOLLOW refuses a terminal symlink. Canonicalizing drops both
+        // constraints, so pin the object the kernel would open instead.
+        let trailing_slash = raw.as_os_str().as_bytes().ends_with(b"/");
+        if trailing_slash || flags & libc::O_NOFOLLOW != 0 {
+            let target = if trailing_slash {
+                raw.clone()
+            } else {
+                normalize_path_nofollow(&raw)
+            };
+            let grant = OpenGrant::new(&target, flags, mode)
+                .map_err(|errno| BrokerError::SystemCall { errno })?;
+            let resolved = match &grant.kind {
+                OpenKind::Reopen(handle) => open_fd_path(handle.as_fd())
+                    .map_err(|errno| BrokerError::SystemCall { errno })?,
+                OpenKind::Create { .. } => target,
+            };
+            (raw, resolved, Some(grant))
+        } else {
+            let resolved = normalize_path(&raw);
+            (raw, resolved, None)
+        }
     };
     let wants_write = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0;
     let reports_write = flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) != 0;
@@ -1648,6 +1677,7 @@ fn handle_openat(
                     syscall,
                     flags,
                     mode,
+                    grant: open_grant,
                     reason,
                     pid: request.pid,
                     report: reports_write,
@@ -1672,6 +1702,7 @@ fn handle_openat(
                 syscall,
                 flags,
                 mode,
+                grant: open_grant,
                 reason,
                 pid: request.pid,
                 report: true,
@@ -1697,7 +1728,7 @@ fn handle_openat(
     // broker's policy check). Landlock cannot express denyWrite holes under an
     // allowWrite root, so pin every allowed open — read or write — with an
     // OpenGrant and inject the broker's fd via SECCOMP_ADDFD.
-    let grant = match openat2_grant {
+    let grant = match open_grant {
         Some(grant) => grant,
         None => OpenGrant::new(&resolved, flags, mode)
             .map_err(|errno| BrokerError::SystemCall { errno })?,
@@ -3326,7 +3357,17 @@ impl OpenGrant {
                 if flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
                     return Err(libc::EEXIST);
                 }
+                validate_nofollow_target(handle.as_fd(), flags)?;
                 OpenKind::Reopen(handle)
+            }
+            // A trailing slash names a directory, so the kernel never creates
+            // the final component: report what it would report instead.
+            Err(libc::ENOENT) if resolved.as_os_str().as_bytes().ends_with(b"/") => {
+                return Err(if flags & libc::O_CREAT != 0 {
+                    libc::EISDIR
+                } else {
+                    libc::ENOENT
+                });
             }
             Err(libc::ENOENT) => OpenKind::Create {
                 anchor: Anchor::new(resolved)?,
@@ -3380,6 +3421,7 @@ impl OpenGrant {
                 if flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
                     return Err(libc::EEXIST);
                 }
+                validate_nofollow_target(handle.as_fd(), flags)?;
                 let resolved = open_fd_path(handle.as_fd())?;
                 Ok((
                     raw,
@@ -3449,6 +3491,23 @@ fn open_child_dirfd(pid: Pid, dirfd: RawFd) -> std::result::Result<OwnedFd, i32>
 fn open_fd_path(fd: BorrowedFd<'_>) -> std::result::Result<PathBuf, i32> {
     fs::read_link(Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string()))
         .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))
+}
+
+fn validate_nofollow_target(handle: BorrowedFd<'_>, flags: i32) -> std::result::Result<(), i32> {
+    if flags & libc::O_NOFOLLOW == 0 || flags & libc::O_PATH != 0 {
+        return Ok(());
+    }
+
+    // SAFETY: stat points to initialized storage and handle is valid.
+    let mut stat = unsafe { mem::zeroed::<libc::stat>() };
+    // SAFETY: handle remains valid for the duration of fstat.
+    if unsafe { libc::fstat(handle.as_raw_fd(), ptr::addr_of_mut!(stat)) } < 0 {
+        return Err(Errno::last() as i32);
+    }
+    if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Err(libc::ELOOP);
+    }
+    Ok(())
 }
 
 enum OpenKind {
