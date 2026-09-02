@@ -2,7 +2,7 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import {
   type ExtensionAPI,
@@ -134,6 +134,8 @@ test('propagates registered extensions and public context to workers', async () 
   expect(prepared?.readPaths).toContain(extensionEntry);
   expect(prepared?.readPaths).toContain(cwd);
   expect(prepared?.readPaths.some((path) => path.endsWith('landstrip.json'))).toBe(true);
+  const landstripJson = prepared?.readPaths.find((path) => path.endsWith('landstrip.json'));
+  expect(prepared?.readPaths).toContain(dirname(landstripJson ?? ''));
   expect(prepared?.domains).toEqual(['api.other.example']);
   expect(prepared?.writePaths.some((path) => path.endsWith('auth.json'))).toBe(true);
   expect(prepared?.writePaths.some((path) => path.endsWith('auth.json.lock'))).toBe(true);

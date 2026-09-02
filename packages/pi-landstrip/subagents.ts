@@ -734,7 +734,10 @@ function modelEndpointDomains(ctx: ExtensionContext, selectedModel: string): str
 }
 
 function agentBootstrapPaths(agentDir: string): string[] {
-  return [
+  // The directory itself must be readable: the worker enumerates it during
+  // startup, and the default denyRead roots (/home, /Users) would otherwise
+  // block it.
+  const entries = [
     'settings.json',
     'landstrip.json',
     'models.json',
@@ -751,7 +754,8 @@ function agentBootstrapPaths(agentDir: string): string[] {
     'bin',
     'npm',
     'git',
-  ].map((path) => join(agentDir, path));
+  ];
+  return [agentDir, ...entries.map((entry) => join(agentDir, entry))];
 }
 
 class Semaphore {
