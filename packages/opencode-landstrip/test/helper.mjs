@@ -1,10 +1,12 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import ts from 'typescript';
 
 export const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const require = createRequire(import.meta.url);
 
 export function transpile(source) {
   return ts.transpileModule(source, {
@@ -19,6 +21,8 @@ export function transpile(source) {
 export async function installLandstripMock(tempDir, source) {
   const directory = join(tempDir, 'node_modules', '@landstrip', 'landstrip-api');
   await mkdir(directory, { recursive: true });
+  const ipaddrRoot = dirname(require.resolve('ipaddr.js/package.json'));
+  await cp(ipaddrRoot, join(tempDir, 'node_modules', 'ipaddr.js'), { recursive: true });
   await writeFile(
     join(directory, 'package.json'),
     JSON.stringify({

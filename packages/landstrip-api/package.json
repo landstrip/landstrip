@@ -36,6 +36,9 @@
     "README.md",
     "LICENSE"
   ],
+  "dependencies": {
+    "ipaddr.js": "^2.5.0"
+  },
   "optionalDependencies": {
     "@landstrip/landstrip-darwin-arm64": "0.18.42",
     "@landstrip/landstrip-darwin-x64": "0.18.42",

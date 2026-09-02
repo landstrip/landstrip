@@ -4,6 +4,9 @@
 const { lstatSync, readlinkSync, realpathSync } = require('node:fs');
 const { homedir } = require('node:os');
 const { basename, dirname, isAbsolute, join, relative, resolve, sep } = require('node:path');
+const { domainToASCII } = require('node:url');
+
+const ipaddr = require('ipaddr.js');
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -64,18 +67,43 @@ function sessionScopeFor(filePath, baseDirectory) {
   return dir;
 }
 
-function domainMatchesPattern(domain, pattern) {
-  // A trailing dot ("pastebin.com.") is the same host to DNS but would slip
-  // past a literal deny entry; strip it from both sides before matching.
-  const normalizedDomain = domain.toLowerCase().replace(/\.+$/, '');
-  const normalizedPattern = pattern.toLowerCase().replace(/\.+$/, '');
+function canonicalizeHost(host) {
+  const bracketed = host.startsWith('[');
+  if (bracketed !== host.endsWith(']')) return null;
 
-  if (normalizedPattern === '*') return true;
-  if (normalizedPattern.startsWith('*.')) {
-    const base = normalizedPattern.slice(2);
-    return normalizedDomain === base || normalizedDomain.endsWith(`.${base}`);
+  // A trailing dot ("pastebin.com.") is the same host to DNS but would slip
+  // past a literal deny entry; strip a single trailing dot and reject the rest.
+  const value = bracketed ? host.slice(1, -1) : host.replace(/\.$/, '');
+  if (!value || value.endsWith('.')) return null;
+
+  if (ipaddr.isValid(value)) {
+    if (bracketed && ipaddr.parse(value).kind() !== 'ipv6') return null;
+    return ipaddr.process(value).toString();
+  }
+  if (bracketed) return null;
+
+  const ascii = domainToASCII(value);
+  if (!ascii) return null;
+
+  try {
+    const parsed = new URL(`http://${ascii}/`);
+    return parsed.hostname === ascii.toLowerCase() ? parsed.hostname : null;
+  } catch {
+    return null;
+  }
+}
+
+function domainMatchesPattern(domain, pattern) {
+  const normalizedDomain = canonicalizeHost(domain);
+  if (!normalizedDomain) return false;
+  if (pattern === '*') return true;
+
+  if (pattern.startsWith('*.')) {
+    const base = canonicalizeHost(pattern.slice(2));
+    return base !== null && (normalizedDomain === base || normalizedDomain.endsWith(`.${base}`));
   }
 
+  const normalizedPattern = canonicalizeHost(pattern);
   return normalizedDomain === normalizedPattern;
 }
 
@@ -330,6 +358,7 @@ module.exports = {
   pathUnderDirectory,
   sessionAllows,
   sessionScopeFor,
+  canonicalizeHost,
   domainMatchesPattern,
   domainMatchesAny,
   allowsAllDomains,

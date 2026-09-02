@@ -29,6 +29,8 @@ export function sessionAllows(prefixes: Set<string>, filePath: string): boolean;
 
 export function sessionScopeFor(filePath: string, baseDirectory: string): string;
 
+export function canonicalizeHost(host: string): string | null;
+
 export function domainMatchesPattern(domain: string, pattern: string): boolean;
 
 export function domainMatchesAny(domain: string, patterns: string[]): boolean;
