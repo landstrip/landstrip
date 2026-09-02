@@ -213,13 +213,13 @@ export function useLandstrip(
   }
 }
 
-export function provideLandstripShell(
+function provideExtensionProvider(
   pi: ExtensionAPI,
-  provider: LandstripShellProvider,
+  register: (runtime: PiLandstripRuntimeV2) => () => void,
 ): () => void {
   let unregisterProvider: (() => void) | undefined;
   const stopDiscovery = useLandstrip(pi, (runtime) => {
-    const unregisterNext = runtime.registerShellProvider(provider);
+    const unregisterNext = register(runtime);
     unregisterProvider?.();
     unregisterProvider = unregisterNext;
   });
@@ -229,20 +229,18 @@ export function provideLandstripShell(
   };
 }
 
+export function provideLandstripShell(
+  pi: ExtensionAPI,
+  provider: LandstripShellProvider,
+): () => void {
+  return provideExtensionProvider(pi, (runtime) => runtime.registerShellProvider(provider));
+}
+
 export function provideLandstripPermissionAsk(
   pi: ExtensionAPI,
   provider: LandstripPermissionAskProvider,
 ): () => void {
-  let unregisterProvider: (() => void) | undefined;
-  const stopDiscovery = useLandstrip(pi, (runtime) => {
-    const unregisterNext = runtime.registerPermissionAskProvider(provider);
-    unregisterProvider?.();
-    unregisterProvider = unregisterNext;
-  });
-  return () => {
-    stopDiscovery();
-    unregisterProvider?.();
-  };
+  return provideExtensionProvider(pi, (runtime) => runtime.registerPermissionAskProvider(provider));
 }
 
 export function publishLandstripRuntime(
@@ -288,7 +286,7 @@ export function contextFromEnvironment(
       !['enabled', 'disabled', 'unavailable'].includes(String(value.sandbox)) ||
       typeof value.cwd !== 'string' ||
       !Number.isInteger(value.depth) ||
-      Number(value.depth) < 0 ||
+      (value.depth as number) < 0 ||
       ['sessionId', 'taskId', 'parentTaskId', 'agent'].some(
         (key) => value[key] !== undefined && typeof value[key] !== 'string',
       )

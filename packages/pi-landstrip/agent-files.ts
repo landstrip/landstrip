@@ -283,7 +283,7 @@ export function prepareProjectAgentEditor(
         )
       : undefined;
   const raw = relocateGlobalPrompt(
-    sourceRaw ? sourceRaw : agent.raw ? { ...agent.raw } : normalizedAgentRaw(agent),
+    sourceRaw ?? (agent.raw ? { ...agent.raw } : normalizedAgentRaw(agent)),
     agent,
   );
   const target = getLandstripConfigTarget(cwd, 'project', agentDir);
