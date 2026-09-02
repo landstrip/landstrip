@@ -36,22 +36,6 @@ pub(crate) struct PolicyValidationReport {
     pub(crate) error: Option<PolicyValidationError>,
 }
 
-impl PolicyValidationReport {
-    pub(crate) fn valid() -> Self {
-        Self {
-            valid: true,
-            error: None,
-        }
-    }
-
-    pub(crate) fn invalid(error: PolicyValidationError) -> Self {
-        Self {
-            valid: false,
-            error: Some(error),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct DoctorReport {
     pub(crate) ok: bool,

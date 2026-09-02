@@ -107,7 +107,10 @@ fn inspect_policy(command: &PolicyCommand) -> Result<CommandOutcome> {
 
 fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport> {
     match result {
-        Ok(()) => Ok(PolicyValidationReport::valid()),
+        Ok(()) => Ok(PolicyValidationReport {
+            valid: true,
+            error: None,
+        }),
         Err(error) => {
             let Some(engine_error) = find_engine_error(&error) else {
                 return Err(error);
@@ -123,10 +126,10 @@ fn policy_validation_report(result: Result<()>) -> Result<PolicyValidationReport
                 rendered_message
             };
 
-            Ok(PolicyValidationReport::invalid(PolicyValidationError {
-                code,
-                message,
-            }))
+            Ok(PolicyValidationReport {
+                valid: false,
+                error: Some(PolicyValidationError { code, message }),
+            })
         }
     }
 }
@@ -144,21 +147,18 @@ fn load_policy(input: &PolicyInput, tool: Option<&std::ffi::OsStr>) -> Result<Ac
     )
 }
 
-#[cfg(unix)]
-fn exit_with_error(error: &anyhow::Error, trap_fd: Option<&TrapFd>) -> ! {
+fn exit_with_error(
+    error: &anyhow::Error,
+    #[cfg(unix)] trap_fd: Option<&TrapFd>,
+    #[cfg(not(unix))] _trap_fd: Option<&()>,
+) -> ! {
     let (trap, exit_code) = error_trap(error);
+    #[cfg(unix)]
     if let Some(trap_fd) = trap_fd
         && let Err(error) = trap_fd.write(&trap)
     {
         log::debug!("trap fd write failed: {error}");
     }
-    trap.emit();
-    process::exit(exit_code)
-}
-
-#[cfg(not(unix))]
-fn exit_with_error(error: &anyhow::Error, _trap_fd: Option<&()>) -> ! {
-    let (trap, exit_code) = error_trap(error);
     trap.emit();
     process::exit(exit_code)
 }
