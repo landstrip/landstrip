@@ -1,33 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import {
-  binaryPath,
-  type LandstripControlResponse,
-  type LandstripTrap,
-} from '@landstrip/landstrip-api';
+import { binaryPath } from '@landstrip/landstrip-api';
+import { isRecord } from '@landstrip/landstrip-api/shared';
 
-import {
-  allowsAllDomains,
-  canonicalizeGlobPattern,
-  canonicalizePath,
-  controlResponseLine,
-  decodeLandstripTrap,
-  domainMatchesAny,
-  domainMatchesPattern,
-  expandHomePath,
-  expandPath,
-  globToRegExp,
-  formatLandstripTrap,
-  formatLandstripTraps,
-  isRecord,
-  normalizePathSeparators,
-  parseLandstripTraps,
-  pathUnderDirectory,
-  sessionAllows,
-  sessionScopeFor,
-} from '@landstrip/landstrip-api/shared';
-
+export type { LandstripControlResponse, LandstripTrap } from '@landstrip/landstrip-api';
 export {
   allowsAllDomains,
   canonicalizeGlobPattern,
@@ -47,11 +24,7 @@ export {
   pathUnderDirectory,
   sessionAllows,
   sessionScopeFor,
-};
-
-// Re-exported so index.ts/tui.ts can import the trap/response types from this
-// module alongside the parsing functions that produce/consume them.
-export type { LandstripControlResponse, LandstripTrap };
+} from '@landstrip/landstrip-api/shared';
 
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -98,10 +71,6 @@ const LANDSTRIP_PACKAGE_NAMES = new Set([
   '@landstrip/landstrip-win32-x64',
   '@landstrip/landstrip-win32-arm64',
 ]);
-
-export function list(values: string[]): string {
-  return values.join(', ') || '(none)';
-}
 
 function rejectUnknownFields(
   value: Record<string, unknown>,
@@ -600,55 +569,4 @@ export function readDiscoveryPort(baseDirectory: string): number | null {
   } catch {
     return null;
   }
-}
-
-/**
- * Human-readable sandbox configuration report consumed by both the server
- * command and the TUI inspector dialog.
- */
-export function sandboxSummary(
-  config: SandboxConfig,
-  globalPath: string,
-  projectPath: string,
-  statusOverride?: string,
-): string {
-  const networkMode = config.network.allowNetwork ? 'unrestricted' : 'proxied';
-  const allowed = list(config.network.allowedDomains);
-  const denied = list(config.network.deniedDomains);
-  const unixSockets = config.network.allowAllUnixSockets
-    ? 'all'
-    : list(config.network.allowUnixSockets);
-  const denyRead = list(config.filesystem.denyRead);
-  const allowRead = list(config.filesystem.allowRead);
-  const allowWrite = list(config.filesystem.allowWrite);
-  const denyWrite = list(config.filesystem.denyWrite);
-
-  const status = statusOverride ?? (config.enabled ? 'active' : 'disabled by config');
-  let binary: string;
-  try {
-    binary = landstripBinaryPath();
-  } catch {
-    binary = '(unavailable)';
-  }
-
-  return [
-    `Status: ${status}`,
-    `landstrip package binary: ${binary}`,
-    '',
-    'Config files',
-    `${projectPath} ${existsSync(projectPath) ? '(found)' : '(missing)'}`,
-    `${globalPath} ${existsSync(globalPath) ? '(found)' : '(missing)'}`,
-    '',
-    `Network: ${networkMode}`,
-    `allow network: ${config.network.allowNetwork ? 'yes' : 'no'}`,
-    `allowed: ${allowed}`,
-    `denied: ${denied}`,
-    `unix sockets: ${unixSockets}`,
-    '',
-    'Filesystem',
-    `deny read: ${denyRead}`,
-    `allow read: ${allowRead}`,
-    `allow write: ${allowWrite}`,
-    `deny write: ${denyWrite}`,
-  ].join('\n');
 }
