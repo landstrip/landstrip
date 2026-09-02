@@ -78,8 +78,8 @@ function normalizePathForMatch(filePath: string): string {
   return process.platform === 'win32' ? normalizePathSeparators(filePath).toLowerCase() : filePath;
 }
 
-// Component count of an absolute path; "/" is 0. Used to rank how specific a
-// matching pattern is so the most specific allow/deny rule wins.
+// Component count of an absolute path; "/" is 0. Read rules use it to rank
+// matching allow and deny patterns by specificity.
 function pathDepth(absolutePath: string): number {
   return absolutePath.split('/').filter((segment) => segment.length > 0).length;
 }
@@ -135,7 +135,7 @@ function isDomainAllowed(domain: string, config: SandboxConfig): boolean {
   );
 }
 
-function isFilesystemAllowed(
+function isReadAllowed(
   path: string,
   allowPatterns: string[],
   denyPatterns: string[],
@@ -144,6 +144,16 @@ function isFilesystemAllowed(
   const allowDepth = matchDepth(path, allowPatterns, baseDirectory);
   const denyDepth = matchDepth(path, denyPatterns, baseDirectory);
   return allowDepth >= 0 && allowDepth >= denyDepth;
+}
+
+function writeAccess(
+  path: string,
+  allowPatterns: string[],
+  denyPatterns: string[],
+  baseDirectory: string,
+): 'allow' | 'deny' | 'unlisted' {
+  if (matchDepth(path, denyPatterns, baseDirectory) >= 0) return 'deny';
+  return matchDepth(path, allowPatterns, baseDirectory) >= 0 ? 'allow' : 'unlisted';
 }
 
 function extractCandidatePaths(command: string): string[] {
@@ -219,9 +229,7 @@ function evaluateReadPermission(
   // everything else asks for approval (allow once/session/persist or reject)
   // rather than being blocked outright. denyRead still hard-applies to bash
   // through the landstrip binary policy, which has no way to prompt.
-  if (
-    isFilesystemAllowed(filePath, effectiveAllowRead, config.filesystem.denyRead, baseDirectory)
-  ) {
+  if (isReadAllowed(filePath, effectiveAllowRead, config.filesystem.denyRead, baseDirectory)) {
     return { status: 'allow', kind: 'read', resource: filePath, message: '' };
   }
 
@@ -240,10 +248,14 @@ function evaluateWritePermission(
   effectiveAllowWrite: string[],
 ): SandboxPermissionDecision {
   const filePath = canonicalizePath(path, baseDirectory);
-  const allowDepth = matchDepth(filePath, effectiveAllowWrite, baseDirectory);
-  const denyDepth = matchDepth(filePath, config.filesystem.denyWrite, baseDirectory);
+  const access = writeAccess(
+    filePath,
+    effectiveAllowWrite,
+    config.filesystem.denyWrite,
+    baseDirectory,
+  );
 
-  if (denyDepth >= 0 && denyDepth >= allowDepth) {
+  if (access === 'deny') {
     return {
       status: 'deny',
       kind: 'write',
@@ -252,9 +264,7 @@ function evaluateWritePermission(
     };
   }
 
-  if (
-    isFilesystemAllowed(filePath, effectiveAllowWrite, config.filesystem.denyWrite, baseDirectory)
-  ) {
+  if (access === 'allow') {
     return { status: 'allow', kind: 'write', resource: filePath, message: '' };
   }
 
@@ -427,8 +437,8 @@ function startTrapServer(
             const operation = trap.operation;
             const allowed =
               operation === 'read'
-                ? isFilesystemAllowed(path, effectiveAllowRead, denyRead, baseDirectory)
-                : isFilesystemAllowed(path, effectiveAllowWrite, denyWrite, baseDirectory);
+                ? isReadAllowed(path, effectiveAllowRead, denyRead, baseDirectory)
+                : writeAccess(path, effectiveAllowWrite, denyWrite, baseDirectory) === 'allow';
             if (allowed) {
               trapSocket.write(controlResponseLine(queryId, 'allow'));
             } else {
@@ -1051,7 +1061,12 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
         config.filesystem.allowWrite,
       );
       for (const decision of decisions) {
-        if (decision.status === 'allow' || hasCallAllowance(input.callID, decision)) continue;
+        if (
+          decision.status === 'allow' ||
+          (decision.status === 'ask' && hasCallAllowance(input.callID, decision))
+        ) {
+          continue;
+        }
         reportBlocked(decision);
       }
     },

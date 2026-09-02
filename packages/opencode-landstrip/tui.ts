@@ -585,6 +585,10 @@ const tui: TuiPlugin = async (api, options, meta) => {
             }
 
             if (trap.kind === 'filesystem') {
+              if (trap.operation === 'write' && trap.reason === 'deny_match') {
+                respondQuery(socket, trap.query_id, 'deny');
+                continue;
+              }
               const sessionPaths =
                 trap.operation === 'read' ? allowances.readPaths : allowances.writePaths;
               if (sessionAllows(sessionPaths, trap.path)) {

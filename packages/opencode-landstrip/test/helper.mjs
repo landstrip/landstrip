@@ -18,6 +18,37 @@ export function transpile(source) {
   }).outputText;
 }
 
+// Resolve with the first newline-terminated line the socket delivers. Rejects on
+// socket error or after the timeout so a missing response fails the test instead
+// of hanging it.
+export function readLine(socket, timeoutMs = 2_000) {
+  return new Promise((resolve, reject) => {
+    let buffer = '';
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('Timed out waiting for trap query response'));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      socket.off('data', onData);
+      socket.off('error', onError);
+    };
+    const onData = (chunk) => {
+      buffer += chunk.toString('utf8');
+      const newline = buffer.indexOf('\n');
+      if (newline === -1) return;
+      cleanup();
+      resolve(buffer.slice(0, newline));
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    socket.on('data', onData);
+    socket.on('error', onError);
+  });
+}
+
 export async function installLandstripMock(tempDir, source) {
   const directory = join(tempDir, 'node_modules', '@landstrip', 'landstrip-api');
   await mkdir(directory, { recursive: true });

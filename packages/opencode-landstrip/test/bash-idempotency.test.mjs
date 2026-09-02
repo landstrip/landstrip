@@ -10,7 +10,7 @@ import { promisify } from 'node:util';
 
 import { binaryPath as installedLandstripBinaryPath } from '@landstrip/landstrip-api';
 
-import { installLandstripMock, packageRoot, transpile } from './helper.mjs';
+import { installLandstripMock, packageRoot, readLine, transpile } from './helper.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -318,6 +318,40 @@ test('permission.ask approves every apply_patch path for one call and then expir
       await assert.rejects(hooks['tool.execute.before'](input, output), /requires approval/);
     },
   );
+});
+
+test('a call allowance cannot override a newly loaded denyWrite rule', async () => {
+  await withPlugin({ enabled: true }, async ({ hooks, tempDir }) => {
+    const path = '../outside-denied.txt';
+    const input = { callID: 'reconfigured-write', tool: 'write' };
+    const permissionOutput = { status: 'allow' };
+
+    await hooks['permission.ask'](
+      {
+        id: 'permission-reconfigured-write',
+        type: 'edit',
+        pattern: path,
+        callID: input.callID,
+        sessionID: 'session',
+        messageID: 'message',
+        title: 'Write file',
+        metadata: { filepath: path },
+        time: { created: 0 },
+      },
+      permissionOutput,
+    );
+    assert.equal(permissionOutput.status, 'ask');
+
+    const shared = await import(pathToFileURL(join(tempDir, 'shared.js')).href);
+    shared.writeConfigFile(shared.getConfigPaths(tempDir).projectPath, {
+      filesystem: { denyWrite: [path] },
+    });
+
+    await assert.rejects(
+      hooks['tool.execute.before'](input, { args: { path } }),
+      /write access denied/,
+    );
+  });
 });
 
 test('a denyRead read asks for approval instead of hard-denying', async () => {
@@ -628,18 +662,23 @@ test('deny overrides allow when a path matches both lists', async () => {
   );
 });
 
-test('denyWrite wins when allowWrite has the same pattern', async () => {
+test('denyWrite wins over a broader allowWrite glob', async () => {
   await withPlugin(
     {
       enabled: true,
-      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: ['.'] },
+      filesystem: {
+        allowRead: ['.'],
+        allowWrite: ['**'],
+        denyRead: [],
+        denyWrite: ['protected'],
+      },
       network: { allowedDomains: ['*'], deniedDomains: [] },
     },
     async ({ hooks, tempDir }) => {
       await assert.rejects(
         hooks['tool.execute.before'](
-          { callID: 'write-equal-pattern', tool: 'write' },
-          { args: { path: join(tempDir, 'notes.txt') } },
+          { callID: 'write-broad-allow', tool: 'write' },
+          { args: { path: join(tempDir, 'protected', 'secret.txt') } },
         ),
         /write access denied/,
       );
@@ -930,35 +969,19 @@ test('query-response: recovery re-extracts the original command', linuxOnly, asy
   );
 });
 
-function readLine(socket) {
-  return new Promise((resolvePromise, reject) => {
-    let buffer = '';
-    const onData = (chunk) => {
-      buffer += chunk.toString('utf8');
-      const newline = buffer.indexOf('\n');
-      if (newline !== -1) {
-        socket.off('data', onData);
-        socket.off('error', onError);
-        resolvePromise(buffer.slice(0, newline));
-      }
-    };
-    const onError = (error) => {
-      socket.off('data', onData);
-      reject(error);
-    };
-    socket.on('data', onData);
-    socket.on('error', onError);
-  });
-}
-
 test('query-response: headless trap handling fails closed without hanging', linuxOnly, async () => {
   await withPlugin(
     {
       enabled: true,
-      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      filesystem: {
+        allowRead: ['.'],
+        allowWrite: ['**'],
+        denyRead: [],
+        denyWrite: ['protected'],
+      },
       network: { allowedDomains: ['*'], deniedDomains: [] },
     },
-    async ({ hooks }) => {
+    async ({ hooks, tempDir }) => {
       const input = { callID: 'trap-server', tool: 'bash' };
       const output = { args: { command: 'git status --short', description: 'status' } };
       try {
@@ -989,6 +1012,20 @@ test('query-response: headless trap handling fails closed without hanging', linu
             action: 'deny',
           });
 
+          socket.write(
+            JSON.stringify({
+              kind: 'filesystem',
+              operation: 'write',
+              path: join(tempDir, 'protected', 'secret.txt'),
+              state: 'query',
+              query_id: '43',
+            }) + '\n',
+          );
+          assert.deepEqual(JSON.parse(await readLine(socket)), {
+            query_id: '43',
+            action: 'deny',
+          });
+
           // Network queries are denied rather than left suspended.
           socket.write(
             JSON.stringify({
@@ -996,11 +1033,11 @@ test('query-response: headless trap handling fails closed without hanging', linu
               operation: 'connect',
               target: '93.184.216.34:443',
               state: 'query',
-              query_id: '43',
+              query_id: '44',
             }) + '\n',
           );
           assert.deepEqual(JSON.parse(await readLine(socket)), {
-            query_id: '43',
+            query_id: '44',
             action: 'deny',
           });
         } finally {
