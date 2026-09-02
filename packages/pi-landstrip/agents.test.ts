@@ -23,7 +23,6 @@ import {
   loadMaxSubagentsSettings,
   MAX_SUBAGENTS,
   setAgentDisabledForScope,
-  setMaxSubagentsConfig,
   setMaxSubagentsConfigForScope,
 } from './config.ts';
 import { temporaryDirectory as makeTemporaryDirectory } from './test-util.ts';
@@ -295,7 +294,7 @@ describe('landstrip agent configuration', () => {
     expect(catalog.diagnostics.join('\n')).toContain(`integer from 0 to ${MAX_SUBAGENTS}`);
   });
 
-  test('updates maxSubagents in project settings when includeProject is true', async () => {
+  test('updates maxSubagents in project settings for project scope', async () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     const projectPath = join(cwd, '.pi', 'settings.json');
@@ -304,14 +303,14 @@ describe('landstrip agent configuration', () => {
       landstrip: { maxSubagents: 2, permission: { bash: 'ask' } },
     });
 
-    await expect(setMaxSubagentsConfig(cwd, 6, true, agentDir)).resolves.toBe('project');
+    await setMaxSubagentsConfigForScope(cwd, 6, 'project', agentDir);
     expect(JSON.parse(readFileSync(projectPath, 'utf8'))).toEqual({
       theme: 'dark',
       landstrip: { maxSubagents: 6, permission: { bash: 'ask' } },
     });
   });
 
-  test('updates maxSubagents in global settings when includeProject is false', async () => {
+  test('updates maxSubagents in global settings for global scope', async () => {
     const cwd = temporaryDirectory();
     const agentDir = temporaryDirectory();
     const path = join(agentDir, 'settings.json');
@@ -320,7 +319,7 @@ describe('landstrip agent configuration', () => {
       landstrip: { maxSubagents: 2, permission: { bash: 'ask' } },
     });
 
-    await expect(setMaxSubagentsConfig(cwd, 6, false, agentDir)).resolves.toBe('global');
+    await setMaxSubagentsConfigForScope(cwd, 6, 'global', agentDir);
     expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
       theme: 'dark',
       landstrip: { maxSubagents: 6, permission: { bash: 'ask' } },

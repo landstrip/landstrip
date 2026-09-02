@@ -223,17 +223,6 @@ export function getPiConfigPaths(
   };
 }
 
-export async function setMaxSubagentsConfig(
-  cwd: string,
-  maxSubagents: number,
-  includeProject = true,
-  agentDir = getAgentDir(),
-): Promise<'global' | 'project'> {
-  const scope = includeProject ? 'project' : 'global';
-  await setMaxSubagentsConfigForScope(cwd, maxSubagents, scope, agentDir);
-  return scope;
-}
-
 async function updateLandstripConfigForScope(
   cwd: string,
   scope: 'global' | 'project',
