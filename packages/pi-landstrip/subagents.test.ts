@@ -19,7 +19,11 @@ import { contextFromEnvironment, LANDSTRIP_CONTEXT_ENV } from './api.ts';
 import type { LandstripIntegration } from './index.ts';
 import {
   boundTaskOutput,
+  dialogKeys,
+  dialogTabs,
   isSupportedPiVersion,
+  paneRow,
+  paneTop,
   registerSubagentWorker,
   renderTaskResult,
   renderTaskTree,
@@ -3327,4 +3331,26 @@ test('renders sandbox state in the settings pane and toggles it', async () => {
   finishCustom?.();
   await running;
   vi.unstubAllEnvs();
+});
+
+const plainTheme = {
+  fg: (_color: string, value: string) => value,
+  bold: (value: string) => value,
+} as unknown as Parameters<typeof paneTop>[0];
+
+test('renders full-width bottom-pane rows without dialog borders', () => {
+  expect(paneTop(plainTheme, 12, 'Landstrip')).toBe(' Landstrip ─');
+  expect(paneRow(plainTheme, 12, 'value')).toBe(' value      ');
+  expect(visibleWidth(paneTop(plainTheme, 1, 'Landstrip'))).toBe(1);
+  expect(visibleWidth(paneRow(plainTheme, 1, 'value'))).toBe(1);
+});
+
+test('renders consistent tabs and key hints', () => {
+  expect(dialogTabs(plainTheme, ['Agents', 'Tasks'], 'Agents')).toBe('[Agents]  Tasks');
+  expect(
+    dialogKeys(plainTheme, [
+      ['Tab', 'next tab'],
+      ['Esc', 'close'],
+    ]),
+  ).toBe('Tab next tab  ·  Esc close');
 });
