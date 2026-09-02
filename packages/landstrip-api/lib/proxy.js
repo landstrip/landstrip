@@ -2,7 +2,10 @@
 'use strict';
 
 const { lookup } = require('node:dns/promises');
-const { BlockList, connect, createServer, isIP } = require('node:net');
+const { Agent, createServer: createHttpServer, request: requestHttp } = require('node:http');
+const { BlockList, connect, isIP } = require('node:net');
+
+const { canonicalizeHost } = require('./shared');
 
 const prohibitedProxyAddresses = new BlockList();
 
@@ -39,21 +42,24 @@ function parseProxyPort(value, defaultPort) {
   return port >= 1 && port <= 65535 ? port : null;
 }
 
-function splitHostPort(target, defaultPort) {
-  const bracketMatch = target.match(/^\[([^\]]+)\](?::(.*))?$/);
-  const host = bracketMatch?.[1];
-  if (host) {
-    const port = parseProxyPort(bracketMatch[2], defaultPort);
-    return port === null ? null : { host, port };
+function splitHostPort(target) {
+  if (/\s|[\u0000-\u001f\u007f]/.test(target) || /[/?#\\]/.test(target)) return null;
+
+  let url;
+  try {
+    url = new URL(`connect://${target}`);
+  } catch {
+    return null;
   }
 
-  const lastColon = target.lastIndexOf(':');
-  if (lastColon > -1 && target.indexOf(':') === lastColon) {
-    const port = parseProxyPort(target.slice(lastColon + 1), defaultPort);
-    return port === null ? null : { host: target.slice(0, lastColon), port };
+  if (url.username || url.password || url.pathname || url.search || url.hash || !url.port) {
+    return null;
   }
 
-  return { host: target, port: defaultPort };
+  const host = canonicalizeHost(url.hostname);
+  const port = parseProxyPort(url.port, 0);
+  if (!host || port === null) return null;
+  return { host, port };
 }
 
 function denyProxyRequest(client, status = '403 Forbidden') {
@@ -61,34 +67,39 @@ function denyProxyRequest(client, status = '403 Forbidden') {
   client.end();
 }
 
-function isPublicProxyAddress(address, family = isIP(address)) {
-  if (family === 4) return !prohibitedProxyAddresses.check(address, 'ipv4');
-  if (family === 6) return !prohibitedProxyAddresses.check(address, 'ipv6');
+function isPublicProxyAddress(address) {
+  const canonicalAddress = canonicalizeHost(address);
+  if (!canonicalAddress) return false;
+
+  const family = isIP(canonicalAddress);
+  if (family === 4) return !prohibitedProxyAddresses.check(canonicalAddress, 'ipv4');
+  if (family === 6) return !prohibitedProxyAddresses.check(canonicalAddress, 'ipv6');
   return false;
 }
 
-async function resolveProxyEndpoint(host) {
-  const literalFamily = isIP(host);
+async function resolveProxyEndpoints(host) {
+  const canonicalHost = canonicalizeHost(host);
+  if (!canonicalHost) throw new Error('Proxy destination has an invalid host');
+
+  const literalFamily = isIP(canonicalHost);
   if (literalFamily === 4 || literalFamily === 6) {
-    if (!isPublicProxyAddress(host, literalFamily)) {
-      throw new Error(`Proxy destination is not public: ${host}`);
-    }
-    return { address: host, family: literalFamily };
+    return [{ address: canonicalHost, family: literalFamily }];
   }
 
-  const addresses = await lookup(host, { all: true, verbatim: true });
-  if (
-    addresses.length === 0 ||
-    addresses.some(({ address, family }) => !isPublicProxyAddress(address, family))
-  ) {
-    throw new Error(`Proxy destination resolves to a non-public address: ${host}`);
+  const addresses = await lookup(canonicalHost, { all: true, verbatim: true });
+  const endpoints = [];
+  const seen = new Set();
+  for (const { address } of addresses) {
+    const canonicalAddress = canonicalizeHost(address);
+    const family = canonicalAddress ? isIP(canonicalAddress) : 0;
+    if ((family !== 4 && family !== 6) || seen.has(canonicalAddress)) continue;
+    seen.add(canonicalAddress);
+    endpoints.push({ address: canonicalAddress, family });
   }
-
-  const endpoint = addresses[0];
-  if (endpoint.family !== 4 && endpoint.family !== 6) {
-    throw new Error(`Proxy could not resolve destination: ${host}`);
+  if (endpoints.length === 0) {
+    throw new Error(`Proxy could not resolve destination: ${canonicalHost}`);
   }
-  return { address: endpoint.address, family: endpoint.family };
+  return endpoints;
 }
 
 function pipeSockets(client, upstream, initialData) {
@@ -104,166 +115,220 @@ function pipeSockets(client, upstream, initialData) {
 function startFilterProxy(options) {
   const { isDomainAllowed, authorization, portRange } = options;
   const sockets = new Set();
+  const hopByHopHeaders = [
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'proxy-connection',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+  ];
 
-  // Track the upstream socket so stop() tears it down, and abandon a still-
-  // connecting upstream when its client goes away — otherwise a connect to a
-  // black-holed host lingers in SYN-retry (~2 min), leaking an fd per request.
-  function trackUpstream(upstream, client, settled) {
-    sockets.add(upstream);
-    upstream.once('close', () => sockets.delete(upstream));
-    client.once('close', () => {
-      if (!settled()) upstream.destroy();
-    });
+  function trackSocket(socket) {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  }
+
+  async function connectProxyEndpoints(endpoints, port, client) {
+    let lastError;
+    for (const endpoint of endpoints) {
+      if (stopped || client.destroyed) throw new Error('Proxy connection was cancelled');
+
+      try {
+        return await new Promise((resolve, reject) => {
+          const upstream = connect({ host: endpoint.address, port, family: endpoint.family });
+          let connected = false;
+          const destroyUpstream = () => upstream.destroy();
+          trackSocket(upstream);
+          client.once('close', destroyUpstream);
+          upstream.once('connect', () => {
+            connected = true;
+            resolve(upstream);
+          });
+          upstream.once('error', reject);
+          upstream.once('close', () => {
+            client.off('close', destroyUpstream);
+            if (!connected) reject(new Error('Proxy connection closed'));
+          });
+        });
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError ?? new Error('Proxy could not connect to destination');
+  }
+
+  function isAuthorized(headers) {
+    return !authorization || headers['proxy-authorization'] === authorization;
+  }
+
+  function stripHopByHopHeaders(headers) {
+    const forwarded = { ...headers };
+    const connection = forwarded.connection;
+    const connectionValue = Array.isArray(connection) ? connection.join(',') : connection;
+    for (const name of connectionValue?.split(',') ?? []) {
+      delete forwarded[name.trim().toLowerCase()];
+    }
+    for (const name of hopByHopHeaders) delete forwarded[name];
+    return forwarded;
+  }
+
+  function denyHttpRequest(response, statusCode, statusMessage) {
+    if (!response.headersSent) {
+      response.writeHead(statusCode, statusMessage, {
+        Connection: 'close',
+        'Content-Length': '0',
+      });
+    }
+    response.end();
   }
 
   async function handleConnect(client, target, rest) {
-    const endpoint = splitHostPort(target, 443);
+    const endpoint = splitHostPort(target);
     if (!endpoint) {
       denyProxyRequest(client, '400 Bad Request');
       return;
     }
 
     if (!(await isDomainAllowed(endpoint.host))) {
-      denyProxyRequest(client);
+      if (!client.destroyed) denyProxyRequest(client);
+      return;
+    }
+    if (stopped || client.destroyed) return;
+
+    const endpoints = await resolveProxyEndpoints(endpoint.host);
+    if (stopped || client.destroyed) return;
+
+    let upstreamSocket;
+    try {
+      upstreamSocket = await connectProxyEndpoints(endpoints, endpoint.port, client);
+    } catch {
+      if (!stopped && !client.destroyed) denyProxyRequest(client, '502 Bad Gateway');
+      return;
+    }
+    if (stopped || client.destroyed) {
+      upstreamSocket.destroy();
       return;
     }
 
-    const resolved = await resolveProxyEndpoint(endpoint.host);
-    let settled = false;
-    const upstream = connect(
-      { host: resolved.address, port: endpoint.port, family: resolved.family },
-      () => {
-        settled = true;
-        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        pipeSockets(client, upstream, rest);
-      },
-    );
-    trackUpstream(upstream, client, () => settled);
-    upstream.once('error', () => {
-      if (settled) return;
-      settled = true;
-      denyProxyRequest(client, '502 Bad Gateway');
-    });
+    client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    pipeSockets(client, upstreamSocket, rest);
   }
 
-  async function handleHttp(client, headerText, rest) {
-    const lines = headerText.split(/\r?\n/);
-    const requestLine = lines[0];
-    if (!requestLine) {
-      denyProxyRequest(client, '400 Bad Request');
-      return;
-    }
-
-    const [method, rawTarget, version] = requestLine.split(' ');
-    if (!method || !rawTarget || !version) {
-      denyProxyRequest(client, '400 Bad Request');
+  async function handleHttp(clientRequest, clientResponse) {
+    if (!isAuthorized(clientRequest.headers)) {
+      denyHttpRequest(clientResponse, 407, 'Proxy Authentication Required');
       return;
     }
 
     let url;
     try {
-      url = new URL(rawTarget);
+      url = new URL(clientRequest.url);
     } catch {
-      const host = lines
-        .find((line) => line.toLowerCase().startsWith('host:'))
-        ?.slice(5)
-        .trim();
-      if (!host) {
-        denyProxyRequest(client, '400 Bad Request');
+      const authority = clientRequest.headers.host;
+      if (!authority) {
+        denyHttpRequest(clientResponse, 400, 'Bad Request');
         return;
       }
 
       try {
-        url = new URL(`http://${host}${rawTarget}`);
+        url = new URL(`http://${authority}${clientRequest.url}`);
       } catch {
-        denyProxyRequest(client, '400 Bad Request');
+        denyHttpRequest(clientResponse, 400, 'Bad Request');
         return;
       }
     }
 
-    if (!(await isDomainAllowed(url.hostname))) {
-      denyProxyRequest(client);
+    if (url.protocol !== 'http:' || url.username || url.password) {
+      denyHttpRequest(clientResponse, 400, 'Bad Request');
       return;
     }
 
-    const port = parseProxyPort(url.port || undefined, url.protocol === 'https:' ? 443 : 80);
+    const host = canonicalizeHost(url.hostname);
+    if (!host) {
+      denyHttpRequest(clientResponse, 400, 'Bad Request');
+      return;
+    }
+    if (!(await isDomainAllowed(host))) {
+      if (!clientResponse.destroyed) denyHttpRequest(clientResponse, 403, 'Forbidden');
+      return;
+    }
+    const clientSocket = clientRequest.socket;
+    if (stopped || clientSocket.destroyed || clientResponse.destroyed) return;
+
+    const port = parseProxyPort(url.port || undefined, 80);
     if (port === null) {
-      denyProxyRequest(client, '400 Bad Request');
+      denyHttpRequest(clientResponse, 400, 'Bad Request');
       return;
     }
 
-    const path = `${url.pathname}${url.search}` || '/';
-    lines[0] = `${method} ${path} ${version}`;
+    const endpoints = await resolveProxyEndpoints(host);
+    if (stopped || clientSocket.destroyed || clientResponse.destroyed) return;
 
-    const rewrittenHeader = lines
-      .filter(
-        (line) =>
-          !line.toLowerCase().startsWith('proxy-connection:') &&
-          !line.toLowerCase().startsWith('proxy-authorization:'),
-      )
-      .map((line) => (line.toLowerCase().startsWith('host:') ? `Host: ${url.host}` : line))
-      .join('\r\n');
-    const resolved = await resolveProxyEndpoint(url.hostname);
-    let settled = false;
-    const upstream = connect({ host: resolved.address, port, family: resolved.family }, () => {
-      settled = true;
-      upstream.write(`${rewrittenHeader}\r\n\r\n`);
-      pipeSockets(client, upstream, rest);
+    const forwardedHeaders = stripHopByHopHeaders(clientRequest.headers);
+    forwardedHeaders.host = url.host;
+
+    const agent = new Agent();
+    agent.createConnection = (_options, callback) => {
+      connectProxyEndpoints(endpoints, port, clientSocket).then(
+        (socket) => callback(null, socket),
+        (error) => callback(error),
+      );
+    };
+    const upstreamRequest = requestHttp({
+      host,
+      port,
+      method: clientRequest.method,
+      path: `${url.pathname}${url.search}` || '/',
+      headers: forwardedHeaders,
+      agent,
     });
-    trackUpstream(upstream, client, () => settled);
-    upstream.once('error', () => {
-      if (settled) return;
-      settled = true;
-      denyProxyRequest(client, '502 Bad Gateway');
+    upstreamRequest.once('response', (upstreamResponse) => {
+      clientResponse.writeHead(
+        upstreamResponse.statusCode ?? 502,
+        upstreamResponse.statusMessage,
+        stripHopByHopHeaders(upstreamResponse.headers),
+      );
+      upstreamResponse.pipe(clientResponse);
     });
+    upstreamRequest.once('error', () => {
+      if (!clientResponse.headersSent) {
+        denyHttpRequest(clientResponse, 502, 'Bad Gateway');
+      } else {
+        clientResponse.destroy();
+      }
+    });
+    clientRequest.once('aborted', () => upstreamRequest.destroy());
+    clientResponse.once('close', () => {
+      if (!clientResponse.writableEnded) upstreamRequest.destroy();
+    });
+    clientRequest.pipe(upstreamRequest);
   }
 
-  function handleClient(client) {
-    sockets.add(client);
-    client.on('close', () => sockets.delete(client));
-    client.on('error', () => sockets.delete(client));
+  const server = createHttpServer({ maxHeaderSize: 65536 }, (request, response) => {
+    handleHttp(request, response).catch(() => denyHttpRequest(response, 502, 'Bad Gateway'));
+  });
+  server.on('connection', trackSocket);
+  server.on('connect', (request, client, head) => {
+    if (!isAuthorized(request.headers)) {
+      denyProxyRequest(client, '407 Proxy Authentication Required');
+      return;
+    }
+    handleConnect(client, request.url, head).catch(() =>
+      denyProxyRequest(client, '502 Bad Gateway'),
+    );
+  });
+  server.on('clientError', (error, client) => {
+    const status =
+      error.code === 'HPE_HEADER_OVERFLOW'
+        ? '431 Request Header Fields Too Large'
+        : '400 Bad Request';
+    denyProxyRequest(client, status);
+  });
 
-    let buffered = Buffer.alloc(0);
-
-    client.on('data', (chunk) => {
-      buffered = Buffer.concat([buffered, chunk]);
-      const headerEnd = buffered.indexOf('\r\n\r\n');
-      if (headerEnd === -1) {
-        if (buffered.length > 65536) {
-          client.removeAllListeners('data');
-          client.pause();
-          denyProxyRequest(client, '431 Request Header Fields Too Large');
-        }
-        return;
-      }
-
-      client.pause();
-      client.removeAllListeners('data');
-
-      const header = buffered.subarray(0, headerEnd).toString('utf-8');
-      const rest = buffered.subarray(headerEnd + 4);
-      if (authorization) {
-        const supplied = header
-          .split(/\r?\n/)
-          .find((line) => line.toLowerCase().startsWith('proxy-authorization:'))
-          ?.slice('proxy-authorization:'.length)
-          .trim();
-        if (supplied !== authorization) {
-          denyProxyRequest(client, '407 Proxy Authentication Required');
-          return;
-        }
-      }
-      const [method, target] = header.split(/\r?\n/, 1)[0].split(' ');
-
-      const task =
-        method?.toUpperCase() === 'CONNECT' && target
-          ? handleConnect(client, target, rest)
-          : handleHttp(client, header, rest);
-      task.catch(() => denyProxyRequest(client, '502 Bad Gateway'));
-    });
-  }
-
-  const server = createServer(handleClient);
   let stopped = false;
 
   return new Promise((resolve, reject) => {

@@ -418,10 +418,13 @@ test('permission.ask can approve one bash domain for wrapping policy', async () 
   );
 });
 
-test('proxy refuses private destinations without connecting', async () => {
+test('proxy connects to allowed private destinations', async () => {
   let connections = 0;
-  const upstream = createServer(() => {
+  const upstreamSockets = new Set();
+  const upstream = createServer((socket) => {
     connections += 1;
+    upstreamSockets.add(socket);
+    socket.once('close', () => upstreamSockets.delete(socket));
   });
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
   const address = upstream.address();
@@ -474,19 +477,21 @@ test('proxy refuses private destinations without connecting', async () => {
             socket.setEncoding('utf-8');
             socket.on('data', (chunk) => {
               data += chunk;
+              if (data.includes('\r\n\r\n')) socket.destroy();
             });
             socket.on('close', () => resolveResponse(data));
             socket.on('error', rejectResponse);
           });
 
-          assert.match(response, /^HTTP\/1\.1 502 Bad Gateway/);
-          assert.equal(connections, 0);
+          assert.match(response, /^HTTP\/1\.1 200 Connection Established/);
+          assert.equal(connections, 1);
         } finally {
           await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
         }
       },
     );
   } finally {
+    for (const socket of upstreamSockets) socket.destroy();
     await new Promise((resolve) => upstream.close(resolve));
   }
 });
