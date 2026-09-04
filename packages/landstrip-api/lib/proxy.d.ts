@@ -19,6 +19,4 @@ export interface FilterProxyHandle {
   stop(): Promise<void>;
 }
 
-export function isPublicProxyAddress(address: string, family?: number): boolean;
-
 export function startFilterProxy(options: FilterProxyOptions): Promise<FilterProxyHandle>;

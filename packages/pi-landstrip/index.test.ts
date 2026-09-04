@@ -35,8 +35,6 @@ import landstripExtension, {
   writeEnvFile,
 } from './index.ts';
 
-import { isPublicProxyAddress } from '@landstrip/landstrip-api/proxy';
-
 import { AsyncQueue, PermissionPromptCoordinator } from './util.ts';
 
 describe('Landstrip launcher environment', () => {
@@ -628,21 +626,6 @@ it('exposes sandbox overview data without registering a dashboard command', asyn
 
   vi.unstubAllEnvs();
   rmSync(agentDir, { recursive: true, force: true });
-});
-
-describe('proxy destination addresses', () => {
-  it('accepts public addresses', () => {
-    expect(isPublicProxyAddress('8.8.8.8')).toBe(true);
-    expect(isPublicProxyAddress('2606:4700:4700::1111')).toBe(true);
-  });
-
-  it('rejects local and private addresses', () => {
-    expect(isPublicProxyAddress('127.0.0.1')).toBe(false);
-    expect(isPublicProxyAddress('10.0.0.1')).toBe(false);
-    expect(isPublicProxyAddress('169.254.169.254')).toBe(false);
-    expect(isPublicProxyAddress('::1')).toBe(false);
-    expect(isPublicProxyAddress('fd00::1')).toBe(false);
-  });
 });
 
 it('rejects a pre-aborted RPC worker startup before allocating resources', async () => {

@@ -3,36 +3,9 @@
 
 const { lookup } = require('node:dns/promises');
 const { Agent, createServer: createHttpServer, request: requestHttp } = require('node:http');
-const { BlockList, connect, isIP } = require('node:net');
+const { connect, isIP } = require('node:net');
 
 const { canonicalizeHost } = require('./shared');
-
-const prohibitedProxyAddresses = new BlockList();
-
-for (const [network, prefix] of [
-  ['0.0.0.0', 8],
-  ['10.0.0.0', 8],
-  ['100.64.0.0', 10],
-  ['127.0.0.0', 8],
-  ['169.254.0.0', 16],
-  ['172.16.0.0', 12],
-  ['192.0.0.0', 24],
-  ['192.168.0.0', 16],
-  ['198.18.0.0', 15],
-  ['224.0.0.0', 4],
-  ['240.0.0.0', 4],
-]) {
-  prohibitedProxyAddresses.addSubnet(network, prefix, 'ipv4');
-}
-for (const [network, prefix] of [
-  ['::', 128],
-  ['::1', 128],
-  ['fc00::', 7],
-  ['fe80::', 10],
-  ['ff00::', 8],
-]) {
-  prohibitedProxyAddresses.addSubnet(network, prefix, 'ipv6');
-}
 
 function parseProxyPort(value, defaultPort) {
   const rawPort = value ?? String(defaultPort);
@@ -69,16 +42,6 @@ function denyProxyRequest(client, status = '403 Forbidden', headers = {}) {
   for (const [name, value] of Object.entries(headers)) response += `${name}: ${value}\r\n`;
   client.write(`${response}\r\n`);
   client.end();
-}
-
-function isPublicProxyAddress(address) {
-  const canonicalAddress = canonicalizeHost(address);
-  if (!canonicalAddress) return false;
-
-  const family = isIP(canonicalAddress);
-  if (family === 4) return !prohibitedProxyAddresses.check(canonicalAddress, 'ipv4');
-  if (family === 6) return !prohibitedProxyAddresses.check(canonicalAddress, 'ipv6');
-  return false;
 }
 
 async function resolveProxyEndpoints(host) {
@@ -373,6 +336,5 @@ function startFilterProxy(options) {
 }
 
 module.exports = {
-  isPublicProxyAddress,
   startFilterProxy,
 };
