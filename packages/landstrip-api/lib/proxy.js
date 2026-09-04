@@ -62,8 +62,12 @@ function splitHostPort(target) {
   return { host, port };
 }
 
-function denyProxyRequest(client, status = '403 Forbidden') {
-  client.write(`HTTP/1.1 ${status}\r\nContent-Length: 0\r\n\r\n`);
+const proxyAuthenticateChallenge = 'Basic realm="landstrip"';
+
+function denyProxyRequest(client, status = '403 Forbidden', headers = {}) {
+  let response = `HTTP/1.1 ${status}\r\nContent-Length: 0\r\n`;
+  for (const [name, value] of Object.entries(headers)) response += `${name}: ${value}\r\n`;
+  client.write(`${response}\r\n`);
   client.end();
 }
 
@@ -176,11 +180,12 @@ function startFilterProxy(options) {
     return forwarded;
   }
 
-  function denyHttpRequest(response, statusCode, statusMessage) {
+  function denyHttpRequest(response, statusCode, statusMessage, headers = {}) {
     if (!response.headersSent) {
       response.writeHead(statusCode, statusMessage, {
         Connection: 'close',
         'Content-Length': '0',
+        ...headers,
       });
     }
     response.end();
@@ -220,7 +225,9 @@ function startFilterProxy(options) {
 
   async function handleHttp(clientRequest, clientResponse) {
     if (!isAuthorized(clientRequest.headers)) {
-      denyHttpRequest(clientResponse, 407, 'Proxy Authentication Required');
+      denyHttpRequest(clientResponse, 407, 'Proxy Authentication Required', {
+        'Proxy-Authenticate': proxyAuthenticateChallenge,
+      });
       return;
     }
 
@@ -314,7 +321,9 @@ function startFilterProxy(options) {
   server.on('connection', trackSocket);
   server.on('connect', (request, client, head) => {
     if (!isAuthorized(request.headers)) {
-      denyProxyRequest(client, '407 Proxy Authentication Required');
+      denyProxyRequest(client, '407 Proxy Authentication Required', {
+        'Proxy-Authenticate': proxyAuthenticateChallenge,
+      });
       return;
     }
     handleConnect(client, request.url, head).catch(() =>

@@ -500,6 +500,24 @@ test('proxy connects to allowed private destinations', async () => {
             socket.on('error', rejectResponse);
           });
           assert.match(unauthenticated, /^HTTP\/1\.1 407 Proxy Authentication Required/);
+          assert.match(unauthenticated, /\r\nProxy-Authenticate: Basic realm="landstrip"\r\n/);
+
+          const unauthenticatedHttp = await new Promise((resolveResponse, rejectResponse) => {
+            const socket = connect(port, '127.0.0.1', () => {
+              socket.write(
+                `GET http://127.0.0.1:${address.port}/ HTTP/1.1\r\nHost: 127.0.0.1:${address.port}\r\n\r\n`,
+              );
+            });
+            let data = '';
+            socket.setEncoding('utf-8');
+            socket.on('data', (chunk) => {
+              data += chunk;
+            });
+            socket.on('close', () => resolveResponse(data));
+            socket.on('error', rejectResponse);
+          });
+          assert.match(unauthenticatedHttp, /^HTTP\/1\.1 407 Proxy Authentication Required/);
+          assert.match(unauthenticatedHttp, /\r\nProxy-Authenticate: Basic realm="landstrip"\r\n/);
 
           const response = await new Promise((resolveResponse, rejectResponse) => {
             const socket = connect(port, '127.0.0.1', () => {
