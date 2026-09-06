@@ -12,7 +12,7 @@ import {
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import { visibleWidth } from '@earendil-works/pi-tui';
-import { expect, test, vi } from 'vitest';
+import { describe, expect, test, vi } from 'vitest';
 
 import { loadAgentCatalog } from './agents.ts';
 import { contextFromEnvironment, LANDSTRIP_CONTEXT_ENV } from './api.ts';
@@ -22,6 +22,7 @@ import {
   dialogKeys,
   dialogTabs,
   isSupportedPiVersion,
+  modelEndpointDomains,
   paneRow,
   paneTop,
   registerSubagentWorker,
@@ -96,6 +97,7 @@ test('propagates registered extensions and public context to workers', async () 
         { provider: 'local', id: 'local-model', baseUrl: 'http://[0:0:0:0:0:0:0:1]:11434/v1' },
         { provider: 'invalid', id: 'invalid-model', baseUrl: 'not a url' },
       ],
+      isUsingOAuth: () => false,
     },
     ui: { notify() {} },
     sessionManager: { getSessionId: () => 'root-session' },
@@ -160,6 +162,34 @@ test('propagates registered extensions and public context to workers', async () 
   expect(context).not.toHaveProperty('rules');
 });
 
+describe('model endpoint domains', () => {
+  const models = [
+    { provider: 'anthropic', id: 'claude', baseUrl: 'https://api.anthropic.com' },
+    { provider: 'openai', id: 'gpt', baseUrl: 'https://api.openai.com/v1' },
+  ];
+  const contextFor = (oauthProviders: string[]): ExtensionContext =>
+    ({
+      modelRegistry: {
+        getAll: () => models,
+        isUsingOAuth: (model: { provider: string }) => oauthProviders.includes(model.provider),
+      },
+    }) as unknown as ExtensionContext;
+
+  test('adds the token refresh host for OAuth-authenticated providers', () => {
+    expect(modelEndpointDomains(contextFor(['anthropic']), 'anthropic/claude')).toEqual([
+      'api.anthropic.com',
+      'platform.claude.com',
+    ]);
+  });
+
+  test('keeps API-key providers limited to the model endpoint', () => {
+    expect(modelEndpointDomains(contextFor([]), 'anthropic/claude')).toEqual(['api.anthropic.com']);
+  });
+
+  test('ignores OAuth on providers without a known refresh host', () => {
+    expect(modelEndpointDomains(contextFor(['openai']), 'openai/gpt')).toEqual(['api.openai.com']);
+  });
+});
 test('renders task result envelopes', () => {
   expect(renderTaskResult('task-1', 'completed', 'Result text')).toBe(
     '<task id="task-1" state="completed">\n<task_result>\nResult text\n</task_result>\n</task>',

@@ -749,8 +749,21 @@ function endpointHost(baseUrl: string | undefined): string | undefined {
   }
 }
 
-/** Model API domain the worker may reach without a permission prompt. */
-function modelEndpointDomains(ctx: ExtensionContext, selectedModel: string): string[] {
+/**
+ * Hosts pi's OAuth flows refresh access tokens against, keyed by provider id.
+ * These differ from the model base URL, so a worker refreshing an expiring
+ * token mid-task would otherwise prompt or, without a UI, fail.
+ */
+const OAUTH_REFRESH_HOSTS: Readonly<Record<string, string>> = {
+  anthropic: 'platform.claude.com',
+  'github-copilot': 'api.github.com',
+  'kimi-coding': 'auth.kimi.com',
+  'openai-codex': 'auth.openai.com',
+  xai: 'auth.x.ai',
+};
+
+/** Model API domains the worker may reach without a permission prompt. */
+export function modelEndpointDomains(ctx: ExtensionContext, selectedModel: string): string[] {
   const models = ctx.modelRegistry?.getAll() ?? [];
   const qualified = models.find((model) => `${model.provider}/${model.id}` === selectedModel);
   // An unqualified model name is only trusted when it matches exactly one entry.
@@ -759,8 +772,13 @@ function modelEndpointDomains(ctx: ExtensionContext, selectedModel: string): str
   const activeName = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
   const active =
     selectedModel === activeName || selectedModel === ctx.model?.id ? ctx.model : undefined;
-  const host = endpointHost(registered?.baseUrl ?? active?.baseUrl);
-  return host ? [host] : [];
+  const model = registered ?? active;
+  const host = endpointHost(model?.baseUrl);
+  if (!host) return [];
+  const domains = [host];
+  const refreshHost = model && OAUTH_REFRESH_HOSTS[model.provider];
+  if (refreshHost && ctx.modelRegistry?.isUsingOAuth(model)) domains.push(refreshHost);
+  return domains;
 }
 
 function agentBootstrapPaths(agentDir: string): string[] {
