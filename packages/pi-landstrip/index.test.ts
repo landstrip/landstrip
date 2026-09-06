@@ -162,6 +162,14 @@ describe('filesystem tool policy authorization', () => {
   it('fails closed without a UI when approval is required', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'pi-landstrip-file-tool-headless-'));
     const outside = mkdtempSync(join(tmpdir(), 'pi-landstrip-file-tool-headless-outside-'));
+    const agentDir = mkdtempSync(join(tmpdir(), 'pi-landstrip-file-tool-headless-agent-'));
+    vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
+    writeFileSync(
+      join(agentDir, 'sandbox.json'),
+      JSON.stringify({
+        filesystem: { allowRead: ['.'], allowWrite: ['.'] },
+      }),
+    );
     const ctx = { cwd, hasUI: false } as ExtensionContext;
 
     await expect(
@@ -173,6 +181,7 @@ describe('filesystem tool policy authorization', () => {
       prompted: false,
       reason: 'Filesystem access requires approval',
     });
+    vi.unstubAllEnvs();
   });
 });
 
