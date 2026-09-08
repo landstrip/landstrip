@@ -68,22 +68,22 @@ function sessionScopeFor(filePath, baseDirectory) {
 }
 
 function canonicalizeHost(host) {
+  if (/[\s\p{Cc}/\\@?#]/u.test(host)) return null;
+
   const bracketed = host.startsWith('[');
   if (bracketed !== host.endsWith(']')) return null;
-
-  // A trailing dot ("pastebin.com.") is the same host to DNS but would slip
-  // past a literal deny entry; strip a single trailing dot and reject the rest.
-  const value = bracketed ? host.slice(1, -1) : host.replace(/\.$/, '');
-  if (!value || value.endsWith('.')) return null;
+  const value = bracketed ? host.slice(1, -1) : host;
 
   if (ipaddr.isValid(value)) {
     if (bracketed && ipaddr.parse(value).kind() !== 'ipv6') return null;
     return ipaddr.process(value).toString();
   }
-  if (bracketed) return null;
+  if (bracketed || /[:%]/.test(value)) return null;
 
-  const ascii = domainToASCII(value);
-  if (!ascii) return null;
+  // A trailing dot ("pastebin.com.") is the same host to DNS but would slip
+  // past a literal deny entry; strip a single trailing dot and reject the rest.
+  const ascii = domainToASCII(value).replace(/\.$/, '');
+  if (!ascii || ascii.endsWith('.')) return null;
 
   try {
     const parsed = new URL(`http://${ascii}/`);
