@@ -4,6 +4,7 @@
 const { lookup } = require('node:dns/promises');
 const { Agent, createServer: createHttpServer, request: requestHttp } = require('node:http');
 const { connect, isIP } = require('node:net');
+const { pipeline } = require('node:stream');
 
 const { canonicalizeHost } = require('./shared');
 
@@ -262,7 +263,9 @@ function startFilterProxy(options) {
         upstreamResponse.statusMessage,
         stripHopByHopHeaders(upstreamResponse.headers),
       );
-      upstreamResponse.pipe(clientResponse);
+      pipeline(upstreamResponse, clientResponse, (error) => {
+        if (error) upstreamRequest.destroy();
+      });
     });
     upstreamRequest.once('error', () => {
       if (!clientResponse.headersSent) {
@@ -272,8 +275,12 @@ function startFilterProxy(options) {
       }
     });
     clientRequest.once('aborted', () => upstreamRequest.destroy());
+    clientRequest.once('error', () => upstreamRequest.destroy());
+    clientResponse.once('error', () => upstreamRequest.destroy());
     clientResponse.once('close', () => {
-      if (!clientResponse.writableEnded) upstreamRequest.destroy();
+      clientRequest.unpipe(upstreamRequest);
+      upstreamRequest.destroy();
+      agent.destroy();
     });
     clientRequest.pipe(upstreamRequest);
   }
