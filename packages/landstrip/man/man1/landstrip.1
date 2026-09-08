@@ -126,11 +126,19 @@ Direct TCP connections and new Unix sockets are denied by default.
 Proxy port
 fields permit their loopback ports but do not start a proxy.
 .Va allowLocalBinding
-permits local TCP binding and loopback connections.
+permits local TCP binding and loopback connections on Linux and macOS.
+On macOS it also permits host-local UDP binding and datagrams through
+Seatbelt's localhost matcher; remote UDP destinations remain denied.
+Linux keeps UDP sockets denied in restricted mode, including when local
+binding is enabled: its connect/bind broker does not mediate per-datagram
+destinations.
+Windows does not support
+.Va allowLocalBinding .
 .Va allowUnixSockets
 permits listed pathname sockets.
 .Va allowNetwork
-turns off TCP enforcement while leaving filesystem policy active.
+turns off network enforcement while leaving filesystem policy active.
+It permits remote UDP and is not a substitute for restricted local UDP.
 .Pp
 Unix socket policy is unavailable on Windows.
 Linux 6.12 and newer also restrict

@@ -315,9 +315,23 @@ fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result
     }
 
     if network.allows_local_tcp_bind() {
-        sb.push_str("(allow network-outbound (remote tcp \"localhost:*\"))\n");
-        sb.push_str("(allow network-bind (local tcp \"localhost:*\"))\n");
-        sb.push_str("(allow network-inbound (local tcp \"localhost:*\"))\n");
+        // allowLocalBinding also grants host-local UDP on Seatbelt. Match the
+        // destination for outbound traffic: a local/source filter would allow
+        // remote egress from a locally bound socket.
+        for protocol in ["tcp", "udp"] {
+            writeln!(
+                sb,
+                "(allow network-outbound (remote {protocol} \"localhost:*\"))"
+            )?;
+            writeln!(
+                sb,
+                "(allow network-bind (local {protocol} \"localhost:*\"))"
+            )?;
+            writeln!(
+                sb,
+                "(allow network-inbound (local {protocol} \"localhost:*\"))"
+            )?;
+        }
     }
 
     match network.unix_socket_access() {
