@@ -3,7 +3,7 @@
   "version": "0.18.43",
   "private": true,
   "description": "Monorepo for Landstrip sandbox and extensions",
-  "license": "Apache-2.0 AND LGPL-2.1-or-later",
+  "license": "Apache-2.0 AND LGPL-3.0-or-later",
   "homepage": "https://github.com/landstrip/landstrip#readme",
   "repository": {
     "type": "git",

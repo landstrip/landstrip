@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
 //! Elevated broker that starts a worker under a leased local account.

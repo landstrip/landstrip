@@ -62,7 +62,9 @@ make ci
 
 | Package                    | License    |
 | -------------------------- | ---------- |
-| `landstrip`                | LGPL 2.1+  |
+| `landstrip`                | LGPL 3.0+  |
 | `@landstrip/landstrip-api` | Apache 2.0 |
 | `opencode-landstrip`       | Apache 2.0 |
 | `pi-landstrip`             | Apache 2.0 |
+
+Landstrip is licensed under LGPL-3.0-or-later. See [LICENSE](packages/landstrip/LICENSE).

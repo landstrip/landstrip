@@ -3,7 +3,7 @@
 authors = ["Jarkko Sakkinen <jarkko.sakkinen@iki.fi>"]
 description = "Sandbox for coding agents with parametrized state"
 edition = "2024"
-license = "LGPL-2.1-or-later"
+license = "LGPL-3.0-or-later"
 homepage = "https://github.com/landstrip/landstrip"
 repository = "https://github.com/landstrip/landstrip"
 name = "landstrip"

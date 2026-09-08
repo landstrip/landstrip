@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: LGPL-2.1-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright (C) Jarkko Sakkinen 2026
 
 set -euo pipefail

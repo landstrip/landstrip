@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-2.1-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
 //! The trap record: one JSON object per landstrip event, tagged by `kind` and
