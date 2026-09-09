@@ -20,10 +20,25 @@ pub(crate) enum PolicyFormat {
 
 impl PolicyFormat {
     pub(crate) fn parse_document(self, document: &str) -> std::result::Result<Value, Error> {
-        match self {
-            Self::Json => serde_json::from_str(document).map_err(parse_failed),
-            Self::Yaml => serde_yml::from_str(document).map_err(parse_failed),
+        let mut value: Value = match self {
+            Self::Json => serde_json::from_str(document).map_err(parse_failed)?,
+            Self::Yaml => serde_yml::from_str(document).map_err(parse_failed)?,
+        };
+        if !value.is_object()
+            || value
+                .get("filesystem")
+                .is_some_and(|filesystem| !filesystem.is_object())
+        {
+            return Err(parse_failed(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "policy root and filesystem must be objects",
+            )));
         }
+        if let Some(paths) = value.pointer_mut("/filesystem/denyReadAlways") {
+            let resolved = deserialize_paths(paths.take()).map_err(parse_failed)?;
+            *paths = Value::Array(resolved.into_iter().map(Value::String).collect());
+        }
+        Ok(value)
     }
 }
 
@@ -46,6 +61,8 @@ pub(crate) struct SandboxFilesystem {
     pub(crate) allow_read: Vec<String>,
     #[serde(deserialize_with = "deserialize_paths")]
     pub(crate) deny_read: Vec<String>,
+    #[serde(deserialize_with = "deserialize_paths")]
+    pub(crate) deny_read_always: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

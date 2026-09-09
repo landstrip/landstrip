@@ -464,6 +464,7 @@ fn supervise_child(
                 .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
                 || (revents[1].intersects(PollFlags::POLLIN)
                     && process_control_responses(
+                        policy,
                         cfd,
                         &mut control_buffer,
                         &mut pending_queries,
@@ -532,7 +533,7 @@ fn supervise_child(
                 // notification atomically via SECCOMP_ADDFD_FLAG_SEND; the child
                 // receives the broker's fd, eliminating the CONTINUE re-exec
                 // window. On failure grant_open responds with an errno itself.
-                grant_open(notify_fd, request.id, &grant);
+                grant_open(policy, notify_fd, request.id, &grant);
             }
             HandleResult::RunMutation(grant) => {
                 grant_mutation(notify_fd, request.id, &grant);
@@ -1660,8 +1661,10 @@ fn handle_openat(
     let wants_write = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0;
     let reports_write = flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) != 0;
     let wants_read = flags & libc::O_WRONLY == 0;
+    let hard_read_denied = wants_read && resolved.is_under_any(&policy.read_denied_always_roots);
+    let query_enabled = query_enabled && !hard_read_denied;
 
-    if wants_write {
+    if wants_write && !hard_read_denied {
         let lexical = normalize_path_lexically(&raw);
         let reason = policy.write_reason(&resolved, &lexical, true);
         if let Some(reason) = reason {
@@ -1729,11 +1732,9 @@ fn handle_openat(
     // broker's policy check). Landlock cannot express denyWrite holes under an
     // allowWrite root, so pin every allowed open — read or write — with an
     // OpenGrant and inject the broker's fd via SECCOMP_ADDFD.
-    let grant = match open_grant {
-        Some(grant) => grant,
-        None => OpenGrant::new(&resolved, flags, mode)
-            .map_err(|errno| BrokerError::SystemCall { errno })?,
-    };
+    let grant = open_grant
+        .map_or_else(|| OpenGrant::new(&resolved, flags, mode), Ok)
+        .map_err(|errno| BrokerError::SystemCall { errno })?;
     Ok(NotificationResult::Open(grant))
 }
 
@@ -2163,7 +2164,26 @@ fn handle_mutation(
         slots.push(Some((resolved, path)));
     }
 
-    denial = denial.or_else(|| reparent_read_denial(policy, spec, &slots));
+    let hard_read_denial = spec
+        .kind
+        .is_reparent()
+        .then(|| {
+            slots.iter().position(|slot| {
+                slot.as_ref().is_some_and(|(path, _)| {
+                    path.is_under_any(&policy.read_denied_always_roots)
+                        || policy
+                            .read_denied_always_roots
+                            .iter()
+                            .any(|root| root.is_under(path))
+                })
+            })
+        })
+        .flatten();
+    let query_enabled = query_enabled && hard_read_denial.is_none();
+    denial = hard_read_denial
+        .map(|index| (index, DenialReason::DenyMatch, TrapOperation::Read))
+        .or(denial)
+        .or_else(|| reparent_read_denial(policy, spec, &slots));
 
     let Some((index, reason, operation)) = denial else {
         // Broker operations where Landlock cannot represent denyWrite holes.
@@ -2603,6 +2623,7 @@ fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>
 const CONTROL_BUFFER_MAX: usize = 64 * 1024;
 
 fn process_control_responses(
+    policy: &AccessPolicy,
     control_fd: BorrowedFd<'_>,
     buffer: &mut Vec<u8>,
     pending_queries: &mut std::collections::HashMap<u64, PendingQuery>,
@@ -2677,7 +2698,7 @@ fn process_control_responses(
                     // The broker fulfils the operation itself — it runs outside
                     // the child's Landlock sandbox — so the approval works even
                     // for paths Landlock forbids.
-                    Some(Grant::Open(grant)) => grant_open(notify_fd, id, &grant),
+                    Some(Grant::Open(grant)) => grant_open(policy, notify_fd, id, &grant),
                     Some(Grant::Mutation(grant)) => grant_mutation(notify_fd, id, &grant),
                     Some(Grant::Socket(grant)) => grant_socket(notify_fd, id, &grant),
                     // No grant to satisfy: let the kernel run the syscall, still
@@ -2717,8 +2738,17 @@ fn deny_all_pending(
     }
 }
 
-fn grant_open(notify_fd: BorrowedFd<'_>, id: u64, grant: &OpenGrant) {
-    let opened = match broker_open(grant) {
+fn grant_open(policy: &AccessPolicy, notify_fd: BorrowedFd<'_>, id: u64, grant: &OpenGrant) {
+    let opened = broker_open(grant).and_then(|fd| {
+        if grant.flags & libc::O_WRONLY == 0
+            && !policy.read_denied_always_roots.is_empty()
+            && open_fd_path(fd.as_fd())?.is_under_any(&policy.read_denied_always_roots)
+        {
+            return Err(libc::EACCES);
+        }
+        Ok(fd)
+    });
+    let opened = match opened {
         Ok(fd) => fd,
         Err(errno) => {
             let _ = respond_notification(notify_fd, notification_error(id, -errno.abs()));

@@ -5,8 +5,9 @@
 //!
 //! Filesystem policy follows the Seatbelt-compatible shape. Writes start
 //! denied; `allowWrite` grants roots and `denyWrite` subtracts from them. Reads
-//! stay unrestricted unless `denyRead` is set; `allowRead` then adds paths back,
-//! with the most specific rule winning where an allow and a deny overlap.
+//! stay unrestricted unless `denyRead` or `denyReadAlways` is set. `allowRead`
+//! adds paths back from ordinary denials, with the most specific rule winning;
+//! `denyReadAlways` roots and descendants cannot be restored by any allow.
 //! Hard links and renames that would give a `denyRead` inode a readable name
 //! stay denied even when the destination is under `allowWrite`.
 //!
@@ -35,6 +36,7 @@ pub(crate) struct AccessPolicy {
     pub(crate) write_denied_links: Vec<PathBuf>,
     pub(crate) read_access: ReadAccess,
     pub(crate) read_denied_roots: Vec<PathBuf>,
+    pub(crate) read_denied_always_roots: Box<[PathBuf]>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) read_symlinks: Vec<PathBuf>,
     pub(crate) network_access: NetworkAccess,
@@ -287,6 +289,10 @@ pub(crate) fn resolve_policy(
     windows: &SandboxWindows,
     policy_base: &Path,
 ) -> Result<AccessPolicy> {
+    #[cfg(target_os = "windows")]
+    if !filesystem.deny_read_always.is_empty() {
+        return Err(Error::PolicyDenyReadAlwaysUnsupported.into());
+    }
     let home_dir = dirs::home_dir();
     let home = home_dir.as_deref();
     let policy_base = if policy_base.is_absolute() {
@@ -315,8 +321,15 @@ pub(crate) fn resolve_policy(
         .filter(|path| path.try_exists().unwrap_or(false))
         .collect::<Vec<_>>();
 
-    let read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
+    let mut read_deny = resolve_paths(&filesystem.deny_read, &policy_base, home)?;
     let mut read_denied_roots = effective_denied_roots(&read_deny, &read_allow);
+    let read_denied_always_roots = resolve_paths(&filesystem.deny_read_always, &policy_base, home)?;
+    let read_allow: Vec<_> = read_allow
+        .into_iter()
+        .filter(|path| !path.is_under_any(&read_denied_always_roots))
+        .collect();
+    read_deny.extend(read_denied_always_roots.iter().cloned());
+    normalize_roots(&mut read_deny);
     // Windows cannot attach deny entries to missing paths.
     #[cfg(target_os = "windows")]
     read_denied_roots.retain(|path| path.try_exists().unwrap_or(true));
@@ -327,6 +340,8 @@ pub(crate) fn resolve_policy(
 
     let (read_access, read_symlinks) =
         lower_read_access(&read_allow, &read_deny, &mut read_denied_roots)?;
+    read_denied_roots.extend(read_denied_always_roots.iter().cloned());
+    normalize_roots(&mut read_denied_roots);
     let policy = AccessPolicy {
         write_roots: write_allow,
         write_denied_roots: write_deny,
@@ -334,6 +349,7 @@ pub(crate) fn resolve_policy(
         write_denied_links,
         read_access,
         read_denied_roots,
+        read_denied_always_roots: read_denied_always_roots.into_boxed_slice(),
         read_symlinks,
         network_access: lower_network_policy(network, &policy_base, home)?,
         app_container_mode: windows.app_container_mode,

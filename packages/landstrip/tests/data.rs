@@ -249,6 +249,8 @@ struct Case {
     format: PolicyFormat,
     stdin_policy: bool,
     trap_fd: bool,
+    grant: bool,
+    grant_rename: Option<(String, String)>,
     fd3: Option<String>,
     cli: Vec<String>,
     launcher: Option<String>,
@@ -272,6 +274,8 @@ impl Case {
             format: PolicyFormat::Json,
             stdin_policy: false,
             trap_fd: false,
+            grant: false,
+            grant_rename: None,
             fd3: None,
             cli: Vec::new(),
             launcher: None,
@@ -294,6 +298,14 @@ impl Case {
                 "format" => case.format = parse_format(value),
                 "stdin_policy" => case.stdin_policy = true,
                 "trap" => case.trap_fd = true,
+                "grant" => {
+                    case.trap_fd = true;
+                    case.grant = true;
+                }
+                "grant_rename" => {
+                    let (from, to) = value.split_once(':').expect("grant_rename=from:to");
+                    case.grant_rename = Some((from.to_owned(), to.to_owned()));
+                }
                 "fd3" => case.fd3 = Some(value.to_owned()),
                 "cli" => case.cli.extend(tokenize(value)),
                 "launcher" => case.launcher = Some(value.to_owned()),
@@ -505,7 +517,11 @@ impl Case {
         }
 
         let trapfd_path = self.trapfd_path(dir);
-        attach_fd3(&mut command, trapfd_path.as_deref());
+        let rename = self
+            .grant_rename
+            .as_ref()
+            .map(|(from, to)| (dir.join(resolver.subst(from)), dir.join(resolver.subst(to))));
+        let responder = attach_fd3(&mut command, trapfd_path.as_deref(), self.grant, rename);
 
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         command.stdin(if self.stdin_policy {
@@ -517,6 +533,7 @@ impl Case {
         let mut child = command
             .spawn()
             .map_err(|e| format!("spawn landstrip: {e}"))?;
+        drop(command);
         if self.stdin_policy {
             let body =
                 self.render_policy(resolver, self.policies.first().map_or("", String::as_str));
@@ -530,6 +547,12 @@ impl Case {
         let output = child
             .wait_with_output()
             .map_err(|e| format!("wait landstrip: {e}"))?;
+        if let Some(responder) = responder {
+            responder
+                .join()
+                .map_err(|_| "trap responder panicked")?
+                .map_err(|e| format!("trap responder: {e}"))?;
+        }
 
         let merged = merge(&output.stdout, &output.stderr);
         let code = output.status.code().unwrap_or(-1);
@@ -2183,17 +2206,54 @@ fn slug(name: &str) -> String {
 }
 
 #[cfg(unix)]
-fn attach_fd3(command: &mut Command, path: Option<&Path>) {
-    use std::os::fd::AsRawFd;
+fn attach_fd3(
+    command: &mut Command,
+    path: Option<&Path>,
+    grant: bool,
+    mut rename: Option<(PathBuf, PathBuf)>,
+) -> Option<std::thread::JoinHandle<std::io::Result<()>>> {
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
 
-    let Some(path) = path else { return };
-    let file = std::fs::OpenOptions::new()
+    let path = path?;
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(path)
         .expect("open fd3 file");
+    let (fd, responder): (OwnedFd, _) = if grant {
+        let (mut control, child) = UnixStream::pair().expect("trap socket pair");
+        control
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("trap timeout");
+        let reader = BufReader::new(control.try_clone().expect("clone trap socket"));
+        let responder = std::thread::spawn(move || {
+            for line in reader.lines() {
+                let line = line?;
+                writeln!(file, "{line}")?;
+                let trap: serde_json::Value = serde_json::from_str(&line)?;
+                if trap["state"] == "query" {
+                    if let Some((from, to)) = rename.take() {
+                        std::fs::rename(from, to)?;
+                    }
+                    writeln!(
+                        control,
+                        "{}",
+                        serde_json::json!({
+                            "query_id": trap["query_id"], "action": "allow"
+                        })
+                    )?;
+                }
+            }
+            Ok(())
+        });
+        (child.into(), Some(responder))
+    } else {
+        (file.into(), None)
+    };
     // SAFETY: dup2 duplicates the open descriptor onto fd 3 in the forked child
     // before exec; the source descriptor stays valid for the closure's lifetime.
     // FD_CLOEXEC is cleared explicitly so fd 3 survives exec even when the source
@@ -2201,16 +2261,24 @@ fn attach_fd3(command: &mut Command, path: Option<&Path>) {
     // the flag, which would otherwise close it).
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(file.as_raw_fd(), 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+            if libc::dup2(fd.as_raw_fd(), 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
+    responder
 }
 
 #[cfg(not(unix))]
-fn attach_fd3(_command: &mut Command, _path: Option<&Path>) {}
+fn attach_fd3(
+    _command: &mut Command,
+    _path: Option<&Path>,
+    _grant: bool,
+    _rename: Option<(PathBuf, PathBuf)>,
+) -> Option<std::thread::JoinHandle<std::io::Result<()>>> {
+    None
+}
 
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: &str) -> Result<(), String> {

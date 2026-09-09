@@ -69,6 +69,8 @@ pub(crate) enum Error {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PolicyUnrestrictedRead,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    PolicyDenyReadAlwaysUnsupported,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PolicyTcpBindUnsupported,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     PolicyUnixSocketUnsupported,
@@ -156,6 +158,9 @@ impl Error {
             Self::PolicyParseFailed { .. } => Some("policy document is not valid JSON or YAML"),
             Self::PolicyUnrestrictedRead => {
                 Some("unrestricted reads are unsupported by the active Windows sandbox")
+            }
+            Self::PolicyDenyReadAlwaysUnsupported => {
+                Some("denyReadAlways is unsupported on Windows")
             }
             Self::PolicyTcpBindUnsupported => {
                 Some("local TCP binding is unsupported by the active Windows sandbox")
