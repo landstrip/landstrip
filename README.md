@@ -3,36 +3,16 @@
 `landstrip` runs commands in an OS-level sandbox using Landlock on Linux,
 Seatbelt on macOS, and AppContainer or restricted users on Windows.
 
-## Install
+## Quick start
+
+Install the CLI and native binary for your platform:
 
 ```sh
 npm install --save-dev @landstrip/landstrip-api
-npx landstrip run -p policy.json -- cargo test
 ```
 
-The npm package installs a Node.js wrapper and a native binary for the current
-platform.
-
-## Usage
-
-```sh
-landstrip run -p policy.json -- cargo test
-landstrip policy validate -p policy.json
-landstrip policy resolve -p policy.json
-landstrip doctor
-```
-
-Run `landstrip --help` or see [landstrip(1)](packages/landstrip/man/man1/landstrip.1) for the full
-command reference.
-
-## Agent extensions
-
-| Integration | Package                | Documentation                                                        |
-| ----------- | ---------------------- | -------------------------------------------------------------------- |
-| OpenCode    | `opencode-landstrip`   | [OpenCode](packages/opencode-landstrip/README.md)                    |
-| Pi          | `pi-landstrip`         | [Pi](packages/pi-landstrip/README.md)                                |
-
-## Policy
+For Linux or macOS, save this as `policy.json`. Windows requires explicit read
+grants for the program and its dependencies; see the manual below.
 
 ```json
 {
@@ -49,22 +29,26 @@ command reference.
 }
 ```
 
-Pass policies with `-p, --policy <FILE>`. Later policies merge over earlier
-ones. Platform behavior and limits are documented in the manual.
+```sh
+npx landstrip run -p policy.json -- cargo test
+npx landstrip policy validate -p policy.json
+npx landstrip doctor
+```
+
+See [landstrip(1)](packages/landstrip/man/man1/landstrip.1) for policy rules,
+merged-policy inspection, CLI options, and platform limits.
+
+## Integrations
+
+- [Node.js API](packages/landstrip-api/README.md): native binary access and trap types.
+- [OpenCode](packages/opencode-landstrip/README.md): `opencode-landstrip` plugin.
+- [Pi](packages/pi-landstrip/README.md): `pi-landstrip` extension and subagents.
 
 ## Development
 
-```sh
-make ci
-```
+Run `make ci` from the repository root.
 
-## Licensing
+## License
 
-| Package                    | License    |
-| -------------------------- | ---------- |
-| `landstrip`                | LGPL 3.0+  |
-| `@landstrip/landstrip-api` | Apache 2.0 |
-| `opencode-landstrip`       | Apache 2.0 |
-| `pi-landstrip`             | Apache 2.0 |
-
-Landstrip is licensed under LGPL-3.0-or-later. See [LICENSE](packages/landstrip/LICENSE).
+- Native sandbox: [LGPL-3.0-or-later](packages/landstrip/LICENSE).
+- Node.js API and agent extensions: Apache-2.0; see each package's `LICENSE`.

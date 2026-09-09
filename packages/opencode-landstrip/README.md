@@ -1,51 +1,44 @@
 # opencode-landstrip
 
-OpenCode plugin that runs AI `bash` calls through Landstrip.
+Landstrip sandboxing for AI `bash` calls in OpenCode ≥1.17.7.
 
-## Install
+## Install and use
 
 ```sh
-# Current project
-opencode plugin install opencode-landstrip
-
-# Global
-opencode plugin install opencode-landstrip --global
+opencode plugin install opencode-landstrip          # project
+opencode plugin install opencode-landstrip --global # global
 ```
 
-The installer configures both the server plugin and TUI presenter.
+Installation configures server and TUI plugins. `/landstrip` opens the management
+pane; Pi's agent/task subcommands are unavailable.
 
-## Permissions
+## Permissions and configuration
 
-OpenCode permissions authorize tool dispatch. Landstrip permissions authorize
-filesystem and network access. Agent approval never bypasses a sandbox hard
-denial, and requests without a live presenter are denied.
+OpenCode authorizes tool dispatch; Landstrip enforces filesystem/network access.
+Approval never bypasses hard denials. Interactive requests without a live
+presenter remain denied. Only AI `bash` receives OS isolation: OpenCode's plugin
+API cannot replace direct user shell commands.
 
-OpenCode intentionally exposes one plugin slash command: `/landstrip`, which
-opens the bottom management pane. Pi-only agent and task subcommands are not
-available. Persistent approvals update `.opencode/sandbox.json` or
-`~/.config/opencode/sandbox.json`.
+Policy precedence (persistent approvals update the project/global files):
 
-## Configuration
+1. Bundled [`sandbox.json`](sandbox.json).
+2. `~/.config/opencode/sandbox.json`.
+3. `.opencode/sandbox.json`.
+4. Plugin options.
 
-Policy merges in this order:
+Arrays combine; later scalar values win. Defaults allow project writes, deny
+sensitive-file writes, and block network access. Enabled sandboxing fails closed
+on unusable binaries/platforms; `enabled: false` explicitly permits unsandboxed Bash.
 
-1. bundled `sandbox.json`;
-2. `~/.config/opencode/sandbox.json`;
-3. `.opencode/sandbox.json`;
-4. plugin options.
+See [landstrip(1)](../landstrip/man/man1/landstrip.1) for native CLI/policy semantics.
+Runtime seccomp traps/query approval are Linux-only. Native macOS `--trap` reports
+setup/launch errors only and closes on successful exec—not runtime violations.
 
-Objects merge recursively, arrays combine, and later scalar values replace
-earlier values. The bundled policy denies sensitive files and network access
-while allowing project writes. See [`sandbox.json`](sandbox.json) for its exact
-defaults.
+## Development
 
-If sandboxing is enabled but the binary or platform is unusable, AI Bash fails
-closed. Set `enabled` to `false` explicitly to allow unsandboxed AI Bash.
+From this package: `npm ci`, then `npm run all` (format, lint, typecheck, tests).
+Read-only formatting check: `npm run ci:fmt`.
 
-Only AI `bash` calls receive OS isolation; direct user shell commands cannot be
-replaced through OpenCode's plugin API.
+## License
 
-## Licensing
-
-`opencode-landstrip` is licensed under the Apache 2.0 license. See [LICENSE](LICENSE)
-for more information.
+Apache-2.0; see [LICENSE](LICENSE).
