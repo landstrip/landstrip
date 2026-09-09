@@ -25,10 +25,12 @@ pub(crate) fn execute(
     tool: &OsStr,
     args: &[OsString],
     trap_fd: Option<&TrapFd>,
+    inherited_fds: &[std::os::fd::RawFd],
 ) -> Result<i32> {
     let profile = render_profile(policy).map_err(seatbelt_error)?;
     apply_profile(&profile)?;
-    close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd).as_slice()).map_err(seatbelt_error)?;
+    close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd).as_slice(), inherited_fds)
+        .map_err(seatbelt_error)?;
     let error = Command::new(tool).args(args).exec();
     Err(Error::launch(tool, error).into())
 }

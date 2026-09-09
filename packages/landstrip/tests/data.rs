@@ -250,6 +250,8 @@ struct Case {
     stdin_policy: bool,
     trap_fd: bool,
     fd3: Option<String>,
+    cli: Vec<String>,
+    launcher: Option<String>,
     cwd: Option<String>,
     cmd: Option<String>,
     net: Option<Net>,
@@ -271,6 +273,8 @@ impl Case {
             stdin_policy: false,
             trap_fd: false,
             fd3: None,
+            cli: Vec::new(),
+            launcher: None,
             cwd: None,
             cmd: None,
             net: None,
@@ -291,6 +295,8 @@ impl Case {
                 "stdin_policy" => case.stdin_policy = true,
                 "trap" => case.trap_fd = true,
                 "fd3" => case.fd3 = Some(value.to_owned()),
+                "cli" => case.cli.extend(tokenize(value)),
+                "launcher" => case.launcher = Some(value.to_owned()),
                 "cwd" => case.cwd = Some(value.to_owned()),
                 "cmd" => case.cmd = Some(value.to_owned()),
                 "net" => case.net = Some(parse_net(value)),
@@ -456,8 +462,19 @@ impl Case {
             return run_fs(ctx, fs, self.format, &policies, resolver);
         }
 
-        let mut command = Command::new(&ctx.bin);
+        let mut command = if let Some(launcher) = &self.launcher {
+            let mut command = Command::new(&ctx.shell);
+            command
+                .arg("-c")
+                .arg(format!("{}; exec \"$@\"", resolver.subst(launcher)))
+                .arg("_")
+                .arg(&ctx.bin);
+            command
+        } else {
+            Command::new(&ctx.bin)
+        };
         command.arg("run");
+        command.args(self.cli.iter().map(|arg| resolver.subst(arg)));
         if self.format == PolicyFormat::Yaml || self.stdin_policy {
             command
                 .arg("--policy-format")
@@ -468,7 +485,7 @@ impl Case {
                 });
         }
         if self.trap_fd {
-            command.args(["--trap-fd", "3"]);
+            command.args(["--trap", "3"]);
         }
         if self.stdin_policy {
             command.args(["-p", "-"]);

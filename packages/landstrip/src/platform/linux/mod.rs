@@ -30,6 +30,7 @@ pub(crate) fn execute(
     tool: &OsStr,
     args: &[OsString],
     trap_fd: Option<&TrapFd>,
+    inherited_fds: &[std::os::fd::RawFd],
 ) -> Result<i32> {
     let network = &policy.network_access;
     if network.unix_socket_access().needs_broker() {
@@ -47,5 +48,6 @@ pub(crate) fn execute(
         network.needs_network_broker(),
         needs_fs_broker,
         trap_fd,
+        inherited_fds,
     )
 }

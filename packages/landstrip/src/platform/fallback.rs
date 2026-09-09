@@ -19,6 +19,7 @@ pub(crate) fn execute(
     _tool: &OsStr,
     _args: &[OsString],
     _trap_fd: Option<&TrapFd>,
+    _inherited_fds: &[std::os::fd::RawFd],
 ) -> Result<i32> {
     Err(Error::PlatformUnsupported.into())
 }

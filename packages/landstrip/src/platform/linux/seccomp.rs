@@ -227,6 +227,7 @@ pub(super) fn run_broker(
     needs_network: bool,
     needs_filesystem: bool,
     trap_fd: Option<&TrapFd>,
+    inherited_fds: &[RawFd],
 ) -> Result<i32> {
     let notify_bind = needs_network && policy.network_access.needs_bind_broker();
     // allowNetwork / allowAllUnixSockets leave unix unrestricted; still trap
@@ -312,7 +313,7 @@ pub(super) fn run_broker(
                 if let Some(trap_fd) = trap_fd {
                     excluded.push(trap_fd.as_raw_fd());
                 }
-                close_inherited_fds(&excluded).map_err(LandstripError::supervise)?;
+                close_inherited_fds(&excluded, inherited_fds).map_err(LandstripError::supervise)?;
 
                 let mut child_tool = Command::new(tool);
                 child_tool.args(args);
@@ -469,7 +470,7 @@ fn supervise_child(
                         notify_fd,
                     ));
             if dead {
-                // The launcher closed, errored, or violated the trap-fd protocol. Any deferred query
+                // The launcher closed, errored, or violated the trap protocol. Any deferred query
                 // is unanswerable: deny it with EACCES so the child's syscall
                 // resumes instead of hanging, and stop polling the fd so the loop
                 // does not spin on a dead socket.
@@ -2595,7 +2596,7 @@ fn read_child_string(pid: Pid, addr: usize, max_len: usize) -> SysResult<Vec<u8>
     Ok(buf)
 }
 
-/// Upper bound on the trap-fd control buffer. A well-formed launcher sends
+/// Upper bound on the trap control buffer. A well-formed launcher sends
 /// newline-terminated JSON responses, each far smaller than this; exceeding it
 /// without a newline means a broken or hostile peer and the partial run-on
 /// data is discarded rather than grown without limit.

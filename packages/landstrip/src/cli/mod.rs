@@ -84,6 +84,11 @@ fn run(command: &RunCommand) -> Result<CommandOutcome> {
         &command.tool,
         &command.tool_args,
         command.trap_fd.as_ref(),
+        &command
+            .inherited_fds
+            .iter()
+            .map(std::os::fd::AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>(),
     );
     #[cfg(not(unix))]
     let result = platform::execute(&policy, &command.tool, &command.tool_args);

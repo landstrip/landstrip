@@ -50,6 +50,8 @@ pub(super) struct RunCommand {
     pub(super) policy: PolicyInput,
     #[cfg(unix)]
     pub(super) trap_fd: Option<TrapFd>,
+    #[cfg(unix)]
+    pub(super) inherited_fds: Vec<OwnedFd>,
     pub(super) tool: OsString,
     pub(super) tool_args: Vec<OsString>,
 }
@@ -108,8 +110,13 @@ struct RunArgs {
 
     #[cfg(unix)]
     /// Write traps to an already-open file descriptor.
-    #[arg(long, value_name = "FD", value_parser = parse_trap_fd)]
+    #[arg(long = "trap", value_name = "FD", value_parser = parse_fd)]
     trap_fd: Option<i32>,
+
+    #[cfg(unix)]
+    /// Preserve open descriptors across sandbox exec (grants access to those resources).
+    #[arg(long = "inherit", value_name = "FD[,FD...]", value_delimiter = ',', value_parser = parse_fd)]
+    inherited_fds: Vec<i32>,
 
     /// Program and arguments. The `--` separator is required.
     #[arg(last = true, required = true, num_args = 1.., value_name = "PROGRAM [ARGS...]")]
@@ -269,14 +276,38 @@ fn run_command(args: RunArgs) -> Result<RunCommand, Error> {
             message: "a program is required after --".to_owned(),
         });
     };
+    #[cfg(unix)]
+    let inherited_fds = {
+        let mut fds = args.inherited_fds;
+        fds.sort_unstable();
+        if fds.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(Error::Usage {
+                message: "--inherit must not contain duplicate descriptors".to_owned(),
+            });
+        }
+        if args.trap_fd.is_some_and(|fd| fds.contains(&fd)) {
+            return Err(Error::Usage {
+                message: "--inherit must not include --trap".to_owned(),
+            });
+        }
+        fds.into_iter()
+            .map(|fd| {
+                // SAFETY: parse_fd validated this inherited descriptor. The
+                // CLI owns it; duplicate and trap checks ensure unique ownership.
+                unsafe { OwnedFd::from_raw_fd(fd) }
+            })
+            .collect()
+    };
     Ok(RunCommand {
         policy: args.policy,
         #[cfg(unix)]
         trap_fd: args.trap_fd.map(|fd| {
-            // SAFETY: parse_trap_fd established that the inherited descriptor is open,
-            // and `--trap-fd` transfers its ownership to this process.
+            // SAFETY: parse_fd established that the inherited descriptor is open,
+            // and `--trap` transfers its ownership to this process.
             TrapFd::from(unsafe { OwnedFd::from_raw_fd(fd) })
         }),
+        #[cfg(unix)]
+        inherited_fds,
         tool,
         tool_args: program.collect(),
     })
@@ -322,18 +353,18 @@ fn parse_policy_path(path: &str) -> Result<PathBuf, String> {
 }
 
 #[cfg(unix)]
-fn parse_trap_fd(value: &str) -> Result<i32, String> {
+fn parse_fd(value: &str) -> Result<i32, String> {
     let fd = value
         .parse::<i32>()
-        .map_err(|_| "trap fd must be an integer greater than or equal to 3".to_owned())?;
+        .map_err(|_| "fd must be an integer greater than or equal to 3".to_owned())?;
     if fd < 3 {
-        return Err("trap fd must be an integer greater than or equal to 3".to_owned());
+        return Err("fd must be an integer greater than or equal to 3".to_owned());
     }
 
     // SAFETY: F_GETFD only inspects the scalar descriptor number.
     if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
         return Err(format!(
-            "trap fd {fd} is not open: {}",
+            "fd {fd} is not open: {}",
             std::io::Error::last_os_error()
         ));
     }

@@ -14,28 +14,44 @@ const FIRST_INHERITED_FD: RawFd = 3;
 /// An inherited descriptor is writable regardless of the sandbox profile.
 /// Excluded descriptors are marked close-on-exec instead: they survive long
 /// enough to report an `exec` that never happened, and the kernel drops them
-/// the instant the tool starts.
-pub(crate) fn close_inherited_fds(excluded: &[RawFd]) -> io::Result<()> {
-    for &fd in excluded {
-        set_cloexec(fd)?;
+/// the instant the tool starts. Only caller-selected `inherited` descriptors survive
+/// exec; these explicitly grant capabilities outside the filesystem/network policy.
+/// All supplied descriptors are borrowed and must remain open until exec.
+pub(crate) fn close_inherited_fds(excluded: &[RawFd], inherited: &[RawFd]) -> io::Result<()> {
+    if inherited.iter().any(|fd| *fd < 3 || excluded.contains(fd)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid inherited descriptor",
+        ));
     }
-
+    for &fd in excluded {
+        set_cloexec(fd, true)?;
+    }
+    for &fd in inherited {
+        set_cloexec(fd, false)?;
+    }
+    let retained: Vec<RawFd> = excluded.iter().chain(inherited).copied().collect();
     #[cfg(target_os = "linux")]
-    close_inherited_except(excluded)?;
+    close_inherited_except(&retained)?;
     #[cfg(target_os = "macos")]
-    close_inherited_except(excluded);
+    close_inherited_except(&retained);
     Ok(())
 }
 
-fn set_cloexec(fd: RawFd) -> io::Result<()> {
+fn set_cloexec(fd: RawFd, enabled: bool) -> io::Result<()> {
     // SAFETY: fcntl(2) copies scalar arguments only.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
         return Err(io::Error::last_os_error());
     }
 
+    let flags = if enabled {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
     // SAFETY: fcntl(2) copies scalar arguments only.
-    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

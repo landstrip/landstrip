@@ -175,7 +175,7 @@ test(
           await hooks['tool.execute.before'](input, output);
           const wrapped = output.args.command;
           assert.notEqual(wrapped, command, messages.join('\n'));
-          assert.match(wrapped, /'--trap-fd' '3'/);
+          assert.match(wrapped, /'--trap' '3'/);
           await hooks['tool.execute.before'](input, output);
           assert.equal(output.args.command, wrapped);
           assert.equal(output.args.description, 'write once before failure (landstrip)');
@@ -216,7 +216,7 @@ test('headless sandbox denies protected file access without hanging', linuxOnly,
 
       try {
         await hooks['tool.execute.before'](input, output);
-        assert.match(output.args.command, /'--trap-fd' '3'/);
+        assert.match(output.args.command, /'--trap' '3'/);
         await assert.rejects(
           execFileAsync('/bin/bash', ['-c', output.args.command], {
             cwd: tempDir,

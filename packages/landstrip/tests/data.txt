@@ -14,6 +14,38 @@ name=launch error reports a launch trap (macos) | os=macos | policy={"network":{
 name=policy parse error reports an internal trap | os=linux,macos | policy={bad | trap=true | cmd=%SHELL% -c 'printf ok' | status=!0 | out="kind":"internal" | out="code":"POLICY_PARSE_FAILED" | trapfd="kind":"internal" | trapfd="code":"POLICY_PARSE_FAILED"
 name=invalid proxy port reports an internal trap | os=linux,macos | policy={"network":{"httpProxyPort":0},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | trap=true | cmd=%SHELL% -c 'printf ok' | status=!0 | out="kind":"internal" | out="code":"POLICY_INVALID_PORT" | trapfd="code":"POLICY_INVALID_PORT"
 
+name=trap rejects empty fd | os=linux,macos | cli=--trap '' | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects noninteger fd | os=linux,macos | cli=--trap abc | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects negative fd | os=linux,macos | cli=--trap=-1 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects stdin | os=linux,macos | cli=--trap 0 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects stdout | os=linux,macos | cli=--trap 1 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects stderr | os=linux,macos | cli=--trap 2 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects closed fd | os=linux,macos | launcher=exec 7>&- | cli=--trap 7 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects fd overflow | os=linux,macos | cli=--trap 2147483648 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects fd list | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 | cli=--trap 3,4 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects multiple descriptors | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 | cli=--trap 3 --trap 4 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=trap rejects repeated descriptor | os=linux,macos | fd3=allowed/fds | cli=--trap 3 --trap 3 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects empty fd | os=linux,macos | cli=--inherit '' | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects noninteger fd | os=linux,macos | cli=--inherit abc | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects negative fd | os=linux,macos | cli=--inherit=-1 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects stdin | os=linux,macos | cli=--inherit 0 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects stdout | os=linux,macos | cli=--inherit 1 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects stderr | os=linux,macos | cli=--inherit 2 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects closed fd | os=linux,macos | launcher=exec 7>&- | cli=--inherit 7 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects fd overflow | os=linux,macos | cli=--inherit 2147483648 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects leading empty entry | os=linux,macos | fd3=allowed/fds | cli=--inherit ,3 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects trailing empty entry | os=linux,macos | fd3=allowed/fds | cli=--inherit 3, | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects middle empty entry | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 | cli=--inherit 3,,4 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects invalid list member | os=linux,macos | fd3=allowed/fds | cli=--inherit 3,abc | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects closed list member | os=linux,macos | fd3=allowed/fds | launcher=exec 7>&- | cli=--inherit 3,7 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects duplicate within list | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 | cli=--inherit 3,4,3 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects duplicate across lists | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 5>&3 | cli=--inherit 3,4 --inherit 5,3 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects duplicate singleton flags | os=linux,macos | fd3=allowed/fds | cli=--inherit 3 --inherit 3 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects trap overlap | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 | cli=--trap 3 --inherit 4,3 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=inherit rejects trap overlap in appended list | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 5>&3 | cli=--inherit 4 --inherit 5,3 --trap 3 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out="code":"USAGE_ERROR" | out!=tool-ran
+name=old trap-fd flag is unsupported | os=linux,macos | fd3=allowed/fds | cli=--trap-fd 3 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out=unexpected argument '--trap-fd' | out="code":"USAGE_ERROR" | out!=tool-ran
+name=old pass-fd flag is unsupported | os=linux,macos | fd3=allowed/fds | cli=--pass-fd 3 | policy={} | cmd=%SHELL% -c 'printf tool-ran' | status=2 | out=unexpected argument '--pass-fd' | out="code":"USAGE_ERROR" | out!=tool-ran
+
 # --- basic read/write policy ---
 
 name=unrestricted read policy runs tool | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed"]}} | cmd=%SHELL% -c 'printf ok' | status=0
@@ -71,6 +103,12 @@ name=denyWrite preserves ENOENT for a missing parent | os=linux | policy={"netwo
 
 name=dev null read and write are permitted | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}} | cmd=%SHELL% -c 'cat /dev/null >/dev/null' | status=0
 name=inherited fd cannot bypass write policy | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"],"allowRead":["/"]}} | fd3=denied/preopened.txt | cmd=%SHELL% -c 'if test -e /dev/fd/3; then echo fd3-inherited >&2; fi; echo bypass >&3' | status=!0 | out!=fd3-inherited | trapfd_empty
+name=unlisted fd closes on exec | os=linux,macos | fd3=allowed/fds | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed","/dev/null"]}} | cmd=%SHELL% -c 'if ( printf leaked >&3 ) 2>/dev/null; then exit 1; fi; printf closed' | status=0 | out=closed | trapfd_empty
+name=inherit list survives exec and closes unlisted fd | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 5>&3 6>&3 | cli=--inherit 3,4,6 | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed","/dev/null"]}} | cmd=%SHELL% -c 'if ( printf leaked >&5 ) 2>/dev/null; then exit 1; fi; printf fd3 >&3 && printf fd4 >&4 && printf fd6 >&6 && printf inherited' | status=0 | out=inherited | trapfd=fd3fd4fd6 | trapfd!=leaked
+name=inherit repeated lists append across exec | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 5>&3 6>&3 | cli=--inherit 3,4 --inherit 6 | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed","/dev/null"]}} | cmd=%SHELL% -c 'if ( printf leaked >&5 ) 2>/dev/null; then exit 1; fi; printf fd3 >&3 && printf fd4 >&4 && printf fd6 >&6 && printf inherited' | status=0 | out=inherited | trapfd=fd3fd4fd6 | trapfd!=leaked
+name=trap closes on successful exec | os=linux,macos | trap=true | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%","/dev/null"]}} | cmd=%SHELL% -c 'if ( printf leaked >&3 ) 2>/dev/null; then exit 1; fi; printf closed' | status=0 | out=closed | trapfd_empty
+name=combined trap and inherit list preserve only listed fds | os=linux,macos | trap=true | launcher=exec 4>&3 5>&3 6>&3 | cli=--inherit 4,6 | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%","/dev/null"]}} | cmd=%SHELL% -c 'if ( printf trap-leaked >&3 ) 2>/dev/null; then exit 1; fi; if ( printf unlisted-leaked >&5 ) 2>/dev/null; then exit 1; fi; printf fd4 >&4 && printf fd6 >&6 && printf inherited' | status=0 | out=inherited | trapfd=fd4fd6 | trapfd!=leaked
+name=combined trap and repeated inherit append across exec | os=linux,macos | fd3=allowed/fds | launcher=exec 4>&3 5>&3 6>&3 | cli=--trap 4 --inherit 3 --inherit 6 | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["%TMP%/allowed","/dev/null"]}} | cmd=%SHELL% -c 'if ( printf trap-leaked >&4 ) 2>/dev/null; then exit 1; fi; if ( printf unlisted-leaked >&5 ) 2>/dev/null; then exit 1; fi; printf fd3 >&3 && printf fd6 >&6 && printf inherited' | status=0 | out=inherited | trapfd=fd3fd6 | trapfd!=leaked
 name=denyRead blocks subdirectory listing | os=macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":["/dev/null"],"denyRead":["/"]}} | cmd=/bin/ls /usr | status=!0
 
 # --- O_PATH handle opens through the ADDFD broker (Linux) ---

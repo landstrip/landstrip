@@ -1862,7 +1862,7 @@ function createLandstripIntegrationWithPrompts(
       const stdio: StdioOptions = workerChildEnd
         ? ['pipe', 'pipe', 'pipe', workerChildEnd]
         : ['pipe', 'pipe', 'pipe'];
-      if (workerChildEnd) landstripArgs.splice(1, 0, '--trap-fd', '3');
+      if (workerChildEnd) landstripArgs.splice(1, 0, '--trap', '3');
       const child = spawn(binaryPath(), landstripArgs, {
         ...spawnOptions,
         cwd: options.cwd,
@@ -2086,7 +2086,7 @@ function createLandstripIntegrationWithPrompts(
             invocation.executable,
             ...invocation.args,
           ];
-          if (process.platform !== 'win32') landstripArgs.splice(1, 0, '--trap-fd', '3');
+          if (process.platform !== 'win32') landstripArgs.splice(1, 0, '--trap', '3');
         } catch (error) {
           await teardownResources();
           throw error;
@@ -2177,7 +2177,7 @@ function createLandstripIntegrationWithPrompts(
                 }
 
                 // Structured traps are trusted only from the trap socket; on
-                // Windows, where trap-fd inheritance is unsupported, use native
+                // Windows, where --trap is unsupported, use native
                 // kernel-denial text from stderr.
                 const blockedPath =
                   extractBlockedPath(errorFdAcc, cwd) ?? extractNativeDeniedPath(stderrAcc, cwd);

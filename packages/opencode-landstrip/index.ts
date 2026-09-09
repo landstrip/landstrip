@@ -509,7 +509,7 @@ function buildWrappedCommand(
   const trapped = [
     landstripBinaryPath(),
     'run',
-    '--trap-fd',
+    '--trap',
     '3',
     '-p',
     policyPath,

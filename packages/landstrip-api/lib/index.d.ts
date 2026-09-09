@@ -10,7 +10,7 @@ export type LandstripMechanism =
 /**
  * `query` holds the syscall until the launcher answers with a
  * {@link LandstripControlResponse}; `info` is terminal. Queries need a socket on
- * `--trap-fd`, and only the Linux broker raises them.
+ * `--trap`, and only the Linux broker raises them.
  */
 export type LandstripTrapState = 'query' | 'info';
 
@@ -118,7 +118,7 @@ export type LandstripInternalTrap =
 
 /**
  * One landstrip event. Failure and completed-denial events are written to
- * stderr; pending Linux query events are written only to `--trap-fd`.
+ * stderr; pending Linux query events are written only to `--trap`.
  */
 export type LandstripTrap =
   | LandstripFilesystemTrap
