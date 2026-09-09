@@ -26,7 +26,7 @@
     "./api": "./api.ts"
   },
   "scripts": {
-    "build": "node -e \"const fs = require('node:fs'); fs.rmSync('dist', { recursive: true, force: true }); fs.mkdirSync('dist'); fs.copyFileSync('sandbox.json', 'dist/sandbox.json')\" && bun build index.ts --outfile dist/index.ts --target=node --packages=external",
+    "build": "node -e \"const fs = require('node:fs'); fs.rmSync('dist', { recursive: true, force: true }); fs.mkdirSync('dist'); fs.copyFileSync('sandbox.json', 'dist/sandbox.json')\" && bun build index.ts --outfile dist/index.ts --target=node --packages=external && bun build worker-auth-entry.ts --outfile dist/worker-auth-entry.js --target=node --packages=external",
     "prepack": "npm run build",
     "fmt": "oxfmt *.ts package.json tsconfig.json sandbox.json .oxfmtrc.json README.md",
     "lint": "oxlint .",
@@ -42,9 +42,11 @@
     "@landstrip/landstrip-api": "^0.18.43",
     "jsonc-parser": "^3.3.1",
     "minimatch": "^10.2.5",
+    "undici": "^8.9.0",
     "yaml": "^2.9.0"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "^0.84.1",
     "@earendil-works/pi-coding-agent": "^0.84.1",
     "@earendil-works/pi-tui": "^0.84.1",
     "@types/node": "^24.0.0",
@@ -55,7 +57,8 @@
     "vitest": "^4.1.9"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": ">=0.82.0",
+    "@earendil-works/pi-coding-agent": ">=0.82.0",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },

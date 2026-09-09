@@ -41,7 +41,7 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from '@earendil-works/pi-tui';
-import { canonicalizeHost } from '@landstrip/landstrip-api/shared';
+import { canonicalizeHost, canonicalizePath } from '@landstrip/landstrip-api/shared';
 import { Type } from 'typebox';
 
 import {
@@ -89,6 +89,10 @@ import {
 } from './config.ts';
 import type { LandstripIntegration, LandstripRpcWorkerLaunch } from './index.ts';
 import { type ExtensionUiRequest, type ExtensionUiResult, RpcProcess } from './rpc-process.ts';
+import { resolveWorkerAuth, workerAuthHost, workerAuthResolver } from './worker-auth.ts';
+import { serveWorkerAuth } from './worker-auth-channel.ts';
+import { workerEnvironment } from './worker-environment.ts';
+import { collectWorkerResourceReadPaths } from './worker-resources.ts';
 import {
   colorizeAgentText,
   combineAbortSignals,
@@ -734,12 +738,6 @@ type WorkerFactory = (
   onRequest: (request: ExtensionUiRequest) => Promise<ExtensionUiResult>,
 ) => Promise<WorkerHandle>;
 
-function dependencyRoot(path: string): string | undefined {
-  const marker = `${sep}node_modules${sep}`;
-  const index = path.lastIndexOf(marker);
-  return index < 0 ? undefined : path.slice(0, index + marker.length - 1);
-}
-
 function endpointHost(baseUrl: string | undefined): string | undefined {
   if (!baseUrl) return undefined;
   try {
@@ -762,8 +760,10 @@ const OAUTH_REFRESH_HOSTS: Readonly<Record<string, string>> = {
   xai: 'auth.x.ai',
 };
 
-/** Model API domains the worker may reach without a permission prompt. */
-export function modelEndpointDomains(ctx: ExtensionContext, selectedModel: string): string[] {
+function modelEndpoint(
+  ctx: ExtensionContext,
+  selectedModel: string,
+): { provider?: string; model: string; domains: string[]; selected?: ExtensionContext['model'] } {
   const models = ctx.modelRegistry?.getAll() ?? [];
   const qualified = models.find((model) => `${model.provider}/${model.id}` === selectedModel);
   // An unqualified model name is only trusted when it matches exactly one entry.
@@ -771,17 +771,54 @@ export function modelEndpointDomains(ctx: ExtensionContext, selectedModel: strin
   const registered = qualified ?? (byId.length === 1 ? byId[0] : undefined);
   const activeName = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
   const active =
-    selectedModel === activeName || selectedModel === ctx.model?.id ? ctx.model : undefined;
+    selectedModel === activeName || (byId.length === 0 && selectedModel === ctx.model?.id)
+      ? ctx.model
+      : undefined;
   const model = registered ?? active;
-  const host = endpointHost(model?.baseUrl);
-  if (!host) return [];
-  const domains = [host];
-  const refreshHost = model && OAUTH_REFRESH_HOSTS[model.provider];
+  if (!model) return { model: selectedModel, domains: [] };
+  const domains: string[] = [];
+  const endpoint = {
+    provider: model.provider,
+    model: `${model.provider}/${model.id}`,
+    domains,
+    selected: structuredClone(model),
+  };
+  const host = endpointHost(model.baseUrl);
+  if (!host) return endpoint;
+  domains.push(host);
+  const refreshHost = OAUTH_REFRESH_HOSTS[endpoint.provider];
   if (refreshHost && ctx.modelRegistry?.isUsingOAuth(model)) domains.push(refreshHost);
-  return domains;
+  return endpoint;
 }
 
-function agentBootstrapPaths(agentDir: string): string[] {
+/** Model API domains the worker may reach without a permission prompt. */
+export function modelEndpointDomains(ctx: ExtensionContext, selectedModel: string): string[] {
+  return modelEndpoint(ctx, selectedModel).domains;
+}
+
+async function workerEndpoint(
+  ctx: ExtensionContext,
+  selectedModel: string,
+  signal: AbortSignal,
+): Promise<
+  ReturnType<typeof modelEndpoint> & { resolveAuth?: ReturnType<typeof workerAuthResolver> }
+> {
+  if (signal.aborted) throw new Error('Task cancelled');
+  const endpoint = modelEndpoint(ctx, selectedModel);
+  const { provider, domains, selected } = endpoint;
+  if (provider === undefined) return endpoint;
+  const auth = await resolveWorkerAuth(ctx.modelRegistry, provider, signal, selected);
+  const host = workerAuthHost(auth?.auth.baseUrl);
+  const granted = [...new Set(host ? [...domains, host] : domains)];
+  return {
+    ...endpoint,
+    domains: granted,
+    resolveAuth:
+      auth && selected ? workerAuthResolver(ctx.modelRegistry, selected, granted) : undefined,
+  };
+}
+
+function agentBootstrapPaths(agentDir: string, privateAuth: boolean): string[] {
   // The directory itself must be readable: the worker enumerates it during
   // startup, and the default denyRead roots (/home, /Users) would otherwise
   // block it.
@@ -789,7 +826,7 @@ function agentBootstrapPaths(agentDir: string): string[] {
     'settings.json',
     'landstrip.json',
     'models.json',
-    'auth.json',
+    ...(privateAuth ? [] : ['auth.json']),
     'trust.json',
     'AGENTS.md',
     'SYSTEM.md',
@@ -3184,10 +3221,13 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     signal: AbortSignal,
     onRequest: (request: ExtensionUiRequest) => Promise<ExtensionUiResult>,
   ): Promise<WorkerHandle> {
+    if (signal.aborted) throw new Error('Task cancelled');
     const invocation = this.piInvocation();
     this.validatePiInvocation();
     const model = agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
     if (!model) throw new Error(`No model available for subagent ${agent.name}`);
+    const endpoint = await workerEndpoint(ctx, model, signal);
+    if (signal.aborted) throw new Error('Task cancelled');
     const thinking =
       agent.variant && PI_THINKING_LEVELS.has(agent.variant)
         ? agent.variant
@@ -3213,10 +3253,17 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       : this.pi.getActiveTools().filter((tool) => tool !== 'task');
     const tools = permittedToolNames(activeTools, rules);
     const workerExtensions = this.integration.getWorkerExtensions?.() ?? [];
+    const workerEntry = join(
+      packageDir,
+      existsSync(join(packageDir, 'worker-auth-entry.js'))
+        ? 'worker-auth-entry.js'
+        : 'worker-auth-entry.ts',
+    );
     const args = [
-      ...invocation.args,
+      ...(endpoint.resolveAuth ? [workerEntry] : invocation.args),
       '--mode',
       'rpc',
+      '--offline',
       '--extension',
       join(packageDir, 'index.ts'),
       ...workerExtensions.flatMap((extension) => ['--extension', extension.entry]),
@@ -3225,8 +3272,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         : task.sessionDir
           ? ['--session-dir', task.sessionDir]
           : []),
+      ...(endpoint.provider === undefined ? [] : ['--provider', endpoint.provider]),
       '--model',
-      model,
+      endpoint.model,
       '--thinking',
       thinking,
       '--system-prompt',
@@ -3248,15 +3296,14 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       if (!sessionWritePath) throw new Error('Subagent task has no session directory or file');
       const authPath = join(agentDir, 'auth.json');
       const settingsPath = join(agentDir, 'settings.json');
+      const modelsStorePath = join(agentDir, 'models-store.json');
       const cliEntry = invocation.args[0] ?? invocation.command;
-      const cliRoot = dependencyRoot(cliEntry) ?? dirname(dirname(cliEntry));
-      const extensionRoot = dependencyRoot(packageDir);
       launch = await this.integration.prepareRpcWorker({
         command: invocation.command,
         args,
         cwd: ctx.cwd,
         env: {
-          ...process.env,
+          ...workerEnvironment(process.env),
           [WORKER_ENV]: Buffer.from(JSON.stringify(config)).toString('base64url'),
           [LANDSTRIP_CONTEXT_ENV]: encodeLandstripContext(publicContext),
           JITI_FS_CACHE: 'false',
@@ -3265,30 +3312,52 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           TEMP: temp,
         },
         ctx,
-        domains: modelEndpointDomains(ctx, model),
+        domains: endpoint.domains,
         readPaths: [
           ...new Set(
             [
               ctx.cwd,
-              ...agentBootstrapPaths(agentDir),
+              ...agentBootstrapPaths(agentDir, !!endpoint.resolveAuth),
+              ...(await collectWorkerResourceReadPaths({
+                cwd: ctx.cwd,
+                agentDir,
+                projectTrusted: isProjectTrusted(ctx),
+                runtimeEntries: [
+                  cliEntry,
+                  packageDir,
+                  ...workerExtensions.map(({ entry }) => entry),
+                ],
+                provenance: [
+                  ...(this.pi.getAllTools?.() ?? []),
+                  ...(this.pi.getCommands?.() ?? []),
+                ].flatMap(({ sourceInfo }) => (sourceInfo ? [sourceInfo] : [])),
+              })),
               join(homedir(), '.agents', 'skills'),
-              packageDir,
-              join(packageDir, 'node_modules'),
               invocation.command,
-              cliRoot,
-              extensionRoot,
-              ...workerExtensions.flatMap((extension) => [
-                extension.entry,
-                dirname(extension.entry),
-                dependencyRoot(extension.entry),
-              ]),
               task.sessionDir,
               task.sessionFile,
               temp,
             ].filter((path): path is string => path !== undefined),
           ),
         ],
-        writePaths: [sessionWritePath, temp, authPath, `${authPath}.lock`, `${settingsPath}.lock`],
+        writePaths: [
+          sessionWritePath,
+          temp,
+          ...(endpoint.resolveAuth ? [] : [authPath, `${authPath}.lock`]),
+          `${settingsPath}.lock`,
+          modelsStorePath,
+          `${modelsStorePath}.lock`,
+        ],
+        protectedPaths: endpoint.resolveAuth
+          ? [
+              ...new Set(
+                [authPath, canonicalizePath(authPath, ctx.cwd)].flatMap((path) => [
+                  path,
+                  `${path}.lock`,
+                ]),
+              ),
+            ]
+          : undefined,
         signal,
       });
       if (signal.aborted) throw new Error('Task cancelled');
@@ -3299,6 +3368,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         env: launch.env,
         spawn: launch.spawn,
         onExtensionUiRequest: onRequest,
+        onAuthPipe: endpoint.resolveAuth
+          ? (pipe) => serveWorkerAuth(pipe, endpoint.resolveAuth!)
+          : undefined,
         requestTimeoutMs: 120_000,
         settleTimeoutMs: 24 * 60 * 60 * 1000,
       });

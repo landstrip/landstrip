@@ -57,9 +57,11 @@ describe('package metadata', () => {
     const extensionPackage = readJson<PackageJson>(new URL('./package.json', import.meta.url));
 
     expect(extensionPackage.dependencies?.['@earendil-works/pi-coding-agent']).toBeUndefined();
+    expect(extensionPackage.dependencies?.['@earendil-works/pi-ai']).toBeUndefined();
     expect(extensionPackage.dependencies?.['@earendil-works/pi-tui']).toBeUndefined();
     expect(extensionPackage.peerDependencies).toMatchObject({
-      '@earendil-works/pi-coding-agent': '*',
+      '@earendil-works/pi-coding-agent': '>=0.82.0',
+      '@earendil-works/pi-ai': '>=0.82.0',
       '@earendil-works/pi-tui': '*',
       typebox: '*',
     });
@@ -76,6 +78,8 @@ describe('package metadata', () => {
     expect(extensionPackage.files).toContain('api.ts');
     expect(extensionPackage.pi?.extensions).toEqual(['./dist/index.ts']);
     expect(existsSync(new URL('./dist/index.ts', import.meta.url))).toBe(true);
+    expect(existsSync(new URL('./dist/worker-auth-entry.js', import.meta.url))).toBe(true);
+    expect(existsSync(new URL('./dist/worker-auth-entry.ts', import.meta.url))).toBe(false);
     expect(existsSync(new URL('./dist/sandbox.json', import.meta.url))).toBe(true);
   });
 });

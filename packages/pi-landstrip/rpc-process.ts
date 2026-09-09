@@ -2,11 +2,12 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { spawn, type SpawnOptions } from 'node:child_process';
-import type { Readable } from 'node:stream';
+import { Duplex, type Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 
 import { formatError, isRecord } from './util.ts';
 import type { LandstripRpcChildProcess } from './api.ts';
+import { WORKER_AUTH_FD } from './worker-auth-channel.ts';
 
 export type RpcRecord = Readonly<Record<string, unknown>>;
 
@@ -45,6 +46,8 @@ export interface RpcProcessOptions {
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
   readonly spawn?: RpcSpawn;
+  /** Private auth transport on fd 4; never part of the public RPC protocol. */
+  readonly onAuthPipe?: (pipe: Duplex) => () => void;
   readonly onExtensionUiRequest?: (
     request: ExtensionUiRequest,
   ) => ExtensionUiResult | Promise<ExtensionUiResult>;
@@ -101,6 +104,7 @@ export class RpcProcess {
   private fatalError: Error | null = null;
   private stopping: Promise<void> | null = null;
   private promptQueue: Promise<void> = Promise.resolve();
+  private disposeAuthPipe?: () => void;
 
   public constructor(options: RpcProcessOptions) {
     if (!options.command) throw new Error('RPC command must not be empty');
@@ -116,6 +120,9 @@ export class RpcProcess {
   public async start(): Promise<void> {
     if (this.child) throw new Error('RPC process is already started');
     if (this.stopping) throw new Error('RPC process is stopping');
+    if (this.options.onAuthPipe && process.platform === 'win32') {
+      throw new Error('Authenticated subagent workers require inherited Unix file descriptors');
+    }
 
     const spawnProcess = this.options.spawn ?? defaultSpawn;
     let child: RpcChildProcess;
@@ -123,7 +130,9 @@ export class RpcProcess {
       child = spawnProcess(this.options.command, this.options.args ?? [], {
         cwd: this.options.cwd,
         env: this.options.env,
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: this.options.onAuthPipe
+          ? ['pipe', 'pipe', 'pipe', 'ignore', 'pipe']
+          : ['pipe', 'pipe', 'pipe'],
       });
     } catch (error) {
       throw this.asError(error, 'Failed to spawn RPC process');
@@ -140,6 +149,8 @@ export class RpcProcess {
     child.on('error', (error) => this.handleChildError(child, error, 'RPC process error'));
     this.exitPromise = new Promise((resolve) => {
       child.once('exit', (code, signal) => {
+        this.disposeAuthPipe?.();
+        this.disposeAuthPipe = undefined;
         if (this.child === child) {
           this.child = null;
           this.failAll(new Error(this.exitMessage(code, signal)));
@@ -173,6 +184,21 @@ export class RpcProcess {
       child.once('error', onError);
       child.once('exit', onExit);
     });
+    if (this.child !== child || this.stopping)
+      throw new Error('RPC process stopped during startup');
+    if (this.options.onAuthPipe) {
+      try {
+        const stdio = 'stdio' in child ? child.stdio : undefined;
+        const pipe = Array.isArray(stdio) ? stdio[WORKER_AUTH_FD] : undefined;
+        if (!(pipe instanceof Duplex)) {
+          throw new Error('Worker launcher does not support private authentication pipes');
+        }
+        this.disposeAuthPipe = this.options.onAuthPipe(pipe);
+      } catch (error) {
+        await this.stop();
+        throw error;
+      }
+    }
   }
 
   public onEvent(listener: (event: RpcRecord) => void): () => void {
@@ -256,6 +282,8 @@ export class RpcProcess {
   }
 
   public async stop(): Promise<void> {
+    this.disposeAuthPipe?.();
+    this.disposeAuthPipe = undefined;
     if (this.stopping) return this.stopping;
     const child = this.child;
     if (!child) return;

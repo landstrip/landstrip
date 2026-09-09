@@ -13,6 +13,7 @@
   },
   "filesystem": {
     "denyRead": ["/Users", "/home"],
+    "denyReadAlways": [],
     "allowRead": [".", "~/.gitconfig", "~/.config/git/config", "/dev/null"],
     "allowWrite": [".", "/dev/null"],
     "denyWrite": [

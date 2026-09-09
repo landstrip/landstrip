@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -88,6 +89,7 @@ import {
   publishLandstripRuntime,
 } from './api.ts';
 import type { RpcSpawn } from './rpc-process.ts';
+import { WORKER_AUTH_FD } from './worker-auth-channel.ts';
 import {
   registerSubagents,
   registerSubagentWorker,
@@ -100,6 +102,7 @@ type LandstripBashTool = ReturnType<typeof createBashToolDefinition>;
 
 interface SandboxFilesystemConfig {
   denyRead: string[];
+  denyReadAlways: string[];
   allowRead: string[];
   allowWrite: string[];
   denyWrite: string[];
@@ -236,12 +239,12 @@ function parseSandboxConfig(value: unknown): SandboxConfigFile {
     requireSandboxObject(value.filesystem, 'filesystem');
     rejectUnknownSandboxFields(
       value.filesystem,
-      ['denyRead', 'allowRead', 'allowWrite', 'denyWrite'],
+      ['denyRead', 'denyReadAlways', 'allowRead', 'allowWrite', 'denyWrite'],
       'filesystem.',
     );
     validateStringArrayFields(
       value.filesystem,
-      ['denyRead', 'allowRead', 'allowWrite', 'denyWrite'],
+      ['denyRead', 'denyReadAlways', 'allowRead', 'allowWrite', 'denyWrite'],
       'filesystem.',
     );
   }
@@ -306,6 +309,9 @@ interface LandstripBashCallbacks {
 }
 
 interface ExecutionAllowances {
+  // Present only for worker launches; never let a broker approve these rules.
+  explicitDenyRead?: { patterns: string[]; globRoots: Map<string, string[]> };
+  readonly protectedPaths?: string[];
   readonly domains: string[];
   readonly readPaths: string[];
   readonly writePaths: string[];
@@ -360,24 +366,33 @@ const NETWORK_PERMISSION_OPTIONS: PromptOption[] = [
   { label: 'Keep blocked', action: 'abort' },
 ];
 
-function loadSandboxConfig(cwd: string, includeProject: boolean): SandboxConfig {
+function loadSandboxConfig(
+  cwd: string,
+  includeProject: boolean,
+): SandboxConfig & { explicitDenyRead: string[] } {
   const projectConfigPath = join(cwd, '.pi', 'sandbox.json');
   const globalConfigPath = join(getAgentDir(), 'sandbox.json');
 
   if (!existsSync(globalConfigPath)) {
-    const templatePath = join(packageDir, 'sandbox.json');
     mkdirSync(dirname(globalConfigPath), { recursive: true });
-    writeFileSync(globalConfigPath, readFileSync(templatePath, 'utf-8'), 'utf-8');
+    writeFileSync(globalConfigPath, '{}\n', 'utf-8');
   }
 
+  const globalOverrides = readOrEmptyConfig(globalConfigPath);
+  const projectOverrides = includeProject ? readOrEmptyConfig(projectConfigPath) : {};
   const globalConfig = deepMerge(
     JSON.parse(readFileSync(join(packageDir, 'sandbox.json'), 'utf-8')),
-    readOrEmptyConfig(globalConfigPath),
+    globalOverrides,
   );
 
-  return includeProject
-    ? deepMerge(globalConfig, readOrEmptyConfig(projectConfigPath))
-    : globalConfig;
+  return {
+    ...deepMerge(globalConfig, projectOverrides),
+    // Persisted rules are explicit, even when identical to an internal default.
+    explicitDenyRead: mergeArray(
+      globalOverrides.filesystem?.denyRead ?? [],
+      projectOverrides.filesystem?.denyRead,
+    ),
+  };
 }
 
 function mergeArray(base: string[], override?: string[]): string[] {
@@ -406,6 +421,7 @@ function deepMerge(base: SandboxConfig, overrides: SandboxConfigFile): SandboxCo
     },
     filesystem: {
       denyRead: mergeArray(base.filesystem.denyRead, filesystem?.denyRead),
+      denyReadAlways: mergeArray(base.filesystem.denyReadAlways, filesystem?.denyReadAlways),
       allowRead: mergeArray(base.filesystem.allowRead, filesystem?.allowRead),
       allowWrite: mergeArray(base.filesystem.allowWrite, filesystem?.allowWrite),
       denyWrite: mergeArray(base.filesystem.denyWrite, filesystem?.denyWrite),
@@ -550,17 +566,81 @@ export function shouldPromptForWrite(path: string, allowWrite: string[], cwd: st
   return allowWrite.length === 0 || !matchesPattern(path, allowWrite, cwd);
 }
 
-export function matchesPattern(filePath: string, patterns: string[], cwd: string): boolean {
+export function matchesPattern(
+  filePath: string,
+  patterns: string[],
+  cwd: string,
+  explicitDenyGlobRoots?: Map<string, string[]>,
+): boolean {
   const abs = normalizePathSeparators(canonicalizePath(filePath, cwd));
 
   return patterns.some((pattern) => {
     const absPattern = normalizePathSeparators(canonicalizeGlobPattern(pattern, cwd));
 
-    if (pattern.includes('*')) {
+    if (/[*?[\]]/.test(pattern)) {
       // Mirror landstrip's matcher: `**/` spans directories, `**` spans any run,
       // but a single `*` stops at `/` — so `/srv/*/pub` cannot reach
       // `/srv/a/secret/pub`. Compiling `*` to `.*` would over-match across `/`.
-      return globToRegExp(absPattern).test(abs);
+      const matcher = globToRegExp(absPattern);
+      // Native glob matches name directory roots as well as files. Descendants
+      // inherit the matched directory's rule, including paths not created yet.
+      for (let candidate = abs; ;) {
+        if (matcher.test(candidate)) return true;
+        const parent = normalizePathSeparators(dirname(candidate));
+        if (parent === candidate) break;
+        candidate = parent;
+      }
+
+      // Only explicit worker denies need native glob lowering. Retain the
+      // canonical roots per worker so trap queries never repeat the traversal.
+      if (!explicitDenyGlobRoots) return false;
+      let roots = explicitDenyGlobRoots.get(absPattern);
+      if (!roots) {
+        const resolvedRoots: string[] = [];
+        const wildcard = absPattern.search(/[*?[\]]/);
+        const base = absPattern.slice(0, absPattern.lastIndexOf('/', wildcard) + 1);
+        const suffix = absPattern.slice(base.length);
+        const segments = suffix.match(/(?:\[[^\]]*\]|[^/])+/g) ?? [];
+        const recursive = suffix.includes('**');
+        const visit = (directory: string, depth: number): void => {
+          if (depth >= 40) throw new Error(`Glob traversal depth exceeded for "${pattern}"`);
+          let entries;
+          try {
+            entries = readdirSync(directory, { withFileTypes: true });
+          } catch (error) {
+            if (
+              isRecord(error) &&
+              ['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM'].includes(String(error.code))
+            ) {
+              return;
+            }
+            throw error;
+          }
+          for (const entry of entries) {
+            const candidate = normalizePathSeparators(join(directory, entry.name));
+            // Match the alias before canonicalizing: `/runtime/ali*` can lower
+            // to a root such as `/opt/worker` that does not match lexically.
+            if (entry.isSymbolicLink() && matcher.test(candidate)) {
+              resolvedRoots.push(normalizePathSeparators(canonicalizePath(candidate, cwd)));
+            }
+            // Like native expansion, never descend through a symlink. Without
+            // globstars, prune directories that cannot match the next segment.
+            if (
+              entry.isDirectory() &&
+              (recursive ||
+                (depth + 1 < segments.length && globToRegExp(segments[depth]!).test(entry.name)))
+            ) {
+              visit(candidate, depth + 1);
+            }
+          }
+        };
+        visit(base, 0);
+        roots = resolvedRoots;
+        explicitDenyGlobRoots.set(absPattern, roots);
+      }
+      return roots.some(
+        (target) => abs === target || abs.startsWith(target.endsWith('/') ? target : `${target}/`),
+      );
     }
 
     const sep = absPattern.endsWith('/') ? '' : '/';
@@ -582,9 +662,7 @@ function longestPrefixMatch(path: string, patterns: string[], cwd: string): numb
   let best = -1;
   for (const pattern of patterns) {
     if (!matchesPattern(path, [pattern], cwd)) continue;
-    const canonical = pattern.includes('*')
-      ? expandPath(pattern, cwd)
-      : canonicalizePath(pattern, cwd);
+    const canonical = canonicalizeGlobPattern(pattern, cwd);
     if (canonical.length > best) best = canonical.length;
   }
   return best;
@@ -988,6 +1066,7 @@ export interface LandstripRpcWorkerOptions extends LandstripProcessOptions {
   readonly env: NodeJS.ProcessEnv;
   readonly readPaths: readonly string[];
   readonly writePaths: readonly string[];
+  readonly protectedPaths?: readonly string[];
   /** Domains the worker may reach through the filter proxy without prompting. */
   readonly domains?: readonly string[];
 }
@@ -1041,7 +1120,7 @@ function createLandstripIntegrationWithPrompts(
   const localCwd = options.cwd ?? process.cwd();
   let projectConfigTrusted = false;
 
-  function loadConfig(cwd: string): SandboxConfig {
+  function loadConfig(cwd: string): ReturnType<typeof loadSandboxConfig> {
     return loadSandboxConfig(cwd, projectConfigTrusted);
   }
 
@@ -1385,13 +1464,18 @@ function createLandstripIntegrationWithPrompts(
       const config = loadConfig(ctx.cwd);
       for (const access of normalized) {
         if (
-          access.operation === 'write' &&
-          matchesPattern(access.path, config.filesystem.denyWrite, ctx.cwd)
+          matchesPattern(
+            access.path,
+            access.operation === 'read'
+              ? config.filesystem.denyReadAlways
+              : config.filesystem.denyWrite,
+            ctx.cwd,
+          )
         ) {
           return {
             allowed: false,
             prompted: false,
-            reason: `Write denied by sandbox policy: ${access.path}`,
+            reason: `${access.operation === 'read' ? 'Read' : 'Write'} denied by sandbox policy: ${access.path}`,
           };
         }
       }
@@ -1500,7 +1584,10 @@ function createLandstripIntegrationWithPrompts(
     const readPolicy = resolveProcessReadPolicy(
       audience,
       config.shell.readAccess,
-      getEffectiveDenyRead(config, cwd),
+      mergeArray(getEffectiveDenyRead(config, cwd), [
+        ...(allowances?.explicitDenyRead?.patterns ?? []),
+        ...[...(allowances?.explicitDenyRead?.globRoots.values() ?? [])].flat(),
+      ]),
       getEffectiveAllowRead(config, cwd, allowances),
     );
 
@@ -1514,8 +1601,9 @@ function createLandstripIntegrationWithPrompts(
       },
       filesystem: {
         ...readPolicy,
+        denyReadAlways: mergeArray(config.filesystem.denyReadAlways, allowances?.protectedPaths),
         allowWrite: getEffectiveAllowWrite(config, allowances),
-        denyWrite: config.filesystem.denyWrite,
+        denyWrite: mergeArray(config.filesystem.denyWrite, allowances?.protectedPaths),
       },
       windows: config.windows,
     };
@@ -1628,7 +1716,28 @@ function createLandstripIntegrationWithPrompts(
 
     const path = normalizeBlockedPath(trap.path, cwd);
     const current = (): TrapQueryResult | undefined => {
+      if (matchesPattern(path, allowances.protectedPaths ?? [], cwd)) {
+        return { action: 'deny', reason: 'hard-deny' };
+      }
       const config = loadConfig(cwd);
+      if (
+        trap.operation === 'read' &&
+        matchesPattern(path, config.filesystem.denyReadAlways, cwd)
+      ) {
+        return { action: 'deny', reason: 'hard-deny' };
+      }
+      if (
+        trap.operation === 'read' &&
+        allowances.explicitDenyRead &&
+        matchesPattern(
+          path,
+          mergeArray(allowances.explicitDenyRead.patterns, config.explicitDenyRead),
+          cwd,
+          allowances.explicitDenyRead.globRoots,
+        )
+      ) {
+        return { action: 'deny', reason: 'hard-deny' };
+      }
       if (trap.operation === 'write' && matchesPattern(path, config.filesystem.denyWrite, cwd)) {
         return { action: 'deny', reason: 'hard-deny' };
       }
@@ -1793,6 +1902,18 @@ function createLandstripIntegrationWithPrompts(
       readPaths: [...options.readPaths],
       writePaths: [...options.writePaths],
       targets: [],
+      protectedPaths: [
+        ...new Set(
+          (options.protectedPaths ?? []).flatMap((path) => {
+            if (/[*?[\]]/.test(path)) {
+              throw new Error(
+                `Worker protected path "${path}" must be a concrete path, not a glob`,
+              );
+            }
+            return [expandPath(path, options.cwd), canonicalizePath(path, options.cwd)];
+          }),
+        ),
+      ],
     };
     const processAllowances = withWindowsProcessReadAccess(
       allowances,
@@ -1800,6 +1921,24 @@ function createLandstripIntegrationWithPrompts(
       options.cwd,
     );
     const config = loadConfig(options.cwd);
+    const explicitDenyGlobRoots = new Map<string, string[]>();
+    processAllowances.explicitDenyRead = {
+      patterns: config.explicitDenyRead,
+      globRoots: explicitDenyGlobRoots,
+    };
+    for (const path of [options.cwd, options.command, ...processAllowances.readPaths]) {
+      if (/[*?[\]]/.test(path)) {
+        throw new Error(`Worker startup read path "${path}" must be a concrete path, not a glob`);
+      }
+      const deny = config.explicitDenyRead.find((pattern) =>
+        matchesPattern(path, [pattern], options.cwd, explicitDenyGlobRoots),
+      );
+      if (deny !== undefined) {
+        throw new Error(
+          `Worker startup read path "${path}" conflicts with explicit filesystem.denyRead "${deny}"; change the configured deny or the worker startup paths`,
+        );
+      }
+    }
     const proxyToken = randomBytes(32).toString('base64url');
     const proxyAuthorization = `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
     const proxy = shouldStartProxy(config)
@@ -1859,9 +1998,17 @@ function createLandstripIntegrationWithPrompts(
         options.command,
         ...options.args,
       ];
-      const stdio: StdioOptions = workerChildEnd
-        ? ['pipe', 'pipe', 'pipe', workerChildEnd]
-        : ['pipe', 'pipe', 'pipe'];
+      const authPipe =
+        Array.isArray(spawnOptions.stdio) && spawnOptions.stdio[WORKER_AUTH_FD] === 'pipe';
+      if (authPipe && process.platform === 'win32') {
+        throw new Error('Sandboxed worker authentication requires inherited Unix file descriptors');
+      }
+      const stdio: StdioOptions = ['pipe', 'pipe', 'pipe'];
+      if (workerChildEnd || authPipe) stdio.push(workerChildEnd ?? 'ignore');
+      if (authPipe) {
+        stdio.push('pipe');
+        landstripArgs.splice(1, 0, '--inherit', String(WORKER_AUTH_FD));
+      }
       if (workerChildEnd) landstripArgs.splice(1, 0, '--trap', '3');
       const child = spawn(binaryPath(), landstripArgs, {
         ...spawnOptions,
@@ -2376,8 +2523,11 @@ function createLandstripIntegrationWithPrompts(
       const current = (): boolean | undefined => {
         const config = loadConfig(ctx.cwd);
         if (
-          operation === 'write' &&
-          matchesPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd)
+          matchesPattern(
+            blockedPath,
+            operation === 'read' ? config.filesystem.denyReadAlways : config.filesystem.denyWrite,
+            ctx.cwd,
+          )
         ) {
           return false;
         }
