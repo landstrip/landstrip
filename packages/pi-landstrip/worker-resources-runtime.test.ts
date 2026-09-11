@@ -134,14 +134,9 @@ async function checkResourceStartup(): Promise<void> {
                   prompt: expect.stringContaining('resource-ancestor-context-ok'),
                 });
               } else {
-                await rpc.start();
-                await rpc.request('get_state');
-                const response = await rpc.request('get_commands');
-                expect(response).not.toMatchObject({
-                  commands: expect.arrayContaining([
-                    expect.objectContaining({ name: 'directory-resource' }),
-                  ]),
-                });
+                await expect(rpc.start().then(() => rpc.request('get_state'))).rejects.toThrow(
+                  /Failed to load extension.*hook\.ts/,
+                );
                 expect(existsSync(marker)).toBe(false);
               }
               if (includeResources) expect(prompts).not.toHaveBeenCalled();
