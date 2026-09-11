@@ -2,26 +2,36 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { Socket } from 'node:net';
-import { resolve } from 'node:path';
-
-import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
-import {
-  createAgentSessionFromServices,
-  createAgentSessionRuntime,
-  createAgentSessionServices,
-  getAgentDir,
-  ModelRuntime,
-  parseArgs,
-  runRpcMode,
-  SessionManager,
-  SettingsManager,
-} from '@earendil-works/pi-coding-agent';
+import { isAbsolute, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { EnvHttpProxyAgent, install, setGlobalDispatcher } from 'undici';
 
 import { WORKER_AUTH_FD, WorkerAuthClient } from './worker-auth-channel.ts';
 import { createWorkerAuthRuntime } from './worker-auth-runtime.ts';
 
 async function main(): Promise<void> {
+  const cliEntry = process.argv[2];
+  if (!cliEntry || !isAbsolute(cliEntry)) throw new Error('Missing host Pi CLI entry');
+  // Pi peers are supplied by the host, not installed beside this standalone worker.
+  const hostUrl = pathToFileURL(cliEntry).href;
+  const {
+    createAgentSessionFromServices,
+    createAgentSessionRuntime,
+    createAgentSessionServices,
+    getAgentDir,
+    ModelRuntime,
+    parseArgs,
+    runRpcMode,
+    SessionManager,
+    SettingsManager,
+  } = (await import(
+    import.meta.resolve('@earendil-works/pi-coding-agent', hostUrl)
+  )) as typeof import('@earendil-works/pi-coding-agent');
+  const { InMemoryCredentialStore } = (await import(
+    import.meta.resolve('@earendil-works/pi-ai', hostUrl)
+  )) as typeof import('@earendil-works/pi-ai');
+  // Preserve the host CLI identity for extensions that launch further workers.
+  process.argv.splice(1, 1);
   const args = parseArgs(process.argv.slice(2));
   if (
     args.mode !== 'rpc' ||
@@ -101,6 +111,12 @@ async function main(): Promise<void> {
         }
         services.modelRuntime = await createWorkerAuthRuntime(
           catalog,
+          await ModelRuntime.create({
+            credentials: new InMemoryCredentialStore(),
+            modelsPath: null,
+            allowModelNetwork: false,
+            refreshOnCreate: false,
+          }),
           initial.model,
           async (signal) => {
             const result = await client.request(signal);

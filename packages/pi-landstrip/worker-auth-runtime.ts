@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { InMemoryCredentialStore, type AuthResult, type Model } from '@earendil-works/pi-ai';
-import { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import type { AuthResult, Model } from '@earendil-works/pi-ai';
+import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 
 /**
  * Compose the worker's existing stream implementation with parent-owned auth.
@@ -11,6 +11,7 @@ import { ModelRuntime } from '@earendil-works/pi-coding-agent';
  */
 export async function createWorkerAuthRuntime(
   catalog: ModelRuntime,
+  runtime: ModelRuntime,
   model: Model<any>,
   resolveAuth: (signal: AbortSignal) => Promise<AuthResult>,
 ): Promise<ModelRuntime> {
@@ -24,12 +25,6 @@ export async function createWorkerAuthRuntime(
   }
   const provider = catalog.getProvider(model.provider);
   if (!provider) throw new Error('Subagent provider is unavailable in the worker');
-  const runtime = await ModelRuntime.create({
-    credentials: new InMemoryCredentialStore(),
-    modelsPath: null,
-    allowModelNetwork: false,
-    refreshOnCreate: false,
-  });
   runtime.registerNativeProvider({
     id: provider.id,
     name: provider.name,

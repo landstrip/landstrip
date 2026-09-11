@@ -3260,7 +3260,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         : 'worker-auth-entry.ts',
     );
     const args = [
-      ...(endpoint.resolveAuth ? [workerEntry] : invocation.args),
+      ...(endpoint.resolveAuth
+        ? ['--experimental-import-meta-resolve', workerEntry, ...invocation.args]
+        : invocation.args),
       '--mode',
       'rpc',
       '--offline',
