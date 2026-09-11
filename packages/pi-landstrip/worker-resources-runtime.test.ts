@@ -134,9 +134,25 @@ async function checkResourceStartup(): Promise<void> {
                   prompt: expect.stringContaining('resource-ancestor-context-ok'),
                 });
               } else {
-                await expect(rpc.start().then(() => rpc.request('get_state'))).rejects.toThrow(
-                  /Failed to load extension.*hook\.ts/,
-                );
+                // Denied metadata can hide resources from discovery (Seatbelt), while
+                // denied content can fail extension loading after discovery (Landlock).
+                await rpc
+                  .start()
+                  .then(() => rpc.request('get_commands'))
+                  .then(
+                    (response) => {
+                      expect(response).not.toMatchObject({
+                        commands: expect.arrayContaining([
+                          expect.objectContaining({ name: 'directory-resource' }),
+                        ]),
+                      });
+                    },
+                    (error: unknown) => {
+                      expect(error).toMatchObject({
+                        message: expect.stringMatching(/Failed to load extension.*hook\.ts/),
+                      });
+                    },
+                  );
                 expect(existsSync(marker)).toBe(false);
               }
               if (includeResources) expect(prompts).not.toHaveBeenCalled();
