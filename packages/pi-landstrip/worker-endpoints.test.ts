@@ -14,7 +14,7 @@ import {
   type LandstripIntegration,
   type LandstripRpcWorkerOptions,
 } from './index.ts';
-import { SubagentRuntime } from './subagents.ts';
+import { modelEndpointDomains, SubagentRuntime } from './subagents.ts';
 import { temporaryDirectory } from './test-util.ts';
 const secret = 'AUTH_SECRET_SENTINEL';
 const selected = {
@@ -34,6 +34,7 @@ function fixture(baseUrl: string) {
     source: secret,
   }));
   const notify = vi.fn();
+  const prompts = vi.fn(async () => undefined);
   const appendEntry = vi.fn();
   const emit = vi.fn();
   const prepare = vi.fn(async (_options: LandstripRpcWorkerOptions) => {
@@ -50,7 +51,7 @@ function fixture(baseUrl: string) {
       getProviderAuth,
     },
     sessionManager: { getSessionId: () => 'endpoint-session' },
-    ui: { notify },
+    ui: { notify, select: prompts, custom: prompts },
   } as unknown as ExtensionContext;
   const runtime = new SubagentRuntime(
     {
@@ -97,7 +98,7 @@ function fixture(baseUrl: string) {
       events: emit.mock.calls,
       notifications: notify.mock.calls,
     });
-  return { cwd, ctx, prepare, run, output };
+  return { cwd, ctx, agent, prepare, getProviderAuth, prompts, run, output };
 }
 
 async function workerOutput(

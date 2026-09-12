@@ -763,7 +763,14 @@ const OAUTH_REFRESH_HOSTS: Readonly<Record<string, string>> = {
 function modelEndpoint(
   ctx: ExtensionContext,
   selectedModel: string,
-): { provider?: string; model: string; domains: string[]; selected?: ExtensionContext['model'] } {
+):
+  | {
+      provider: string;
+      model: string;
+      domains: string[];
+      selected: NonNullable<ExtensionContext['model']>;
+    }
+  | { error: 'Model not found' | 'Ambiguous model' } {
   const models = ctx.modelRegistry?.getAll() ?? [];
   const qualified = models.find((model) => `${model.provider}/${model.id}` === selectedModel);
   // An unqualified model name is only trusted when it matches exactly one entry.
@@ -775,7 +782,7 @@ function modelEndpoint(
       ? ctx.model
       : undefined;
   const model = registered ?? active;
-  if (!model) return { model: selectedModel, domains: [] };
+  if (!model) return { error: byId.length > 1 ? 'Ambiguous model' : 'Model not found' };
   const domains: string[] = [];
   const endpoint = {
     provider: model.provider,
@@ -793,28 +800,29 @@ function modelEndpoint(
 
 /** Model API domains the worker may reach without a permission prompt. */
 export function modelEndpointDomains(ctx: ExtensionContext, selectedModel: string): string[] {
-  return modelEndpoint(ctx, selectedModel).domains;
+  const endpoint = modelEndpoint(ctx, selectedModel);
+  return 'error' in endpoint ? [] : endpoint.domains;
 }
 
 async function workerEndpoint(
   ctx: ExtensionContext,
   selectedModel: string,
+  agentName: string,
   signal: AbortSignal,
-): Promise<
-  ReturnType<typeof modelEndpoint> & { resolveAuth?: ReturnType<typeof workerAuthResolver> }
-> {
+) {
   if (signal.aborted) throw new Error('Task cancelled');
   const endpoint = modelEndpoint(ctx, selectedModel);
+  if ('error' in endpoint) {
+    throw new Error(`${endpoint.error} for subagent ${agentName}: ${selectedModel}`);
+  }
   const { provider, domains, selected } = endpoint;
-  if (provider === undefined) return endpoint;
   const auth = await resolveWorkerAuth(ctx.modelRegistry, provider, signal, selected);
   const host = workerAuthHost(auth?.auth.baseUrl);
   const granted = [...new Set(host ? [...domains, host] : domains)];
   return {
     ...endpoint,
     domains: granted,
-    resolveAuth:
-      auth && selected ? workerAuthResolver(ctx.modelRegistry, selected, granted) : undefined,
+    resolveAuth: auth ? workerAuthResolver(ctx.modelRegistry, selected, granted) : undefined,
   };
 }
 
@@ -3226,7 +3234,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     this.validatePiInvocation();
     const model = agent.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
     if (!model) throw new Error(`No model available for subagent ${agent.name}`);
-    const endpoint = await workerEndpoint(ctx, model, signal);
+    const endpoint = await workerEndpoint(ctx, model, agent.name, signal);
     if (signal.aborted) throw new Error('Task cancelled');
     const thinking =
       agent.variant && PI_THINKING_LEVELS.has(agent.variant)
@@ -3274,7 +3282,8 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         : task.sessionDir
           ? ['--session-dir', task.sessionDir]
           : []),
-      ...(endpoint.provider === undefined ? [] : ['--provider', endpoint.provider]),
+      '--provider',
+      endpoint.provider,
       '--model',
       endpoint.model,
       '--thinking',
