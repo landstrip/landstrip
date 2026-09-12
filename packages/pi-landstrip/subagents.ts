@@ -645,8 +645,9 @@ function taskProgress(task: TaskRecord): string[] {
   return progress;
 }
 
-function workerDialogTitle(task: TaskRecord, title: string): string {
-  return `@${task.agent} · ${task.description} · ${task.id.slice(0, 8)}\n${title}`;
+function workerDialogTitle(task: TaskRecord, title?: string): string {
+  const label = `@${task.agent} · ${task.description} · ${task.id.slice(0, 8)}`;
+  return title === undefined ? label : `${label}\n${title}`;
 }
 
 function messageContentText(message: unknown): string {
@@ -3310,6 +3311,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       const modelsStorePath = join(agentDir, 'models-store.json');
       const cliEntry = invocation.args[0] ?? invocation.command;
       launch = await this.integration.prepareRpcWorker({
+        permissionPromptLabel: workerDialogTitle(task),
         command: invocation.command,
         args,
         cwd: ctx.cwd,

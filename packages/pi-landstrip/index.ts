@@ -309,6 +309,7 @@ interface LandstripBashCallbacks {
 }
 
 interface ExecutionAllowances {
+  readonly permissionPromptLabel?: string;
   // Present only for worker launches; never let a broker approve these rules.
   explicitDenyRead?: { patterns: string[]; globRoots: Map<string, string[]> };
   readonly protectedPaths?: string[];
@@ -861,20 +862,21 @@ async function showPermissionPrompt(
   title: string,
   options: PromptOption[],
   signal?: AbortSignal,
+  label?: string,
 ): Promise<PermissionChoice> {
   if (!ctx.hasUI) return 'abort';
 
   const labels = options.map((option) =>
     option.hint ? `${option.label} — ${option.hint}` : option.label,
   );
-  const selected = await ctx.ui.select(title, labels, { signal });
+  const selected = await ctx.ui.select(label ? `${label}\n${title}` : title, labels, { signal });
   if (signal?.aborted) return 'abort';
   const index = selected === undefined ? -1 : labels.indexOf(selected);
   const option = options[index];
   if (!option) return 'abort';
   if (option.confirm) {
     const confirmed = await ctx.ui.confirm(
-      'Save this permission?',
+      label ? `${label}\nSave this permission?` : 'Save this permission?',
       `${title}\n\n${option.hint ?? 'This changes persisted sandbox policy.'}`,
       { signal },
     );
@@ -888,11 +890,12 @@ function promptReadBlock(
   filePath: string,
   reason?: string,
   signal?: AbortSignal,
+  label?: string,
 ): Promise<PermissionChoice> {
   const title = reason
     ? `Read blocked: "${filePath}" is in denyRead (${reason})`
     : `Read blocked: "${filePath}" is not in allowRead`;
-  return showPermissionPrompt(ctx, title, PERMISSION_OPTIONS, signal);
+  return showPermissionPrompt(ctx, title, PERMISSION_OPTIONS, signal, label);
 }
 
 // Write the full environment to a temporary shell file.
@@ -1063,6 +1066,7 @@ export interface SandboxOverview {
 }
 
 export interface LandstripRpcWorkerOptions extends LandstripProcessOptions {
+  readonly permissionPromptLabel?: string;
   readonly env: NodeJS.ProcessEnv;
   readonly readPaths: readonly string[];
   readonly writePaths: readonly string[];
@@ -1565,6 +1569,7 @@ function createLandstripIntegrationWithPrompts(
           `Network blocked: "${domain}" is not in the allowed domains list`,
           PERMISSION_OPTIONS,
           promptSignal,
+          allowances?.permissionPromptLabel,
         );
         if (choice === 'abort' || promptSignal.aborted) return false;
         await applyDomainChoice(choice, domain, cwd, allowances);
@@ -1703,6 +1708,7 @@ function createLandstripIntegrationWithPrompts(
             `Network blocked: ${trap.operation} "${trap.target}"`,
             NETWORK_PERMISSION_OPTIONS,
             promptSignal,
+            allowances.permissionPromptLabel,
           );
           if (choice === 'abort' || promptSignal.aborted)
             return { action: 'deny', reason: 'rejected' };
@@ -1769,12 +1775,14 @@ function createLandstripIntegrationWithPrompts(
                   ? 'granting allowRead will override it'
                   : undefined,
                 promptSignal,
+                allowances.permissionPromptLabel,
               )
             : await showPermissionPrompt(
                 ctx,
                 `Write blocked: "${path}" is not in allowWrite`,
                 PERMISSION_OPTIONS,
                 promptSignal,
+                allowances.permissionPromptLabel,
               );
         if (choice === 'abort' || promptSignal.aborted)
           return { action: 'deny', reason: 'rejected' };
@@ -1898,6 +1906,7 @@ function createLandstripIntegrationWithPrompts(
       return prepareUnsandboxedRpcWorker(options);
     }
     const allowances: ExecutionAllowances = {
+      permissionPromptLabel: options.permissionPromptLabel,
       domains: [...(options.domains ?? [])],
       readPaths: [...options.readPaths],
       writePaths: [...options.writePaths],

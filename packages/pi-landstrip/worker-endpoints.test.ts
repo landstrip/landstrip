@@ -84,6 +84,7 @@ function fixture(baseUrl: string) {
   const task = {
     id: 'endpoint-task',
     agent: 'test',
+    description: 'Check endpoint access',
     depth: 1,
     sessionDir,
     state: 'queued',
