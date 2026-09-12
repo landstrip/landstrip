@@ -24,7 +24,7 @@ const selected = {
 };
 const unrelated = { provider: 'other', id: 'other', baseUrl: 'https://unrelated.example' };
 
-function fixture(baseUrl: string) {
+function fixture(baseUrl: string, modelBaseUrl = selected.baseUrl) {
   const cwd = temporaryDirectory('pi-landstrip-endpoint-');
   const sessionDir = join(cwd, 'session');
   mkdirSync(sessionDir);
@@ -46,7 +46,7 @@ function fixture(baseUrl: string) {
     hasUI: true,
     model: unrelated,
     modelRegistry: {
-      getAll: () => [selected, unrelated],
+      getAll: () => [{ ...selected, baseUrl: modelBaseUrl }, unrelated],
       isUsingOAuth: (model: { provider: string }) => model.provider === selected.provider,
       getProviderAuth,
     },
@@ -129,9 +129,12 @@ afterEach(() => vi.unstubAllEnvs());
 const sandboxTest = test.runIf(['linux', 'darwin', 'win32'].includes(process.platform));
 const workerTimeout = process.platform === 'win32' ? 60_000 : 12_000;
 const testTimeout = process.platform === 'win32' ? 240_000 : 30_000;
-sandboxTest.each([false, true])(
-  'real worker endpoint grant respects explicit denial: %s',
-  async (denied) => {
+sandboxTest.for(
+  ['127.0.0.1', '::1'].flatMap((host) => [false, true].map((denied) => ({ host, denied }))),
+)(
+  'real worker endpoint $host grant respects explicit denial: $denied',
+  { timeout: testTimeout },
+  async ({ host, denied }, context) => {
     const agentDir = temporaryDirectory('pi-landstrip-endpoint-agent-');
     vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
     const authPath = join(agentDir, 'auth.json');
@@ -140,7 +143,7 @@ sandboxTest.each([false, true])(
       join(agentDir, 'sandbox.json'),
       JSON.stringify({
         enabled: true,
-        network: { allowedDomains: [], deniedDomains: denied ? ['127.0.0.1'] : [] },
+        network: { allowedDomains: [], deniedDomains: denied ? [host] : [] },
         filesystem: { allowRead: [authPath], allowWrite: [agentDir, authPath] },
       }),
     );
@@ -149,22 +152,37 @@ sandboxTest.each([false, true])(
       requests += 1;
       response.end('effective-endpoint-ok');
     });
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(0, '127.0.0.1', resolve);
-    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, host, () => {
+          server.removeListener('error', reject);
+          resolve();
+        });
+      });
+    } catch (error) {
+      if (
+        host === '::1' &&
+        error instanceof Error &&
+        'code' in error &&
+        ['EAFNOSUPPORT', 'EPROTONOSUPPORT', 'EADDRNOTAVAIL'].includes(String(error.code))
+      ) {
+        context.skip(`IPv6 loopback unavailable: ${error.code}`);
+      }
+      throw error;
+    }
     try {
       const address = server.address();
       if (!address || typeof address === 'string')
         throw new Error('Missing fixture server address');
-      const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+      const baseUrl = `http://${host === '::1' ? '[::1]' : host}:${address.port}/v1`;
       const f = fixture(baseUrl);
       const prompts = vi.fn(async () => undefined);
       f.ctx.ui.select = prompts;
       f.ctx.ui.custom = prompts as ExtensionContext['ui']['custom'];
       const integration = createLandstripIntegration({ registerBashTool: false, cwd: f.cwd });
       f.prepare.mockImplementation(async (options) => {
-        expect(options.domains).toEqual(['api.githubcopilot.com', 'api.github.com', '127.0.0.1']);
+        expect(options.domains).toEqual(['api.githubcopilot.com', 'api.github.com', host]);
         expect(options.protectedPaths).toEqual(
           expect.arrayContaining([authPath, `${authPath}.lock`]),
         );
@@ -230,5 +248,4 @@ sandboxTest.each([false, true])(
       );
     }
   },
-  testTimeout,
 );
