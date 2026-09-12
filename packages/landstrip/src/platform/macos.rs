@@ -127,8 +127,8 @@ fn render_mach_rules(sb: &mut String) -> fmt::Result {
     writeln!(sb, "  (global-name \"com.apple.lsd.mapdb\")")?;
     writeln!(sb, "  (global-name \"com.apple.PowerManagement.control\")")?;
     writeln!(sb, "  (global-name \"com.apple.securityd.xpc\")")?;
-    // apple/container CLI talks to its daemon over XPC.
-    writeln!(sb, "  (global-name \"com.apple.container.apiserver\")")?;
+    // apple/container CLI talks to its daemons over XPC.
+    writeln!(sb, "  (global-name-prefix \"com.apple.container.\")")?;
     writeln!(sb, "  (global-name \"com.apple.system.logger\")")?;
     writeln!(
         sb,
