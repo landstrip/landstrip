@@ -748,14 +748,39 @@ export function extractNativeDeniedPath(output: string, cwd: string): string | n
   return null;
 }
 
+function extractDeniedPathMention(
+  output: string,
+  cwd: string,
+  denied: (path: string) => boolean,
+): string | null {
+  const start = /(?<=^|['"`\s=:(])(?=\/|[a-zA-Z]:[\\/])/g;
+  for (const line of output.split(/\r?\n/)) {
+    for (const match of line.matchAll(start)) {
+      const raw = line.slice(match.index);
+      const quoted = raw.match(/^([^'"`]+)['"`]/);
+      const words = (quoted ? quoted[1] : raw).replace(/[.,:;)\]]+$/, '').split(' ');
+      for (let count = words.length; count > 0; count -= 1) {
+        const candidate = words.slice(0, count).join(' ');
+        if (!existsSync(candidate)) continue;
+        const path = normalizeBlockedPath(candidate, cwd);
+        if (denied(path)) return path;
+        break;
+      }
+    }
+  }
+  return null;
+}
+
 export function extractRetryableNativeReadDeniedPath(
   output: string,
   cwd: string,
   allowRead: string[],
   denyRead: string[],
 ): string | null {
+  const denied = (path: string): boolean => !readAllowed(path, allowRead, denyRead, cwd);
   const path = extractNativeDeniedPath(output, cwd);
-  return path && !readAllowed(path, allowRead, denyRead, cwd) ? path : null;
+  if (path) return denied(path) ? path : null;
+  return extractDeniedPathMention(output, cwd, denied);
 }
 
 export function extractNativeWriteDeniedPath(output: string, cwd: string): string | null {
