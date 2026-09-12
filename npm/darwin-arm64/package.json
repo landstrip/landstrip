@@ -1,6 +1,6 @@
 {
   "name": "@landstrip/landstrip-darwin-arm64",
-  "version": "0.19.1",
+  "version": "0.19.2",
   "description": "macOS arm64 binary for landstrip",
   "license": "LGPL-3.0-or-later",
   "homepage": "https://github.com/landstrip/landstrip#readme",
