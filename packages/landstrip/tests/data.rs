@@ -18,56 +18,13 @@ use std::time::{Duration, Instant};
 
 const DATA: &str = include_str!("data.txt");
 
-/// Re-exec argument marker for `fs=opath` probes (see [`opath_probe`]).
-const OPATH_PROBE_ARG: &str = "--test-opath";
-const FUTIMENS_PROBE_ARG: &str = "--test-futimens";
-const TRUNCATE_PROBE_ARG: &str = "--test-truncate";
-const EXCLUSIVE_OPEN_PROBE_ARG: &str = "--test-exclusive-open";
-const OPENAT2_PROBE_ARG: &str = "--test-openat2";
-const FD_METADATA_PROBE_ARG: &str = "--test-fd-metadata";
-const ABSTRACT_UNIX_PROBE_ARG: &str = "--test-abstract-connect";
-const SIGNAL_OUTSIDE_PROBE_ARG: &str = "--test-signal-outside";
-const SIGNAL_THREAD_PROBE_ARG: &str = "--test-signal-thread";
-const IO_URING_PROBE_ARG: &str = "--test-io-uring";
-const DAEMON_PROBE_ARG: &str = "--test-daemon";
+mod probe;
 
 fn main() {
     let mut args = std::env::args_os();
-    match args.nth(1).as_deref() {
-        Some(value) if value == std::ffi::OsStr::new(OPATH_PROBE_ARG) => {
-            std::process::exit(opath_probe(args.next()));
-        }
-        Some(value) if value == std::ffi::OsStr::new(FUTIMENS_PROBE_ARG) => {
-            std::process::exit(futimens_probe(args.next()));
-        }
-        Some(value) if value == std::ffi::OsStr::new(TRUNCATE_PROBE_ARG) => {
-            std::process::exit(truncate_probe(args.next()));
-        }
-        Some(value) if value == std::ffi::OsStr::new(EXCLUSIVE_OPEN_PROBE_ARG) => {
-            std::process::exit(exclusive_open_probe(args.next()));
-        }
-        Some(value) if value == std::ffi::OsStr::new(OPENAT2_PROBE_ARG) => {
-            std::process::exit(openat2_probe(args.next(), args.next()));
-        }
-        Some(value) if value == std::ffi::OsStr::new(FD_METADATA_PROBE_ARG) => {
-            std::process::exit(fd_metadata_probe(args.next(), args.next()));
-        }
-        Some(value) if value == std::ffi::OsStr::new(ABSTRACT_UNIX_PROBE_ARG) => {
-            std::process::exit(abstract_connect_probe(args.next()));
-        }
-        Some(value) if value == std::ffi::OsStr::new(SIGNAL_OUTSIDE_PROBE_ARG) => {
-            std::process::exit(signal_outside_probe());
-        }
-        Some(value) if value == std::ffi::OsStr::new(SIGNAL_THREAD_PROBE_ARG) => {
-            std::process::exit(signal_thread_probe());
-        }
-        Some(value) if value == std::ffi::OsStr::new(IO_URING_PROBE_ARG) => {
-            std::process::exit(io_uring_probe());
-        }
-        Some(value) if value == std::ffi::OsStr::new(DAEMON_PROBE_ARG) => {
-            std::process::exit(daemon_probe(args.next()));
-        }
-        _ => {}
+    let _bin = args.next();
+    if let Some(code) = args.next().and_then(|sub| probe::dispatch(&sub, args)) {
+        std::process::exit(code);
     }
     let ctx = Context::new();
     let mut failed = 0u32;
@@ -110,6 +67,7 @@ fn main() {
 /// Per-run constants shared by every case.
 struct Context {
     bin: PathBuf,
+    probe: String,
     tmp_root: PathBuf,
     home: PathBuf,
     repo: PathBuf,
@@ -123,8 +81,11 @@ impl Context {
         let tmp_root = test_tmp_root();
         let _ = robust_remove(&tmp_root);
         std::fs::create_dir_all(&tmp_root).expect("create tmp root");
+        let exe = std::env::current_exe().expect("current exe");
+        let probe = exe.to_string_lossy().into_owned();
         Self {
             bin: PathBuf::from(env!("CARGO_BIN_EXE_landstrip")),
+            probe,
             tmp_root,
             home: home_dir(),
             repo: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
@@ -211,34 +172,7 @@ enum Net {
     UnixAllowed,
     UnixDenied,
     UnixAbstractDenied,
-    SignalOutsideDenied,
-    SignalThreadAllowed,
-    IoUringDenied,
     DaemonCleaned,
-}
-
-/// Fs action driven natively by the harness (no shell/tool can O_PATH portably).
-enum Fs {
-    /// O_PATH directory open of `path`; `allowed` selects the expected result.
-    OPath { path: String, allowed: bool },
-    /// fd-only utimensat of `path`; `allowed` selects the expected result.
-    UtimensatFd { path: String, allowed: bool },
-    /// fd-based metadata mutation of `path`; `allowed` selects the expected result.
-    FdMetadata {
-        operation: String,
-        path: String,
-        allowed: bool,
-    },
-    /// truncate(2) of `path`; `allowed` selects the expected result.
-    Truncate { path: String, allowed: bool },
-    /// Exclusive creation of an existing `path`; success means `EEXIST` preserved its contents.
-    ExclusiveOpen { path: String, allowed: bool },
-    /// Native openat2 semantic probe; `allowed` selects the expected result.
-    Openat2 {
-        operation: String,
-        path: String,
-        allowed: bool,
-    },
 }
 
 struct Case {
@@ -257,7 +191,6 @@ struct Case {
     cwd: Option<String>,
     cmd: Option<String>,
     net: Option<Net>,
-    fs: Option<Fs>,
     unixsock: Option<String>,
     status: Status,
     checks: Vec<Check>,
@@ -282,7 +215,6 @@ impl Case {
             cwd: None,
             cmd: None,
             net: None,
-            fs: None,
             unixsock: None,
             status: Status::Zero,
             checks: Vec::new(),
@@ -312,7 +244,6 @@ impl Case {
                 "cwd" => case.cwd = Some(value.to_owned()),
                 "cmd" => case.cmd = Some(value.to_owned()),
                 "net" => case.net = Some(parse_net(value)),
-                "fs" => case.fs = Some(parse_fs(value)),
                 "unixsock" => case.unixsock = Some(value.to_owned()),
                 "status" => case.status = parse_status(value),
                 "out" | "out!" | "trapfd" | "trapfd!" => {
@@ -351,6 +282,7 @@ impl Case {
             repo: &ctx.repo,
             shell: &shell,
             nc: &ctx.nc,
+            probe: &ctx.probe,
             pid: ctx.pid,
         };
 
@@ -468,10 +400,6 @@ impl Case {
                 dir,
                 &self.unixsock,
             );
-        }
-
-        if let Some(fs) = &self.fs {
-            return run_fs(ctx, fs, self.format, &policies, resolver);
         }
 
         let mut command = if let Some(launcher) = &self.launcher {
@@ -621,6 +549,7 @@ struct Resolver<'a> {
     shell: &'a str,
     nc: &'a str,
     pid: u32,
+    probe: &'a str,
 }
 
 impl Resolver<'_> {
@@ -640,6 +569,7 @@ impl Resolver<'_> {
             .replace("%REPO%", &encode(&self.repo.to_string_lossy()))
             .replace("%SHELL%", &encode(self.shell))
             .replace("%NC%", &encode(self.nc))
+            .replace("%PROBE%", &encode(self.probe))
             .replace("%PID%", &self.pid.to_string())
     }
 }
@@ -658,660 +588,9 @@ fn parse_net(value: &str) -> Net {
         "unix-allowed" => Net::UnixAllowed,
         "unix-denied" => Net::UnixDenied,
         "unix-abstract-denied" => Net::UnixAbstractDenied,
-        "signal-outside-denied" => Net::SignalOutsideDenied,
-        "signal-thread-allowed" => Net::SignalThreadAllowed,
-        "io-uring-denied" => Net::IoUringDenied,
         "daemon-cleaned" => Net::DaemonCleaned,
         other => panic!("unknown net kind `{other}`"),
     }
-}
-
-/// `fs=<operation>:<path>:<allowed|denied>`, where operation is one of
-/// `opath`, `utimensat-fd`, fd metadata calls, `truncate`, or an open probe.
-fn parse_fs(value: &str) -> Fs {
-    let (kind, spec) = value
-        .split_once(':')
-        .unwrap_or_else(|| panic!("fs action `{value}` lacks an operation"));
-    let (path, want) = spec
-        .rsplit_once(':')
-        .unwrap_or_else(|| panic!("fs action `{value}` lacks a result marker"));
-    let allowed = match want {
-        "allowed" => true,
-        "denied" => false,
-        other => panic!("unknown fs result `{other}`"),
-    };
-    match kind {
-        "opath" => Fs::OPath {
-            path: path.to_owned(),
-            allowed,
-        },
-        "utimensat-fd" => Fs::UtimensatFd {
-            path: path.to_owned(),
-            allowed,
-        },
-        "chmod-empty" | "chmod-null" | "fchmod" | "fchmodat2-empty" | "fchmodat2-invalid"
-        | "fchmodat2-nofollow" | "fchown" | "fchownat-cwd-empty" | "fchownat-empty"
-        | "fchownat-invalid" | "fremovexattr" | "fsetxattr" | "fsetxattr-overlong"
-        | "legacy-utimes" | "lremovexattr" | "utimensat-invalid" | "x32-fchmod" => Fs::FdMetadata {
-            operation: kind.to_owned(),
-            path: path.to_owned(),
-            allowed,
-        },
-        "truncate" => Fs::Truncate {
-            path: path.to_owned(),
-            allowed,
-        },
-        "exclusive-open" => Fs::ExclusiveOpen {
-            path: path.to_owned(),
-            allowed,
-        },
-        "open-nofollow"
-        | "openat2-beneath"
-        | "openat2-in-root"
-        | "openat2-no-symlinks"
-        | "openat2-short" => Fs::Openat2 {
-            operation: kind.to_owned(),
-            path: path.to_owned(),
-            allowed,
-        },
-        _ => panic!("unknown fs kind `{kind}`"),
-    }
-}
-
-/// Runs an fs action as a re-exec of this test binary under landstrip.
-fn run_fs(
-    ctx: &Context,
-    fs: &Fs,
-    format: PolicyFormat,
-    policies: &[PathBuf],
-    resolver: &Resolver,
-) -> Result<(), String> {
-    let (marker, path, allowed, operation) = match fs {
-        Fs::OPath { path, allowed } => (OPATH_PROBE_ARG, path, allowed, None),
-        Fs::UtimensatFd { path, allowed } => (FUTIMENS_PROBE_ARG, path, allowed, None),
-        Fs::FdMetadata {
-            operation,
-            path,
-            allowed,
-        } => (FD_METADATA_PROBE_ARG, path, allowed, Some(operation)),
-        Fs::Truncate { path, allowed } => (TRUNCATE_PROBE_ARG, path, allowed, None),
-        Fs::ExclusiveOpen { path, allowed } => (EXCLUSIVE_OPEN_PROBE_ARG, path, allowed, None),
-        Fs::Openat2 {
-            operation,
-            path,
-            allowed,
-        } => (OPENAT2_PROBE_ARG, path, allowed, Some(operation)),
-    };
-    let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-    let mut command = landstrip_net(ctx, format, policies);
-    command.arg(exe).arg(marker).arg(resolver.subst(path));
-    if let Some(operation) = operation {
-        command.arg(operation);
-    }
-    let output = command
-        .output()
-        .map_err(|e| format!("spawn fs probe: {e}"))?;
-    if output.status.success() != *allowed {
-        return Err(format!(
-            "fs probe {marker} of {path} {}denied; output={}",
-            if *allowed { "" } else { "not " },
-            merge(&output.stdout, &output.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
-/// Re-exec probe for `fs=opath` cases: performs an O_PATH directory open of
-/// the given path, exiting 0 on success and 1 on failure.
-#[cfg(unix)]
-fn opath_probe(path: Option<std::ffi::OsString>) -> i32 {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // Linux O_PATH | O_DIRECTORY.
-    const O_PATH_DIRECTORY: i32 = 0o10000000 | 0o200000;
-    let Some(path) = path else {
-        return 2;
-    };
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(O_PATH_DIRECTORY)
-        .open(path)
-    {
-        Ok(_) => 0,
-        Err(_) => 1,
-    }
-}
-
-#[cfg(not(unix))]
-fn opath_probe(_path: Option<std::ffi::OsString>) -> i32 {
-    2
-}
-
-/// Re-exec probe for the fd-only form of utimensat used by futimens.
-#[cfg(target_os = "linux")]
-fn futimens_probe(path: Option<std::ffi::OsString>) -> i32 {
-    use std::os::fd::AsRawFd;
-
-    let Some(path) = path else {
-        return 2;
-    };
-    let Ok(file) = std::fs::File::open(path) else {
-        return 1;
-    };
-    let times = [
-        libc::timespec {
-            tv_sec: 1,
-            tv_nsec: 0,
-        },
-        libc::timespec {
-            tv_sec: 2,
-            tv_nsec: 0,
-        },
-    ];
-    // SAFETY: file is live, times points to two initialized timespecs, and a null
-    // pathname selects the fd-only Linux utimensat form used by glibc futimens.
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_utimensat,
-            file.as_raw_fd(),
-            std::ptr::null::<libc::c_char>(),
-            times.as_ptr(),
-            0,
-        )
-    };
-    if rc == 0 { 0 } else { 1 }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn futimens_probe(_path: Option<std::ffi::OsString>) -> i32 {
-    2
-}
-
-#[cfg(target_os = "linux")]
-fn fd_metadata_probe(
-    path: Option<std::ffi::OsString>,
-    operation: Option<std::ffi::OsString>,
-) -> i32 {
-    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
-
-    let (Some(path), Some(operation)) = (path, operation) else {
-        return 2;
-    };
-    let Ok(file) = std::fs::File::open(&path) else {
-        return 1;
-    };
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return 2;
-    };
-    let name = c"user.landstrip-test";
-    let value = b"value";
-    let rc = match operation.to_str() {
-        Some("fchmod") => unsafe { libc::fchmod(file.as_raw_fd(), 0o600) },
-        Some("fchmodat2-empty") => unsafe {
-            libc::syscall(
-                libc::SYS_fchmodat2,
-                file.as_raw_fd(),
-                c"".as_ptr(),
-                0o600,
-                libc::AT_EMPTY_PATH,
-            ) as i32
-        },
-        Some("fchmodat2-invalid") => {
-            let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_fchmodat2,
-                    libc::AT_FDCWD,
-                    path.as_ptr(),
-                    0o600,
-                    0x4000_0000_i32,
-                )
-            };
-            return i32::from(
-                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
-            );
-        }
-        Some("fchmodat2-nofollow") => {
-            let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_fchmodat2,
-                    libc::AT_FDCWD,
-                    path.as_ptr(),
-                    0o600,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            return i32::from(
-                rc != -1
-                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP),
-            );
-        }
-        Some("fchown") => unsafe {
-            libc::fchown(file.as_raw_fd(), libc::geteuid(), libc::getegid())
-        },
-        Some("fchownat-empty") => unsafe {
-            libc::fchownat(
-                file.as_raw_fd(),
-                c"".as_ptr(),
-                libc::geteuid(),
-                libc::getegid(),
-                libc::AT_EMPTY_PATH,
-            )
-        },
-        Some("fchownat-cwd-empty") => unsafe {
-            if libc::fchdir(file.as_raw_fd()) != 0 {
-                return 1;
-            }
-            libc::fchownat(
-                libc::AT_FDCWD,
-                c"".as_ptr(),
-                libc::geteuid(),
-                libc::getegid(),
-                libc::AT_EMPTY_PATH,
-            )
-        },
-        Some("fchownat-invalid") => {
-            let rc = unsafe {
-                libc::fchownat(
-                    libc::AT_FDCWD,
-                    path.as_ptr(),
-                    libc::geteuid(),
-                    libc::getegid(),
-                    0x4000_0000_i32,
-                )
-            };
-            return i32::from(
-                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
-            );
-        }
-        Some("utimensat-invalid") => {
-            let rc = unsafe {
-                libc::utimensat(
-                    libc::AT_FDCWD,
-                    path.as_ptr(),
-                    std::ptr::null(),
-                    0x4000_0000_i32,
-                )
-            };
-            return i32::from(
-                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
-            );
-        }
-        Some("x32-fchmod") => {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                let _ = libc::syscall(libc::SYS_fchmod | 0x4000_0000, file.as_raw_fd(), 0o600);
-                // Returning means the BPF filter did not reject the x32 ABI.
-                return 0;
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                -1
-            }
-        }
-        Some("fsetxattr") => unsafe {
-            libc::fsetxattr(
-                file.as_raw_fd(),
-                name.as_ptr(),
-                value.as_ptr().cast(),
-                value.len(),
-                0,
-            )
-        },
-        Some("fsetxattr-overlong") => {
-            let name = std::ffi::CString::new(vec![b'x'; 256]).unwrap();
-            let rc = unsafe {
-                libc::fsetxattr(
-                    file.as_raw_fd(),
-                    name.as_ptr(),
-                    value.as_ptr().cast(),
-                    value.len(),
-                    0,
-                )
-            };
-            return i32::from(
-                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ERANGE),
-            );
-        }
-        Some("fremovexattr") => unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) },
-        Some("lremovexattr") => unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) },
-        Some("legacy-utimes") => {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            unsafe {
-                libc::syscall(
-                    libc::SYS_utimes,
-                    path.as_ptr(),
-                    std::ptr::null::<libc::timeval>(),
-                ) as i32
-            }
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            {
-                -1
-            }
-        }
-        Some("chmod-null") => {
-            let rc = unsafe { libc::chmod(std::ptr::null(), 0o600) };
-            return i32::from(
-                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EFAULT),
-            );
-        }
-        Some("chmod-empty") => {
-            let rc = unsafe { libc::chmod(c"".as_ptr(), 0o600) };
-            return i32::from(
-                rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT),
-            );
-        }
-        _ => return 2,
-    };
-    if rc == 0 { 0 } else { 1 }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn fd_metadata_probe(
-    _path: Option<std::ffi::OsString>,
-    _operation: Option<std::ffi::OsString>,
-) -> i32 {
-    2
-}
-
-#[cfg(target_os = "linux")]
-fn truncate_probe(path: Option<std::ffi::OsString>) -> i32 {
-    use std::os::unix::ffi::OsStrExt;
-
-    let Some(path) = path else {
-        return 2;
-    };
-    let Ok(path) = std::ffi::CString::new(path.as_bytes()) else {
-        return 2;
-    };
-    // SAFETY: path is NUL-terminated and length is nonnegative.
-    if unsafe { libc::truncate(path.as_ptr(), 1) } == 0 {
-        0
-    } else {
-        1
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn truncate_probe(_path: Option<std::ffi::OsString>) -> i32 {
-    2
-}
-
-#[cfg(target_os = "linux")]
-fn exclusive_open_probe(path: Option<std::ffi::OsString>) -> i32 {
-    use std::os::unix::ffi::OsStrExt;
-
-    let Some(path) = path else {
-        return 2;
-    };
-    let Ok(c_path) = std::ffi::CString::new(path.as_bytes()) else {
-        return 2;
-    };
-    // SAFETY: c_path is NUL-terminated and the mode is valid for O_CREAT.
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_CLOEXEC,
-            0o600,
-        )
-    };
-    if fd >= 0 {
-        // SAFETY: open returned a new descriptor.
-        unsafe { libc::close(fd) };
-        return 1;
-    }
-    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-        return 1;
-    }
-    match std::fs::read(path) {
-        Ok(contents) if contents == b"keep\n" => 0,
-        _ => 1,
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn exclusive_open_probe(_path: Option<std::ffi::OsString>) -> i32 {
-    2
-}
-
-#[cfg(target_os = "linux")]
-#[repr(C)]
-struct TestOpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
-}
-
-#[cfg(target_os = "linux")]
-fn test_openat2(
-    dirfd: libc::c_int,
-    path: &std::ffi::CStr,
-    how: &TestOpenHow,
-    size: usize,
-) -> Result<std::os::fd::OwnedFd, i32> {
-    use std::os::fd::FromRawFd;
-
-    // SAFETY: path and how remain valid for the duration of the syscall.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            dirfd,
-            path.as_ptr(),
-            std::ptr::from_ref(how),
-            size,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO));
-    }
-    let fd = i32::try_from(fd).map_err(|_| libc::EBADF)?;
-    // SAFETY: openat2 returned a new owned descriptor.
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
-}
-
-#[cfg(target_os = "linux")]
-fn openat2_probe(path: Option<std::ffi::OsString>, operation: Option<std::ffi::OsString>) -> i32 {
-    use std::io::Read;
-    use std::os::fd::AsRawFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    let (Some(path), Some(operation)) = (path, operation) else {
-        return 2;
-    };
-    let Ok(c_path) = std::ffi::CString::new(path.as_bytes()) else {
-        return 2;
-    };
-    let readonly = 0_u64;
-    match operation.to_str() {
-        Some("open-nofollow") => {
-            use std::os::fd::FromRawFd;
-
-            let source = std::path::Path::new(&path);
-            let (Some(parent), Some(name)) = (source.parent(), source.file_name()) else {
-                return 2;
-            };
-            let parent_path = parent.to_path_buf();
-            let Ok(parent) = std::fs::File::open(parent) else {
-                return 2;
-            };
-            let Ok(name) = std::ffi::CString::new(name.as_bytes()) else {
-                return 2;
-            };
-            let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            let failed_with_eloop = |fd| {
-                if fd >= 0 {
-                    // SAFETY: a nonnegative open result is an owned descriptor.
-                    unsafe { libc::close(fd) };
-                    return false;
-                }
-                std::io::Error::last_os_error().raw_os_error() == Some(libc::ELOOP)
-            };
-
-            // SAFETY: c_path is NUL-terminated.
-            let open_eloop = failed_with_eloop(unsafe { libc::open(c_path.as_ptr(), flags) });
-            // SAFETY: parent owns a valid directory fd and name is NUL-terminated.
-            let openat_eloop = failed_with_eloop(unsafe {
-                libc::openat(parent.as_raw_fd(), name.as_ptr(), flags)
-            });
-            let how = TestOpenHow {
-                flags: u64::try_from(flags).expect("open flags fit u64"),
-                mode: 0,
-                resolve: 0,
-            };
-            if !open_eloop
-                || !openat_eloop
-                || !matches!(
-                    test_openat2(parent.as_raw_fd(), &name, &how, 24),
-                    Err(libc::ELOOP)
-                )
-            {
-                return 1;
-            }
-
-            let beneath = TestOpenHow {
-                resolve: 0x08,
-                ..how
-            };
-            if !matches!(
-                test_openat2(parent.as_raw_fd(), &name, &beneath, 24),
-                Err(libc::ELOOP)
-            ) {
-                return 1;
-            }
-
-            // O_PATH|O_NOFOLLOW validly opens the link itself.
-            // SAFETY: c_path is NUL-terminated.
-            let link_fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if link_fd < 0 {
-                return 1;
-            }
-            // SAFETY: open returned a new owned descriptor.
-            let link_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(link_fd) };
-            // SAFETY: stat points to initialized storage and link_fd is valid.
-            let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
-            if unsafe { libc::fstat(link_fd.as_raw_fd(), std::ptr::addr_of_mut!(stat)) } != 0
-                || stat.st_mode & libc::S_IFMT != libc::S_IFLNK
-            {
-                return 1;
-            }
-
-            let mut trailing = path.as_bytes().to_vec();
-            trailing.push(b'/');
-            let Ok(trailing) = std::ffi::CString::new(trailing) else {
-                return 2;
-            };
-            // A trailing slash requires the terminal directory symlink to be followed.
-            // SAFETY: trailing is NUL-terminated.
-            let trailing_fd = unsafe { libc::open(trailing.as_ptr(), flags | libc::O_DIRECTORY) };
-            if trailing_fd < 0 {
-                return 1;
-            }
-            // SAFETY: open returned a new owned descriptor.
-            drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(trailing_fd) });
-
-            // A trailing slash resolves the final component as a directory, so
-            // a dangling link, a file, and a create all fail as the kernel says.
-            let errno_of = |name: &str, flags: i32| -> i32 {
-                let mut target = parent_path.as_os_str().as_bytes().to_vec();
-                target.extend_from_slice(name.as_bytes());
-                let Ok(target) = std::ffi::CString::new(target) else {
-                    return 0;
-                };
-                // SAFETY: target is NUL-terminated.
-                let fd = unsafe { libc::open(target.as_ptr(), flags, 0o600) };
-                if fd >= 0 {
-                    // SAFETY: a nonnegative open result is an owned descriptor.
-                    unsafe { libc::close(fd) };
-                    return 0;
-                }
-                std::io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EIO)
-            };
-            let directory = flags | libc::O_DIRECTORY;
-            if errno_of("/dangling/", directory) != libc::ENOENT
-                || errno_of("/file-link/", directory) != libc::ENOTDIR
-                || errno_of("/file/", libc::O_RDONLY) != libc::ENOTDIR
-                || errno_of("/new-file/", libc::O_CREAT | libc::O_WRONLY) != libc::EISDIR
-            {
-                return 1;
-            }
-            0
-        }
-        Some("openat2-no-symlinks") => test_openat2(
-            libc::AT_FDCWD,
-            &c_path,
-            &TestOpenHow {
-                flags: readonly,
-                mode: 0,
-                resolve: 0x04,
-            },
-            24,
-        )
-        .map_or_else(|errno| i32::from(errno != libc::ELOOP), |_| 1),
-        Some("openat2-short") => test_openat2(
-            libc::AT_FDCWD,
-            &c_path,
-            &TestOpenHow {
-                flags: readonly,
-                mode: 0,
-                resolve: 0,
-            },
-            16,
-        )
-        .map_or_else(|errno| i32::from(errno != libc::EINVAL), |_| 1),
-        Some("openat2-beneath") => {
-            let Ok(dir) = std::fs::File::open(&path) else {
-                return 2;
-            };
-            test_openat2(
-                dir.as_raw_fd(),
-                c"../outside.txt",
-                &TestOpenHow {
-                    flags: readonly,
-                    mode: 0,
-                    resolve: 0x08,
-                },
-                24,
-            )
-            .map_or_else(|errno| i32::from(errno != libc::EXDEV), |_| 1)
-        }
-        Some("openat2-in-root") => {
-            let Ok(dir) = std::fs::File::open(&path) else {
-                return 2;
-            };
-            let opened = test_openat2(
-                dir.as_raw_fd(),
-                c"/inside.txt",
-                &TestOpenHow {
-                    flags: readonly,
-                    mode: 0,
-                    resolve: 0x10,
-                },
-                24,
-            );
-            match opened {
-                Ok(fd) => {
-                    let mut file = std::fs::File::from(fd);
-                    let mut contents = String::new();
-                    i32::from(file.read_to_string(&mut contents).is_err() || contents != "inside\n")
-                }
-                Err(_) => 1,
-            }
-        }
-        _ => 2,
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn openat2_probe(_path: Option<std::ffi::OsString>, _operation: Option<std::ffi::OsString>) -> i32 {
-    2
 }
 
 fn parse_status(value: &str) -> Status {
@@ -1389,9 +668,6 @@ fn run_net(
         }
         Net::UnixDenied => run_unix_denied(ctx, format, policies, dir),
         Net::UnixAbstractDenied => run_unix_abstract_denied(ctx, format, policies),
-        Net::SignalOutsideDenied => run_signal_outside_denied(ctx, format, policies),
-        Net::SignalThreadAllowed => run_signal_thread_allowed(ctx, format, policies),
-        Net::IoUringDenied => run_io_uring_denied(ctx, format, policies),
         Net::DaemonCleaned => run_daemon_cleaned(ctx, format, policies, dir),
     }
 }
@@ -1748,128 +1024,6 @@ fn run_self_probe(
 }
 
 #[cfg(target_os = "linux")]
-fn io_uring_probe() -> i32 {
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_io_uring_setup,
-            1_u32,
-            std::ptr::null::<libc::c_void>(),
-        )
-    };
-    i32::from(result != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn io_uring_probe() -> i32 {
-    2
-}
-
-#[cfg(target_os = "linux")]
-fn run_io_uring_denied(
-    ctx: &Context,
-    format: PolicyFormat,
-    policies: &[PathBuf],
-) -> Result<(), String> {
-    run_self_probe(
-        ctx,
-        format,
-        policies,
-        IO_URING_PROBE_ARG,
-        None,
-        "io_uring probe spawn",
-        "io_uring setup not denied",
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn run_io_uring_denied(
-    _ctx: &Context,
-    _format: PolicyFormat,
-    _policies: &[PathBuf],
-) -> Result<(), String> {
-    Err("io-uring-denied is linux-only".to_owned())
-}
-
-#[cfg(target_os = "linux")]
-fn daemon_probe(pid_file: Option<std::ffi::OsString>) -> i32 {
-    let Some(pid_file) = pid_file else {
-        return 2;
-    };
-    let mut ready = [0; 2];
-    // SAFETY: ready points to two writable file-descriptor slots.
-    if unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
-        return 2;
-    }
-
-    // SAFETY: the probe is single-threaded and both children call _exit or pause.
-    let first = unsafe { libc::fork() };
-    if first == -1 {
-        return 2;
-    }
-    if first == 0 {
-        // SAFETY: these descriptors were returned by pipe2 above.
-        unsafe { libc::close(ready[0]) };
-        // SAFETY: setsid has no pointer preconditions.
-        if unsafe { libc::setsid() } == -1 {
-            // SAFETY: terminate without running duplicated cleanup.
-            unsafe { libc::_exit(2) };
-        }
-        // SAFETY: this process is still single-threaded.
-        let daemon = unsafe { libc::fork() };
-        if daemon != 0 {
-            // SAFETY: terminate the intermediate process after a successful or failed fork.
-            unsafe { libc::_exit(if daemon == -1 { 2 } else { 0 }) };
-        }
-
-        // Do not keep Command::output's pipes open after landstrip exits.
-        for fd in 0..=2 {
-            // SAFETY: close accepts any integer descriptor.
-            unsafe { libc::close(fd) };
-        }
-        // SAFETY: getpid has no preconditions.
-        let pid = unsafe { libc::getpid() };
-        if std::fs::write(pid_file, format!("{pid}\n")).is_err() {
-            // SAFETY: terminate without running duplicated cleanup.
-            unsafe { libc::_exit(2) };
-        }
-        let byte = [1_u8];
-        // SAFETY: ready[1] is open and byte points to one readable byte.
-        let _ = unsafe { libc::write(ready[1], byte.as_ptr().cast(), byte.len()) };
-        // SAFETY: close accepts the pipe descriptor and pause waits for cleanup's SIGKILL.
-        unsafe {
-            libc::close(ready[1]);
-            loop {
-                libc::pause();
-            }
-        }
-    }
-
-    // SAFETY: parent owns both pipe descriptors and the read buffer is valid.
-    unsafe { libc::close(ready[1]) };
-    let mut byte = [0_u8];
-    // SAFETY: ready[0] is open and byte points to one writable byte.
-    let synchronized = unsafe { libc::read(ready[0], byte.as_mut_ptr().cast(), byte.len()) } == 1;
-    // SAFETY: close accepts the pipe descriptor.
-    unsafe { libc::close(ready[0]) };
-    loop {
-        // SAFETY: first is this process's child and the status is intentionally discarded.
-        let waited = unsafe { libc::waitpid(first, std::ptr::null_mut(), 0) };
-        if waited == first {
-            break;
-        }
-        if waited == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return 2;
-        }
-    }
-    if synchronized { 23 } else { 2 }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn daemon_probe(_pid_file: Option<std::ffi::OsString>) -> i32 {
-    2
-}
-
-#[cfg(target_os = "linux")]
 fn run_daemon_cleaned(
     ctx: &Context,
     format: PolicyFormat,
@@ -1880,7 +1034,7 @@ fn run_daemon_cleaned(
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
     let output = landstrip_net(ctx, format, policies)
         .arg(exe)
-        .arg(DAEMON_PROBE_ARG)
+        .arg("daemon")
         .arg(&pid_file)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1920,34 +1074,6 @@ fn run_daemon_cleaned(
     Err("daemon-cleaned is linux-only".to_owned())
 }
 
-/// Re-exec probe: connect to a host-created abstract Unix socket. Exit 0 when
-/// Landlock denies the connect (EPERM/EACCES), 1 when it unexpectedly succeeds.
-#[cfg(target_os = "linux")]
-fn abstract_connect_probe(name: Option<std::ffi::OsString>) -> i32 {
-    use std::os::linux::net::SocketAddrExt;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::net::{SocketAddr, UnixStream};
-
-    let Some(name) = name else {
-        return 2;
-    };
-    let Ok(addr) = SocketAddr::from_abstract_name(name.as_bytes()) else {
-        return 2;
-    };
-    match UnixStream::connect_addr(&addr) {
-        Ok(_) => 1,
-        Err(error) => match error.raw_os_error() {
-            Some(libc::EACCES | libc::EPERM) => 0,
-            _ => 2,
-        },
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn abstract_connect_probe(_name: Option<std::ffi::OsString>) -> i32 {
-    2
-}
-
 /// Denies connect to an abstract Unix socket created by the harness before the
 /// sandbox started. Landlock ABI 6+ (Linux 6.12+) enforces the abstract-socket
 /// scope; older kernels are skipped because seccomp cannot tell a host socket
@@ -1974,7 +1100,7 @@ fn run_unix_abstract_denied(
         ctx,
         format,
         policies,
-        ABSTRACT_UNIX_PROBE_ARG,
+        "abstract-connect",
         Some(std::ffi::OsStr::new(&name)),
         "abstract unix connect spawn",
         "host abstract unix connect not denied",
@@ -1988,109 +1114,6 @@ fn run_unix_abstract_denied(
     _policies: &[PathBuf],
 ) -> Result<(), String> {
     Err("unix-abstract-denied is linux-only".to_owned())
-}
-
-/// Re-exec probe: signal the parent process. Exit 0 when Landlock denies
-/// (EPERM/EACCES), 1 when the signal unexpectedly succeeds.
-#[cfg(target_os = "linux")]
-fn signal_outside_probe() -> i32 {
-    // SAFETY: getppid/kill with signal 0 have no preconditions.
-    let rc = unsafe { libc::kill(libc::getppid(), 0) };
-    if rc == 0 {
-        return 1;
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::EPERM | libc::EACCES) => 0,
-        _ => 2,
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn signal_outside_probe() -> i32 {
-    2
-}
-
-/// Denies signaling a process outside the sandbox (the landstrip parent).
-/// Landlock ABI 6+ (Linux 6.12+) enforces signal scope; older kernels skip.
-#[cfg(target_os = "linux")]
-fn run_signal_outside_denied(
-    ctx: &Context,
-    format: PolicyFormat,
-    policies: &[PathBuf],
-) -> Result<(), String> {
-    if skip_old_landlock() {
-        return Ok(());
-    }
-    run_self_probe(
-        ctx,
-        format,
-        policies,
-        SIGNAL_OUTSIDE_PROBE_ARG,
-        None,
-        "signal-outside spawn",
-        "signal to parent not denied",
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn run_signal_outside_denied(
-    _ctx: &Context,
-    _format: PolicyFormat,
-    _policies: &[PathBuf],
-) -> Result<(), String> {
-    Err("signal-outside-denied is linux-only".to_owned())
-}
-
-/// Re-exec probe: a thread signals the main thread of the same process.
-/// Exit 0 when that works. Landstrip restricts then execs, so both threads
-/// share one domain and erratum 2 does not apply.
-#[cfg(target_os = "linux")]
-fn signal_thread_probe() -> i32 {
-    // SAFETY: gettid(2) has no preconditions.
-    let main_tid = unsafe { libc::gettid() };
-    let result = std::thread::spawn(move || {
-        // SAFETY: tgkill with signal 0 only checks permission.
-        unsafe { libc::tgkill(libc::getpid(), main_tid, 0) }
-    })
-    .join();
-    match result {
-        Ok(0) => 0,
-        _ => 1,
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn signal_thread_probe() -> i32 {
-    2
-}
-
-#[cfg(target_os = "linux")]
-fn run_signal_thread_allowed(
-    ctx: &Context,
-    format: PolicyFormat,
-    policies: &[PathBuf],
-) -> Result<(), String> {
-    if skip_old_landlock() {
-        return Ok(());
-    }
-    run_self_probe(
-        ctx,
-        format,
-        policies,
-        SIGNAL_THREAD_PROBE_ARG,
-        None,
-        "signal-thread spawn",
-        "same-process thread signal failed",
-    )
-}
-
-#[cfg(not(target_os = "linux"))]
-fn run_signal_thread_allowed(
-    _ctx: &Context,
-    _format: PolicyFormat,
-    _policies: &[PathBuf],
-) -> Result<(), String> {
-    Err("signal-thread-allowed is linux-only".to_owned())
 }
 
 fn wait_for_unix_socket(server: &mut Child, sock: &Path) -> Result<(), String> {
