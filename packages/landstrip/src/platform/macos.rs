@@ -146,7 +146,8 @@ fn render_mach_rules(sb: &mut String) -> fmt::Result {
     writeln!(
         sb,
         "(allow system-socket (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))"
-    )
+    )?;
+    writeln!(sb, "(allow system-socket (socket-domain AF_ROUTE))")
 }
 
 fn glob_to_sbpl_regex(pattern: &str) -> String {

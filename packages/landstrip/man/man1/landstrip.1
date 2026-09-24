@@ -203,6 +203,11 @@ outside this boundary.
 .It macOS
 Seatbelt enforces a profile fixed at process startup, without runtime trap
 reporting or approval queries.
+.Dv AF_ROUTE
+sockets are available under every network policy for routing and interface
+discovery.
+Kernel privilege checks continue to prevent unprivileged route-changing
+operations.
 .It Windows
 AppContainer or restricted local users enforce explicit filesystem grants.
 Restricted-user mode uses Windows Filtering Platform rules.

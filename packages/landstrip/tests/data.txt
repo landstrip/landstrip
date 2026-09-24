@@ -135,6 +135,7 @@ name=default network denies TCP listener | os=linux,macos | policy={"filesystem"
 name=allowLocalBinding permits localhost listener | os=linux,macos | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=listener-allowed
 name=allowNetwork permits localhost listener | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=listener-allowed
 name=allowNetwork still denies io_uring setup | os=linux | policy={"network":{"allowNetwork":true}} | cmd=%PROBE% io-uring | status=0
+name=default network permits route socket (macos) | os=macos | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%PROBE% route-socket | status=0
 
 # --- unix domain sockets (macOS) ---
 

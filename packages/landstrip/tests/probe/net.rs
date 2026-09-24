@@ -28,3 +28,18 @@ pub fn abstract_connect_probe(name: Option<std::ffi::OsString>) -> i32 {
 pub fn abstract_connect_probe(_name: Option<std::ffi::OsString>) -> i32 {
     2
 }
+
+#[cfg(target_os = "macos")]
+pub fn route_socket_probe() -> i32 {
+    let fd = unsafe { libc::socket(libc::AF_ROUTE, libc::SOCK_RAW, 0) };
+    if fd < 0 {
+        return 1;
+    }
+    unsafe { libc::close(fd) };
+    0
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn route_socket_probe() -> i32 {
+    2
+}
