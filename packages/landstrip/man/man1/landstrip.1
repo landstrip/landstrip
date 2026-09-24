@@ -163,8 +163,9 @@ Direct TCP connections are denied by default.
 On Linux and macOS, proxy ports permit host-local TCP connections but do not
 start a proxy.
 .Va allowLocalBinding
-permits local TCP binding and connections; macOS also permits host-local UDP.
-Linux denies UDP sockets in restricted mode.
+permits host-local TCP and UDP binding and connections on Linux and macOS.
+On Linux, per-datagram destinations are mediated to ensure remote UDP remains denied;
+UDP peer disassociation via AF_UNSPEC connect is permitted.
 macOS uses Seatbelt's localhost matcher, which may include other local
 interfaces, not just loopback; remote UDP remains denied.
 .Va allowUnixSockets

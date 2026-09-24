@@ -39,7 +39,7 @@ pub(super) fn enforce_access_policy(policy: &AccessPolicy, restrict_read: bool) 
     if policy.network_access.restricts_connect_tcp() {
         handled_access_net |= AccessNet::ConnectTcp;
     }
-    if policy.network_access.restricts_bind_tcp() {
+    if policy.network_access.restricts_bind_ip() {
         handled_access_net |= AccessNet::BindTcp;
     }
 

@@ -43,3 +43,66 @@ pub fn route_socket_probe() -> i32 {
 pub fn route_socket_probe() -> i32 {
     2
 }
+
+pub fn udp_bind_probe() -> i32 {
+    match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+pub fn udp_local_probe() -> i32 {
+    let server = match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(s) => s,
+        Err(_) => return 1,
+    };
+    let addr = match server.local_addr() {
+        Ok(a) => a,
+        Err(_) => return 2,
+    };
+    let client = match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(s) => s,
+        Err(_) => return 3,
+    };
+    if client.connect(addr).is_err() {
+        return 4;
+    }
+    if client.send(b"ping").is_err() {
+        return 5;
+    }
+    let mut buf = [0u8; 16];
+    match server.recv_from(&mut buf) {
+        Ok((len, _)) if &buf[..len] == b"ping" => {}
+        _ => return 6,
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let unspec = libc::sockaddr {
+            sa_family: libc::AF_UNSPEC as libc::sa_family_t,
+            sa_data: [0; 14],
+        };
+        let res = unsafe {
+            libc::connect(
+                client.as_raw_fd(),
+                &unspec as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+            )
+        };
+        if res != 0 {
+            return 7;
+        }
+    }
+    0
+}
+
+pub fn udp_remote_probe() -> i32 {
+    let socket = match std::net::UdpSocket::bind("127.0.0.1:0") {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    match socket.send_to(b"test", "8.8.8.8:53") {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}

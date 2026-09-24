@@ -317,7 +317,7 @@ fn render_network_rules(sb: &mut String, network: &NetworkAccess) -> fmt::Result
         )?;
     }
 
-    if network.allows_local_tcp_bind() {
+    if network.allows_local_binding() {
         // allowLocalBinding also grants host-local UDP on Seatbelt. Match the
         // destination for outbound traffic: a local/source filter would allow
         // remote egress from a locally bound socket.

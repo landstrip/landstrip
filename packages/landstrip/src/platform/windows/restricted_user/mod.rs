@@ -133,7 +133,7 @@ fn validate_restricted_network(
         )
         .into());
     }
-    if policy.network_access.allows_local_tcp_bind() {
+    if policy.network_access.allows_local_binding() {
         return Err(Error::sandbox_setup(
             Mechanism::Windowsuser,
             "allowLocalBinding is not supported by restricted-user isolation",

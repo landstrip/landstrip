@@ -158,6 +158,13 @@ name=denied TCP connect is reported | os=linux | policy={"network":{"httpProxyPo
 name=httpProxyPort permits its loopback port only | os=linux,macos | net=connect-allowed
 name=allowLocalBinding permits loopback TCP connect | os=linux,macos | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=loopback-allowed
 
+
+# --- UDP policy ---
+
+name=default network denies UDP bind | os=linux,macos | policy={"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%PROBE% udp-bind | status=!0
+name=allowLocalBinding permits localhost UDP | os=linux,macos | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%PROBE% udp-local | status=0
+name=allowLocalBinding denies remote UDP | os=linux,macos | policy={"network":{"allowLocalBinding":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%PROBE% udp-remote | status=0
+
 # --- policy validation ---
 
 name=empty path is rejected | os=linux,macos | policy={"network":{"allowNetwork":true},"filesystem":{"allowWrite":[""]}} | cmd=%SHELL% -c 'printf ok' | status=!0
