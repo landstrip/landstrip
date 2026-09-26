@@ -40,22 +40,34 @@ async function withPlugin(options, run) {
     process.env.HOME = home;
     process.env.USERPROFILE = home;
 
-    const {
-      default: { server: plugin },
-    } = await import(pathToFileURL(modulePath).href);
+    const { default: plugin } = await import(pathToFileURL(modulePath).href);
     const messages = [];
-    const hooks = await plugin(
-      {
-        client: {
-          app: { log: async (entry) => messages.push(entry.body.message) },
-          tui: { showToast: async () => undefined },
-        },
-        directory: tempDir,
-      },
+    const handlers = { tool: {}, shell: {}, permission: {} };
+    const context = {
+      location: { directory: tempDir },
       options,
-    );
-    await hooks.config({ shell: '/bin/sh' });
-    await run({ hooks, messages, tempDir });
+      tool: {
+        hook: (name, fn) => {
+          handlers.tool[name] = fn;
+        },
+      },
+      shell: {
+        hook: (name, fn) => {
+          handlers.shell[name] = fn;
+        },
+      },
+      permission: {
+        hook: (name, fn) => {
+          handlers.permission[name] = fn;
+        },
+      },
+    };
+    const dispose = await plugin.setup(context);
+    try {
+      await run({ handlers, messages, tempDir });
+    } finally {
+      await dispose?.();
+    }
   } finally {
     if (originalHome === undefined) delete process.env.HOME;
     else process.env.HOME = originalHome;
@@ -64,6 +76,41 @@ async function withPlugin(options, run) {
     await rm(tempDir, { force: true, recursive: true });
   }
 }
+
+test('permission evaluation preserves host denials and never preapproves a domain', async () => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      network: { allowNetwork: false, allowedDomains: [], deniedDomains: [] },
+    },
+    async ({ handlers, tempDir }) => {
+      const evaluation = {
+        action: 'read',
+        resources: [join(tempDir, 'public.txt')],
+        effect: 'deny',
+      };
+      await handlers.permission.evaluate(evaluation);
+      assert.equal(evaluation.effect, 'deny');
+
+      const shell = { action: 'shell', resources: ['curl https://example.com'], effect: 'allow' };
+      await handlers.permission.evaluate(shell);
+      assert.equal(shell.effect, 'ask');
+      const hostDeniedShell = { ...shell, effect: 'deny' };
+      await handlers.permission.evaluate(hostDeniedShell);
+      assert.equal(hostDeniedShell.effect, 'deny');
+      await assert.rejects(
+        handlers.tool['execute.before']({
+          id: 'not-approved',
+          sessionID: 'test-session',
+          tool: 'shell',
+          input: { command: 'curl https://example.com' },
+        }),
+        /example\.com/,
+      );
+    },
+  );
+});
 
 test('proxy authenticates requests and connects to allowed private destinations', async () => {
   let connections = 0;
@@ -88,13 +135,24 @@ test('proxy authenticates requests and connects to allowed private destinations'
         filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
         network: { allowNetwork: false, allowedDomains: ['*'], deniedDomains: [] },
       },
-      async ({ hooks }) => {
-        const input = { callID: 'proxy-call', tool: 'bash' };
+      async ({ handlers, tempDir }) => {
+        const event = {
+          id: 'proxy-call',
+          sessionID: 'test-session',
+          tool: 'shell',
+          input: { command: 'curl https://example.com' },
+        };
         try {
-          const args = { command: 'curl https://example.com' };
-          await hooks['tool.execute.before'](input, { args });
-          const env = {};
-          await hooks['shell.env'](input, { env });
+          await handlers.tool['execute.before'](event);
+          const invocation = {
+            command: event.input.command,
+            cwd: tempDir,
+            shell: '/bin/sh',
+            timeout: 1000,
+            env: {},
+          };
+          await handlers.shell['create.before'](invocation);
+          const env = invocation.env;
           const proxyUrl = new URL(env.HTTP_PROXY);
           const authorization = `Basic ${Buffer.from(
             `${proxyUrl.username}:${proxyUrl.password}`,
@@ -143,7 +201,11 @@ test('proxy authenticates requests and connects to allowed private destinations'
           assert.ok(response.endsWith('smoke-payload'));
           assert.equal(connections, 1);
         } finally {
-          await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+          await handlers.tool['execute.after']({
+            ...event,
+            status: 'completed',
+            result: { output: '' },
+          });
         }
       },
     );
@@ -165,27 +227,45 @@ test(
         filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
         network: { allowNetwork: true, allowedDomains: ['*'], deniedDomains: [] },
       },
-      async ({ hooks, messages, tempDir }) => {
+      async ({ handlers, messages, tempDir }) => {
         const counter = join(tempDir, 'attempts');
         const command = `printf 'attempt\\n' >> ${JSON.stringify(counter)}; exit 17`;
-        const input = { callID: 'single-execution', tool: 'bash' };
-        const output = { args: { command, description: 'write once before failure' } };
+        const event = {
+          id: 'single-execution',
+          sessionID: 'test-session',
+          tool: 'shell',
+          input: { command, description: 'write once before failure' },
+        };
 
         try {
-          await hooks['tool.execute.before'](input, output);
-          const wrapped = output.args.command;
+          await handlers.tool['execute.before'](event);
+          const wrapped = event.input.command;
           assert.notEqual(wrapped, command, messages.join('\n'));
           assert.match(wrapped, /'--trap' '3'/);
-          await hooks['tool.execute.before'](input, output);
-          assert.equal(output.args.command, wrapped);
-          assert.equal(output.args.description, 'write once before failure (landstrip)');
+          const invocation = {
+            command: wrapped,
+            cwd: tempDir,
+            shell: '/bin/sh',
+            timeout: 1000,
+            env: {},
+          };
+          await handlers.shell['create.before'](invocation);
+          assert.equal(invocation.command, wrapped);
+          assert.equal(event.input.description, 'write once before failure (landstrip)');
           await assert.rejects(
-            execFileAsync('/bin/bash', ['-c', wrapped], { cwd: tempDir, timeout: 10_000 }),
+            execFileAsync('/bin/bash', ['-c', invocation.command], {
+              cwd: tempDir,
+              timeout: 10_000,
+            }),
             (error) => error.code === 17,
           );
           assert.equal(await readFile(counter, 'utf8'), 'attempt\n');
         } finally {
-          await hooks['tool.execute.after'](input, { title: '', output: '', metadata: {} });
+          await handlers.tool['execute.after']({
+            ...event,
+            status: 'completed',
+            result: { output: '' },
+          });
         }
       },
     );
@@ -204,21 +284,23 @@ test('headless sandbox denies protected file access without hanging', linuxOnly,
       },
       network: { allowNetwork: true, allowedDomains: ['*'], deniedDomains: [] },
     },
-    async ({ hooks, tempDir }) => {
+    async ({ handlers, tempDir }) => {
       await mkdir(join(tempDir, 'protected'));
       const secret = join(tempDir, 'protected', 'secret.txt');
       await writeFile(secret, 'secret stays private\n');
-      const input = { callID: 'headless-denial', tool: 'bash' };
-      const output = {
-        args: { command: 'cat protected/secret.txt; printf changed > protected/secret.txt' },
+      const event = {
+        id: 'headless-denial',
+        sessionID: 'test-session',
+        tool: 'shell',
+        input: { command: 'cat protected/secret.txt; printf changed > protected/secret.txt' },
       };
-      const result = { title: '', output: '', metadata: {} };
+      const result = { output: '' };
 
       try {
-        await hooks['tool.execute.before'](input, output);
-        assert.match(output.args.command, /'--trap' '3'/);
+        await handlers.tool['execute.before'](event);
+        assert.match(event.input.command, /'--trap' '3'/);
         await assert.rejects(
-          execFileAsync('/bin/bash', ['-c', output.args.command], {
+          execFileAsync('/bin/bash', ['-c', event.input.command], {
             cwd: tempDir,
             timeout: 10_000,
           }),
@@ -234,7 +316,7 @@ test('headless sandbox denies protected file access without hanging', linuxOnly,
         );
         assert.equal(await readFile(secret, 'utf8'), 'secret stays private\n');
       } finally {
-        await hooks['tool.execute.after'](input, result);
+        await handlers.tool['execute.after']({ ...event, status: 'completed', result });
       }
     },
   );

@@ -1,6 +1,6 @@
 # opencode-landstrip
 
-Landstrip sandboxing for AI `bash` calls in OpenCode ≥1.17.7.
+Landstrip sandboxing for AI commands in OpenCode ≥2.0.18.
 
 ## Install and use
 

@@ -27,12 +27,16 @@ test('package metadata matches the Landstrip release', () => {
     extensionLock.packages[''].dependencies?.['@landstrip/landstrip-api'],
     `^${version}`,
   );
-  assert.equal(extensionPackage.dependencies?.['@opentui/core'], '>=0.3.4');
+  assert.equal(extensionPackage.dependencies?.['@opentui/core'], '>=0.5.12');
   assert.equal(extensionPackage.devDependencies?.['@opentui/core'], undefined);
   assert.equal(extensionPackage.devDependencies?.['@opentui/keymap'], undefined);
-  assert.equal(extensionLock.packages[''].dependencies?.['@opentui/core'], '>=0.3.4');
+  assert.equal(extensionPackage.engines?.opencode, '>=2.0.18');
+  assert.equal(extensionPackage.peerDependencies?.['@opencode/plugin'], '^2.0.18');
+  assert.equal(extensionPackage.devDependencies?.['@opencode/plugin'], '^2.0.18');
+  assert.equal(extensionLock.packages[''].dependencies?.['@opentui/core'], '>=0.5.12');
   assert.equal(extensionLock.packages[''].devDependencies?.['@opentui/core'], undefined);
   assert.equal(extensionLock.packages[''].devDependencies?.['@opentui/keymap'], undefined);
+  assert.equal(extensionLock.packages[''].peerDependencies?.['@opencode/plugin'], '^2.0.18');
   assert.equal(extensionLock.packages['node_modules/@opentui/core']?.dev, undefined);
   assert.equal(extensionLock.packages['node_modules/@opentui/keymap'], undefined);
 
@@ -52,7 +56,7 @@ test('registers the Landstrip pane without intercepting commands', () => {
   assert.match(tuiSource, /slash: \{ name: 'landstrip' \}/);
   assert.doesNotMatch(tuiSource, /slash: \{ name: 'sandbox' \}/);
   assert.doesNotMatch(tuiSource, /DialogConfirm|ui\.dialog/);
-  assert.match(tuiSource, /app: \(\) => jsx\(LandstripPane/);
+  assert.match(tuiSource, /render: \(\) => jsx\(LandstripPane/);
   assert.match(tuiSource, /position: 'absolute',[\s\S]*bottom: 0,[\s\S]*left: 0,[\s\S]*right: 0/);
   assert.match(tuiSource, /width: 22, children: label/);
   assert.match(tuiSource, /Disable the sandbox\? Commands will run without OS isolation\./);

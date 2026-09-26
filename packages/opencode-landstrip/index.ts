@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import type { Hooks, Plugin, PluginInput, PluginOptions } from '@opencode-ai/plugin';
+import type { Plugin } from '@opencode/plugin';
 
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -32,8 +32,6 @@ import {
   normalizeOptions,
   normalizePathSeparators,
   parseLandstripTraps,
-  permissionPatterns,
-  permissionType,
   readDiscoveryPort,
   trapSessionHelloLine,
 } from './shared.js';
@@ -652,371 +650,279 @@ function errorWithConfigPaths(baseDirectory: string, message: string): Error {
   return new Error(`${message}\n\nUpdate sandbox config in:\n  ${projectPath}\n  ${globalPath}`);
 }
 
-const plugin: Plugin = async ({ client, directory }: PluginInput, options?: PluginOptions) => {
-  const optionOverrides = normalizeOptions(options);
-  const activeBash = new Map<string, BashSandboxState>();
-  const notified = new Set<string>();
-  const callAllowances = new Set<string>();
-  let enabledNotified = false;
-  let configuredShell: string | undefined;
-  let landstripCheck: { ok: true; version: string } | { ok: false; reason: string } | undefined;
-
-  function allowanceKey(callID: string, kind: SandboxPermissionKind, resource: string): string {
-    return `${callID}:${kind}:${resource}`;
-  }
-
-  function clearCallAllowances(callID: string): void {
-    for (const key of callAllowances) {
-      if (key.startsWith(`${callID}:`)) callAllowances.delete(key);
+const plugin: Plugin.Plugin = {
+  id: 'opencode-landstrip',
+  async setup(context: Plugin.Context) {
+    const directory = context.location?.directory ?? process.cwd();
+    const optionOverrides = normalizeOptions(context.options);
+    const pendingCallIDByCommand = new Map<string, string>();
+    const pendingSessionIDByCommand = new Map<string, string>();
+    const activeBash = new Map<string, BashSandboxState>();
+    const notified = new Set<string>();
+    let enabledNotified = false;
+    let landstripCheck: { ok: true; version: string } | { ok: false; reason: string } | undefined;
+    function reportBlocked(decision: SandboxPermissionDecision): never {
+      throw errorWithConfigPaths(directory, decision.message);
     }
-  }
 
-  function hasCallAllowance(callID: string, decision: SandboxPermissionDecision): boolean {
-    return callAllowances.has(allowanceKey(callID, decision.kind, decision.resource));
-  }
-
-  function reportBlocked(decision: SandboxPermissionDecision): never {
-    client.tui
-      ?.showToast?.({
-        body: {
-          title: 'Sandbox blocked',
-          message: decision.message.slice(0, 120),
-          variant: 'error',
-        },
-      })
-      ?.catch?.(() => undefined);
-    throw errorWithConfigPaths(directory, decision.message);
-  }
-
-  client.app
-    ?.log?.({
-      body: {
-        service: 'opencode-landstrip',
-        level: 'info',
-        message: `plugin loaded for ${directory}`,
-      },
-      query: { directory },
-    })
-    ?.catch?.(() => undefined);
-
-  client.tui
-    ?.showToast?.({
-      body: {
-        title: 'Sandbox',
-        message: `Loaded for ${directory}`,
-        variant: 'info',
-        duration: 5000,
-      },
-    })
-    ?.catch?.(() => undefined);
-
-  const notifyGate = new Map<string, Promise<void>>();
-
-  async function notifyOnce(key: string, message: string, variant: ToastVariant): Promise<void> {
-    if (notified.has(key)) return;
-    const pending = notifyGate.get(key);
-    if (pending) return pending;
-
-    const promise = (async () => {
+    async function notifyOnce(key: string, message: string, variant: ToastVariant): Promise<void> {
+      if (notified.has(key)) return;
       notified.add(key);
+      const output =
+        variant === 'error' ? console.error : variant === 'warning' ? console.warn : console.info;
+      output(`opencode-landstrip: ${message}`);
+    }
 
-      await client.tui
-        ?.showToast?.({
-          body: { title: 'opencode-landstrip', message, variant },
-          query: { directory },
-        })
-        ?.catch?.(() => undefined);
+    function checkLandstrip(): typeof landstripCheck {
+      if (landstripCheck) return landstripCheck;
 
-      await client.app
-        ?.log?.({
-          body: {
-            service: 'opencode-landstrip',
-            level: variant === 'error' ? 'error' : variant === 'warning' ? 'warn' : 'info',
-            message,
-          },
-          query: { directory },
-        })
-        ?.catch?.(() => undefined);
+      if (!SUPPORTED_PLATFORMS.has(process.platform)) {
+        landstripCheck = {
+          ok: false,
+          reason: `landstrip sandboxing is not supported on ${process.platform}`,
+        };
+        return landstripCheck;
+      }
 
-      notifyGate.delete(key);
-    })();
+      let version: string | null;
+      try {
+        const result = spawnSync(landstripBinaryPath(), ['--version'], { encoding: 'utf-8' });
+        version = result.status === 0 ? result.stdout.trim() : null;
+      } catch (error) {
+        landstripCheck = {
+          ok: false,
+          reason: error instanceof Error ? error.message : String(error),
+        };
+        return landstripCheck;
+      }
 
-    notifyGate.set(key, promise);
-    return promise;
-  }
+      if (!version) {
+        landstripCheck = {
+          ok: false,
+          reason: `landstrip was not found. Reinstall with: npm install @landstrip/landstrip-api`,
+        };
+        return landstripCheck;
+      }
 
-  function checkLandstrip(): typeof landstripCheck {
-    if (landstripCheck) return landstripCheck;
+      if (!hasMinimumVersion(version, LANDSTRIP_VERSION)) {
+        landstripCheck = {
+          ok: false,
+          reason: `landstrip ${REQUIRED_LANDSTRIP_VERSION} or newer is required; found: ${version}`,
+        };
+        return landstripCheck;
+      }
 
-    if (!SUPPORTED_PLATFORMS.has(process.platform)) {
-      landstripCheck = {
-        ok: false,
-        reason: `landstrip sandboxing is not supported on ${process.platform}`,
-      };
+      landstripCheck = { ok: true, version };
       return landstripCheck;
     }
 
-    let version: string | null;
-    try {
-      const result = spawnSync(landstripBinaryPath(), ['--version'], { encoding: 'utf-8' });
-      version = result.status === 0 ? result.stdout.trim() : null;
-    } catch (error) {
-      landstripCheck = {
-        ok: false,
-        reason: error instanceof Error ? error.message : String(error),
-      };
-      return landstripCheck;
-    }
-
-    if (!version) {
-      landstripCheck = {
-        ok: false,
-        reason: `landstrip was not found. Reinstall with: npm install @landstrip/landstrip-api`,
-      };
-      return landstripCheck;
-    }
-
-    if (!hasMinimumVersion(version, LANDSTRIP_VERSION)) {
-      landstripCheck = {
-        ok: false,
-        reason: `landstrip ${REQUIRED_LANDSTRIP_VERSION} or newer is required; found: ${version}`,
-      };
-      return landstripCheck;
-    }
-
-    landstripCheck = { ok: true, version };
-    return landstripCheck;
-  }
-
-  async function activeConfig(): Promise<SandboxConfig | null> {
-    const config = loadConfig(directory, optionOverrides);
-    if (!config.enabled) {
-      await notifyOnce(
-        `not-configured:${directory}`,
-        'Sandbox is disabled by configuration',
-        'info',
-      );
-      return null;
-    }
-
-    const check = checkLandstrip();
-    if (!check?.ok) {
-      const reason = check?.reason ?? 'Unknown Landstrip installation error';
-      await notifyOnce(`broken-installation:${reason}`, reason, 'error');
-      throw new Error(`Broken @landstrip/landstrip-api installation: ${reason}`);
-    }
-
-    if (!enabledNotified) {
-      enabledNotified = true;
-      if (config.network.allowNetwork) {
+    async function activeConfig(): Promise<SandboxConfig | null> {
+      const config = loadConfig(directory, optionOverrides);
+      if (!config.enabled) {
         await notifyOnce(
-          'network-allow',
-          'Network sandbox is disabled because network.allowNetwork is true.',
-          'warning',
-        );
-      } else {
-        const networkLabel = allowsAllDomains(config.network.allowedDomains)
-          ? 'all domains'
-          : `${config.network.allowedDomains.length} domains`;
-        await notifyOnce(
-          'enabled',
-          `Sandbox enabled: ${networkLabel}, ${config.filesystem.allowWrite.length} write paths`,
+          `not-configured:${directory}`,
+          'Sandbox is disabled by configuration',
           'info',
         );
-        if (allowsAllDomains(config.network.allowedDomains)) {
+        return null;
+      }
+
+      const check = checkLandstrip();
+      if (!check?.ok) {
+        const reason = check?.reason ?? 'Unknown Landstrip installation error';
+        await notifyOnce(`broken-installation:${reason}`, reason, 'error');
+        throw new Error(`Broken @landstrip/landstrip-api installation: ${reason}`);
+      }
+
+      if (!enabledNotified) {
+        enabledNotified = true;
+        if (config.network.allowNetwork) {
           await notifyOnce(
-            'network-all',
-            'Network sandbox allows all domains because network.allowedDomains contains "*".',
+            'network-allow',
+            'Network sandbox is disabled because network.allowNetwork is true.',
             'warning',
           );
+        } else {
+          const networkLabel = allowsAllDomains(config.network.allowedDomains)
+            ? 'all domains'
+            : `${config.network.allowedDomains.length} domains`;
+          await notifyOnce(
+            'enabled',
+            `Sandbox enabled: ${networkLabel}, ${config.filesystem.allowWrite.length} write paths`,
+            'info',
+          );
+          if (allowsAllDomains(config.network.allowedDomains)) {
+            await notifyOnce(
+              'network-all',
+              'Network sandbox allows all domains because network.allowedDomains contains "*".',
+              'warning',
+            );
+          }
         }
       }
+
+      return config;
     }
 
-    return config;
-  }
+    async function cleanupBash(callID: string): Promise<void> {
+      const state = activeBash.get(callID);
+      if (!state) return;
 
-  async function cleanupBash(callID: string): Promise<void> {
-    clearCallAllowances(callID);
-    const state = activeBash.get(callID);
-    if (!state) return;
-
-    activeBash.delete(callID);
-    if (state.stop) await state.stop().catch(() => undefined);
-    if (state.trapServer) {
-      await new Promise<void>((resolve) => {
-        state.trapServer!.close(() => resolve());
-      });
-    }
-    rmSync(state.policyDir, { recursive: true, force: true });
-  }
-
-  async function prepareBash(
-    callID: string,
-    sessionID: string | undefined,
-    args: Record<string, unknown>,
-    config: SandboxConfig,
-  ): Promise<void> {
-    if (typeof args.command !== 'string') return;
-    const normalizedSessionID = sessionID?.trim() || undefined;
-
-    const rewriteDescription = (): void => {
-      if (typeof args.description === 'string' && !args.description.endsWith(' (landstrip)')) {
-        args.description = `${args.description} (landstrip)`;
-      }
-    };
-
-    const existing = activeBash.get(callID);
-    if (existing) {
-      if (
-        existing.sessionID === normalizedSessionID &&
-        (args.command === existing.originalCommand || args.command === existing.wrappedCommand)
-      ) {
-        args.command = existing.wrappedCommand;
-        rewriteDescription();
-        return;
-      }
-
-      await cleanupBash(callID);
-    }
-
-    if (isGeneratedWrappedCommand(args.command as string)) {
-      if (activeBash.has(callID)) await cleanupBash(callID);
-      const original = extractOriginalCommand(args.command as string);
-      if (original) args.command = original;
-    }
-
-    const allowNetwork = config.network.allowNetwork;
-    const callAllowedDomains: string[] = [];
-    const effectiveConfig = {
-      ...config,
-      network: { ...config.network },
-      filesystem: config.filesystem,
-    };
-
-    if (!allowNetwork) {
-      for (const decision of evaluateCommandDomains(args.command as string, effectiveConfig)) {
-        if (decision.status === 'allow') continue;
-        if (decision.status === 'ask' && hasCallAllowance(callID, decision)) {
-          callAllowedDomains.push(decision.resource);
-          continue;
-        }
-        throw errorWithConfigPaths(directory, decision.message);
-      }
-    }
-
-    if (callAllowedDomains.length > 0) {
-      effectiveConfig.network = {
-        ...effectiveConfig.network,
-        allowedDomains: [...effectiveConfig.network.allowedDomains, ...callAllowedDomains],
-      };
-    }
-
-    const proxyToken = allowNetwork ? null : randomBytes(32).toString('base64url');
-    const proxyAuthorization =
-      proxyToken === null
-        ? undefined
-        : `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
-    const proxy = allowNetwork
-      ? null
-      : await startFilterProxy({
-          isDomainAllowed: (domain) => isDomainAllowed(domain, effectiveConfig),
-          ...(proxyAuthorization === undefined ? {} : { authorization: proxyAuthorization }),
+      activeBash.delete(callID);
+      if (state.stop) await state.stop().catch(() => undefined);
+      if (state.trapServer) {
+        await new Promise<void>((resolve) => {
+          state.trapServer!.close(() => resolve());
         });
-    const proxyPort = proxy ? proxy.port : null;
-    let policy: { dir: string; path: string };
-
-    try {
-      policy = writePolicyFile(effectiveConfig, directory, proxyPort);
-    } catch (error) {
-      if (proxy) await proxy.stop().catch(() => undefined);
-      throw error;
+      }
+      rmSync(state.policyDir, { recursive: true, force: true });
     }
 
-    const originalCommand = args.command as string;
+    async function prepareBash(
+      callID: string,
+      sessionID: string | undefined,
+      args: Record<string, unknown>,
+      config: SandboxConfig,
+      env?: Record<string, string | undefined>,
+      overrideShell?: string,
+    ): Promise<void> {
+      if (typeof args.command !== 'string') return;
+      const normalizedSessionID = sessionID?.trim() || undefined;
 
-    // The TUI owns interactive query handling. Fall back to an in-process
-    // broker when no TUI endpoint or session identity is available.
-    const interactiveSessionID = normalizedSessionID ?? '';
-    const discoveredPort =
-      process.platform === 'linux' && interactiveSessionID ? readDiscoveryPort(directory) : null;
-    const tuiTrapPort =
-      discoveredPort !== null && (await trapPortAcceptsConnections(discoveredPort))
-        ? discoveredPort
-        : null;
-    const trapServer =
-      tuiTrapPort === null
-        ? await startTrapServer(
-            effectiveConfig.filesystem.allowRead,
-            effectiveConfig.filesystem.allowWrite,
-            effectiveConfig.filesystem.denyRead,
-            effectiveConfig.filesystem.denyWrite,
-            directory,
-          )
-        : null;
-    const trapPort = tuiTrapPort ?? trapServer?.port ?? null;
+      const rewriteDescription = (): void => {
+        if (typeof args.description === 'string' && !args.description.endsWith(' (landstrip)')) {
+          args.description = `${args.description} (landstrip)`;
+        }
+      };
 
-    const wrappedCommand = buildWrappedCommand(
-      policy.path,
-      configuredShell ?? process.env.SHELL ?? '/bin/sh',
-      originalCommand,
-      trapPort,
-      tuiTrapPort === null ? undefined : interactiveSessionID,
-    );
+      const existing = activeBash.get(callID);
+      if (existing) {
+        if (
+          existing.sessionID === normalizedSessionID &&
+          (args.command === existing.originalCommand || args.command === existing.wrappedCommand)
+        ) {
+          args.command = existing.wrappedCommand;
+          rewriteDescription();
+          if (env) {
+            const envVars = proxyEnv(existing.port, existing.proxyToken);
+            if (envVars) Object.assign(env, envVars);
+          }
+          return;
+        }
 
-    activeBash.set(callID, {
-      originalCommand,
-      wrappedCommand,
-      sessionID: normalizedSessionID,
-      policyDir: policy.dir,
-      port: proxyPort,
-      proxyToken,
-      stop: proxy ? proxy.stop : null,
-      trapServer: trapServer?.server ?? null,
-      trapServerPort: trapPort,
-      trapLines: trapServer?.trapLines ?? [],
-    });
+        await cleanupBash(callID);
+      }
 
-    args.command = wrappedCommand;
-    rewriteDescription();
-  }
+      if (isGeneratedWrappedCommand(args.command as string)) {
+        if (activeBash.has(callID)) await cleanupBash(callID);
+        const original = extractOriginalCommand(args.command as string);
+        if (original) args.command = original;
+      }
 
-  const hooks: Hooks = {
-    config: async (config) => {
-      const value: unknown = config;
-      configuredShell =
-        isRecord(value) && typeof value.shell === 'string' ? value.shell : undefined;
-    },
+      const allowNetwork = config.network.allowNetwork;
+      if (!allowNetwork) {
+        for (const decision of evaluateCommandDomains(args.command as string, config)) {
+          if (decision.status !== 'allow') throw errorWithConfigPaths(directory, decision.message);
+        }
+      }
 
-    'permission.ask': async (input, output) => {
+      const proxyToken = allowNetwork ? null : randomBytes(32).toString('base64url');
+      const proxyAuthorization =
+        proxyToken === null
+          ? undefined
+          : `Basic ${Buffer.from(`landstrip:${proxyToken}`).toString('base64')}`;
+      const proxy = allowNetwork
+        ? null
+        : await startFilterProxy({
+            isDomainAllowed: (domain) => isDomainAllowed(domain, config),
+            ...(proxyAuthorization === undefined ? {} : { authorization: proxyAuthorization }),
+          });
+      const proxyPort = proxy ? proxy.port : null;
+      let policy: { dir: string; path: string };
+
+      try {
+        policy = writePolicyFile(config, directory, proxyPort);
+      } catch (error) {
+        if (proxy) await proxy.stop().catch(() => undefined);
+        throw error;
+      }
+
+      const originalCommand = args.command as string;
+
+      // The TUI owns interactive query handling. Fall back to an in-process
+      // broker when no TUI endpoint or session identity is available.
+      const interactiveSessionID = normalizedSessionID ?? '';
+      const discoveredPort =
+        process.platform === 'linux' && interactiveSessionID ? readDiscoveryPort(directory) : null;
+      const tuiTrapPort =
+        discoveredPort !== null && (await trapPortAcceptsConnections(discoveredPort))
+          ? discoveredPort
+          : null;
+      const trapServer =
+        tuiTrapPort === null
+          ? await startTrapServer(
+              config.filesystem.allowRead,
+              config.filesystem.allowWrite,
+              config.filesystem.denyRead,
+              config.filesystem.denyWrite,
+              directory,
+            )
+          : null;
+      const trapPort = tuiTrapPort ?? trapServer?.port ?? null;
+
+      const wrappedCommand = buildWrappedCommand(
+        policy.path,
+        overrideShell ?? process.env.SHELL ?? '/bin/sh',
+        originalCommand,
+        trapPort,
+        tuiTrapPort === null ? undefined : interactiveSessionID,
+      );
+
+      activeBash.set(callID, {
+        originalCommand,
+        wrappedCommand,
+        sessionID: normalizedSessionID,
+        policyDir: policy.dir,
+        port: proxyPort,
+        proxyToken,
+        stop: proxy ? proxy.stop : null,
+        trapServer: trapServer?.server ?? null,
+        trapServerPort: trapPort,
+        trapLines: trapServer?.trapLines ?? [],
+      });
+
+      args.command = wrappedCommand;
+      rewriteDescription();
+      if (env) {
+        const envVars = proxyEnv(proxyPort, proxyToken);
+        if (envVars) Object.assign(env, envVars);
+      }
+    }
+
+    context.permission.hook('evaluate', async (evaluation) => {
+      if (evaluation.effect === 'deny') return;
       const config = await activeConfig();
       if (!config) return;
 
-      const request = input as Record<string, unknown>;
-      const permission = permissionType(request);
-      const metadata = isRecord(request.metadata) ? request.metadata : {};
-      const tool = isRecord(request.tool) ? request.tool : undefined;
-      const callID =
-        typeof request.callID === 'string'
-          ? request.callID
-          : typeof tool?.callID === 'string'
-            ? tool.callID
-            : undefined;
-      const patterns = permissionPatterns(request);
-
+      const action = evaluation.action;
+      const patterns = [...(evaluation.resources ?? [])];
       const effectiveAllowRead = config.filesystem.allowRead;
       const effectiveAllowWrite = config.filesystem.allowWrite;
-      const args: Record<string, unknown> = { ...metadata };
-      if (permission === 'read') args.paths = patterns;
-      if (permission === 'edit') {
+      const args: Record<string, unknown> = { ...evaluation.metadata };
+      if (action === 'read' || action === 'external_directory') args.paths = patterns;
+      if (action === 'edit') {
         args.paths =
           patterns.length > 0
             ? patterns
-            : [metadata.filepath].filter((path): path is string => typeof path === 'string');
+            : [args.filepath].filter((path): path is string => typeof path === 'string');
       }
-      if (permission === 'bash' && typeof args.command !== 'string') args.command = patterns[0];
+      if ((action === 'shell' || action === 'bash') && typeof args.command !== 'string') {
+        args.command = patterns[0];
+      }
+      const toolName =
+        action === 'shell' ? 'bash' : action === 'external_directory' ? 'read' : action;
       const decisions = evaluateToolPermissions(
-        permission,
+        toolName,
         args,
         config,
         directory,
@@ -1026,76 +932,95 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
 
       const denied = decisions.find((item) => item.status === 'deny');
       if (denied) {
-        output.status = 'deny';
+        evaluation.effect = 'deny';
+        evaluation.message = denied.message;
         return;
       }
 
       const approvals = decisions.filter((item) => item.status === 'ask');
       if (approvals.length === 0) return;
 
-      output.status = 'ask';
-      if (callID) {
-        for (const approval of approvals) {
-          callAllowances.add(allowanceKey(callID, approval.kind, approval.resource));
-        }
-      }
-    },
+      evaluation.effect = 'ask';
+      evaluation.message = approvals.map((item) => item.message).join('\n');
+    });
 
-    'tool.execute.before': async (input, output) => {
-      if (!isRecord(output.args)) return;
-
+    context.tool.hook('execute.before', async (event) => {
       const config = await activeConfig();
       if (!config) return;
 
-      if (input.tool === 'bash') {
-        await prepareBash(input.callID, input.sessionID, output.args, config);
+      const args = isRecord(event.input) ? event.input : {};
+
+      if (event.tool === 'shell') {
+        if (args.background === true) {
+          throw new Error(
+            'Background shell commands are not supported while the sandbox is enabled',
+          );
+        }
+        if (typeof args.command === 'string') {
+          await prepareBash(event.id, event.sessionID, args, config);
+          pendingCallIDByCommand.set(args.command, event.id);
+          pendingSessionIDByCommand.set(args.command, event.sessionID);
+        }
         return;
       }
 
       const decisions = evaluateToolPermissions(
-        input.tool,
-        output.args,
+        event.tool,
+        args,
         config,
         directory,
         config.filesystem.allowRead,
         config.filesystem.allowWrite,
       );
       for (const decision of decisions) {
-        if (
-          decision.status === 'allow' ||
-          (decision.status === 'ask' && hasCallAllowance(input.callID, decision))
-        ) {
+        if (decision.status === 'allow') continue;
+        if (decision.status === 'ask' && ['read', 'write', 'edit', 'patch'].includes(event.tool)) {
+          // These host tools assert their own permission during execution.
           continue;
         }
         reportBlocked(decision);
       }
-    },
+    });
 
-    'shell.env': async (input, output) => {
-      if (!input.callID) return;
-      const state = activeBash.get(input.callID);
+    context.shell.hook('create.before', async (invocation) => {
+      const config = await activeConfig();
+      if (!config) return;
+
+      let callID = pendingCallIDByCommand.get(invocation.command);
+      let sessionID = pendingSessionIDByCommand.get(invocation.command);
+      if (callID) {
+        pendingCallIDByCommand.delete(invocation.command);
+      } else {
+        callID = `shell-${randomBytes(6).toString('hex')}`;
+      }
+      if (sessionID) {
+        pendingSessionIDByCommand.delete(invocation.command);
+      }
+
+      await prepareBash(
+        callID,
+        sessionID,
+        invocation as unknown as Record<string, unknown>,
+        config,
+        invocation.env,
+        invocation.shell,
+      );
+    });
+
+    context.tool.hook('execute.after', async (event) => {
+      if (event.tool !== 'shell') return;
+
+      const state = activeBash.get(event.id);
       if (!state) return;
 
-      const envVars = proxyEnv(state.port, state.proxyToken);
-      if (envVars) Object.assign(output.env, envVars);
-    },
-
-    'tool.execute.after': async (input, output) => {
-      if (input.tool !== 'bash') {
-        clearCallAllowances(input.callID);
-        return;
-      }
-
-      const state = activeBash.get(input.callID);
-      if (!state) {
-        await cleanupBash(input.callID);
-        return;
-      }
-
-      const outputText = output?.output ?? '';
-      // Query traps were already resolved in-process by the local trap server;
-      // only terminal (info) traps and trap-server-collected lines belong in
-      // the after-the-fact toast.
+      const outputText =
+        event.status === 'completed'
+          ? typeof event.result.output === 'string'
+            ? event.result.output
+            : typeof event.result.content === 'string'
+              ? event.result.content
+              : ''
+          : '';
       const serverTrapOutput = state.trapLines.join('\n');
       const combinedOutput = serverTrapOutput ? outputText + '\n' + serverTrapOutput : outputText;
       const traps = parseLandstripTraps(combinedOutput);
@@ -1103,23 +1028,7 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
         (trap: LandstripTrap) => !(trap.kind === 'filesystem' && trap.state === 'query'),
       );
       if (errors.length > 0) {
-        const message = formatLandstripTraps(errors);
-        await client.tui
-          ?.showToast?.({
-            body: { title: 'opencode-landstrip', message, variant: 'error' },
-            query: { directory },
-          })
-          ?.catch?.(() => undefined);
-        await client.app
-          ?.log?.({
-            body: {
-              service: 'opencode-landstrip',
-              level: 'error',
-              message,
-            },
-            query: { directory },
-          })
-          ?.catch?.(() => undefined);
+        console.error(`opencode-landstrip: ${formatLandstripTraps(errors)}`);
       }
 
       const blockedTrap = traps.find(
@@ -1138,15 +1047,15 @@ const plugin: Plugin = async ({ client, directory }: PluginInput, options?: Plug
         );
       }
 
-      await cleanupBash(input.callID);
-    },
+      await cleanupBash(event.id);
+    });
 
-    dispose: async () => {
+    return async () => {
       await Promise.all([...activeBash.keys()].map((callID) => cleanupBash(callID)));
-    },
-  };
-
-  return hooks;
+      activeBash.clear();
+    };
+  },
 };
 
-export default { server: plugin };
+export { plugin };
+export default plugin;
