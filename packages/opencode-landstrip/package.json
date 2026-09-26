@@ -57,7 +57,7 @@
     "@opencode/plugin": "^2.0.18",
     "@opencode/theme": "^2.0.18",
     "@types/node": "^26.1.1",
-    "oxfmt": "^0.68.0",
+    "oxfmt": "^0.70.0",
     "oxlint": "^1.68.0",
     "typescript": "^5.9.3"
   },
