@@ -30,12 +30,8 @@ Arrays combine; later scalar values win. Defaults allow project writes, deny
 sensitive-file writes, and block network access. Enabled sandboxing fails closed
 on unusable binaries/platforms; `enabled: false` explicitly permits unsandboxed Bash.
 
-- `filesystem.denyReadAlways` cannot be overridden by equal/nested read grants
-  and blocks promptable reads on those paths. Non-empty `denyReadAlways` is
-  unsupported on Windows.
-- `filesystem.denyWriteAlways` cannot be overridden by equal/nested write grants
-  and blocks promptable writes on those paths. Non-empty `denyWriteAlways` is
-  unsupported on Windows.
+`filesystem.denyReadAlways` and `filesystem.denyWriteAlways` block approvals and
+equal/nested grants. Non-empty hard-denial lists are unsupported on Windows.
 
 See [landstrip(1)](../landstrip/man/man1/landstrip.1) for native CLI/policy semantics.
 Runtime seccomp traps/query approval are Linux-only. Native macOS `--trap` reports
