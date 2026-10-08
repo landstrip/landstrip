@@ -6,6 +6,7 @@ import {
   deepMergeSandboxConfig,
   extractDomainsFromCommand,
   isRecord,
+  mergeArray,
   parseSandboxConfig,
 } from '@landstrip/landstrip-api/shared';
 import type { SandboxConfig, SandboxConfigOverrides } from '@landstrip/landstrip-api/shared';
@@ -143,12 +144,24 @@ export function loadConfig(
 }
 
 export function writeConfigFile(configPath: string, update: SandboxConfigOverrides): void {
-  const current = readConfigFile(configPath);
+  const next: Record<string, unknown> = { ...readConfigFile(configPath) };
+  for (const [key, value] of Object.entries(normalizeConfig(update))) {
+    if (!isRecord(value)) {
+      next[key] = value;
+      continue;
+    }
 
-  const templateConfig: SandboxConfig = JSON.parse(
-    readFileSync(join(packageDir, 'sandbox.json'), 'utf-8'),
-  );
-  const next = deepMerge(deepMerge(templateConfig, current), update);
+    const previous = next[key];
+    const section: Record<string, unknown> = isRecord(previous) ? { ...previous } : {};
+    for (const [field, fieldValue] of Object.entries(value)) {
+      if (fieldValue === undefined) continue;
+      const existing = section[field];
+      section[field] = Array.isArray(fieldValue)
+        ? mergeArray(Array.isArray(existing) ? existing : [], fieldValue)
+        : fieldValue;
+    }
+    next[key] = section;
+  }
 
   mkdirSync(dirname(configPath), { recursive: true });
   writeFileSync(configPath, JSON.stringify(next, null, 2) + '\n');
