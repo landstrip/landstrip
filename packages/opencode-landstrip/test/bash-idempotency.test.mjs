@@ -19,6 +19,7 @@ async function withPlugin(options, run) {
   const home = join(tempDir, 'home');
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
+  const originalConfigHome = process.env.XDG_CONFIG_HOME;
 
   try {
     await mkdir(home, { recursive: true });
@@ -39,6 +40,7 @@ async function withPlugin(options, run) {
     await writeFile(modulePath, transpile(await readFile(join(packageRoot, 'index.ts'), 'utf8')));
     process.env.HOME = home;
     process.env.USERPROFILE = home;
+    process.env.XDG_CONFIG_HOME = join(tempDir, 'config');
 
     const { default: plugin } = await import(pathToFileURL(modulePath).href);
     const messages = [];
@@ -73,6 +75,8 @@ async function withPlugin(options, run) {
     else process.env.HOME = originalHome;
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = originalUserProfile;
+    if (originalConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = originalConfigHome;
     await rm(tempDir, { force: true, recursive: true });
   }
 }

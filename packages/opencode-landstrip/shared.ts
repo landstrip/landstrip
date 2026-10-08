@@ -75,7 +75,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
@@ -105,8 +105,11 @@ export function deepMerge(base: SandboxConfig, overrides: SandboxConfigOverrides
 }
 
 export function getConfigPaths(baseDirectory: string): { globalPath: string; projectPath: string } {
+  const configHome = process.env.XDG_CONFIG_HOME;
+  const configDirectory =
+    configHome && isAbsolute(configHome) ? configHome : join(homedir(), '.config');
   return {
-    globalPath: join(homedir(), '.config', 'opencode', 'sandbox.json'),
+    globalPath: join(configDirectory, 'opencode', 'sandbox.json'),
     projectPath: join(baseDirectory, '.opencode', 'sandbox.json'),
   };
 }
@@ -137,6 +140,7 @@ export function loadConfig(
   }
 
   const templateConfig: SandboxConfig = JSON.parse(readFileSync(templatePath, 'utf-8'));
+  templateConfig.filesystem.denyWrite.push(globalPath);
   const globalOverrides = readConfigFile(globalPath);
   const baseConfig = deepMerge(templateConfig, globalOverrides);
 

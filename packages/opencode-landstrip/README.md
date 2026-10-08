@@ -19,12 +19,10 @@ Approval never bypasses hard denials. Interactive requests without a live
 presenter remain denied. Only AI `bash` receives OS isolation: OpenCode's plugin
 API cannot replace direct user shell commands.
 
-Policy precedence (persistent approvals update the project/global files):
-
-1. Bundled [`sandbox.json`](sandbox.json).
-2. `~/.config/opencode/sandbox.json`.
-3. `.opencode/sandbox.json`.
-4. Plugin options.
+Policy precedence: bundled [`sandbox.json`](sandbox.json) → global →
+`.opencode/sandbox.json` → plugin options. The global file is
+`$XDG_CONFIG_HOME/opencode/sandbox.json` (`~/.config` when unset, empty, or relative).
+Persistent approvals update the chosen project/global file.
 
 Arrays combine; later scalar values win. Defaults allow project writes, deny
 sensitive-file writes, and block network access. Enabled sandboxing fails closed
