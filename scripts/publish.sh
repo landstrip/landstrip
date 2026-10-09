@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright (C) Jarkko Sakkinen 2026
 #
-# Publish locally packed assets, wait for npm provenance, and verify the release.
+# Stage locally, wait for trusted npm publishing, and finalize the release.
 # Run `make package` first, then push the signed tag yourself.
 
 set -euo pipefail
@@ -187,7 +187,7 @@ stage_github_release() {
 }
 
 wait_for_npm_workflow() {
-  local run_info run_id run_status previous_run attempt
+  local run_info run_id run_status previous_run attempt pipeline_url conclusion
   local run_query="[.[] | select(.displayTitle == \"Publish npm $version\")][0] | if . == null then \"\" else \"\(.databaseId) \(.status)\" end"
 
   run_info="$(github_retry "$GH" run list --workflow publish-npm.yml --branch main \
@@ -197,20 +197,34 @@ wait_for_npm_workflow() {
     previous_run="${run_id:-0}"
     # Do not retry dispatch automatically: a lost response may still have started a run.
     "$GH" workflow run publish-npm.yml --ref main -f "version=$version" \
-      || die "workflow dispatch failed; inspect GitHub Actions, then rerun make publish VERSION=$version"
+      || die "cannot dispatch npm publishing; retry: make publish VERSION=$version"
     run_id=
     for attempt in {1..60}; do
       run_id="$(github_retry "$GH" run list --workflow publish-npm.yml --branch main \
         --event workflow_dispatch --limit 100 --json databaseId,displayTitle \
         --jq "[.[] | select(.displayTitle == \"Publish npm $version\" and .databaseId > $previous_run)][0].databaseId // empty")"
       [[ -z "$run_id" ]] || break
-      ((attempt < 60)) || die "cannot find dispatched npm workflow; rerun make publish VERSION=$version"
+      ((attempt < 60)) || die "cannot find dispatched npm publish pipeline; retry: make publish VERSION=$version"
       sleep 2
     done
   fi
-  printf 'waiting for npm publication for %s (run %s)\n' "$version" "$run_id"
-  "$GH" run watch "$run_id" --exit-status --interval 10 \
-    || die "npm workflow failed; inspect run $run_id, then rerun make publish VERSION=$version"
+  pipeline_url="$(github_retry "$GH" run view "$run_id" --json url --jq .url)"
+  [[ "$pipeline_url" == https://* ]] \
+    || die "cannot determine npm publish pipeline URL; retry: make publish VERSION=$version"
+  printf 'waiting for npm publish pipeline: %s\n' "$pipeline_url"
+  while :; do
+    run_info="$(github_retry "$GH" run view "$run_id" --json status,conclusion \
+      --jq '"\(.status) \(.conclusion // "")"')"
+    read -r run_status conclusion <<<"$run_info"
+    case "$run_status" in
+      completed)
+        [[ "$conclusion" == success ]] && break
+        die "npm publish pipeline $run_id ended with status ${conclusion:-unknown}; retry: make publish VERSION=$version"
+        ;;
+      queued|waiting|requested|pending|in_progress) sleep 10 ;;
+      *) die "npm publish pipeline $run_id ended with status $run_status; retry: make publish VERSION=$version" ;;
+    esac
+  done
 }
 
 complete_release() {
@@ -224,21 +238,18 @@ complete_release() {
     [[ "$is_draft" == true ]] || die "public release $version has unpublished npm packages"
     wait_for_npm_workflow
     NPM="$NPM" NODE="$NODE" scripts/publish-npm-provenance.sh check "$version" "$workdir/release"
-  else
-    printf 'npm packages already published and verified; skipping workflow dispatch\n'
   fi
 
   publish_cargo_package "$repo_root/packages/landstrip"
   NPM="$NPM" "$NODE" scripts/update-npm-integrity.mjs "$version" "${extension_dirs[@]}"
   git add -- "${lock_files[@]}"
   if ! git diff --cached --quiet; then
-    git commit -s -m "chore: Update package-lock.json files"
-    printf 'push the integrity commit\n'
+    git commit -s -m "release: update npm package integrity metadata"
   fi
   if [[ "$is_draft" == true ]]; then
     github_retry "$GH" release edit "$version" --draft=false
   fi
-  printf 'published and verified landstrip %s\n' "$version"
+  printf 'published landstrip %s\npush the integrity commit if one was created\n' "$version"
 }
 
 platform_binary() {
@@ -306,7 +317,7 @@ fi
 workdir="$(mktemp -d)"
 mkdir -p "$workdir/packages" "$workdir/release"
 if github_release_exists; then
-  printf 'resuming verification of release %s using its existing assets\n' "$version"
+  printf 'verifying staged landstrip %s\n' "$version"
   github_retry "$GH" release download "$version" --pattern '*.tgz' \
     --pattern '*.tgz.sha256' --dir "$workdir/release"
   complete_release
@@ -323,7 +334,7 @@ remote_main="$(git ls-remote origin refs/heads/main | awk '{print $1}')"
 [[ "$remote_main" == "$tag_commit" ]] \
   || die "push the release commit to origin/main before staging the release"
 cargo_root="$repo_root"
-printf 'staging tag %s (%s)\n' "$version" "${tag_commit:0:12}"
+printf 'staging tag %s\n' "$version"
 
 package_version="$($NODE -p "require('$cargo_root/packages/landstrip-api/package.json').version")"
 [[ "$version" == "$package_version" ]] \
