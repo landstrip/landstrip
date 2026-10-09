@@ -249,7 +249,7 @@ complete_release() {
   if [[ "$is_draft" == true ]]; then
     github_retry "$GH" release edit "$version" --draft=false
   fi
-  printf 'published landstrip %s\npush the integrity commit if one was created\n' "$version"
+  printf 'published landstrip %s\n' "$version"
 }
 
 platform_binary() {
