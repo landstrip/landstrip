@@ -82,9 +82,16 @@ check_published() {
     let data="";
     process.stdin.on("data", part => data += part);
     process.stdin.on("end", () => {
-      const dist = JSON.parse(data);
-      if (dist.integrity !== process.argv[1] ||
-          dist.attestations?.provenance?.predicateType !== "https://slsa.dev/provenance/v1") {
+      let dist;
+      try {
+        dist = JSON.parse(data);
+      } catch (error) {
+        console.error("invalid npm registry metadata:", process.argv[2], error.message);
+        process.exitCode = 2;
+        return;
+      }
+      if (dist?.integrity !== process.argv[1] ||
+          dist?.attestations?.provenance?.predicateType !== "https://slsa.dev/provenance/v1") {
         console.error("published npm package integrity or provenance differs:", process.argv[2]);
         process.exitCode = 2;
       }
@@ -92,6 +99,7 @@ check_published() {
   ' "$digest" "$name@$version"
 }
 
+result=0
 for path in "${archives[@]}"; do
   name="$(tar -xOf "$path" package/package.json | "$NODE" -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).name')"
   status=0
@@ -125,6 +133,11 @@ for path in "${archives[@]}"; do
   elif [[ "$mode" == preflight ]]; then
     ((status == 0 || status == 1)) || exit "$status"
   else
-    ((status == 0)) || { printf 'npm package not verified: %s@%s\n' "$name" "$version" >&2; exit 1; }
+    ((status == 0 || status == 1)) || exit "$status"
+    if ((status == 1)); then
+      printf 'npm package not yet published: %s@%s\n' "$name" "$version" >&2
+      result=1
+    fi
   fi
 done
+exit "$result"
