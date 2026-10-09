@@ -8,7 +8,7 @@ NODE ?= node
 NPM ?= npm
 VERSION ?=
 
-.PHONY: default help all check ci test clippy package publish publish-finish install uninstall clean
+.PHONY: default help all check ci test clippy package publish install uninstall clean
 
 help: ## Show this help
 	@awk -F ':[^#]*## ?' '/^[a-z_-]+:[^#]*##/{printf "  make %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -50,10 +50,6 @@ clean: ## Remove build artifacts
 ci: ## Run the local CI script
 	CARGO="$(CARGO)" NODE="$(NODE)" NPM="$(NPM)" ./scripts/ci.sh
 
-publish: ## Pack locally and stage a draft release for npm provenance
+publish: ## Publish the release, waiting for npm provenance and verifying the result
 	CARGO="$(CARGO)" GH="$(GH)" NODE="$(NODE)" NPM="$(NPM)" \
-		./scripts/publish.sh "$(VERSION)"
-
-publish-finish: ## Verify npm provenance and publish the draft release
-	PUBLISH_MODE=finish CARGO="$(CARGO)" GH="$(GH)" NODE="$(NODE)" NPM="$(NPM)" \
 		./scripts/publish.sh "$(VERSION)"

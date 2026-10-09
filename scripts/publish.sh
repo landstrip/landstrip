@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright (C) Jarkko Sakkinen 2026
 #
-# Pack locally, stage a draft release, then dispatch npm provenance publishing.
+# Publish locally packed assets, wait for npm provenance, and verify the release.
 # Run `make package` first, then push the signed tag yourself.
 
 set -euo pipefail
@@ -132,11 +132,11 @@ github_release_exists() {
   local error_file="$workdir/gh-release-error"
 
   for attempt in {1..6}; do
-    if $GH api "repos/:owner/:repo/releases/tags/$version" \
+    if $GH release view "$version" --json isDraft,tagName,assets \
       >"$workdir/gh-release.json" 2>"$error_file"; then
       return 0
     fi
-    if grep -q 'HTTP 404' "$error_file"; then
+    if grep -Eq '^release not found$|HTTP 404' "$error_file"; then
       return 1
     fi
     if ((attempt == 6)) || ! grep -Eq 'HTTP 502|HTTP 503|HTTP 429' "$error_file"; then
@@ -157,7 +157,7 @@ stage_github_release() {
   if github_release_exists; then
     $NODE -e '
       const release = require(process.argv[1]);
-      if (!release.draft || release.tag_name !== process.argv[2]) process.exit(1);
+      if (!release.isDraft || release.tagName !== process.argv[2]) process.exit(1);
     ' "$workdir/gh-release.json" "$version" \
       || die "release $version exists but is not a draft for this tag"
     for asset in "${assets[@]}"; do
@@ -186,6 +186,61 @@ stage_github_release() {
     --draft --notes-from-tag --title "landstrip $version" --verify-tag
 }
 
+wait_for_npm_workflow() {
+  local run_info run_id run_status previous_run attempt
+  local run_query="[.[] | select(.displayTitle == \"Publish npm $version\")][0] | if . == null then \"\" else \"\(.databaseId) \(.status)\" end"
+
+  run_info="$(github_retry "$GH" run list --workflow publish-npm.yml --branch main \
+    --event workflow_dispatch --limit 100 --json databaseId,displayTitle,status --jq "$run_query")"
+  read -r run_id run_status <<<"$run_info"
+  if [[ -z "$run_id" || "$run_status" == completed ]]; then
+    previous_run="${run_id:-0}"
+    # Do not retry dispatch automatically: a lost response may still have started a run.
+    "$GH" workflow run publish-npm.yml --ref main -f "version=$version" \
+      || die "workflow dispatch failed; inspect GitHub Actions, then rerun make publish VERSION=$version"
+    run_id=
+    for attempt in {1..60}; do
+      run_id="$(github_retry "$GH" run list --workflow publish-npm.yml --branch main \
+        --event workflow_dispatch --limit 100 --json databaseId,displayTitle \
+        --jq "[.[] | select(.displayTitle == \"Publish npm $version\" and .databaseId > $previous_run)][0].databaseId // empty")"
+      [[ -z "$run_id" ]] || break
+      ((attempt < 60)) || die "cannot find dispatched npm workflow; rerun make publish VERSION=$version"
+      sleep 2
+    done
+  fi
+  printf 'waiting for npm publication for %s (run %s)\n' "$version" "$run_id"
+  "$GH" run watch "$run_id" --exit-status --interval 10 \
+    || die "npm workflow failed; inspect run $run_id, then rerun make publish VERSION=$version"
+}
+
+complete_release() {
+  local status=0 is_draft
+
+  is_draft="$($NODE -p 'require(process.argv[1]).isDraft' "$workdir/gh-release.json")"
+  scripts/publish-npm-provenance.sh verify "$version" "$workdir/release"
+  scripts/publish-npm-provenance.sh check "$version" "$workdir/release" || status=$?
+  if ((status != 0)); then
+    ((status == 1)) || exit "$status"
+    [[ "$is_draft" == true ]] || die "public release $version has unpublished npm packages"
+    wait_for_npm_workflow
+    scripts/publish-npm-provenance.sh check "$version" "$workdir/release"
+  else
+    printf 'npm packages already published and verified; skipping workflow dispatch\n'
+  fi
+
+  publish_cargo_package "$repo_root/packages/landstrip"
+  NPM="$NPM" "$NODE" scripts/update-npm-integrity.mjs "$version" "${extension_dirs[@]}"
+  git add -- "${lock_files[@]}"
+  if ! git diff --cached --quiet; then
+    git commit -s -m "chore: Update package-lock.json files"
+    printf 'push the integrity commit\n'
+  fi
+  if [[ "$is_draft" == true ]]; then
+    github_retry "$GH" release edit "$version" --draft=false
+  fi
+  printf 'published and verified landstrip %s\n' "$version"
+}
+
 platform_binary() {
   local platform="$1"
   if [[ "$platform" == win32-* ]]; then
@@ -195,7 +250,7 @@ platform_binary() {
   fi
 }
 
-for command in "$CARGO" "$GH" "$NODE" "$NPM" bun tar; do
+for command in "$CARGO" "$GH" "$NODE" "$NPM" tar; do
   require_command "$command"
 done
 if ! command -v sha256sum >/dev/null 2>&1 && \
@@ -241,12 +296,6 @@ if ! git merge-base --is-ancestor "$tag_commit" "$head_commit"; then
   die "tag $version is not an ancestor of HEAD"
 fi
 
-mode="${PUBLISH_MODE:-stage}"
-[[ "$mode" == stage || "$mode" == finish ]] || die "invalid PUBLISH_MODE: $mode"
-if [[ "$mode" == stage && "$tag_commit" != "$head_commit" ]]; then
-  die "checkout the exact tag commit before staging npm provenance"
-fi
-
 if [[ "$tag_commit" != "$head_commit" ]] \
   && ! git diff --quiet "$tag_commit" "$head_commit" -- \
     packages/landstrip/Cargo.toml packages/landstrip/Cargo.lock \
@@ -256,22 +305,16 @@ fi
 
 workdir="$(mktemp -d)"
 mkdir -p "$workdir/packages" "$workdir/release"
-if [[ "$mode" == finish ]]; then
-  github_release_exists || die "no staged GitHub release for $version"
-  $NODE -e 'const r = require(process.argv[1]); process.exit(r.draft ? 0 : 1)' \
-    "$workdir/gh-release.json" || die "release $version is not a draft"
+if github_release_exists; then
+  printf 'resuming verification of release %s using its existing assets\n' "$version"
   github_retry "$GH" release download "$version" --pattern '*.tgz' \
     --pattern '*.tgz.sha256' --dir "$workdir/release"
-  scripts/publish-npm-provenance.sh check "$version" "$workdir/release"
-  NPM="$NPM" "$NODE" scripts/update-npm-integrity.mjs "$version" "${extension_dirs[@]}"
-  git add -- "${lock_files[@]}"
-  if ! git diff --cached --quiet; then
-    git commit -s -m "chore: Update package-lock.json files"
-  fi
-  github_retry "$GH" release edit "$version" --draft=false
-  printf 'published landstrip %s\npush the integrity commit\n' "$version"
+  complete_release
   exit 0
 fi
+
+[[ "$tag_commit" == "$head_commit" ]] \
+  || die "checkout the exact tag commit before packing a new release"
 
 remote_commit="$(git ls-remote origin "refs/tags/$version^{}" | awk '{print $1}')"
 [[ -n "$remote_commit" && "$remote_commit" == "$tag_commit" ]] \
@@ -341,8 +384,5 @@ scripts/publish-npm-provenance.sh preflight "$version" "$workdir/release"
 
 publish_cargo_package "$cargo_root/packages/landstrip"
 stage_github_release
-if ! github_retry "$GH" workflow run publish-npm.yml --ref main -f "version=$version"; then
-  die "release staged; retry: gh workflow run publish-npm.yml --ref main -f version=$version"
-fi
-printf 'staged landstrip %s and dispatched npm publish workflow\n' "$version"
-printf 'after it succeeds, run: make publish-finish VERSION=%s\n' "$version"
+github_release_exists || die "cannot find newly staged GitHub release $version"
+complete_release

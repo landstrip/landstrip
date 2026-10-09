@@ -48,6 +48,12 @@ merged-policy inspection, CLI options, and platform limits.
 
 Run `make ci` from the repository root.
 
+For releases, run `make package`, push the signed release tag and commit, then
+run `make publish`. It waits for npm publishing, verifies provenance and
+integrity, updates the lockfiles, and makes the GitHub release public. Rerunning
+it reuses the existing release assets and skips npm publishing when already
+verified. Push any resulting lockfile commit yourself.
+
 ## License
 
 - Native sandbox: [LGPL-3.0-or-later](packages/landstrip/LICENSE).
