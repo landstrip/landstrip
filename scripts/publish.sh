@@ -217,13 +217,13 @@ complete_release() {
   local status=0 is_draft
 
   is_draft="$($NODE -p 'require(process.argv[1]).isDraft' "$workdir/gh-release.json")"
-  scripts/publish-npm-provenance.sh verify "$version" "$workdir/release"
-  scripts/publish-npm-provenance.sh check "$version" "$workdir/release" || status=$?
+  NPM="$NPM" NODE="$NODE" scripts/publish-npm-provenance.sh verify "$version" "$workdir/release"
+  NPM="$NPM" NODE="$NODE" scripts/publish-npm-provenance.sh check "$version" "$workdir/release" || status=$?
   if ((status != 0)); then
     ((status == 1)) || exit "$status"
     [[ "$is_draft" == true ]] || die "public release $version has unpublished npm packages"
     wait_for_npm_workflow
-    scripts/publish-npm-provenance.sh check "$version" "$workdir/release"
+    NPM="$NPM" NODE="$NODE" scripts/publish-npm-provenance.sh check "$version" "$workdir/release"
   else
     printf 'npm packages already published and verified; skipping workflow dispatch\n'
   fi
@@ -380,7 +380,7 @@ printf '%s\n' "packing npm packages locally"
 for package_dir in "${npm_package_dirs[@]}"; do
   pack_npm_package "$package_dir"
 done
-scripts/publish-npm-provenance.sh preflight "$version" "$workdir/release"
+NPM="$NPM" NODE="$NODE" scripts/publish-npm-provenance.sh preflight "$version" "$workdir/release"
 
 publish_cargo_package "$cargo_root/packages/landstrip"
 stage_github_release
