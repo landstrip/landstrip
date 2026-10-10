@@ -673,13 +673,30 @@ function shellEnvironment(
   return createProxyEnvironment(proxyPort, proxyToken, result);
 }
 
+// The runner needs ProgramData and LOCALAPPDATA to set up the AppContainer
+// (without them the launch fails with ERROR_ENVVAR_NOT_FOUND, os error 203),
+// and the sandboxed program needs SystemRoot and its companions to start.
+const WINDOWS_LAUNCHER_ENVIRONMENT = [
+  'ProgramData',
+  'LOCALAPPDATA',
+  'SystemRoot',
+  'windir',
+  'ComSpec',
+  'PATHEXT',
+] as const;
+
 export function createLandstripLauncherEnvironment(
   providerEnv: NodeJS.ProcessEnv,
   hostEnv: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
-  if (platform !== 'win32' || hostEnv.ProgramData === undefined) return providerEnv;
-  return { ...providerEnv, ProgramData: hostEnv.ProgramData };
+  if (platform !== 'win32') return providerEnv;
+  const result: NodeJS.ProcessEnv = { ...providerEnv };
+  for (const name of WINDOWS_LAUNCHER_ENVIRONMENT) {
+    const value = hostEnv[name];
+    if (value !== undefined) result[name] = value;
+  }
+  return result;
 }
 
 export function createWindowsDenyRead(denyRead: readonly string[], volumeRoot: string): string[] {
