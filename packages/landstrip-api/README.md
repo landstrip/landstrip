@@ -40,6 +40,13 @@ Descriptor lifetimes and the reply protocol are covered in the manual.
 Integration helpers are exported through [`/shared`](lib/shared.d.ts) and
 [`/proxy`](lib/proxy.d.ts).
 
+`writeLandstripPolicyFile(policy, prefix = 'landstrip-')` from `/shared` writes
+`policy.json` and returns `{ dir, path }`. The caller owns `dir` and must remove it
+with `rmSync(dir, { recursive: true, force: true })` after use. Serialization
+happens before directory creation; failed writes remove partial files and their
+directory. If cleanup also fails, an `AggregateError` reports both errors and the
+directory path.
+
 ## Development
 
 Run `make ci` from the repository root.

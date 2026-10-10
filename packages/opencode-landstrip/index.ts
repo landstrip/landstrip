@@ -5,10 +5,9 @@ import type { Plugin } from '@opencode/plugin';
 
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { rmSync } from 'node:fs';
 import { type AddressInfo, connect as connectNet, createServer } from 'node:net';
-import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename } from 'node:path';
 
 import {
   createProxyCredentials,
@@ -38,7 +37,7 @@ import {
   normalizeOptions,
   parseLandstripTraps,
   readDiscoveryPort,
-  serializeLandstripPolicy,
+  writeLandstripPolicyFile,
   trapSessionHelloLine,
 } from './shared.js';
 
@@ -210,21 +209,15 @@ function writePolicyFile(
   baseDirectory: string,
   proxyPort: number | null,
 ): { dir: string; path: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'opencode-landstrip-'));
-  const path = join(dir, 'policy.json');
-  writeFileSync(
-    path,
-    serializeLandstripPolicy(
-      buildLandstripPolicy({
-        network: config.network,
-        filesystem: config.filesystem,
-        baseDirectory,
-        httpProxyPort: proxyPort,
-      }),
-    ),
+  return writeLandstripPolicyFile(
+    buildLandstripPolicy({
+      network: config.network,
+      filesystem: config.filesystem,
+      baseDirectory,
+      httpProxyPort: proxyPort,
+    }),
+    'opencode-landstrip-',
   );
-
-  return { dir, path };
 }
 
 function proxyEnv(

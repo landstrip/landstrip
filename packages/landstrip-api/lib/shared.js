@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 'use strict';
 
-const { lstatSync, readlinkSync, realpathSync } = require('node:fs');
-const { homedir } = require('node:os');
+const {
+  lstatSync,
+  mkdtempSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} = require('node:fs');
+const { homedir, tmpdir } = require('node:os');
 const { basename, dirname, isAbsolute, join, relative, resolve, sep } = require('node:path');
 const { domainToASCII } = require('node:url');
 
@@ -425,6 +432,26 @@ function buildLandstripPolicy(options) {
 
 function serializeLandstripPolicy(policy) {
   return JSON.stringify(policy, null, 2) + '\n';
+}
+
+function writeLandstripPolicyFile(policy, prefix = 'landstrip-') {
+  const contents = serializeLandstripPolicy(policy);
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  const path = join(dir, 'policy.json');
+  try {
+    writeFileSync(path, contents, 'utf8');
+  } catch (error) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        `Failed to remove partial Landstrip policy directory "${dir}"`,
+      );
+    }
+    throw error;
+  }
+  return { dir, path };
 }
 
 function requireSandboxObject(value, label) {
@@ -1004,6 +1031,7 @@ module.exports = {
   resolveFilesystemPolicy,
   buildLandstripPolicy,
   serializeLandstripPolicy,
+  writeLandstripPolicyFile,
   mergeArray,
   parseSandboxConfig,
   deepMergeSandboxConfig,

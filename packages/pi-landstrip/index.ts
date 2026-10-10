@@ -73,7 +73,7 @@ import {
   parseTrapLine,
   pathUnderDirectory,
   sessionScopeFor,
-  serializeLandstripPolicy,
+  writeLandstripPolicyFile,
   shouldPromptForWrite as sharedShouldPromptForWrite,
   normalizeBlockedPath,
   extractNativeDeniedPath,
@@ -1310,14 +1310,10 @@ function createLandstripIntegrationWithPrompts(
     audience: PolicyAudience,
     allowances?: ExecutionAllowances,
   ): { dir: string; path: string } {
-    const dir = mkdtempSync(join(tmpdir(), 'pi-landstrip-'));
-    const path = join(dir, 'policy.json');
-    writeFileSync(
-      path,
-      serializeLandstripPolicy(buildLandstripPolicy(cwd, proxyPort, audience, allowances)),
-      'utf-8',
+    return writeLandstripPolicyFile(
+      buildLandstripPolicy(cwd, proxyPort, audience, allowances),
+      'pi-landstrip-',
     );
-    return { dir, path };
   }
 
   function startProxy(

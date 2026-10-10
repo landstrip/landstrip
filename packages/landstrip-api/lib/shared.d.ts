@@ -115,6 +115,11 @@ export function buildLandstripPolicy(
 
 export function serializeLandstripPolicy(policy: LandstripPolicy): string;
 
+export function writeLandstripPolicyFile(
+  policy: LandstripPolicy,
+  prefix?: string,
+): { dir: string; path: string };
+
 
 export function mergeArray(base: string[], override?: string[]): string[];
 

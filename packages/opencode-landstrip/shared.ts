@@ -41,6 +41,7 @@ export {
   sessionAllows,
   sessionScopeFor,
   serializeLandstripPolicy,
+  writeLandstripPolicyFile,
   deepMergeSandboxConfig,
   mergeArray,
   parseSandboxConfig,
