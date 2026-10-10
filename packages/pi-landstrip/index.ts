@@ -25,6 +25,7 @@ import type {
   BashToolInput,
   ExtensionAPI,
   ExtensionContext,
+  ExtensionToolContext,
 } from '@earendil-works/pi-coding-agent';
 
 import {
@@ -2160,7 +2161,7 @@ function createLandstripIntegrationWithPrompts(
     params: BashToolInput,
     signal: AbortSignal | undefined,
     onUpdate: AgentToolUpdateCallback<BashToolDetails | undefined> | undefined,
-    ctx: ExtensionContext,
+    ctx: ExtensionToolContext,
   ): Promise<AgentToolResult<BashToolDetails | undefined>> {
     let landstripErrorOutput = '';
     let stderrOutput = '';
