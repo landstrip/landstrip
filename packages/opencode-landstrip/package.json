@@ -51,7 +51,7 @@
     "@landstrip/landstrip-api": "^0.19.9",
     "@opentui/core": ">=0.5.12",
     "@opentui/solid": ">=0.5.12",
-    "solid-js": "1.9.12"
+    "solid-js": "1.9.16"
   },
   "devDependencies": {
     "@opencode/plugin": "^2.0.18",
