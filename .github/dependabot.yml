@@ -12,6 +12,10 @@ updates:
     directory: /packages/pi-landstrip
     schedule:
       interval: weekly
+    groups:
+      pi-sdk:
+        patterns:
+          - "@earendil-works/pi-*"
   - package-ecosystem: npm
     directory: /packages/opencode-landstrip
     schedule:
