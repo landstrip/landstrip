@@ -79,16 +79,6 @@ import { dirname, isAbsolute, join } from 'node:path';
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
-const LANDSTRIP_PACKAGE_NAMES = new Set([
-  '@landstrip/landstrip-api',
-  '@landstrip/landstrip-darwin-arm64',
-  '@landstrip/landstrip-darwin-x64',
-  '@landstrip/landstrip-linux-x64',
-  '@landstrip/landstrip-linux-arm64',
-  '@landstrip/landstrip-win32-x64',
-  '@landstrip/landstrip-win32-arm64',
-]);
-
 export function normalizeConfig(value: unknown): SandboxConfigOverrides {
   return parseSandboxConfig(value);
 }
@@ -179,31 +169,8 @@ export function landstripBinaryPath(): string {
   if (_landstripBinaryPathError !== undefined) throw _landstripBinaryPathError;
 
   try {
-    const filePath = realpathSync.native(binaryPath());
-    let probe = dirname(filePath);
-
-    while (true) {
-      const manifestPath = join(probe, 'package.json');
-      if (existsSync(manifestPath)) {
-        try {
-          const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as unknown;
-          if (isRecord(manifest) && LANDSTRIP_PACKAGE_NAMES.has(String(manifest.name))) {
-            _landstripBinaryPath = filePath;
-            return filePath;
-          }
-        } catch {
-          // malformed package.json — continue walking to parent
-        }
-      }
-
-      const parent = dirname(probe);
-      if (parent === probe) break;
-      probe = parent;
-    }
-
-    throw new Error(
-      `Refusing to use landstrip binary outside official @landstrip/landstrip-api packages: ${filePath}`,
-    );
+    _landstripBinaryPath = binaryPath();
+    return _landstripBinaryPath;
   } catch (error) {
     _landstripBinaryPathError = error;
     throw error;

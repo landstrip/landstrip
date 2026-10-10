@@ -251,9 +251,9 @@ export interface ExtractDeniedPathOptions {
   command?: string;
 }
 /**
- * Path to the native landstrip binary for the running platform.
+ * Canonical path to the native landstrip binary in an official Landstrip package.
  *
- * @throws if the platform is unsupported, or the binary package is not installed.
+ * @throws if the target is unsupported, the binary is missing, or ownership cannot be verified.
  */
 export function binaryPath(platform?: string, arch?: string): string;
 

@@ -31,6 +31,11 @@ const packages = {
   },
 };
 
+const officialPackageNames = new Set([
+  '@landstrip/landstrip-api',
+  ...Object.values(packages).map((value) => value.packageName),
+]);
+
 function target(platform = process.platform, arch = process.arch) {
   const key = `${platform}-${arch}`;
   const value = packages[key];
@@ -65,7 +70,30 @@ function binaryPath(platform = process.platform, arch = process.arch) {
     throw new Error(`landstrip binary not found at ${resolved}`);
   }
 
-  return resolved;
+  const filePath = fs.realpathSync.native(resolved);
+  let probe = path.dirname(filePath);
+  while (true) {
+    let owner;
+    try {
+      owner = JSON.parse(fs.readFileSync(path.join(probe, 'package.json'), 'utf8'));
+    } catch (error) {
+      if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+    }
+    if (
+      owner !== null &&
+      typeof owner === 'object' &&
+      !Array.isArray(owner) &&
+      officialPackageNames.has(owner.name)
+    ) {
+      return filePath;
+    }
+    const parent = path.dirname(probe);
+    if (parent === probe) break;
+    probe = parent;
+  }
+  throw new Error(
+    `Refusing to use landstrip binary outside official @landstrip/landstrip-api packages: ${filePath}`,
+  );
 }
 
 exports.binaryPath = binaryPath;

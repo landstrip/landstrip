@@ -26,10 +26,11 @@ execFileSync(binaryPath(), ['run', '-p', 'policy.json', '--', 'cargo', 'test'], 
 });
 ```
 
-`binaryPath()` returns the installed native binary's path and throws if the
-platform is unsupported or its binary package is missing. `packageName()` returns
-the platform's binary package name. Both accept optional `platform` and `arch`
-arguments, defaulting to the current process.
+`binaryPath()` returns the installed native binary's canonical path and checks
+that it belongs to an official Landstrip package. It throws if the platform is
+unsupported, the binary is missing, or package ownership cannot be verified.
+`packageName()` returns the platform's binary package name. Both accept optional
+`platform` and `arch` arguments, defaulting to the current process.
 
 The package exports [`LandstripTrap` and `LandstripControlResponse`](lib/index.d.ts)
 for structured events and Linux broker replies. Runtime traps and approval
