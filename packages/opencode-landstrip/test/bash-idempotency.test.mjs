@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -78,6 +78,106 @@ async function withPlugin(options, run) {
     if (originalConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = originalConfigHome;
     await rm(tempDir, { force: true, recursive: true });
+  }
+}
+
+const shellResultCases = [
+  ['string output', (text) => ({ output: text }), true],
+  ['string content', (text) => ({ content: text }), true],
+  [
+    'structured output with duplicate content',
+    (text) => ({
+      output: { output: text, exit: 1, truncated: false },
+      content: [{ type: 'text', text }],
+    }),
+    true,
+  ],
+  [
+    'mixed text and file content',
+    (text) => ({
+      content: [
+        { type: 'text', text: 'command output' },
+        { type: 'file', uri: 'file:///ignored.txt', mime: 'text/plain', name: text },
+        { type: 'text', text },
+      ],
+    }),
+    true,
+  ],
+  [
+    'invalid structured output with text content',
+    (text) => ({ output: { output: null }, content: [{ type: 'text', text }] }),
+    true,
+  ],
+  ['empty string output takes precedence', (text) => ({ output: '', content: text }), false],
+  [
+    'empty structured output takes precedence',
+    (text) => ({ output: { output: '' }, content: [{ type: 'text', text }] }),
+    false,
+  ],
+  [
+    'non-text and malformed content',
+    (text) => ({
+      content: [null, 42, { type: 'text', text: 42 }, { type: 'file', text }],
+    }),
+    false,
+  ],
+  ['missing output', () => ({}), false],
+];
+
+for (const diagnostic of ['native denial', 'filesystem trap']) {
+  for (const [name, makeResult, hasDiagnostic] of shellResultCases) {
+    test(`shell diagnostics handle ${diagnostic} in ${name}`, async (t) => {
+      await withPlugin(
+        {
+          enabled: true,
+          filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+          network: { allowNetwork: true },
+        },
+        async ({ handlers, tempDir }) => {
+          const blockedPath = join(await realpath(tempDir), 'secret.txt');
+          const text =
+            diagnostic === 'native denial'
+              ? `cat: ${blockedPath}: Permission denied`
+              : JSON.stringify({
+                  kind: 'filesystem',
+                  state: 'info',
+                  operation: 'read',
+                  path: blockedPath,
+                  query_id: 'diagnostic-query',
+                });
+          const event = {
+            id: 'diagnostic-call',
+            sessionID: 'test-session',
+            tool: 'shell',
+            input: { command: 'cat secret.txt' },
+          };
+          await handlers.tool['execute.before'](event);
+
+          const warnings = [];
+          const errors = [];
+          t.mock.method(console, 'warn', (message) => warnings.push(message));
+          t.mock.method(console, 'error', (message) => errors.push(message));
+          const completed = { ...event, status: 'completed', result: makeResult(text) };
+          await handlers.tool['execute.after'](completed);
+          await handlers.tool['execute.after'](completed);
+
+          assert.deepEqual(
+            warnings,
+            hasDiagnostic
+              ? [
+                  `opencode-landstrip: Sandbox blocked read to "${blockedPath}". No live TUI presenter was available, so access remains denied.`,
+                ]
+              : [],
+          );
+          assert.deepEqual(
+            errors,
+            hasDiagnostic && diagnostic === 'filesystem trap'
+              ? [`opencode-landstrip: landstrip: filesystem read denied (${blockedPath})`]
+              : [],
+          );
+        },
+      );
+    });
   }
 }
 

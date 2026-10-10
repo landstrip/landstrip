@@ -873,14 +873,25 @@ const plugin: Plugin.Plugin = {
       const state = activeBash.get(event.id);
       if (!state) return;
 
-      const outputText =
-        event.status === 'completed'
-          ? typeof event.result.output === 'string'
-            ? event.result.output
-            : typeof event.result.content === 'string'
-              ? event.result.content
-              : ''
-          : '';
+      let outputText = '';
+      if (event.status === 'completed') {
+        const { output, content } = event.result;
+        if (typeof output === 'string') {
+          outputText = output;
+        } else if (isRecord(output) && typeof output.output === 'string') {
+          outputText = output.output;
+        } else if (typeof content === 'string') {
+          outputText = content;
+        } else if (Array.isArray(content)) {
+          outputText = content
+            .flatMap((part) =>
+              isRecord(part) && part.type === 'text' && typeof part.text === 'string'
+                ? [part.text]
+                : [],
+            )
+            .join('\n');
+        }
+      }
       const serverTrapOutput = state.trapLines.join('\n');
       const combinedOutput = serverTrapOutput ? outputText + '\n' + serverTrapOutput : outputText;
       const traps = parseLandstripTraps(combinedOutput);
