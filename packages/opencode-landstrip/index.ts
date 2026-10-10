@@ -491,7 +491,7 @@ function evaluateToolPermissions(
     );
   }
 
-  if (tool === 'apply_patch' && typeof args.patchText === 'string') {
+  if ((tool === 'patch' || tool === 'apply_patch') && typeof args.patchText === 'string') {
     return extractPatchPaths(args.patchText).map((path) =>
       evaluateWritePermission(path, config, baseDirectory, effectiveAllowWrite),
     );

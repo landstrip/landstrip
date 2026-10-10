@@ -513,3 +513,145 @@ test('headless sandbox denies protected file access without hanging', linuxOnly,
     },
   );
 });
+
+const patchPermissionCases = [
+  [
+    'allows add, update, delete, and move',
+    [
+      '*** Add File: new.txt',
+      '+new',
+      '*** Update File: existing.txt',
+      '@@',
+      '-before',
+      '+after',
+      '*** Delete File: old.txt',
+      '*** Update File: source.txt',
+      '*** Move to: destination.txt',
+      '@@',
+      '-before',
+      '+after',
+    ],
+  ],
+  ['denies add', ['*** Add File: protected.txt', '+new'], 'protected.txt', 'denyWriteAlways'],
+  [
+    'denies update',
+    ['*** Update File: protected.txt', '@@', '-before', '+after'],
+    'protected.txt',
+    'denyWriteAlways',
+  ],
+  ['denies delete', ['*** Delete File: protected.txt'], 'protected.txt', 'denyWriteAlways'],
+  [
+    'checks later files in a multi-file patch',
+    ['*** Add File: new.txt', '+new', '*** Delete File: protected.txt'],
+    'protected.txt',
+    'denyWriteAlways',
+  ],
+  [
+    'denies a protected move source',
+    ['*** Update File: protected.txt', '*** Move to: destination.txt', '@@', '-before', '+after'],
+    'protected.txt',
+    'denyWriteAlways',
+  ],
+  [
+    'denies a protected move destination',
+    ['*** Update File: source.txt', '*** Move to: protected.txt', '@@', '-before', '+after'],
+    'protected.txt',
+    'denyWriteAlways',
+  ],
+  [
+    'honors denyWrite over allowWrite',
+    ['*** Update File: blocked.txt', '@@', '-before', '+after'],
+    'blocked.txt',
+    'denyWrite overrides allowWrite',
+  ],
+];
+
+for (const tool of ['patch', 'apply_patch']) {
+  for (const [name, lines, blockedFile, reason] of patchPermissionCases) {
+    test(`patch permissions: ${tool} ${name}`, async () => {
+      await withPlugin(
+        {
+          enabled: true,
+          filesystem: {
+            allowWrite: ['.'],
+            denyWrite: ['blocked.txt'],
+            denyWriteAlways: ['protected.txt'],
+          },
+          network: { allowNetwork: true },
+        },
+        async ({ handlers, tempDir }) => {
+          for (const file of [
+            'existing.txt',
+            'old.txt',
+            'source.txt',
+            'protected.txt',
+            'blocked.txt',
+          ]) {
+            await writeFile(join(tempDir, file), 'before\n');
+          }
+          const patchText = ['*** Begin Patch', ...lines, '*** End Patch'].join('\n');
+          const event = {
+            id: 'patch-call',
+            sessionID: 'test-session',
+            tool,
+            input: { patchText },
+          };
+          if (blockedFile) {
+            const blockedPath = join(await realpath(tempDir), blockedFile);
+            await assert.rejects(
+              handlers.tool['execute.before'](event),
+              (error) =>
+                error.message.includes(
+                  `Sandbox: write access denied for "${blockedPath}" (${reason}).`,
+                ) && error.message.includes(join(tempDir, '.opencode', 'sandbox.json')),
+            );
+          } else {
+            await handlers.tool['execute.before'](event);
+          }
+          assert.equal(event.input.patchText, patchText);
+          for (const file of [
+            'existing.txt',
+            'old.txt',
+            'source.txt',
+            'protected.txt',
+            'blocked.txt',
+          ]) {
+            assert.equal(await readFile(join(tempDir, file), 'utf8'), 'before\n');
+          }
+        },
+      );
+    });
+  }
+
+  test(`patch permissions: ${tool} leaves execution alone when disabled`, async () => {
+    await withPlugin(
+      { enabled: false, filesystem: { denyWriteAlways: ['protected.txt'] } },
+      async ({ handlers }) => {
+        await handlers.tool['execute.before']({
+          id: 'disabled-patch',
+          sessionID: 'test-session',
+          tool,
+          input: { patchText: '*** Begin Patch\n*** Delete File: protected.txt\n*** End Patch' },
+        });
+      },
+    );
+  });
+}
+
+test('patch permissions: V2 defers unlisted paths to host approval', async () => {
+  await withPlugin({ enabled: true, filesystem: { allowWrite: ['.'] } }, async ({ handlers }) => {
+    await handlers.tool['execute.before']({
+      id: 'unlisted-patch',
+      sessionID: 'test-session',
+      tool: 'patch',
+      input: { patchText: '*** Begin Patch\n*** Add File: ../outside.txt\n+new\n*** End Patch' },
+    });
+    const evaluation = {
+      action: 'edit',
+      resources: ['../outside.txt'],
+      effect: 'allow',
+    };
+    await handlers.permission.evaluate(evaluation);
+    assert.equal(evaluation.effect, 'ask');
+  });
+});
