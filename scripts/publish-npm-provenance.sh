@@ -106,7 +106,7 @@ for path in "${archives[@]}"; do
   check_published "$name" "$path" || status=$?
   if [[ "$mode" == publish ]]; then
     if ((status == 0)); then
-      printf 'already published with provenance: %s@%s\n' "$name" "$version"
+      printf '%s@%s is already published\n' "$name" "$version"
       continue
     fi
     ((status == 1)) || exit "$status"
@@ -134,8 +134,9 @@ for path in "${archives[@]}"; do
     ((status == 0 || status == 1)) || exit "$status"
   else
     ((status == 0 || status == 1)) || exit "$status"
-    if ((status == 1)); then
-      printf 'npm package not yet published: %s@%s\n' "$name" "$version" >&2
+    if ((status == 0)); then
+      printf '%s@%s is already published\n' "$name" "$version"
+    else
       result=1
     fi
   fi
