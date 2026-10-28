@@ -6,8 +6,8 @@
 use super::unix::close_inherited_fds;
 use crate::config::SandboxDarwin;
 use crate::error::Error;
-use crate::paths::PathExt;
-use crate::policy::{AccessPolicy, GlobPattern, NetworkAccess, ReadAccess, UnixSocketAccess};
+use crate::paths::{GlobPattern, PathExt};
+use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::ffi::{CStr, CString, OsStr, OsString};

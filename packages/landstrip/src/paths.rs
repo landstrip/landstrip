@@ -4,6 +4,10 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+pub(crate) mod glob;
+
+pub(crate) use glob::GlobPattern;
+
 pub(crate) trait PathExt {
     fn is_under(&self, root: impl AsRef<Path>) -> bool;
     fn is_strictly_under(&self, root: impl AsRef<Path>) -> bool;
