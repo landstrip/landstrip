@@ -151,12 +151,30 @@ impl AccessPolicy {
     /// Whether a write to `canonical` lands in the `denyWrite` deny-list. Glob
     /// patterns in `write_denied_patterns` are evaluated dynamically so files
     /// created after sandbox startup are also blocked.
-    pub(crate) fn is_write_denied(&self, canonical: &Path) -> bool {
-        matches_denied(
-            &self.write_denied_roots,
-            &self.write_denied_patterns,
-            canonical,
+    pub(crate) fn write_denied(&self) -> DenyRuleSet<'_> {
+        DenyRuleSet::new(&self.write_denied_roots, &self.write_denied_patterns)
+    }
+
+    pub(crate) fn write_denied_always(&self) -> DenyRuleSet<'_> {
+        DenyRuleSet::new(
+            &self.write_denied_always_roots,
+            &self.write_denied_always_patterns,
         )
+    }
+
+    pub(crate) fn read_denied(&self) -> DenyRuleSet<'_> {
+        DenyRuleSet::new(&self.read_denied_roots, &self.read_denied_patterns)
+    }
+
+    pub(crate) fn read_denied_always(&self) -> DenyRuleSet<'_> {
+        DenyRuleSet::new(
+            &self.read_denied_always_roots,
+            &self.read_denied_always_patterns,
+        )
+    }
+
+    pub(crate) fn is_write_denied(&self, canonical: &Path) -> bool {
+        self.write_denied().matches(canonical)
     }
 
     /// A denied subtree is only as strong as the symlinks leading into it:
@@ -170,15 +188,7 @@ impl AccessPolicy {
     }
 
     pub(crate) fn is_write_denied_always(&self, canonical: &Path, lexical: &Path) -> bool {
-        matches_denied(
-            &self.write_denied_always_roots,
-            &self.write_denied_always_patterns,
-            canonical,
-        ) || matches_denied(
-            &self.write_denied_always_roots,
-            &self.write_denied_always_patterns,
-            lexical,
-        )
+        self.write_denied_always().matches(canonical) || self.write_denied_always().matches(lexical)
     }
 
     pub(crate) fn is_read_denied(&self, path: &Path) -> bool {
@@ -195,35 +205,23 @@ impl AccessPolicy {
     }
 
     pub(crate) fn is_read_denied_always(&self, path: &Path) -> bool {
-        matches_denied(
-            &self.read_denied_always_roots,
-            &self.read_denied_always_patterns,
-            path,
-        )
+        self.read_denied_always().matches(path)
     }
 
     pub(crate) fn has_read_denied_under(&self, dir: &Path) -> bool {
-        has_denied_under(&self.read_denied_roots, &self.read_denied_patterns, dir)
+        self.read_denied().has_denied_under(dir)
     }
 
     pub(crate) fn has_write_denied_under(&self, dir: &Path) -> bool {
-        has_denied_under(&self.write_denied_roots, &self.write_denied_patterns, dir)
+        self.write_denied().has_denied_under(dir)
     }
 
     pub(crate) fn has_read_denied_always_under(&self, dir: &Path) -> bool {
-        has_denied_under(
-            &self.read_denied_always_roots,
-            &self.read_denied_always_patterns,
-            dir,
-        )
+        self.read_denied_always().has_denied_under(dir)
     }
 
     pub(crate) fn has_write_denied_always_under(&self, dir: &Path) -> bool {
-        has_denied_under(
-            &self.write_denied_always_roots,
-            &self.write_denied_always_patterns,
-            dir,
-        )
+        self.write_denied_always().has_denied_under(dir)
     }
 
     /// Why a write to `canonical` is mediated, or `None` when the policy permits
@@ -661,14 +659,18 @@ struct ResolvedDenyPaths {
 }
 
 impl ResolvedDenyPaths {
+    fn as_rules(&self) -> DenyRuleSet<'_> {
+        DenyRuleSet::new(&self.concrete, &self.patterns)
+    }
+
     fn matches(&self, path: &Path) -> bool {
-        matches_denied(&self.concrete, &self.patterns, path)
+        self.as_rules().matches(path)
     }
 
     fn carveouts(&self, always: &Self, allow: &[PathBuf]) -> Vec<PathBuf> {
         allow
             .iter()
-            .filter(|path| !always.matches(path) && matches_any_pattern(path, &self.patterns))
+            .filter(|path| !always.matches(path) && self.as_rules().matches_patterns(path))
             .cloned()
             .collect()
     }
@@ -1117,24 +1119,6 @@ impl PolicyResolver {
     }
 }
 
-fn matches_denied(roots: &[PathBuf], patterns: &[String], path: &Path) -> bool {
-    path.is_under_any(roots) || matches_any_pattern(path, patterns)
-}
-
-#[cfg(target_os = "linux")]
-fn has_denied_under(roots: &[PathBuf], patterns: &[String], dir: &Path) -> bool {
-    roots.iter().any(|root| root.is_under(dir))
-        || patterns
-            .iter()
-            .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
-}
-
-fn matches_any_pattern(path: &Path, patterns: &[String]) -> bool {
-    patterns
-        .iter()
-        .any(|pattern| GlobPattern::new(pattern).matches_tree(path))
-}
-
 const MAX_TRAVERSAL_DEPTH: u32 = 40;
 
 /// Roots and skipped symlinks collected from a single `scan_allowed_root` traversal.
@@ -1242,4 +1226,35 @@ fn push_path_variants(paths: &mut Vec<PathBuf>, path: &Path) {
 #[cfg(not(target_os = "macos"))]
 fn push_path_variants(paths: &mut Vec<PathBuf>, path: &Path) {
     paths.push(path.normalize());
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DenyRuleSet<'a> {
+    roots: &'a [PathBuf],
+    patterns: &'a [String],
+}
+
+impl<'a> DenyRuleSet<'a> {
+    pub(crate) fn new(roots: &'a [PathBuf], patterns: &'a [String]) -> Self {
+        Self { roots, patterns }
+    }
+
+    pub(crate) fn matches(self, path: &Path) -> bool {
+        path.is_under_any(self.roots) || self.matches_patterns(path)
+    }
+
+    pub(crate) fn matches_patterns(self, path: &Path) -> bool {
+        self.patterns
+            .iter()
+            .any(|pattern| GlobPattern::new(pattern).matches_tree(path))
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn has_denied_under(self, dir: &Path) -> bool {
+        self.roots.iter().any(|root| root.is_under(dir))
+            || self
+                .patterns
+                .iter()
+                .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
+    }
 }
