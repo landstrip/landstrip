@@ -6,7 +6,7 @@
 use super::unix::close_inherited_fds;
 use crate::config::SandboxDarwin;
 use crate::error::Error;
-use crate::paths::PathCoverage;
+use crate::paths::PathExt;
 use crate::policy::{AccessPolicy, GlobPattern, NetworkAccess, ReadAccess, UnixSocketAccess};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;

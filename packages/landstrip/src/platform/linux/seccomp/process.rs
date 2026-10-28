@@ -3,6 +3,7 @@
 
 use super::error::{BrokerError, SysResult};
 use crate::error::Error as LandstripError;
+use crate::paths::PathExt;
 use crate::trap::ProcessContext;
 use anyhow::Result;
 use nix::errno::Errno;
@@ -542,11 +543,12 @@ impl TargetFilesystem<'_> {
             self.root.try_clone()?
         };
         let base_label = self.label(base.as_fd())?;
-        let lexical = crate::paths::normalize_path_lexically(&if path.is_absolute() && !scoped {
+        let lexical = if path.is_absolute() && !scoped {
             path.to_path_buf()
         } else {
             base_label.join(path.strip_prefix("/").unwrap_or(path))
-        });
+        }
+        .clean_lexically();
         let mut dirs = self.directory_stack(base.as_fd())?;
         let floor = if scoped { dirs.len() } else { 1 };
         let mut pending = path_components(path.as_os_str().as_bytes());
@@ -593,7 +595,7 @@ impl TargetFilesystem<'_> {
                         }
                         return Ok(ResolvedPath {
                             lexical,
-                            label: crate::paths::normalize_path_lexically(&label),
+                            label: label.clean_lexically(),
                             trailing_slash,
                             anonymous: false,
                             anchor: None,

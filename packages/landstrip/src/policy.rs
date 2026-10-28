@@ -19,10 +19,7 @@
 
 use crate::config::{AppContainerMode, PathSelector, SandboxDarwin, SandboxNetwork, Settings};
 use crate::error::{Error, PathIo};
-use crate::paths::{
-    NormalizeRoots, PathCoverage, canonicalize_existing_prefix, normalize_path,
-    normalize_path_lexically,
-};
+use crate::paths::{NormalizeRoots, PathExt};
 use anyhow::Result;
 #[cfg(target_os = "linux")]
 use nix::sys::stat::fstat;
@@ -734,7 +731,7 @@ fn lower_read_access(
     read_denied_patterns: &[String],
     read_denied_roots: &[PathBuf],
 ) -> Result<LoweredReadAccess> {
-    let fs_root = normalize_path(Path::new("/"));
+    let fs_root = Path::new("/").normalize();
     // Reject a full-volume Windows grant because propagating it over `C:\`
     // can hang while walking the volume.
     #[cfg(target_os = "windows")]
@@ -880,7 +877,7 @@ impl PolicyResolver {
             env::current_dir()?.join(policy_base)
         };
         Ok(Self {
-            base: normalize_path_lexically(&base),
+            base: base.clean_lexically(),
             home: dirs::home_dir(),
         })
     }
@@ -907,7 +904,7 @@ impl PolicyResolver {
             self.base.join(raw)
         };
 
-        Ok(normalize_path_lexically(&resolved))
+        Ok(resolved.clean_lexically())
     }
 
     #[cfg(target_os = "linux")]
@@ -959,7 +956,7 @@ impl PolicyResolver {
         for selector in paths {
             anchored.push(selector.clone());
             if selector.is_base_relative() {
-                let relative = normalize_path_lexically(Path::new(selector.as_str()));
+                let relative = Path::new(selector.as_str()).clean_lexically();
                 let relative_str = relative.to_string_lossy();
                 let pattern = GlobPattern::new(&relative_str);
                 for root in write_allow {
@@ -1015,7 +1012,7 @@ impl PolicyResolver {
                 }
                 patterns.push(resolved_str.clone().into_owned());
                 let base = GlobPattern::new(&resolved_str).base();
-                let canonical = normalize_path_lexically(&canonicalize_existing_prefix(&base));
+                let canonical = base.canonicalize_existing_prefix().clean_lexically();
                 let base_str = base.to_string_lossy();
                 let canonical_str = canonical.to_string_lossy();
                 if canonical_str != base_str
@@ -1067,7 +1064,7 @@ impl PolicyResolver {
     /// paths, so a link below another symlink (macOS `/var`) needs both forms.
     /// Canonicalizing the parent keeps the link itself unresolved.
     fn link_spellings(link: &Path) -> impl Iterator<Item = PathBuf> {
-        let lexical = normalize_path_lexically(link);
+        let lexical = link.clean_lexically();
         let canonical = match (lexical.parent(), lexical.file_name()) {
             (Some(parent), Some(name)) => fs::canonicalize(parent)
                 .ok()
@@ -1184,7 +1181,7 @@ fn scan_allowed_root(
         let file_type = metadata.file_type();
 
         if file_type.is_symlink() && !is_explicit {
-            symlinks.push(normalize_path_lexically(&current));
+            symlinks.push(current.clean_lexically());
             continue;
         }
         if !has_denied_descendant || !file_type.is_dir() {
@@ -1238,15 +1235,13 @@ fn effective_denied_roots(read_deny: &[PathBuf], read_allow: &[PathBuf]) -> Vec<
 
 #[cfg(target_os = "macos")]
 fn push_path_variants(paths: &mut Vec<PathBuf>, path: &Path) {
-    paths.push(normalize_path_lexically(path));
-    paths.push(normalize_path_lexically(&canonicalize_existing_prefix(
-        path,
-    )));
+    paths.push(path.clean_lexically());
+    paths.push(path.canonicalize_existing_prefix().clean_lexically());
 }
 
 #[cfg(not(target_os = "macos"))]
 fn push_path_variants(paths: &mut Vec<PathBuf>, path: &Path) {
-    paths.push(normalize_path(path));
+    paths.push(path.normalize());
 }
 
 #[derive(Clone, Copy)]
@@ -1366,7 +1361,7 @@ impl<'a> GlobPattern<'a> {
             return Err(Error::PolicyTraversalDepth.into());
         }
 
-        let candidate = normalize_path_lexically(path);
+        let candidate = path.clean_lexically();
         if self.matches_path(&candidate) {
             matches.push(candidate);
         }

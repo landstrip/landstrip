@@ -9,7 +9,7 @@ use super::grant::{
 use super::notify::NotificationResult;
 use super::process::{MissingTarget, ResolvedPath, TargetProcess, fd_label_under_root};
 use super::supervise::{Denial, Denials};
-use crate::paths::normalize_path_lexically;
+use crate::paths::PathExt;
 use crate::policy::{AccessPolicy, DenialReason};
 use crate::trap::{FilesystemDenial, ProcessContext, TrapOperation};
 use std::os::fd::{AsFd, OwnedFd, RawFd};
@@ -653,7 +653,7 @@ impl AccessRequest {
             let Some(label) = fd_label_under_root(&filesystem.root_label, target.as_fd())? else {
                 return Ok(None);
             };
-            let lexical = normalize_path_lexically(&label);
+            let lexical = label.clean_lexically();
             return Ok(Some(AccessTarget {
                 requested_path: label.clone(),
                 label,
@@ -1119,7 +1119,7 @@ fn handle_fd_mutation(
         }));
     };
     let resolved = requested_path.clone();
-    let lexical = normalize_path_lexically(&requested_path);
+    let lexical = requested_path.clean_lexically();
     let hard_write_denied = policy.is_write_denied_always(&resolved, &lexical);
     let reason = policy.write_reason(&resolved, true);
     let operation = MutationGrant::Fd { target, mutation };
