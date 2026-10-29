@@ -2,7 +2,7 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, relative, sep } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 
 import { getAgentDir, withFileMutationQueue } from '@earendil-works/pi-coding-agent';
 import {
@@ -14,12 +14,7 @@ import {
 } from 'jsonc-parser';
 
 import { type AgentDefinition, validateAgentRaw } from './agents.ts';
-import {
-  type ConfigObject,
-  getLandstripConfigTarget,
-  type LandstripConfigKind,
-  type LandstripConfigTarget,
-} from './config.ts';
+import { type ConfigObject, getLandstripConfigTarget } from './config.ts';
 import { parseMarkdownAgentRaw } from './opencode-agents.ts';
 import { expandFileReferences, isRecord } from './util.ts';
 
@@ -55,26 +50,15 @@ function valueAtPath(root: unknown, path: JsonPath): unknown {
   return value;
 }
 
-function agentJsonPath(kind: LandstripConfigKind, name: string): JsonPath {
-  return kind === 'settings' ? ['landstrip', 'agent', name] : ['agent', name];
+function agentJsonPath(name: string): JsonPath {
+  return ['agent', name];
 }
 
-function parseEditorSnippet(
-  content: string,
-  name: string,
-  kind: LandstripConfigKind,
-): ConfigObject {
+function parseEditorSnippet(content: string, name: string): ConfigObject {
   const root = parseJsonDocument(content, 'Edited agent');
-  const parentPath = kind === 'settings' ? ['landstrip'] : [];
-  const parent = valueAtPath(root, parentPath);
-  const container = valueAtPath(root, [...parentPath, 'agent']);
-  const expectedRootKey = kind === 'settings' ? 'landstrip' : 'agent';
+  const container = root.agent;
   if (
     Object.keys(root).length !== 1 ||
-    root[expectedRootKey] === undefined ||
-    !isRecord(parent) ||
-    Object.keys(parent).length !== 1 ||
-    parent.agent === undefined ||
     !isRecord(container) ||
     Object.keys(container).length !== 1 ||
     !isRecord(container[name])
@@ -88,14 +72,8 @@ function ensureFinalNewline(content: string): string {
   return content.endsWith('\n') ? content : `${content}\n`;
 }
 
-async function writeJsonNode(
-  path: string,
-  nodePath: JsonPath,
-  value: ConfigObject,
-  validate?: () => void,
-): Promise<void> {
+async function writeJsonNode(path: string, nodePath: JsonPath, value: ConfigObject): Promise<void> {
   await withFileMutationQueue(path, async () => {
-    validate?.();
     const content = existsSync(path) ? readFileSync(path, 'utf8') : '{}\n';
     parseJsonDocument(content, path);
     const edited = applyEdits(content, modify(content, nodePath, value, JSON_FORMAT));
@@ -108,13 +86,11 @@ async function deleteJsonNode(
   path: string,
   nodePath: JsonPath,
   containerPaths: readonly JsonPath[],
-  validate?: () => void,
   removeEmptyFile = false,
 ): Promise<boolean> {
   if (!existsSync(path)) return false;
   let deleted = false;
   await withFileMutationQueue(path, async () => {
-    validate?.();
     let content = readFileSync(path, 'utf8');
     const root = parseJsonDocument(content, path);
     if (valueAtPath(root, nodePath) === undefined) return;
@@ -137,14 +113,10 @@ async function deleteJsonNode(
   return deleted;
 }
 
-function readAgentNode(
-  path: string,
-  kind: LandstripConfigKind,
-  name: string,
-): ConfigObject | undefined {
+function readAgentNode(path: string, name: string): ConfigObject | undefined {
   if (!existsSync(path)) return undefined;
   const root = parseJsonDocument(readFileSync(path, 'utf8'), path);
-  const value = valueAtPath(root, agentJsonPath(kind, name));
+  const value = valueAtPath(root, agentJsonPath(name));
   return isRecord(value) ? { ...value } : undefined;
 }
 
@@ -202,17 +174,6 @@ function projectMarkdownPath(cwd: string, agentDir: string, agent: AgentDefiniti
   throw new Error(`Agent ${agent.name} has no Markdown source`);
 }
 
-function assertProjectConfigTarget(
-  cwd: string,
-  agentDir: string,
-  target: LandstripConfigTarget,
-): void {
-  const current = getLandstripConfigTarget(cwd, 'project', agentDir);
-  if (current.path !== target.path || current.kind !== target.kind) {
-    throw new Error('Landstrip project configuration source changed while updating it');
-  }
-}
-
 export function canDeleteProjectAgent(
   cwd: string,
   agent: AgentDefinition,
@@ -220,7 +181,7 @@ export function canDeleteProjectAgent(
 ): boolean {
   try {
     const target = getLandstripConfigTarget(cwd, 'project', agentDir);
-    if (readAgentNode(target.path, target.kind, agent.name) !== undefined) return true;
+    if (readAgentNode(target.path, agent.name) !== undefined) return true;
   } catch {
     return false;
   }
@@ -234,16 +195,12 @@ export async function deleteProjectAgent(
   agentDir = getAgentDir(),
 ): Promise<boolean> {
   const target = getLandstripConfigTarget(cwd, 'project', agentDir);
-  const containers: readonly JsonPath[] =
-    target.kind === 'settings' ? [['landstrip', 'agent'], ['landstrip']] : [['agent']];
   const deletedOverride = await deleteJsonNode(
     target.path,
-    agentJsonPath(target.kind, agent.name),
-    containers,
-    () => assertProjectConfigTarget(cwd, agentDir, target),
-    target.kind === 'dedicated',
+    agentJsonPath(agent.name),
+    [['agent']],
+    true,
   );
-
   const origin = agent.origin;
   if (origin?.source !== 'local' || !origin.path || origin.kind !== 'pi-markdown') {
     return deletedOverride;
@@ -275,13 +232,7 @@ export function prepareProjectAgentEditor(
   }
   const sourcePath = origin?.path;
   const sourceRaw =
-    origin?.kind === 'config' && sourcePath
-      ? readAgentNode(
-          sourcePath,
-          basename(sourcePath) === 'landstrip.json' ? 'dedicated' : 'settings',
-          agent.name,
-        )
-      : undefined;
+    origin?.kind === 'config' && sourcePath ? readAgentNode(sourcePath, agent.name) : undefined;
   const raw = relocateGlobalPrompt(
     sourceRaw ?? (agent.raw ? { ...agent.raw } : normalizedAgentRaw(agent)),
     agent,
@@ -290,19 +241,11 @@ export function prepareProjectAgentEditor(
 
   return {
     title: `Edit @${agent.name}`,
-    content: `${JSON.stringify(
-      target.kind === 'settings'
-        ? { landstrip: { agent: { [agent.name]: raw } } }
-        : { agent: { [agent.name]: raw } },
-      null,
-      2,
-    )}\n`,
+    content: `${JSON.stringify({ agent: { [agent.name]: raw } }, null, 2)}\n`,
     async save(content) {
-      const edited = parseEditorSnippet(content, agent.name, target.kind);
+      const edited = parseEditorSnippet(content, agent.name);
       validateAgentRaw(agent.name, edited);
-      await writeJsonNode(target.path, agentJsonPath(target.kind, agent.name), edited, () =>
-        assertProjectConfigTarget(cwd, agentDir, target),
-      );
+      await writeJsonNode(target.path, agentJsonPath(agent.name), edited);
     },
   };
 }

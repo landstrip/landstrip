@@ -47,8 +47,8 @@ Worker boundaries:
 
 ## Agents and tasks
 
-Configure `~/.pi/agent/landstrip.json`, trusted-project `.pi/landstrip.json`, or
-`landstrip` in the corresponding Pi settings file. Global definitions load first.
+Configure `~/.pi/agent/landstrip.json` or trusted-project `.pi/landstrip.json`.
+Global definitions load first.
 
 ```json
 {

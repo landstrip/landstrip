@@ -56,23 +56,6 @@ function parseFrontmatter(content: string): { data: ConfigObject; body: string }
   return { data: { ...parsed }, body: match[2] ?? '' };
 }
 
-function convertToolsToPermission(tools: unknown): ConfigObject {
-  if (!isRecord(tools)) throw new Error('tools must be a map of booleans');
-  const permission: ConfigObject = {};
-  for (const [tool, enabled] of Object.entries(tools)) {
-    if (typeof enabled !== 'boolean') {
-      throw new Error(`tools.${tool} must be a boolean`);
-    }
-    const action = enabled ? 'allow' : 'deny';
-    if (tool === 'write' || tool === 'edit' || tool === 'patch') {
-      permission.edit = action;
-      continue;
-    }
-    permission[tool] = action;
-  }
-  return permission;
-}
-
 /** Normalize markdown agent fields into pi-landstrip agent shape. */
 export function normalizeMarkdownAgentRaw(data: ConfigObject, prompt: string): ConfigObject {
   const known = new Set([
@@ -87,11 +70,9 @@ export function normalizeMarkdownAgentRaw(data: ConfigObject, prompt: string): C
     'hidden',
     'color',
     'steps',
-    'maxSteps',
     'options',
     'permission',
     'disable',
-    'tools',
   ]);
 
   const options: ConfigObject = isRecord(data.options) ? { ...data.options } : {};
@@ -99,16 +80,10 @@ export function normalizeMarkdownAgentRaw(data: ConfigObject, prompt: string): C
     if (!known.has(key)) options[key] = value;
   }
 
-  let permission: ConfigObject = {};
-  if (data.tools !== undefined) {
-    permission = convertToolsToPermission(data.tools);
-  }
-  if (data.permission !== undefined) {
-    if (!isRecord(data.permission)) throw new Error('permission must be an object');
-    permission = { ...permission, ...data.permission };
+  if (data.permission !== undefined && !isRecord(data.permission)) {
+    throw new Error('permission must be an object');
   }
 
-  const steps = data.steps ?? data.maxSteps;
   const raw: ConfigObject = {
     description: data.description,
     prompt,
@@ -118,11 +93,13 @@ export function normalizeMarkdownAgentRaw(data: ConfigObject, prompt: string): C
     hidden: data.hidden,
     disable: data.disable,
     color: data.color,
+    steps: data.steps,
     temperature: data.temperature,
     top_p: data.top_p,
   };
-  if (steps !== undefined) raw.steps = steps;
-  if (Object.keys(permission).length > 0) raw.permission = permission;
+  if (isRecord(data.permission) && Object.keys(data.permission).length > 0) {
+    raw.permission = { ...data.permission };
+  }
   if (Object.keys(options).length > 0) raw.options = options;
 
   for (const key of Object.keys(raw)) {

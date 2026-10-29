@@ -247,24 +247,9 @@ export function resolvePiPackage(): PiPackage | undefined {
   }
 
   try {
-    const pkg = findPiPackage(
-      fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent')),
-    );
-    if (pkg) return pkg;
+    return findPiPackage(fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent')));
   } catch {
-    // Fall back to package discovery for runtimes without import.meta.resolve.
-  }
-
-  let dir = packageDir;
-  for (;;) {
-    const pkgPath = join(dir, 'node_modules', '@earendil-works', 'pi-coding-agent', 'package.json');
-    if (existsSync(pkgPath)) {
-      const pkg = readPiPackage(pkgPath);
-      if (pkg) return pkg;
-    }
-    const parent = dirname(dir);
-    if (parent === dir) return undefined;
-    dir = parent;
+    return undefined;
   }
 }
 

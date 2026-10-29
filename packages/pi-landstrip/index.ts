@@ -77,11 +77,10 @@ import {
   pathUnderDirectory,
   sessionScopeFor,
   writeLandstripPolicyFile,
-  shouldPromptForWrite as sharedShouldPromptForWrite,
+  shouldPromptForWrite,
   normalizeBlockedPath,
   extractNativeDeniedPath,
   extractNativeWriteDeniedPath,
-  extractDeniedPath,
   extractTrapBlockedPath,
 } from '@landstrip/landstrip-api/shared';
 import {
@@ -90,19 +89,6 @@ import {
   createProxyEnvironment,
   startFilterProxy,
 } from '@landstrip/landstrip-api/proxy';
-
-export {
-  controlResponseLine,
-  domainMatchesAny,
-  extractDeniedPath,
-  extractNativeDeniedPath,
-  extractNativeWriteDeniedPath,
-  formatLandstripTraps,
-  isQueryTrap,
-  parseTrapLine,
-  sessionScopeFor,
-  type ShellReadAccess,
-};
 
 export interface SandboxConfig extends BaseSandboxConfig {
   shell: SandboxShellConfig;
@@ -407,10 +393,6 @@ function mergeAllowances(base: string[], session: string[], execution?: string[]
   return [...base, ...session, ...(execution ?? [])];
 }
 
-export function shouldPromptForWrite(path: string, allowWrite: string[], cwd: string): boolean {
-  return sharedShouldPromptForWrite(path, allowWrite, cwd);
-}
-
 export function matchesPattern(
   filePath: string,
   patterns: string[],
@@ -496,12 +478,7 @@ export function matchesPattern(
   });
 }
 
-export function readAllowed(
-  path: string,
-  allowRead: string[],
-  denyRead: string[],
-  cwd: string,
-): boolean {
+function readAllowed(path: string, allowRead: string[], denyRead: string[], cwd: string): boolean {
   return isPathReadAllowed(path, allowRead, denyRead, cwd);
 }
 

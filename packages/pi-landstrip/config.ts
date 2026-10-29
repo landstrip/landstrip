@@ -98,11 +98,8 @@ export function isProjectTrusted(ctx: ExtensionContext): boolean {
 export const MAX_SUBAGENTS = 16;
 
 export type AgentSource = 'built-in' | 'global' | 'local';
-export type LandstripConfigKind = 'dedicated' | 'settings';
-
 export interface LandstripConfigTarget {
   readonly path: string;
-  readonly kind: LandstripConfigKind;
 }
 
 export interface LandstripConfigFile {
@@ -166,68 +163,27 @@ function expandAgentPromptReferences(config: LandstripConfigFile, path: string):
   }
 }
 
-function parseLandstripConfig(
-  value: unknown,
-  path: string,
-  kind: LandstripConfigKind,
-): LandstripConfigFile {
-  const label = kind === 'settings' ? 'landstrip' : 'configuration';
-  if (!isRecord(value)) throw new Error(`${path}: ${label} must be a JSON object`);
+function parseLandstripConfig(value: unknown, path: string): LandstripConfigFile {
+  if (!isRecord(value)) throw new Error(`${path}: configuration must be a JSON object`);
   for (const key of Object.keys(value)) {
     if (!(LANDSTRIP_KEYS as readonly string[]).includes(key)) {
-      throw new Error(`${path}: ${label} has an unknown field ${key}`);
+      throw new Error(`${path}: configuration has an unknown field ${key}`);
     }
   }
 
-  const field = (name: string): string => (kind === 'settings' ? `landstrip.${name}` : name);
   const config: LandstripConfigFile = {};
   if ('maxSubagents' in value) {
     if (typeof value.maxSubagents !== 'number') {
-      throw new Error(`${path}: ${field('maxSubagents')} must be a number`);
+      throw new Error(`${path}: maxSubagents must be a number`);
     }
     config.maxSubagents = value.maxSubagents;
   }
   if ('agent' in value) {
-    if (!isRecord(value.agent)) throw new Error(`${path}: ${field('agent')} must be an object`);
+    if (!isRecord(value.agent)) throw new Error(`${path}: agent must be an object`);
     config.agent = value.agent;
   }
   if ('permission' in value) config.permission = value.permission;
   return config;
-}
-
-function readLandstripConfigSource(
-  cwd: string,
-  scope: 'global' | 'project',
-  agentDir: string,
-): LandstripConfigSource {
-  const settingsPaths = getPiConfigPaths(cwd, 'settings.json', agentDir);
-  const dedicatedPaths = getPiConfigPaths(cwd, 'landstrip.json', agentDir);
-  const settingsPath = scope === 'global' ? settingsPaths.globalPath : settingsPaths.projectPath;
-  const dedicatedPath = scope === 'global' ? dedicatedPaths.globalPath : dedicatedPaths.projectPath;
-  const settings = existsSync(settingsPath) ? readJsonObject(settingsPath) : undefined;
-  const hasSettingsConfig = settings?.landstrip !== undefined;
-  const hasDedicatedConfig = existsSync(dedicatedPath);
-
-  if (hasSettingsConfig && hasDedicatedConfig) {
-    throw new Error(
-      `Landstrip configuration is defined in both ${settingsPath} and ${dedicatedPath}`,
-    );
-  }
-  if (hasDedicatedConfig) {
-    return {
-      path: dedicatedPath,
-      kind: 'dedicated',
-      config: parseLandstripConfig(readJsonObject(dedicatedPath), dedicatedPath, 'dedicated'),
-    };
-  }
-  if (hasSettingsConfig) {
-    return {
-      path: settingsPath,
-      kind: 'settings',
-      config: parseLandstripConfig(settings!.landstrip, settingsPath, 'settings'),
-    };
-  }
-  return { path: dedicatedPath, kind: 'dedicated', config: {} };
 }
 
 export function getLandstripConfigTarget(
@@ -235,8 +191,21 @@ export function getLandstripConfigTarget(
   scope: 'global' | 'project',
   agentDir = getAgentDir(),
 ): LandstripConfigTarget {
-  const { path, kind } = readLandstripConfigSource(cwd, scope, agentDir);
-  return { path, kind };
+  const paths = getPiConfigPaths(cwd, 'landstrip.json', agentDir);
+  return { path: scope === 'global' ? paths.globalPath : paths.projectPath };
+}
+
+function readLandstripConfigSource(
+  cwd: string,
+  scope: 'global' | 'project',
+  agentDir: string,
+): LandstripConfigSource {
+  const { path } = getLandstripConfigTarget(cwd, scope, agentDir);
+  if (!existsSync(path)) return { path, config: {} };
+  return {
+    path,
+    config: parseLandstripConfig(readJsonObject(path), path),
+  };
 }
 
 function mergeValue(base: unknown, override: unknown): unknown {
@@ -289,27 +258,17 @@ async function updateLandstripConfigForScope(
   const target = getLandstripConfigTarget(cwd, scope, agentDir);
   await withFileMutationQueue(target.path, async () => {
     const source = readLandstripConfigSource(cwd, scope, agentDir);
-    if (source.path !== target.path || source.kind !== target.kind) {
-      throw new Error(`Landstrip ${scope} configuration source changed while updating it`);
-    }
-
     const landstrip = { ...source.config };
     update(landstrip);
-    const empty = Object.keys(landstrip).length === 0;
-    if (source.kind === 'dedicated' && empty) {
+    if (Object.keys(landstrip).length === 0) {
       if (existsSync(source.path)) unlinkSync(source.path);
       return;
     }
 
     let content = existsSync(source.path) ? readFileSync(source.path, 'utf8') : '{}\n';
-    if (source.kind === 'settings' && empty) {
-      content = applyEdits(content, modify(content, ['landstrip'], undefined, JSON_FORMAT));
-    } else {
-      const root = source.kind === 'settings' ? ['landstrip'] : [];
-      for (const key of LANDSTRIP_KEYS) {
-        if (source.config[key] === landstrip[key]) continue;
-        content = applyEdits(content, modify(content, [...root, key], landstrip[key], JSON_FORMAT));
-      }
+    for (const key of LANDSTRIP_KEYS) {
+      if (source.config[key] === landstrip[key]) continue;
+      content = applyEdits(content, modify(content, [key], landstrip[key], JSON_FORMAT));
     }
     mkdirSync(dirname(source.path), { recursive: true });
     writeFileSync(source.path, ensureFinalNewline(content), { mode: 0o600 });
