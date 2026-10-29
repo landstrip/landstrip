@@ -1251,7 +1251,7 @@ function commandRedirectsToPath(command, path, cwd) {
   );
   for (const redirect of redirects) {
     const target = redirect[1] ?? redirect[2] ?? redirect[3] ?? redirect[4];
-    if (target !== undefined && normalizePathMatch(target, cwd) === path) return true;
+    if (target !== undefined && normalizeBlockedPath(target, cwd) === path) return true;
   }
   return false;
 }
@@ -1286,7 +1286,7 @@ function extractNativeWriteDeniedPath(output, cwd = process.cwd(), command) {
 
   match = output.match(
     new RegExp(
-      String.raw`^([^\s:]+):\s+((?:[a-zA-Z]:[\\/]|\\\\|\/|\.{1,2}[\\/])[^:\r\n]*?):\s+${denial}$`,
+      String.raw`^([^\s:]+):\s+(?:line \d+:\s+)?((?:[a-zA-Z]:)?[^:\r\n]+?):\s+${denial}$`,
       'im',
     ),
   );
@@ -1294,7 +1294,10 @@ function extractNativeWriteDeniedPath(output, cwd = process.cwd(), command) {
     const tool = basename(match[1]);
     const path = normalizePathMatch(match[2], cwd);
     if (path && nativeWriteTools.has(tool)) return path;
-    if (path && nativeShellTools.has(tool) && commandRedirectsToPath(command, path, cwd)) return path;
+    if (nativeShellTools.has(tool)) {
+      const target = normalizeBlockedPath(match[2], cwd);
+      if (commandRedirectsToPath(command, target, cwd)) return target;
+    }
   }
 
   match = output.match(
