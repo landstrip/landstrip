@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
@@ -873,6 +873,133 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
       writeFileSync(join(root, 'sandbox.json'), JSON.stringify({ enabled: false }));
       expect(await callTool('read', { path: join(root, 'hard-secret.txt') })).toBeUndefined();
       expect(await callTool('write', { path: join(root, 'outside.txt') })).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('sandboxed bash preserves trap diagnostics with command output and never double-prompts Keep blocked', async () => {
+    const rawRoot = mkdtempSync(join(tmpdir(), 'pi-landstrip-bash-test-'));
+    const root = realpathSync(rawRoot);
+    try {
+      vi.stubEnv('PI_CODING_AGENT_DIR', root);
+      const projectDir = join(root, 'project');
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(
+        join(root, 'sandbox.json'),
+        JSON.stringify({
+          enabled: true,
+          shell: { readAccess: 'host' },
+          network: { allowNetwork: true },
+          filesystem: {
+            allowRead: [root],
+            denyRead: [],
+            denyReadAlways: [],
+            allowWrite: [projectDir],
+            denyWrite: ['**/*.pem'],
+            denyWriteAlways: [join(projectDir, 'immutable.txt')],
+          },
+        }),
+      );
+
+      const mockApi = createMockExtensionAPI();
+      const integration = createLandstripIntegration({ registerBashTool: true, cwd: projectDir });
+      const runtime = new SubagentRuntime(mockApi.api, integration);
+      integration.setSubagentRuntime?.(runtime);
+      integration.register(mockApi.api);
+      runtime.register();
+
+      const ctx = createMockExtensionContext(projectDir);
+      for (const handler of mockApi.listeners.get('session_start') ?? []) {
+        await handler({}, ctx);
+      }
+
+      const bashTool = mockApi.tools.get('bash');
+      expect(bashTool).toBeDefined();
+
+      const textOf = (res: { content: Array<{ text?: string }> }) =>
+        res.content.map((entry) => entry.text ?? '').join('\n');
+
+      const hardResult = await bashTool.execute(
+        'call-hard',
+        { command: 'echo blocked > immutable.txt' } satisfies LandstripBashInput,
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      expect(hardResult.isError).toBe(true);
+      const hardOutput = textOf(hardResult);
+      expect(hardOutput).toMatch(/Permission denied|Access is denied/i);
+      expect(hardOutput).toContain('Command exited with code');
+      if (process.platform === 'linux') {
+        expect(hardOutput).toContain(
+          `landstrip: filesystem write denied (${join(projectDir, 'immutable.txt')})`,
+        );
+      }
+
+      const headlessSoftResult = await bashTool.execute(
+        'call-headless-soft',
+        { command: 'echo cert > test.pem' } satisfies LandstripBashInput,
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      expect(headlessSoftResult.isError).toBe(true);
+      const headlessSoftOutput = textOf(headlessSoftResult);
+      expect(headlessSoftOutput).toMatch(/Permission denied|Access is denied/i);
+      expect(headlessSoftOutput).toContain('Command exited with code');
+      if (process.platform === 'linux') {
+        expect(headlessSoftOutput).toContain(
+          `landstrip: filesystem write denied (${join(projectDir, 'test.pem')})`,
+        );
+      }
+
+      const rejectSelect = vi.fn().mockResolvedValue('Keep blocked');
+      const rejectCtx = {
+        ...ctx,
+        hasUI: true,
+        ui: {
+          ...ctx.ui,
+          select: rejectSelect,
+        },
+      };
+      const rejectResult = await bashTool.execute(
+        'call-reject',
+        { command: 'echo cert > test.pem' } satisfies LandstripBashInput,
+        new AbortController().signal,
+        () => {},
+        rejectCtx,
+      );
+      expect(rejectSelect).toHaveBeenCalledTimes(1);
+      expect(rejectResult.isError).toBe(true);
+      const rejectOutput = textOf(rejectResult);
+      expect(rejectOutput).toMatch(/Permission denied|Access is denied/i);
+      expect(rejectOutput).toContain('Command exited with code');
+      if (process.platform === 'linux') {
+        expect(rejectOutput).toContain(
+          `landstrip: filesystem write denied (${join(projectDir, 'test.pem')})`,
+        );
+      }
+
+      const allowSelect = vi.fn().mockResolvedValue('Allow once');
+      const allowCtx = {
+        ...ctx,
+        hasUI: true,
+        ui: {
+          ...ctx.ui,
+          select: allowSelect,
+        },
+      };
+      const allowed = await bashTool.execute(
+        'call-allow',
+        { command: 'echo cert > test.pem && cat test.pem' } satisfies LandstripBashInput,
+        new AbortController().signal,
+        () => {},
+        allowCtx,
+      );
+      expect(allowSelect).toHaveBeenCalledTimes(1);
+      expect(allowed.isError).not.toBe(true);
+      expect(textOf(allowed)).toContain('cert');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -174,6 +174,7 @@ export function resolveProcessReadPolicy(
 interface LandstripBashCallbacks {
   onStderr?: (data: Buffer) => void;
   onErrorFd?: (data: Buffer) => void;
+  onRejectedPath?: (operation: 'read' | 'write', path: string) => void;
   promptOnBlock?: boolean;
 }
 
@@ -2264,10 +2265,13 @@ function createLandstripIntegrationWithPrompts(
                         callbacks.promptOnBlock === true,
                         signal,
                       );
-                      if (
-                        result.reason === 'unprompted' ||
-                        (!isFilesystemTrap(trap) && result.reason === 'rejected')
-                      ) {
+                      if (result.action === 'deny') {
+                        if (result.reason === 'rejected' && isFilesystemTrap(trap)) {
+                          callbacks.onRejectedPath?.(
+                            trap.operation,
+                            normalizeBlockedPath(trap.path, cwd),
+                          );
+                        }
                         appendErrorLine(line);
                       }
                       respondQuery(trap.query_id, result.action);
@@ -2330,6 +2334,10 @@ function createLandstripIntegrationWithPrompts(
   ): Promise<AgentToolResult<BashToolDetails | undefined>> {
     let landstripErrorOutput = '';
     let stderrOutput = '';
+    const rejectedPaths = {
+      read: new Set<string>(),
+      write: new Set<string>(),
+    };
     const allowances: ExecutionAllowances = {
       domains: [],
       readPaths: [],
@@ -2346,6 +2354,9 @@ function createLandstripIntegrationWithPrompts(
           onStderr: (data) => {
             stderrOutput += data.toString('utf8');
           },
+          onRejectedPath: (operation, path) => {
+            rejectedPaths[operation].add(path);
+          },
           promptOnBlock: true,
         },
         allowances,
@@ -2354,6 +2365,11 @@ function createLandstripIntegrationWithPrompts(
     });
 
     const run = () => sandboxedBash.execute(id, params, signal, onUpdate, ctx);
+    const formatTrapErrors = (): string | null => {
+      const landstripErrors = parseLandstripTraps(landstripErrorOutput);
+      if (landstripErrors.length === 0) return null;
+      return [...new Set(formatLandstripTraps(landstripErrors).split('\n'))].join('\n');
+    };
     const blockedReadPathForRetry = (nativeOutput: string): string | null => {
       const config = loadConfig(ctx.cwd);
       if (!enforcesShellReadPolicy(config.shell.readAccess)) return null;
@@ -2372,7 +2388,7 @@ function createLandstripIntegrationWithPrompts(
       operation: 'read' | 'write',
       blockedPath: string,
     ): Promise<AgentToolResult<BashToolDetails | undefined> | null> => {
-      if (!ctx.hasUI) return null;
+      if (!ctx.hasUI || rejectedPaths[operation].has(blockedPath)) return null;
 
       const { globalPath, projectPath } = getPiConfigPaths(ctx.cwd, 'sandbox.json');
       const isWriteDeniedAlways = (config: SandboxConfig): boolean =>
@@ -2499,16 +2515,15 @@ function createLandstripIntegrationWithPrompts(
         if (retryResult) return retryResult;
       }
 
-      const landstripErrors = parseLandstripTraps(landstripErrorOutput);
-      if (landstripErrors.length > 0) {
-        throw new Error(formatLandstripTraps(landstripErrors));
+      const trapMessage = formatTrapErrors();
+      if (trapMessage) {
+        throw new Error(errorText ? `${trapMessage}\n\n${errorText}` : trapMessage);
       }
       throw error;
     }
-    const landstripErrors = parseLandstripTraps(landstripErrorOutput);
-    if (landstripErrors.length > 0) {
-      const message = formatLandstripTraps(landstripErrors);
-      result.content.unshift({ type: 'text', text: `\n${message}\n` });
+    const trapMessage = formatTrapErrors();
+    if (trapMessage) {
+      result.content.unshift({ type: 'text', text: `\n${trapMessage}\n` });
     }
     const blockedWritePath =
       extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'write') ??
