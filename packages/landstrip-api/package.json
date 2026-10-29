@@ -1,6 +1,6 @@
 {
   "name": "@landstrip/landstrip-api",
-  "version": "0.20.14",
+  "version": "0.20.15",
   "description": "TypeScript APIs for the Landstrip sandbox",
   "license": "Apache-2.0",
   "homepage": "https://github.com/landstrip/landstrip#readme",
@@ -33,7 +33,7 @@
     "LICENSE"
   ],
   "dependencies": {
-    "@landstrip/landstrip": "0.20.14",
+    "@landstrip/landstrip": "0.20.15",
     "ipaddr.js": "^2.5.0"
   },
   "publishConfig": {
