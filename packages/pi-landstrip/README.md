@@ -60,6 +60,18 @@ Global definitions load first.
 `maxSubagents` accepts values from 0 to 16. Agent definitions can override
 model, prompt, mode, options, and permissions.
 
+The `task` tool accepts an optional `model` parameter, `provider/model[:level]`,
+that overrides the agent's configured model (and variant) for that run, e.g.
+`model="openrouter/openai/gpt-6-luna:low"`. The provider is required, and the
+model must exist and have authentication configured. The tool description tells
+the LLM to set it only when the user explicitly asks for a model or level. Valid
+levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
+Without a level, the model's entry in `modelThinkingLevels` (keyed by
+`provider/model`), then `defaultThinkingLevel`, both from
+`~/.pi/agent/settings.json`, then `medium` is used. The override is stored on
+the task, so resuming it with `task_id` keeps the same model, and its auth is
+checked again on resume. Passing a new `model` with `task_id` is an error.
+
 Use `/landstrip-sandbox` for sandbox overview/policy (`Overview`, `Policy`, `Help`)
 and `/landstrip-subagents` for subagent/task management (`Tasks`, `Log`, `Subagent`,
 `Primary`, `Settings`, `Help`). Task IDs accept unique prefixes; bare IDs open logs.

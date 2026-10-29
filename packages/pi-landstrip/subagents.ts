@@ -155,6 +155,56 @@ export function paneRow(_theme: Theme, width: number, content = ''): string {
 }
 
 const PI_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+const FALLBACK_THINKING_LEVEL = 'medium';
+
+/**
+ * Parse a task `model` override of the form `provider/model[:level]`. The provider is
+ * required. The suffix after the last colon is a thinking level only when it is a valid
+ * level, so model IDs that contain colons (e.g. `...:free`) stay intact. `variant` is
+ * undefined when no level was given.
+ */
+function parseTaskModelOverride(value: string): { model: string; variant?: string } {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error('Task model cannot be empty');
+  let model = trimmed;
+  let variant: string | undefined;
+  const index = trimmed.lastIndexOf(':');
+  if (index > 0 && PI_THINKING_LEVELS.has(trimmed.slice(index + 1))) {
+    model = trimmed.slice(0, index);
+    variant = trimmed.slice(index + 1);
+  }
+  const slash = model.indexOf('/');
+  if (slash <= 0 || slash === model.length - 1) {
+    throw new Error(`Task model must be "provider/model[:level]", got: ${value}`);
+  }
+  return variant ? { model, variant } : { model };
+}
+
+/**
+ * Thinking level for a task whose model was overridden without an explicit level: the
+ * per-model setting, then `defaultThinkingLevel`, then `medium` (Pi's own order).
+ */
+function resolveOverrideThinkingLevel(
+  settings: ReturnType<ExtensionAPI['getSettings']> | undefined,
+  qualifiedModel: string,
+): string {
+  const perModel = settings?.modelThinkingLevels?.[qualifiedModel];
+  if (perModel && PI_THINKING_LEVELS.has(perModel)) return perModel;
+  const fallback = settings?.defaultThinkingLevel;
+  return fallback && PI_THINKING_LEVELS.has(fallback) ? fallback : FALLBACK_THINKING_LEVEL;
+}
+
+/** Reject an override before any worker starts: it must be a known model with auth. */
+function assertOverrideModelUsable(ctx: ExtensionContext, model: string): void {
+  const found = ctx.modelRegistry
+    ?.getAll()
+    .find((candidate) => `${candidate.provider}/${candidate.id}` === model);
+  if (!found) throw new Error(`Model not found for task: ${model}`);
+  if (!ctx.modelRegistry.hasConfiguredAuth(found)) {
+    throw new Error(`No authentication configured for task model: ${model}`);
+  }
+}
+
 const SANDBOX_HELP_ROWS = [
   ['Tab', 'Next tab'],
   ['↑ / ↓', 'Scroll when content exceeds pane height'],
@@ -314,6 +364,12 @@ const taskParameters = Type.Object({
   description: Type.String({ description: 'Short task label (3-5 words)' }),
   prompt: Type.String({ description: 'Full instructions for the subagent' }),
   subagent_type: Type.String({ description: 'Subagent name' }),
+  model: Type.Optional(
+    Type.String({
+      description:
+        'NEVER set this unless the user explicitly asks for a particular model or thinking level; by default the subagent uses the model configured for it. Format: "provider/model[:level]" (level: off, minimal, low, medium, high, xhigh, max). Without a level, the entry for the model in modelThinkingLevels, then defaultThinkingLevel (from Pi settings) is used. Cannot be combined with task_id.',
+    }),
+  ),
   task_id: Type.Optional(Type.String({ description: 'Task ID to resume' })),
   command: Type.Optional(Type.String({ description: 'Originating command, if any' })),
   background: Type.Optional(
@@ -402,6 +458,7 @@ interface TaskInput {
   description: string;
   prompt: string;
   subagent_type: string;
+  model?: string;
   task_id?: string;
   command?: string;
   background?: boolean;
@@ -459,6 +516,8 @@ export interface SubagentTaskRecord extends BaseTaskRecord {
   kind?: 'subagent';
   agent: string;
   description: string;
+  /** Model override from the task call; reapplied when the task is resumed. */
+  modelOverride?: { model: string; variant?: string };
 }
 
 export interface CommandTaskRecord extends BaseTaskRecord {
@@ -3471,14 +3530,20 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       throw new Error(`Invalid agent configuration:\n${catalog.diagnostics.join('\n')}`);
     }
     if (catalog.maxSubagents === 0) throw new Error('Subagents are disabled by maxSubagents: 0');
-    const agent = catalog.agents.get(input.subagent_type);
-    if (!agent || agent.disabled || agent.mode === 'primary')
+    const baseAgent = catalog.agents.get(input.subagent_type);
+    if (!baseAgent || baseAgent.disabled || baseAgent.mode === 'primary')
       throw new Error(`Unknown subagent: ${input.subagent_type}`);
+    if (input.model !== undefined && input.task_id) {
+      throw new Error('Cannot change the model when resuming a task (model with task_id)');
+    }
+    const requestedOverride =
+      input.model !== undefined ? parseTaskModelOverride(input.model) : undefined;
+    if (requestedOverride) assertOverrideModelUsable(ctx, requestedOverride.model);
     const rules = callerRules ?? catalog.permissions;
-    const taskPermission = permissionDecision(rules, 'task', agent.name);
-    if (taskPermission === 'deny') throw new Error(`Task permission denied for ${agent.name}`);
+    const taskPermission = permissionDecision(rules, 'task', baseAgent.name);
+    if (taskPermission === 'deny') throw new Error(`Task permission denied for ${baseAgent.name}`);
     if (taskPermission === 'ask') {
-      await this.broker.ask(ctx, input.description, 'task', agent.name, signal, {
+      await this.broker.ask(ctx, input.description, 'task', baseAgent.name, signal, {
         context: parentTask ? this.taskContext(parentTask, ctx) : this.permissionContext(ctx),
         toolName: 'task',
         input: { ...input },
@@ -3499,8 +3564,8 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       if (task.parentTaskId !== parentTask?.id) {
         throw new Error(`Task ${task.id} does not belong to this parent task`);
       }
-      if (task.agent !== agent.name) {
-        throw new Error(`Task ${task.id} belongs to agent ${task.agent}, not ${agent.name}`);
+      if (task.agent !== baseAgent.name) {
+        throw new Error(`Task ${task.id} belongs to agent ${task.agent}, not ${baseAgent.name}`);
       }
       if (
         !this.running.has(task.id) &&
@@ -3510,8 +3575,14 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         throw new Error(`Task ${task.id} session is unavailable`);
       }
     } else {
-      task = this.createRecord(input, ctx, parentTask, agent, depth);
+      task = this.createRecord(input, ctx, parentTask, baseAgent, depth, requestedOverride);
     }
+    const override = task.kind === 'command' ? undefined : task.modelOverride;
+    // A resumed task re-checks its stored override: credentials may have gone.
+    if (input.task_id && override) assertOverrideModelUsable(ctx, override.model);
+    const agent: AgentDefinition = override
+      ? { ...baseAgent, model: override.model, variant: override.variant }
+      : baseAgent;
 
     const existingRun = this.runPromises.get(task.id);
 
@@ -3666,6 +3737,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     parentTask: TaskRecord | undefined,
     agent: AgentDefinition,
     depth: number,
+    modelOverride?: { model: string; variant?: string },
   ): TaskRecord {
     const parentSession = parentTask?.sessionFile ?? ctx.sessionManager.getSessionFile();
     const id = randomUUID();
@@ -3689,6 +3761,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       depth,
       state: 'queued',
       background: input.background === true,
+      modelOverride,
     };
     this.tasks.set(task.id, task);
     this.persist(task);
@@ -3882,7 +3955,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     const thinking =
       agent.variant && PI_THINKING_LEVELS.has(agent.variant)
         ? agent.variant
-        : this.pi.getThinkingLevel();
+        : task.kind !== 'command' && task.modelOverride
+          ? resolveOverrideThinkingLevel(this.pi.getSettings(), endpoint.model)
+          : this.pi.getThinkingLevel();
     if (agent.variant && !PI_THINKING_LEVELS.has(agent.variant)) {
       ctx.ui.notify(
         `Agent ${agent.name} uses unsupported Pi model variant: ${agent.variant}`,
