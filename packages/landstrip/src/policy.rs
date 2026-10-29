@@ -4,10 +4,12 @@
 //! Policy lowering from JSON settings to platform access rules.
 //!
 //! Filesystem policy follows the Seatbelt-compatible shape. Writes start
-//! denied; `allowWrite` grants roots and `denyWrite` subtracts from them. Reads
-//! stay unrestricted unless `denyRead` or `denyReadAlways` is set. `allowRead`
-//! adds paths back from ordinary denials, with the most specific rule winning;
-//! `denyReadAlways` roots and descendants cannot be restored by any allow.
+//! denied; `allowWrite` grants roots and adds paths back from `denyWrite`
+//! denials, with the most specific rule winning; `denyWriteAlways` roots and
+//! descendants cannot be restored by any allow. Reads stay unrestricted unless
+//! `denyRead` or `denyReadAlways` is set. `allowRead` adds paths back from
+//! ordinary denials, with the most specific rule winning; `denyReadAlways`
+//! roots and descendants cannot be restored by any allow.
 //! Hard links and renames that would give a `denyRead` inode a readable name
 //! stay denied even when the destination is under `allowWrite`.
 //!
@@ -54,6 +56,7 @@ pub(crate) struct AccessPolicy {
     pub(crate) write_denied_always_roots: Box<[PathBuf]>,
     pub(crate) write_denied_always_patterns: Box<[String]>,
     pub(crate) write_denied_patterns: Vec<String>,
+    pub(crate) write_carveouts: Vec<PathBuf>,
     pub(crate) write_denied_links: DeniedLinks,
     pub(crate) read_access: ReadAccess,
     pub(crate) read_denied_roots: Vec<PathBuf>,
@@ -181,7 +184,22 @@ impl AccessPolicy {
     }
 
     pub(crate) fn is_write_denied(&self, canonical: &Path) -> bool {
-        self.write_denied().matches(canonical)
+        self.is_write_denied_always(canonical, canonical)
+            || self.write_denied_roots.iter().any(|root| {
+                canonical.is_under(root)
+                    && !self
+                        .write_carveouts
+                        .iter()
+                        .any(|carveout| carveout.is_under(root) && canonical.is_under(carveout))
+            })
+            || self.write_denied_patterns.iter().any(|pattern| {
+                let glob = GlobPattern::new(pattern);
+                glob.matches_tree(canonical)
+                    && !self
+                        .write_carveouts
+                        .iter()
+                        .any(|carveout| canonical.is_under(carveout) && glob.matches_tree(carveout))
+            })
     }
 
     /// A denied subtree is only as strong as the symlinks leading into it:

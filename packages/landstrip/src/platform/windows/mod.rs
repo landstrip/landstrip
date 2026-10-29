@@ -10,10 +10,12 @@ mod restricted_user;
 pub(crate) use restricted_user::{manage, run_worker, status};
 
 use crate::error::{Error, Mechanism};
+use crate::paths::PathExt;
 use crate::policy::{AccessPolicy, ReadAccess};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString, c_void};
+use std::fs;
 use std::io;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
@@ -575,10 +577,29 @@ impl PathAccessEntry {
         // Placed after grant entries so the resulting DACL has DENY before
         // GRANT in access-evaluation order.
         for path in &policy.write_denied_roots {
-            entries.push(Self::subtree_deny(
-                path,
-                FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE,
-            ));
+            let carved: Vec<&Path> = policy
+                .write_carveouts
+                .iter()
+                .map(PathBuf::as_path)
+                .filter(|carveout| carveout.is_strictly_under(path))
+                .collect();
+            if carved.is_empty() {
+                entries.push(Self::subtree_deny(
+                    path,
+                    FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE,
+                ));
+            } else if policy
+                .write_roots
+                .iter()
+                .any(|root| path.is_strictly_under(root))
+            {
+                Self::push_carved_write_deny(
+                    &mut entries,
+                    path,
+                    &carved,
+                    FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE,
+                )?;
+            }
         }
         for path in &policy.read_denied_roots {
             // Traverse (`FILE_TRAVERSE`/`FILE_GENERIC_EXECUTE` on a directory) is
@@ -623,6 +644,42 @@ impl PathAccessEntry {
             inherit: true,
             propagate: true,
         }
+    }
+
+    fn push_carved_write_deny(
+        entries: &mut Vec<Self>,
+        root: &Path,
+        carved: &[&Path],
+        access: u32,
+    ) -> Result<()> {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(current) = stack.pop() {
+            if current.is_under_any(carved) {
+                continue;
+            }
+            let has_carved_descendant = carved
+                .iter()
+                .any(|carveout| carveout.is_strictly_under(&current));
+            let is_dir = fs::symlink_metadata(&current).is_ok_and(|md| md.file_type().is_dir());
+            if !has_carved_descendant || !is_dir {
+                entries.push(Self::subtree_deny(&current, access));
+                continue;
+            }
+            entries.push(Self {
+                access_mode: DENY_ACCESS,
+                path: current.clone(),
+                access,
+                inherit: false,
+                propagate: false,
+            });
+            for entry in
+                fs::read_dir(&current).map_err(|source| Error::PolicyIoFailed { source })?
+            {
+                let entry = entry.map_err(|source| Error::PolicyIoFailed { source })?;
+                stack.push(entry.path());
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn apply(&self, sid: PSID) -> Win32CallResult<()> {

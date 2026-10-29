@@ -7,7 +7,7 @@ use super::{
     AccessPolicy, DenialTier, DeniedLink, DeniedLinks, DenyRuleSet, IpBindAccess, NetworkAccess,
     ReadAccess, UnixSocketAccess,
 };
-use crate::config::{PathSelector, SandboxDarwin, SandboxNetwork, Settings};
+use crate::config::{PathSelector, SandboxDarwin, SandboxFilesystem, SandboxNetwork, Settings};
 use crate::error::{Error, PathIo};
 use crate::paths::{GlobPattern, NormalizeRoots, PathExt};
 use anyhow::Result;
@@ -31,49 +31,18 @@ impl Settings {
         }
         let resolver = PolicyResolver::new(policy_base)?;
 
-        let mut write_allow = resolver.resolve_paths(&filesystem.allow_write)?;
-        // Missing Windows allow roots cannot receive ACL entries. Dropping them is
-        // fail-closed because sandbox SIDs receive no access to those paths.
-        #[cfg(target_os = "windows")]
-        retain_windows_allow_roots(&mut write_allow);
-        let write_deny_selectors =
-            PolicyResolver::anchor_write_deny_selectors(&filesystem.deny_write, &write_allow);
-        let write_always_selectors = PolicyResolver::anchor_write_deny_selectors(
-            &filesystem.deny_write_always,
-            &write_allow,
-        );
-        // Linux mediates denyWrite globs dynamically; expanding them here can scan
-        // an entire project before even starting a simple command.
-        let mut resolved_write_deny =
-            resolver.resolve_deny_paths(&write_deny_selectors, !cfg!(target_os = "linux"))?;
-        let resolved_write_always = resolver.resolve_deny_paths(&write_always_selectors, true)?;
-        let mut denied_links: Vec<DeniedLink> = resolver
-            .collect_symlink_ancestors(&write_deny_selectors)?
-            .into_iter()
-            .map(|path| DeniedLink::new(path, DenialTier::Queryable))
-            .collect();
-        denied_links.extend(
-            resolver
-                .collect_symlink_ancestors(&write_always_selectors)?
-                .into_iter()
-                .map(|path| DeniedLink::new(path, DenialTier::Always)),
-        );
-        let write_denied_links = DeniedLinks::new(denied_links);
-        resolved_write_deny.merge_always(&resolved_write_always, &mut write_allow);
-        let write_deny = resolved_write_deny.concrete;
-        let write_denied_patterns = resolved_write_deny.patterns;
-        let mut write_denied_always_roots = resolved_write_always.concrete;
-        write_denied_always_roots.normalize_roots();
-        let write_denied_always_patterns = resolved_write_always.patterns;
+        let write = resolver.resolve_write_policy(filesystem)?;
 
         let mut read_allow = resolver.resolve_paths(&filesystem.allow_read)?;
         #[cfg(target_os = "windows")]
         retain_windows_allow_roots(&mut read_allow);
         let mut resolved_read_deny = resolver.resolve_deny_paths(&filesystem.deny_read, true)?;
+        resolved_read_deny.merge_expanded();
         let mut read_denied_roots =
             effective_denied_roots(&resolved_read_deny.concrete, &read_allow);
-        let resolved_read_always =
+        let mut resolved_read_always =
             resolver.resolve_deny_paths(&filesystem.deny_read_always, true)?;
+        resolved_read_always.merge_expanded();
         let read_carveouts = resolved_read_deny.carveouts(&resolved_read_always, &read_allow);
         resolved_read_deny.merge_always(&resolved_read_always, &mut read_allow);
         let read_deny = resolved_read_deny.concrete;
@@ -83,12 +52,6 @@ impl Settings {
         // Windows cannot attach deny entries to missing paths or volume roots.
         #[cfg(target_os = "windows")]
         retain_windows_deny_roots(&mut read_denied_roots);
-
-        #[cfg(target_os = "windows")]
-        let (write_allow, write_deny) = {
-            let write_roots = lower_windows_write_access(&write_allow, write_deny);
-            (write_roots.allow, write_roots.deny)
-        };
 
         let lowered_read = lower_read_access(
             &read_allow,
@@ -100,12 +63,13 @@ impl Settings {
         read_denied_roots.extend(read_denied_always_roots.iter().cloned());
         read_denied_roots.normalize_roots();
         let policy = AccessPolicy {
-            write_roots: write_allow,
-            write_denied_roots: write_deny,
-            write_denied_always_roots: write_denied_always_roots.into_boxed_slice(),
-            write_denied_always_patterns: write_denied_always_patterns.into_boxed_slice(),
-            write_denied_patterns,
-            write_denied_links,
+            write_roots: write.roots,
+            write_denied_roots: write.denied_roots,
+            write_denied_always_roots: write.denied_always_roots,
+            write_denied_always_patterns: write.denied_always_patterns,
+            write_denied_patterns: write.denied_patterns,
+            write_carveouts: write.carveouts,
+            write_denied_links: write.denied_links,
             read_access,
             read_denied_roots,
             read_denied_patterns,
@@ -128,6 +92,16 @@ impl Settings {
     }
 }
 
+struct ResolvedWritePolicy {
+    roots: Vec<PathBuf>,
+    denied_roots: Vec<PathBuf>,
+    denied_always_roots: Box<[PathBuf]>,
+    denied_always_patterns: Box<[String]>,
+    denied_patterns: Vec<String>,
+    carveouts: Vec<PathBuf>,
+    denied_links: DeniedLinks,
+}
+
 struct LoweredReadAccess {
     access: ReadAccess,
     symlinks: Vec<PathBuf>,
@@ -135,6 +109,7 @@ struct LoweredReadAccess {
 
 struct ResolvedDenyPaths {
     concrete: Vec<PathBuf>,
+    expanded: Vec<PathBuf>,
     patterns: Vec<String>,
 }
 
@@ -147,12 +122,39 @@ impl ResolvedDenyPaths {
         self.as_rules().matches(path)
     }
 
+    fn merge_expanded(&mut self) {
+        self.concrete.extend(std::mem::take(&mut self.expanded));
+        self.concrete.normalize_roots();
+    }
+
     fn carveouts(&self, always: &Self, allow: &[PathBuf]) -> Vec<PathBuf> {
         allow
             .iter()
             .filter(|path| !always.matches(path) && self.as_rules().matches_patterns(path))
             .cloned()
             .collect()
+    }
+
+    fn apply_write_carveouts(&mut self, always: &Self, allow: &[PathBuf]) -> Vec<PathBuf> {
+        let carveouts: Vec<PathBuf> = allow
+            .iter()
+            .filter(|path| !always.matches(path) && self.matches(path))
+            .cloned()
+            .collect();
+        self.concrete.retain(|deny| !carveouts.contains(deny));
+        let patterns = &self.patterns;
+        let matches_pattern = |path: &Path| {
+            patterns
+                .iter()
+                .any(|pattern| GlobPattern::new(pattern).matches_tree(path))
+        };
+        self.expanded.retain(|candidate| {
+            !carveouts
+                .iter()
+                .any(|carveout| candidate.is_under(carveout) && matches_pattern(carveout))
+        });
+        self.merge_expanded();
+        carveouts
     }
 
     fn merge_always(&mut self, always: &Self, allow: &mut Vec<PathBuf>) {
@@ -188,11 +190,7 @@ fn lower_windows_write_access(
 ) -> WindowsWriteRoots {
     retain_windows_deny_roots(&mut write_deny);
 
-    let mut carved_writes: Vec<PathBuf> = write_allow
-        .iter()
-        .filter(|allow| !allow.is_under_any(&write_deny))
-        .cloned()
-        .collect();
+    let mut carved_writes = write_allow.to_vec();
     carved_writes.normalize_roots();
 
     WindowsWriteRoots {
@@ -350,6 +348,60 @@ impl PolicyResolver {
         })
     }
 
+    fn resolve_write_policy(&self, filesystem: &SandboxFilesystem) -> Result<ResolvedWritePolicy> {
+        let mut write_allow = self.resolve_paths(&filesystem.allow_write)?;
+        // Missing Windows allow roots cannot receive ACL entries. Dropping them is
+        // fail-closed because sandbox SIDs receive no access to those paths.
+        #[cfg(target_os = "windows")]
+        retain_windows_allow_roots(&mut write_allow);
+        let write_always_selectors =
+            Self::anchor_write_deny_selectors(&filesystem.deny_write_always, &write_allow, true);
+        let mut resolved_write_always = self.resolve_deny_paths(&write_always_selectors, true)?;
+        resolved_write_always.merge_expanded();
+        write_allow.retain(|path| !resolved_write_always.matches(path));
+        let write_deny_selectors =
+            Self::anchor_write_deny_selectors(&filesystem.deny_write, &write_allow, false);
+        // Linux mediates denyWrite globs dynamically; expanding them here can scan
+        // an entire project before even starting a simple command.
+        let mut resolved_write_deny =
+            self.resolve_deny_paths(&write_deny_selectors, !cfg!(target_os = "linux"))?;
+        let carveouts =
+            resolved_write_deny.apply_write_carveouts(&resolved_write_always, &write_allow);
+        let mut denied_links: Vec<DeniedLink> = self
+            .collect_symlink_ancestors(&write_deny_selectors)?
+            .into_iter()
+            .map(|path| DeniedLink::new(path, DenialTier::Queryable))
+            .collect();
+        denied_links.extend(
+            self.collect_symlink_ancestors(&write_always_selectors)?
+                .into_iter()
+                .map(|path| DeniedLink::new(path, DenialTier::Always)),
+        );
+        let denied_links = DeniedLinks::new(denied_links);
+        resolved_write_deny.merge_always(&resolved_write_always, &mut write_allow);
+        let write_deny = resolved_write_deny.concrete;
+        let denied_patterns = resolved_write_deny.patterns;
+        let mut denied_always_roots = resolved_write_always.concrete;
+        denied_always_roots.normalize_roots();
+        let denied_always_patterns = resolved_write_always.patterns;
+
+        #[cfg(target_os = "windows")]
+        let (write_allow, write_deny) = {
+            let write_roots = lower_windows_write_access(&write_allow, write_deny);
+            (write_roots.allow, write_roots.deny)
+        };
+
+        Ok(ResolvedWritePolicy {
+            roots: write_allow,
+            denied_roots: write_deny,
+            denied_always_roots: denied_always_roots.into_boxed_slice(),
+            denied_always_patterns: denied_always_patterns.into_boxed_slice(),
+            denied_patterns,
+            carveouts,
+            denied_links,
+        })
+    }
+
     fn resolve_sandbox_path(&self, path: &str) -> Result<PathBuf> {
         if path.is_empty() {
             return Err(Error::PolicyEmptyPath.into());
@@ -416,6 +468,7 @@ impl PolicyResolver {
     fn anchor_write_deny_selectors(
         paths: &[PathSelector],
         write_allow: &[PathBuf],
+        anchor_root_name: bool,
     ) -> Vec<PathSelector> {
         let mut anchored = Vec::with_capacity(paths.len() * (1 + write_allow.len()));
         for selector in paths {
@@ -425,14 +478,16 @@ impl PolicyResolver {
                 let relative_str = relative.to_string_lossy();
                 let pattern = GlobPattern::new(&relative_str);
                 for root in write_allow {
-                    if root.file_name().is_some_and(|name| {
-                        let name = Path::new(name);
-                        if selector.is_literal() {
-                            relative == name
-                        } else {
-                            pattern.matches_path(name)
-                        }
-                    }) {
+                    if anchor_root_name
+                        && root.file_name().is_some_and(|name| {
+                            let name = Path::new(name);
+                            if selector.is_literal() {
+                                relative == name
+                            } else {
+                                pattern.matches_path(name)
+                            }
+                        })
+                    {
                         anchored.push(PathSelector::Literal {
                             literal: root.to_string_lossy().into_owned(),
                         });
@@ -458,6 +513,7 @@ impl PolicyResolver {
         expand_globs: bool,
     ) -> Result<ResolvedDenyPaths> {
         let mut concrete: Vec<PathBuf> = Vec::new();
+        let mut expanded: Vec<PathBuf> = Vec::new();
         let mut patterns: Vec<String> = Vec::new();
 
         for selector in paths {
@@ -466,7 +522,7 @@ impl PolicyResolver {
             if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
                 if expand_globs {
                     for candidate in GlobPattern::new(&resolved_str).expand()? {
-                        push_path_variants(&mut concrete, &candidate);
+                        push_path_variants(&mut expanded, &candidate);
                     }
                 }
                 patterns.push(resolved_str.clone().into_owned());
@@ -487,10 +543,15 @@ impl PolicyResolver {
         }
 
         concrete.normalize_roots();
+        expanded.normalize_roots();
         patterns.sort_unstable();
         patterns.dedup();
 
-        Ok(ResolvedDenyPaths { concrete, patterns })
+        Ok(ResolvedDenyPaths {
+            concrete,
+            expanded,
+            patterns,
+        })
     }
 
     fn collect_symlink_ancestors(&self, paths: &[PathSelector]) -> Result<Vec<PathBuf>> {

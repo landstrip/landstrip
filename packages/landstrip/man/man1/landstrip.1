@@ -172,7 +172,9 @@ entries additionally anchor at every
 .Va allowWrite
 root that is a directory, so the write deny list covers all granted write
 scopes, not only the policy base.
-They also match each granted root's own name, protecting exact-file grants
+Relative
+.Va denyWriteAlways
+entries also match each granted root's own name, protecting exact-file grants
 and directory roots that match the deny selector.
 Path entries accept bare strings, explicit literal selectors
 .Pq Dq literal ,
@@ -192,9 +194,9 @@ and Windows matching is case-insensitive.
 .Ss Filesystem
 Writes default to denied.
 .Va allowWrite
-grants roots;
-.Va denyWrite
-takes precedence.
+grants roots and adds exceptions to
+.Va denyWrite ,
+with the most specific rule winning;
 .Va denyWriteAlways
 cannot be overridden by grants or broker approval.
 Reads default to unrestricted on Linux/macOS and require explicit

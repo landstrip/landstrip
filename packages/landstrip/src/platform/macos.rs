@@ -295,10 +295,27 @@ impl ProfileBuilder {
                 "(deny file-write* (subpath \"{escaped}\"){message})"
             )?;
         }
+        for carveout in &policy.write_carveouts {
+            if carveout.is_under_any(&policy.write_denied_roots) {
+                let escaped = escape_sbpl_literal(&carveout.to_string_lossy());
+                writeln!(self.sb, "(allow file-write* (subpath \"{escaped}\"))")?;
+            }
+        }
 
         // Regex rules are evaluated at syscall time, so unlike expand_glob_path
         // they also cover paths created after sandbox_init.
         for pattern in &policy.write_denied_patterns {
+            let filter = Self::render_pattern_filter(pattern, &policy.write_carveouts);
+            writeln!(self.sb, "(deny file-write* {filter}{message})")?;
+        }
+        for root in &policy.write_denied_always_roots {
+            let escaped = escape_sbpl_literal(&root.to_string_lossy());
+            writeln!(
+                self.sb,
+                "(deny file-write* (subpath \"{escaped}\"){message})"
+            )?;
+        }
+        for pattern in &policy.write_denied_always_patterns {
             let regex = Self::glob_to_sbpl_regex(pattern);
             let escaped = escape_sbpl_regex_literal(&regex);
             writeln!(
@@ -308,71 +325,77 @@ impl ProfileBuilder {
         }
 
         if !policy.write_roots.is_empty() {
-            for root in &policy.read_denied_roots {
-                let escaped = escape_sbpl_literal(&root.to_string_lossy());
-                writeln!(
-                    self.sb,
-                    "(deny file-write-unlink (subpath \"{escaped}\"){message})"
-                )?;
-            }
-            for pattern in &policy.read_denied_patterns {
-                let filter = Self::render_pattern_filter(pattern, &policy.read_carveouts);
-                writeln!(self.sb, "(deny file-write-unlink {filter}{message})")?;
-            }
-            for link in policy.write_denied_links.iter() {
-                let escaped = escape_sbpl_literal(&link.path.to_string_lossy());
-                writeln!(
-                    self.sb,
-                    "(deny file-write-unlink (literal \"{escaped}\"){message})"
-                )?;
-            }
+            self.write_unlink_rules(policy)?;
+        }
 
-            let mut ancestors: Vec<PathBuf> = Vec::new();
-            // Ancestors that are themselves granted write roots must not
-            // receive unlink protection: a granted root's own lifecycle (for
-            // example a lock directory released with rmdir) must stay intact,
-            // and denied descendants are already protected by their own write
-            // denies.
-            let is_granted_root =
-                |p: &Path| policy.write_roots.iter().any(|root| root.as_path() == p);
-            for root in policy
-                .write_denied_roots
-                .iter()
-                .chain(policy.read_denied_roots.iter())
-            {
-                for ancestor in root.ancestors().skip(1) {
-                    if ancestor != Path::new("/")
-                        && !is_granted_root(ancestor)
-                        && ancestor.is_under_any(&policy.write_roots)
-                    {
-                        ancestors.push(ancestor.to_path_buf());
-                    }
+        Ok(())
+    }
+
+    fn write_unlink_rules(&mut self, policy: &AccessPolicy) -> fmt::Result {
+        let message = &self.message;
+        for root in &policy.read_denied_roots {
+            let escaped = escape_sbpl_literal(&root.to_string_lossy());
+            writeln!(
+                self.sb,
+                "(deny file-write-unlink (subpath \"{escaped}\"){message})"
+            )?;
+        }
+        for pattern in &policy.read_denied_patterns {
+            let filter = Self::render_pattern_filter(pattern, &policy.read_carveouts);
+            writeln!(self.sb, "(deny file-write-unlink {filter}{message})")?;
+        }
+        for link in policy.write_denied_links.iter() {
+            let escaped = escape_sbpl_literal(&link.path.to_string_lossy());
+            writeln!(
+                self.sb,
+                "(deny file-write-unlink (literal \"{escaped}\"){message})"
+            )?;
+        }
+
+        let mut ancestors: Vec<PathBuf> = Vec::new();
+        // Ancestors that are themselves granted write roots must not
+        // receive unlink protection: a granted root's own lifecycle (for
+        // example a lock directory released with rmdir) must stay intact,
+        // and denied descendants are already protected by their own write
+        // denies.
+        let is_granted_root = |p: &Path| policy.write_roots.iter().any(|root| root.as_path() == p);
+        for root in policy
+            .write_denied_roots
+            .iter()
+            .chain(policy.read_denied_roots.iter())
+        {
+            for ancestor in root.ancestors().skip(1) {
+                if ancestor != Path::new("/")
+                    && !is_granted_root(ancestor)
+                    && ancestor.is_under_any(&policy.write_roots)
+                {
+                    ancestors.push(ancestor.to_path_buf());
                 }
             }
-            for pattern in policy
-                .write_denied_patterns
-                .iter()
-                .chain(policy.read_denied_patterns.iter())
-            {
-                let base = GlobPattern::new(pattern).base();
-                for ancestor in base.ancestors() {
-                    if ancestor != Path::new("/")
-                        && !is_granted_root(ancestor)
-                        && ancestor.is_under_any(&policy.write_roots)
-                    {
-                        ancestors.push(ancestor.to_path_buf());
-                    }
+        }
+        for pattern in policy
+            .write_denied_patterns
+            .iter()
+            .chain(policy.read_denied_patterns.iter())
+        {
+            let base = GlobPattern::new(pattern).base();
+            for ancestor in base.ancestors() {
+                if ancestor != Path::new("/")
+                    && !is_granted_root(ancestor)
+                    && ancestor.is_under_any(&policy.write_roots)
+                {
+                    ancestors.push(ancestor.to_path_buf());
                 }
             }
-            ancestors.sort_unstable();
-            ancestors.dedup();
-            for ancestor in &ancestors {
-                let escaped = escape_sbpl_literal(&ancestor.to_string_lossy());
-                writeln!(
-                    self.sb,
-                    "(deny file-write-unlink (literal \"{escaped}\"){message})"
-                )?;
-            }
+        }
+        ancestors.sort_unstable();
+        ancestors.dedup();
+        for ancestor in &ancestors {
+            let escaped = escape_sbpl_literal(&ancestor.to_string_lossy());
+            writeln!(
+                self.sb,
+                "(deny file-write-unlink (literal \"{escaped}\"){message})"
+            )?;
         }
 
         Ok(())
