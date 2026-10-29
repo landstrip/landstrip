@@ -4,6 +4,7 @@
 export type LandstripMechanism =
   | 'landlock'
   | 'seccomp'
+  | 'namespace'
   | 'seatbelt'
   | 'appcontainer'
   | 'windowsuser';
@@ -86,13 +87,12 @@ export type LandstripPolicyErrorCode =
   | 'POLICY_UNRESTRICTED_READ'
   | 'POLICY_DENY_READ_ALWAYS_UNSUPPORTED'
   | 'POLICY_DENY_WRITE_ALWAYS_UNSUPPORTED'
-  | 'POLICY_TCP_BIND_UNSUPPORTED'
   | 'POLICY_LOCAL_BINDING_UNSUPPORTED'
   | 'POLICY_UNIX_SOCKET_UNSUPPORTED'
   | 'POLICY_UNIX_SOCKET_PATH'
-  | 'POLICY_DENY_WRITE_SYMLINK_ANCESTOR'
   | 'POLICY_INVALID_PORT'
   | 'POLICY_EMPTY_PATH'
+  | 'POLICY_INVALID_MACH_LOOKUP'
   | 'POLICY_INVALID_LOG_TAG'
   | 'POLICY_HOME_UNAVAILABLE'
   | 'POLICY_TRAVERSAL_DEPTH';

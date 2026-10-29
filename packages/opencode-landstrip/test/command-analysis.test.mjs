@@ -7,6 +7,7 @@ import {
   extractNativeWriteDeniedPath,
   extractDeniedPath,
   canonicalizePath,
+  decodeLandstripTrap,
 } from '@landstrip/landstrip-api/shared';
 
 test('extractDomainsFromCommand extracts unique domains from URLs in commands', () => {
@@ -113,4 +114,49 @@ test('extractDeniedPath resolves structured traps, native errors, and candidate 
 
   // Unrelated output
   assert.equal(extractDeniedPath('command completed successfully', { cwd }), null);
+});
+
+test('decodeLandstripTrap aligns mechanisms and policy error codes with error.rs', () => {
+  assert.deepEqual(
+    decodeLandstripTrap({
+      kind: 'internal',
+      code: 'SANDBOX_SETUP_FAILED',
+      mechanism: 'namespace',
+      message: 'unshare failed',
+    }),
+    {
+      kind: 'internal',
+      code: 'SANDBOX_SETUP_FAILED',
+      mechanism: 'namespace',
+      message: 'unshare failed',
+    },
+  );
+  assert.deepEqual(
+    decodeLandstripTrap({
+      kind: 'internal',
+      code: 'POLICY_INVALID_MACH_LOOKUP',
+      message: 'wildcard mach lookup',
+    }),
+    {
+      kind: 'internal',
+      code: 'POLICY_INVALID_MACH_LOOKUP',
+      message: 'wildcard mach lookup',
+    },
+  );
+  assert.equal(
+    decodeLandstripTrap({
+      kind: 'internal',
+      code: 'POLICY_TCP_BIND_UNSUPPORTED',
+      message: 'retired',
+    }),
+    null,
+  );
+  assert.equal(
+    decodeLandstripTrap({
+      kind: 'internal',
+      code: 'POLICY_DENY_WRITE_SYMLINK_ANCESTOR',
+      message: 'retired',
+    }),
+    null,
+  );
 });
