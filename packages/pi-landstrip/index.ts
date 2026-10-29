@@ -61,6 +61,7 @@ import {
   isDenialTrap,
   isFilesystemTrap,
   isPathReadAllowed,
+  isPathWriteAllowed,
   isRecord,
   isQueryTrap,
   matchesPathPattern,
@@ -611,6 +612,19 @@ function promptReadBlock(
   const title = reason
     ? `Read blocked: "${filePath}" is in denyRead (${reason})`
     : `Read blocked: "${filePath}" is not in allowRead`;
+  return showPermissionPrompt(ctx, title, PERMISSION_OPTIONS, signal, label);
+}
+
+function promptWriteBlock(
+  ctx: ExtensionContext,
+  filePath: string,
+  reason?: string,
+  signal?: AbortSignal,
+  label?: string,
+): Promise<PermissionChoice> {
+  const title = reason
+    ? `Write blocked: "${filePath}" is in denyWrite (${reason})`
+    : `Write blocked: "${filePath}" is not in allowWrite`;
   return showPermissionPrompt(ctx, title, PERMISSION_OPTIONS, signal, label);
 }
 
@@ -1190,7 +1204,10 @@ function createLandstripIntegrationWithPrompts(
     allowances?: ExecutionAllowances,
   ): Promise<void> {
     const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
-    const scope = sessionScopeFor(filePath, cwd);
+    let scope = sessionScopeFor(filePath, cwd);
+    if (!isPathWriteAllowed(filePath, [scope], loadConfig(cwd).filesystem.denyWrite, cwd)) {
+      scope = filePath;
+    }
     const configPath =
       choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
     if (configPath) {
@@ -1235,7 +1252,12 @@ function createLandstripIntegrationWithPrompts(
               getEffectiveDenyRead(config, ctx.cwd),
               ctx.cwd,
             )
-          : shouldPromptForWrite(access.path, getEffectiveAllowWrite(config), ctx.cwd),
+          : shouldPromptForWrite(
+              access.path,
+              getEffectiveAllowWrite(config),
+              config.filesystem.denyWrite,
+              ctx.cwd,
+            ),
       );
     };
 
@@ -1248,7 +1270,7 @@ function createLandstripIntegrationWithPrompts(
             ? matchesPattern(access.path, config.filesystem.denyReadAlways, ctx.cwd)
             : matchesWriteDenyPattern(
                 access.path,
-                mergeArray(config.filesystem.denyWriteAlways, config.filesystem.denyWrite),
+                config.filesystem.denyWriteAlways,
                 ctx.cwd,
                 getEffectiveAllowWrite(config),
               );
@@ -1508,18 +1530,12 @@ function createLandstripIntegrationWithPrompts(
       }
       if (
         trap.operation === 'write' &&
-        (matchesWriteDenyPattern(
+        matchesWriteDenyPattern(
           path,
           config.filesystem.denyWriteAlways,
           cwd,
           getEffectiveAllowWrite(config, allowances),
-        ) ||
-          matchesWriteDenyPattern(
-            path,
-            config.filesystem.denyWrite,
-            cwd,
-            getEffectiveAllowWrite(config, allowances),
-          ))
+        )
       ) {
         return { action: 'deny', reason: 'hard-deny' };
       }
@@ -1531,7 +1547,12 @@ function createLandstripIntegrationWithPrompts(
               getEffectiveDenyRead(config, cwd),
               cwd,
             )
-          : !shouldPromptForWrite(path, getEffectiveAllowWrite(config, allowances), cwd);
+          : !shouldPromptForWrite(
+              path,
+              getEffectiveAllowWrite(config, allowances),
+              config.filesystem.denyWrite,
+              cwd,
+            );
       return allowed ? { action: 'allow' } : undefined;
     };
     const existing = current();
@@ -1553,10 +1574,17 @@ function createLandstripIntegrationWithPrompts(
                 promptSignal,
                 allowances.permissionPromptLabel,
               )
-            : await showPermissionPrompt(
+            : await promptWriteBlock(
                 ctx,
-                `Write blocked: "${path}" is not in allowWrite`,
-                PERMISSION_OPTIONS,
+                path,
+                matchesWriteDenyPattern(
+                  path,
+                  config.filesystem.denyWrite,
+                  cwd,
+                  getEffectiveAllowWrite(config, allowances),
+                )
+                  ? 'granting allowWrite will override it'
+                  : undefined,
                 promptSignal,
                 allowances.permissionPromptLabel,
               );
@@ -2347,31 +2375,19 @@ function createLandstripIntegrationWithPrompts(
       if (!ctx.hasUI) return null;
 
       const { globalPath, projectPath } = getPiConfigPaths(ctx.cwd, 'sandbox.json');
-      const writeDeniedBy = (config: SandboxConfig): 'denyWriteAlways' | 'denyWrite' | null => {
-        const writeRoots = getEffectiveAllowWrite(config, allowances);
-        if (
-          matchesWriteDenyPattern(
-            blockedPath,
-            config.filesystem.denyWriteAlways,
-            ctx.cwd,
-            writeRoots,
-          )
-        ) {
-          return 'denyWriteAlways';
-        }
-        if (
-          matchesWriteDenyPattern(blockedPath, config.filesystem.denyWrite, ctx.cwd, writeRoots)
-        ) {
-          return 'denyWrite';
-        }
-        return null;
-      };
+      const isWriteDeniedAlways = (config: SandboxConfig): boolean =>
+        matchesWriteDenyPattern(
+          blockedPath,
+          config.filesystem.denyWriteAlways,
+          ctx.cwd,
+          getEffectiveAllowWrite(config, allowances),
+        );
       const current = (): boolean | undefined => {
         const config = loadConfig(ctx.cwd);
         if (
           operation === 'read'
             ? matchesPattern(blockedPath, config.filesystem.denyReadAlways, ctx.cwd)
-            : writeDeniedBy(config) !== null
+            : isWriteDeniedAlways(config)
         ) {
           return false;
         }
@@ -2386,6 +2402,7 @@ function createLandstripIntegrationWithPrompts(
             : shouldPromptForWrite(
                 blockedPath,
                 getEffectiveAllowWrite(config, allowances),
+                config.filesystem.denyWrite,
                 ctx.cwd,
               );
         return needsPrompt ? undefined : true;
@@ -2404,10 +2421,17 @@ function createLandstripIntegrationWithPrompts(
                     : undefined,
                   promptSignal,
                 )
-              : await showPermissionPrompt(
+              : await promptWriteBlock(
                   ctx,
-                  `Write blocked: "${blockedPath}" is not in allowWrite`,
-                  PERMISSION_OPTIONS,
+                  blockedPath,
+                  matchesWriteDenyPattern(
+                    blockedPath,
+                    config.filesystem.denyWrite,
+                    ctx.cwd,
+                    getEffectiveAllowWrite(config, allowances),
+                  )
+                    ? 'granting allowWrite will override it'
+                    : undefined,
                   promptSignal,
                 );
           if (choice === 'abort' || promptSignal.aborted) return false;
@@ -2422,32 +2446,25 @@ function createLandstripIntegrationWithPrompts(
       );
       if (!access) {
         const config = loadConfig(ctx.cwd);
-        if (operation === 'write') {
-          const tier = writeDeniedBy(config);
-          if (tier) {
-            notify(
-              ctx,
-              `"${blockedPath}" is blocked by ${tier}. Check:\n  ${projectPath}\n  ${globalPath}`,
-              'warning',
-            );
-          }
+        if (operation === 'write' && isWriteDeniedAlways(config)) {
+          notify(
+            ctx,
+            `"${blockedPath}" is blocked by denyWriteAlways. Check:\n  ${projectPath}\n  ${globalPath}`,
+            'warning',
+          );
         }
         return null;
       }
 
-      let config = loadConfig(ctx.cwd);
-      if (operation === 'write') {
-        const tier = writeDeniedBy(config);
-        if (tier) {
-          notify(
-            ctx,
-            `"${blockedPath}" was added to allowWrite, but ${tier} still blocks it. Check:\n  ${projectPath}\n  ${globalPath}`,
-            'warning',
-          );
-          return null;
-        }
+      const config = loadConfig(ctx.cwd);
+      if (operation === 'write' && isWriteDeniedAlways(config)) {
+        notify(
+          ctx,
+          `"${blockedPath}" was added to allowWrite, but denyWriteAlways still blocks it. Check:\n  ${projectPath}\n  ${globalPath}`,
+          'warning',
+        );
+        return null;
       }
-
       onUpdate?.({
         content: [
           {

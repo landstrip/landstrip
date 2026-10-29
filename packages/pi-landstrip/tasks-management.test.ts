@@ -817,8 +817,30 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
       expect(await callTool('write', { path: join(root, 'allowed', 'ok.txt') })).toBeUndefined();
       expect(await callTool('write', { path: join(root, 'allowed', 'readonly.txt') })).toEqual({
         block: true,
-        reason: `Write denied by sandbox policy: ${join(root, 'allowed', 'readonly.txt')}`,
+        reason: 'Filesystem access requires approval',
       });
+      const select = vi.fn().mockResolvedValue('Allow once');
+      const uiCtx = {
+        ...ctx,
+        hasUI: true,
+        ui: {
+          ...ctx.ui,
+          select,
+        },
+      };
+      let promptResult: unknown;
+      for (const handler of mockApi.listeners.get('tool_call') ?? []) {
+        const result = await handler(
+          { toolName: 'write', input: { path: join(root, 'allowed', 'readonly.txt') } },
+          uiCtx,
+        );
+        if (result) {
+          promptResult = result;
+          break;
+        }
+      }
+      expect(promptResult).toBeUndefined();
+      expect(select).toHaveBeenCalledTimes(1);
       expect(await callTool('edit', { path: join(root, 'allowed', 'immutable.txt') })).toEqual({
         block: true,
         reason: `Write denied by sandbox policy: ${join(root, 'allowed', 'immutable.txt')}`,

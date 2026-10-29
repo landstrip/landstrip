@@ -148,7 +148,7 @@ export function deepMergeSandboxConfig<T extends SandboxConfig = SandboxConfig>(
 ): T;
 
 
-export type PathAccessDecision = 'allow' | 'ask' | 'deny' | 'denyAlways';
+export type PathAccessDecision = 'allow' | 'ask' | 'deny';
 
 export type DomainAccessDecision = 'allow' | 'ask' | 'deny';
 
@@ -198,20 +198,22 @@ export function isPathReadAllowed(
 export function isPathWriteAllowed(
   filePath: string,
   allowWrite: LandstripPathSelector[],
+  denyWrite: LandstripPathSelector[],
   baseDirectory?: string,
 ): boolean;
 
 export function shouldPromptForWrite(
   filePath: string,
   allowWrite: LandstripPathSelector[],
+  denyWrite: LandstripPathSelector[],
   baseDirectory?: string,
 ): boolean;
+
 export function evaluateReadAccess(
   filePath: string,
   filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile,
   options?: EvaluateReadOptions,
-): 'allow' | 'ask' | 'deny';
-
+): PathAccessDecision;
 export function evaluateWriteAccess(
   filePath: string,
   filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile,
@@ -255,4 +257,7 @@ export interface ExtractDeniedPathOptions {
   command?: string | undefined;
 }
 
-export function extractDeniedPath(output: string, options?: ExtractDeniedPathOptions): string | null;
+export function extractDeniedPath(
+  output: string,
+  options?: ExtractDeniedPathOptions,
+): string | null;

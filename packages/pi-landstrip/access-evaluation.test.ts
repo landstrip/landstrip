@@ -54,16 +54,29 @@ describe('access evaluation helpers in pi-landstrip', () => {
   it('evaluates write access tiers', () => {
     const fs = {
       allowWrite: ['/workspace/project'],
-      denyWrite: ['/workspace/project/node_modules'],
+      denyWrite: ['/workspace/project/node_modules', '**/*.pem'],
       denyWriteAlways: ['/workspace/project/.git'],
     };
 
     expect(evaluateWriteAccess('/workspace/project/.git/config', fs, { baseDirectory: cwd })).toBe(
-      'denyAlways',
+      'deny',
     );
     expect(
       evaluateWriteAccess('/workspace/project/node_modules/pkg', fs, { baseDirectory: cwd }),
-    ).toBe('deny');
+    ).toBe('ask');
+    expect(
+      evaluateWriteAccess('/workspace/project/node_modules/pkg', fs, {
+        baseDirectory: cwd,
+        allowWriteOverrides: ['/workspace/project/node_modules/pkg'],
+      }),
+    ).toBe('allow');
+    expect(evaluateWriteAccess('/workspace/project/a.pem', fs, { baseDirectory: cwd })).toBe('ask');
+    expect(
+      evaluateWriteAccess('/workspace/project/a.pem', fs, {
+        baseDirectory: cwd,
+        allowWriteOverrides: ['/workspace/project/a.pem'],
+      }),
+    ).toBe('allow');
     expect(evaluateWriteAccess('/workspace/project/src/index.ts', fs, { baseDirectory: cwd })).toBe(
       'allow',
     );
@@ -98,7 +111,18 @@ describe('access evaluation helpers in pi-landstrip', () => {
     expect(isPathReadAllowed('/workspace/project/file', ['/workspace'], [], cwd)).toBe(true);
     expect(isPathReadAllowed('/workspace/project/file', [], ['/workspace'], cwd)).toBe(false);
 
-    expect(shouldPromptForWrite('/workspace/project/file', [], cwd)).toBe(true);
-    expect(shouldPromptForWrite('/workspace/project/file', ['/workspace'], cwd)).toBe(false);
+    expect(shouldPromptForWrite('/workspace/project/file', [], [], cwd)).toBe(true);
+    expect(shouldPromptForWrite('/workspace/project/file', ['/workspace'], [], cwd)).toBe(false);
+    expect(
+      shouldPromptForWrite('/workspace/project/a.pem', ['/workspace/project'], ['**/*.pem'], cwd),
+    ).toBe(true);
+    expect(
+      shouldPromptForWrite(
+        '/workspace/project/a.pem',
+        ['/workspace/project', '/workspace/project/a.pem'],
+        ['**/*.pem'],
+        cwd,
+      ),
+    ).toBe(false);
   });
 });

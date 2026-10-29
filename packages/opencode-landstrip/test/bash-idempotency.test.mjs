@@ -270,7 +270,7 @@ test('permission evaluation hard-denies denyReadAlways and denyWriteAlways witho
         effect: 'allow',
       };
       await handlers.permission.evaluate(writeDeny);
-      assert.equal(writeDeny.effect, 'deny');
+      assert.equal(writeDeny.effect, 'ask');
 
       const writeAllow = {
         action: 'edit',
@@ -568,10 +568,8 @@ const patchPermissionCases = [
     'denyWriteAlways',
   ],
   [
-    'honors denyWrite over allowWrite',
+    'prompts on denyWrite inside allowWrite',
     ['*** Update File: blocked.txt', '@@', '-before', '+after'],
-    'blocked.txt',
-    'denyWrite overrides allowWrite',
   ],
 ];
 

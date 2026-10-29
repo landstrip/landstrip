@@ -120,21 +120,12 @@ function evaluateWritePermission(
     allowWriteOverrides: effectiveAllowWrite,
   });
 
-  if (decision === 'denyAlways') {
-    return {
-      status: 'deny',
-      kind: 'write',
-      resource: filePath,
-      message: `Sandbox: write access denied for "${filePath}" (denyWriteAlways).`,
-    };
-  }
-
   if (decision === 'deny') {
     return {
       status: 'deny',
       kind: 'write',
       resource: filePath,
-      message: `Sandbox: write access denied for "${filePath}" (denyWrite overrides allowWrite).`,
+      message: `Sandbox: write access denied for "${filePath}" (denyWriteAlways).`,
     };
   }
 
@@ -146,7 +137,7 @@ function evaluateWritePermission(
     status: 'ask',
     kind: 'write',
     resource: filePath,
-    message: `Sandbox: write access requires approval for "${filePath}" (not in filesystem.allowWrite).`,
+    message: `Sandbox: write access requires approval for "${filePath}".`,
   };
 }
 

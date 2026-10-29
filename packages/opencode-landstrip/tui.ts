@@ -14,9 +14,12 @@ import { createSignal, onMount } from 'solid-js';
 
 import {
   controlResponseLine,
+  evaluateReadAccess,
+  evaluateWriteAccess,
+  isPathReadAllowed,
+  isPathWriteAllowed,
   isQueryTrap,
   parseLandstripTraps,
-  sessionAllows,
   sessionScopeFor,
 } from '@landstrip/landstrip-api/shared';
 
@@ -465,11 +468,20 @@ const tui: TuiPlugin.Definition = {
       const action = choice === 'deny' ? 'deny' : 'allow';
       const verb = entry.operation === 'read' ? 'Read' : 'Write';
       const directory = entry.directory;
-      const scope = sessionScopeFor(entry.path, directory);
+      const config = loadConfig(directory, optionOverrides);
+      let scope = sessionScopeFor(entry.path, directory);
+      if (
+        entry.operation === 'read'
+          ? !isPathReadAllowed(entry.path, [scope], config.filesystem.denyRead, directory, {
+              requireAllowMatch: true,
+            })
+          : !isPathWriteAllowed(entry.path, [scope], config.filesystem.denyWrite, directory)
+      ) {
+        scope = entry.path;
+      }
       const allowances = sessionAllowancesFor(sessionAllowances, entry.sessionID);
       const sessionPaths =
         entry.operation === 'read' ? allowances.readPaths : allowances.writePaths;
-
       let responseAction: 'allow' | 'deny' = action;
       try {
         if (action === 'allow') {
@@ -582,23 +594,29 @@ const tui: TuiPlugin.Definition = {
               if (seen.has(trap.query_id)) continue;
               seen.add(trap.query_id);
 
-              if (!loadConfig(sessionDirectory, optionOverrides).enabled) {
+              const config = loadConfig(sessionDirectory, optionOverrides);
+              if (!config.enabled) {
                 respondQuery(socket, trap.query_id, 'allow');
                 continue;
               }
 
               if (trap.kind === 'filesystem') {
-                if (trap.operation === 'write' && trap.reason === 'deny_match') {
-                  respondQuery(socket, trap.query_id, 'deny');
-                  continue;
-                }
-                const sessionPaths =
-                  trap.operation === 'read' ? allowances.readPaths : allowances.writePaths;
-                if (sessionAllows(sessionPaths, trap.path)) {
+                const sessionAllowed =
+                  trap.operation === 'read'
+                    ? evaluateReadAccess(
+                        trap.path,
+                        { ...config.filesystem, allowRead: [...allowances.readPaths] },
+                        { baseDirectory: sessionDirectory, requireAllowMatch: true },
+                      ) === 'allow'
+                    : evaluateWriteAccess(
+                        trap.path,
+                        { ...config.filesystem, allowWrite: [...allowances.writePaths] },
+                        { baseDirectory: sessionDirectory },
+                      ) === 'allow';
+                if (sessionAllowed) {
                   respondQuery(socket, trap.query_id, 'allow');
                   continue;
                 }
-
                 const entry: FsQueryEntry = {
                   kind: 'fs-query',
                   id: `landstrip-${trap.operation}:${socketId}:${trap.query_id}`,

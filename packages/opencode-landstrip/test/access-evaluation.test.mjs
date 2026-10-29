@@ -106,21 +106,36 @@ test('evaluateReadAccess handles allow, deny, denyAlways, and specificity overri
   assert.equal(resUnlisted, 'ask');
 });
 
-test('evaluateWriteAccess evaluates allow, deny, denyAlways, and unlisted tiers', () => {
+test('evaluateWriteAccess evaluates allow, ask, deny, and carveout tiers', () => {
   const cwd = '/workspace/project';
   const fs = {
     allowWrite: ['/workspace/project'],
-    denyWrite: ['/workspace/project/node_modules'],
+    denyWrite: ['/workspace/project/node_modules', '**/*.pem'],
     denyWriteAlways: ['/workspace/project/.git'],
   };
 
   assert.equal(
     evaluateWriteAccess('/workspace/project/.git/config', fs, { baseDirectory: cwd }),
-    'denyAlways',
+    'deny',
   );
   assert.equal(
     evaluateWriteAccess('/workspace/project/node_modules/pkg', fs, { baseDirectory: cwd }),
-    'deny',
+    'ask',
+  );
+  assert.equal(
+    evaluateWriteAccess('/workspace/project/node_modules/pkg', fs, {
+      baseDirectory: cwd,
+      allowWriteOverrides: ['/workspace/project/node_modules/pkg'],
+    }),
+    'allow',
+  );
+  assert.equal(evaluateWriteAccess('/workspace/project/a.pem', fs, { baseDirectory: cwd }), 'ask');
+  assert.equal(
+    evaluateWriteAccess('/workspace/project/a.pem', fs, {
+      baseDirectory: cwd,
+      allowWriteOverrides: ['/workspace/project/a.pem'],
+    }),
+    'allow',
   );
   assert.equal(
     evaluateWriteAccess('/workspace/project/src/index.ts', fs, { baseDirectory: cwd }),
@@ -162,7 +177,20 @@ test('isPathReadAllowed and shouldPromptForWrite work as expected', () => {
   );
 
   // shouldPromptForWrite
-  assert.equal(shouldPromptForWrite('/workspace/project/file', [], cwd), true);
-  assert.equal(shouldPromptForWrite('/workspace/project/file', ['/workspace'], cwd), false);
-  assert.equal(shouldPromptForWrite('/other/file', ['/workspace'], cwd), true);
+  assert.equal(shouldPromptForWrite('/workspace/project/file', [], [], cwd), true);
+  assert.equal(shouldPromptForWrite('/workspace/project/file', ['/workspace'], [], cwd), false);
+  assert.equal(
+    shouldPromptForWrite('/workspace/project/a.pem', ['/workspace/project'], ['**/*.pem'], cwd),
+    true,
+  );
+  assert.equal(
+    shouldPromptForWrite(
+      '/workspace/project/a.pem',
+      ['/workspace/project', '/workspace/project/a.pem'],
+      ['**/*.pem'],
+      cwd,
+    ),
+    false,
+  );
+  assert.equal(shouldPromptForWrite('/other/file', ['/workspace'], [], cwd), true);
 });
