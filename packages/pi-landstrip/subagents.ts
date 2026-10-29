@@ -1572,7 +1572,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     });
     this.pi.registerShortcut('ctrl+shift+t', {
       description: 'Open Landstrip task sessions dashboard',
-      handler: async (ctx) => this.openLandstrip('tasks', ctx),
+      handler: async (ctx) => this.openLandstrip('tasks', ctx, 'subagents'),
     });
     this.pi.on('session_start', async (_event, ctx) => {
       this.recentCompletions.clear();
@@ -1697,7 +1697,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
   async openLandstrip(
     args: string,
     ctx: ExtensionContext,
-    scope?: 'sandbox' | 'subagents',
+    viewScope: 'sandbox' | 'subagents',
   ): Promise<void> {
     if (ctx.mode !== 'tui') {
       ctx.ui.notify('Agent management is available in TUI mode', 'warning');
@@ -1706,23 +1706,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
     const projectTrusted = isProjectTrusted(ctx);
     let tasks = [...this.tasks.values()];
-    let requested = args.trim();
-    if (requested === 'sandbox:help') {
-      scope = 'sandbox';
-      requested = 'help';
-    } else if (requested === 'subagents:help') {
-      scope = 'subagents';
-      requested = 'help';
-    }
-    const viewScope: 'sandbox' | 'subagents' =
-      scope ??
-      (!requested ||
-      requested === 'overview' ||
-      requested === 'sandbox' ||
-      requested === 'status' ||
-      requested === 'policy'
-        ? 'sandbox'
-        : 'subagents');
+    const requested = args.trim();
     let catalog = this.getAgentCatalog(ctx);
     for (const diagnostic of catalog.diagnostics) ctx.ui.notify(diagnostic, 'warning');
     let agents = [...catalog.agents.values()]
@@ -1778,7 +1762,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       tab = 'primary';
     } else if (requested === 'settings') {
       tab = 'settings';
-    } else if (requested === 'overview' || requested === 'sandbox' || requested === 'status') {
+    } else if (requested === 'overview' || requested === 'status') {
       tab = 'overview';
     } else if (requested === 'policy') {
       tab = 'policy';

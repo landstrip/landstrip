@@ -409,10 +409,12 @@ describe('Landstrip Split Views (/landstrip-sandbox and /landstrip-subagents)', 
         } as any,
       } as unknown as ExtensionContext;
 
-      const sandboxCommand = mockApi.commands.get('landstrip-sandbox');
-      const subagentsCommand = mockApi.commands.get('landstrip-subagents');
-      expect(sandboxCommand).toBeDefined();
-      expect(subagentsCommand).toBeDefined();
+      expect([...mockApi.commands.keys()].sort()).toEqual([
+        'landstrip-sandbox',
+        'landstrip-subagents',
+      ]);
+      const sandboxCommand = mockApi.commands.get('landstrip-sandbox')!;
+      const subagentsCommand = mockApi.commands.get('landstrip-subagents')!;
 
       expect(getLandstripSandboxArgumentCompletions('').map((item) => item.value)).toEqual([
         'status',

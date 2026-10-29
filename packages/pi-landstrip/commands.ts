@@ -17,11 +17,7 @@ export interface CommandSubagentRuntime {
   selectPrimaryAgent(name: string, ctx: ExtensionContext): Promise<boolean>;
   cancelTasks(taskIds: readonly string[], ctx: ExtensionContext): Promise<number>;
   deleteTasks(taskIds: readonly string[], ctx: ExtensionContext): number;
-  openLandstrip(
-    args: string,
-    ctx: ExtensionContext,
-    scope?: 'sandbox' | 'subagents',
-  ): Promise<void>;
+  openLandstrip(args: string, ctx: ExtensionContext, scope: 'sandbox' | 'subagents'): Promise<void>;
   primaryAgentName(): string | undefined;
 }
 
@@ -47,7 +43,7 @@ interface CompletionDeps {
   readonly ctx: ExtensionContext | undefined;
 }
 
-/** Parsed `/landstrip` argument text. Parsed once, shared by dispatch and completion. */
+/** Parsed slash-command argument text. Parsed once, shared by dispatch and completion. */
 interface Argv {
   /** Subcommand name, lowercased; empty when nothing was typed. */
   readonly name: string;
@@ -60,7 +56,7 @@ interface Argv {
 }
 
 /**
- * A `/landstrip` subcommand. Dispatch, completion and help are all derived from
+ * A Landstrip slash-command subcommand. Dispatch, completion and help are all derived from
  * this one declaration, so the three can never drift apart.
  */
 interface Subcommand {
@@ -71,8 +67,6 @@ interface Subcommand {
   readonly complete?: (argv: Argv, deps: CompletionDeps) => Completion[];
   readonly run: (argv: Argv, deps: CommandDeps) => Promise<void> | void;
 }
-
-const DEFAULT_SUBCOMMAND = 'status';
 
 function parseArgv(args: string): Argv {
   const raw = args.trim();
@@ -213,20 +207,6 @@ const policySubcommand: Subcommand = {
   },
 };
 
-const sandboxSubcommand: Subcommand = {
-  name: 'sandbox',
-  summary: 'Inspect or toggle sandbox OS isolation',
-  pane: (argv, { ctx, integration }) =>
-    !argv.rest && integration.sandboxCallbacks?.overview?.(ctx.cwd, isProjectTrusted(ctx))
-      ? 'overview'
-      : undefined,
-  complete: () => [
-    { value: 'sandbox on', label: 'on', description: 'Enable OS sandbox isolation' },
-    { value: 'sandbox off', label: 'off', description: 'Disable OS sandbox isolation' },
-  ],
-  run: async (argv, deps) => runSandboxToggle(argv.rest, deps),
-};
-
 const settingsSubcommand: Subcommand = {
   name: 'settings',
   summary: 'Manage subagent concurrency settings',
@@ -292,7 +272,7 @@ const tasksSubcommand: Subcommand = {
   summary: 'Inspect and manage running task sessions',
   pane: (argv) => {
     const first = argv.words[0]?.toLowerCase() ?? '';
-    if (['cancel', 'delete', 'kill'].includes(first)) return undefined;
+    if (['cancel', 'delete'].includes(first)) return undefined;
     if (first === 'inspect' && argv.words[1]) return argv.words[1];
     if (first && first !== 'list') return first;
     return 'tasks';
@@ -300,7 +280,7 @@ const tasksSubcommand: Subcommand = {
   complete: (argv, { runtime }) => {
     const tasks = runtime?.getTasks() ?? [];
     const action = argv.words[0]?.toLowerCase();
-    if (action === 'cancel' || action === 'kill') return taskItems(tasks, `tasks ${action} `);
+    if (action === 'cancel') return taskItems(tasks, 'tasks cancel ');
     if (action === 'delete') return taskItems(tasks, 'tasks delete ');
     if (action === 'inspect') return taskItems(tasks, 'tasks inspect ');
     return [
@@ -314,14 +294,14 @@ const tasksSubcommand: Subcommand = {
     const [rawAction = '', rawTaskId = ''] = argv.words;
     let action = rawAction.toLowerCase();
     let taskId = rawTaskId;
-    if (!['cancel', 'delete', 'kill', 'inspect', 'list'].includes(action) && action) {
+    if (!['cancel', 'delete', 'inspect', 'list'].includes(action) && action) {
       const matched = matchingTasksById(runtime.getTasks(), action);
       if (matched.length > 0) {
         action = 'inspect';
         taskId = matched[0]!.id;
       }
     }
-    if (action === 'cancel' || action === 'kill') {
+    if (action === 'cancel') {
       if (!taskId) {
         ctx.ui.notify('Task ID required to cancel a task', 'error');
         return;
@@ -378,28 +358,6 @@ const logsSubcommand: Subcommand = {
   },
 };
 
-const SUBCOMMANDS: readonly Subcommand[] = [
-  statusSubcommand,
-  sandboxSubcommand,
-  policySubcommand,
-  settingsSubcommand,
-  agentsSubcommand,
-  subagentsSubcommand,
-  tasksSubcommand,
-  logsSubcommand,
-  {
-    name: 'help',
-    summary: 'Show Landstrip commands and shortcuts help',
-    pane: () => 'help',
-    run: (_argv, { ctx }) => {
-      ctx.ui.notify(
-        `Commands: /landstrip [${SUBCOMMANDS.map((command) => command.name).join('|')}]`,
-        'info',
-      );
-    },
-  },
-];
-
 const SANDBOX_SUBCOMMANDS: readonly Subcommand[] = [
   statusSubcommand,
   policySubcommand,
@@ -416,7 +374,7 @@ const SANDBOX_SUBCOMMANDS: readonly Subcommand[] = [
   {
     name: 'help',
     summary: 'Show Landstrip sandbox commands and shortcuts',
-    pane: () => 'sandbox:help',
+    pane: () => 'help',
     run: (_argv, { ctx }) => {
       ctx.ui.notify(
         `Commands: /landstrip-sandbox [${SANDBOX_SUBCOMMANDS.map((command) => command.name).join('|')}]`,
@@ -435,7 +393,7 @@ const SUBAGENTS_SUBCOMMANDS: readonly Subcommand[] = [
   {
     name: 'help',
     summary: 'Show Landstrip subagents commands and shortcuts',
-    pane: () => 'subagents:help',
+    pane: () => 'help',
     run: (_argv, { ctx }) => {
       ctx.ui.notify(
         `Commands: /landstrip-subagents [${SUBAGENTS_SUBCOMMANDS.map((command) => command.name).join('|')}]`,
@@ -476,14 +434,6 @@ function getCompletionsForTable(
   return fuzzyFilter(items, argv.trailing ? '' : (argv.words.at(-1) ?? ''), itemText);
 }
 
-export function getLandstripArgumentCompletions(
-  argumentPrefix: string,
-  runtime?: CommandSubagentRuntime,
-  contextProvider?: () => ExtensionContext | undefined,
-): AutocompleteItem[] {
-  return getCompletionsForTable(SUBCOMMANDS, true, argumentPrefix, runtime, contextProvider);
-}
-
 export function getLandstripSandboxArgumentCompletions(
   argumentPrefix: string,
   runtime?: CommandSubagentRuntime,
@@ -516,7 +466,7 @@ async function dispatchCommandTable(
   commands: readonly Subcommand[],
   defaultName: string,
   commandLabel: string,
-  scope: 'sandbox' | 'subagents' | undefined,
+  scope: 'sandbox' | 'subagents',
   args: string,
   ctx: CommandContext,
   runtime: CommandSubagentRuntime,
@@ -544,24 +494,6 @@ async function dispatchCommandTable(
   }
 
   await command.run(argv, deps);
-}
-
-export async function handleLandstripCommand(
-  args: string,
-  ctx: CommandContext,
-  runtime: CommandSubagentRuntime,
-  integration: LandstripIntegration,
-): Promise<void> {
-  await dispatchCommandTable(
-    SUBCOMMANDS,
-    DEFAULT_SUBCOMMAND,
-    'landstrip',
-    undefined,
-    args,
-    ctx,
-    runtime,
-    integration,
-  );
 }
 
 export async function handleLandstripSandboxCommand(
@@ -605,12 +537,6 @@ export function registerLandstripCommands(
   runtime: CommandSubagentRuntime,
   integration: LandstripIntegration,
 ): void {
-  pi.registerCommand('landstrip', {
-    description: 'Manage Landstrip sandbox, agents, tasks, and runtime settings',
-    getArgumentCompletions: (prefix) =>
-      getLandstripArgumentCompletions(prefix, runtime, () => integration.getExtensionContext()),
-    handler: async (args, ctx) => handleLandstripCommand(args, ctx, runtime, integration),
-  });
   pi.registerCommand('landstrip-sandbox', {
     description: 'Inspect and configure Landstrip OS sandbox status and policy',
     getArgumentCompletions: (prefix) =>
