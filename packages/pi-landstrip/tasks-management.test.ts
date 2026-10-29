@@ -929,7 +929,7 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
       );
       expect(hardResult.isError).toBe(true);
       const hardOutput = textOf(hardResult);
-      expect(hardOutput).toMatch(/Permission denied|Access is denied/i);
+      expect(hardOutput).toMatch(/Permission denied|Access is denied|Operation not permitted/i);
       expect(hardOutput).toContain('Command exited with code');
       if (process.platform === 'linux') {
         expect(hardOutput).toContain(
@@ -946,7 +946,9 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
       );
       expect(headlessSoftResult.isError).toBe(true);
       const headlessSoftOutput = textOf(headlessSoftResult);
-      expect(headlessSoftOutput).toMatch(/Permission denied|Access is denied/i);
+      expect(headlessSoftOutput).toMatch(
+        /Permission denied|Access is denied|Operation not permitted/i,
+      );
       expect(headlessSoftOutput).toContain('Command exited with code');
       if (process.platform === 'linux') {
         expect(headlessSoftOutput).toContain(
@@ -973,7 +975,7 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
       expect(rejectSelect).toHaveBeenCalledTimes(1);
       expect(rejectResult.isError).toBe(true);
       const rejectOutput = textOf(rejectResult);
-      expect(rejectOutput).toMatch(/Permission denied|Access is denied/i);
+      expect(rejectOutput).toMatch(/Permission denied|Access is denied|Operation not permitted/i);
       expect(rejectOutput).toContain('Command exited with code');
       if (process.platform === 'linux') {
         expect(rejectOutput).toContain(
@@ -998,7 +1000,7 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
         allowCtx,
       );
       expect(allowSelect).toHaveBeenCalledTimes(1);
-      expect(allowed.isError).not.toBe(true);
+      expect(allowed.isError, textOf(allowed)).not.toBe(true);
       expect(textOf(allowed)).toContain('cert');
     } finally {
       rmSync(root, { recursive: true, force: true });
