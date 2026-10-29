@@ -1021,98 +1021,91 @@ function shouldPromptForWrite(filePath, allowWrite, baseDirectory = process.cwd(
   return !isPathWriteAllowed(filePath, allowWrite, baseDirectory);
 }
 
-function normalizeReadOptions(options, allowReadOverrides) {
-  if (typeof options === 'string') {
-    return {
-      baseDirectory: options,
-      allowReadOverrides: Array.isArray(allowReadOverrides) ? allowReadOverrides : [],
-      requireAllowMatch: false,
-    };
-  }
-  return {
-    baseDirectory: options?.baseDirectory,
-    allowReadOverrides: options?.allowReadOverrides ?? (Array.isArray(allowReadOverrides) ? allowReadOverrides : []),
-    requireAllowMatch: options?.requireAllowMatch ?? false,
-  };
-}
+function evaluateReadAccess(filePath, filesystemConfig, options) {
+  const filesystem = filesystemConfig ?? {};
+  const baseDirectory = options?.baseDirectory;
+  const allowReadOverrides = options?.allowReadOverrides ?? [];
+  const requireAllowMatch = options?.requireAllowMatch ?? false;
 
-function evaluateReadAccess(filePath, filesystemOrConfig, options, allowReadOverrides) {
-  const filesystem = filesystemOrConfig && 'filesystem' in filesystemOrConfig ? filesystemOrConfig.filesystem : (filesystemOrConfig ?? {});
-  const opts = normalizeReadOptions(options, allowReadOverrides);
-  const baseDirectory = opts.baseDirectory;
-
-  if (filesystem.denyReadAlways && matchesPathPattern(filePath, filesystem.denyReadAlways, baseDirectory)) {
+  if (
+    filesystem.denyReadAlways &&
+    matchesPathPattern(filePath, filesystem.denyReadAlways, baseDirectory)
+  ) {
     return 'deny';
   }
 
-  const effectiveAllowRead = opts.allowReadOverrides.length > 0
-    ? mergeArray(filesystem.allowRead ?? [], opts.allowReadOverrides)
-    : (filesystem.allowRead ?? []);
+  const effectiveAllowRead =
+    allowReadOverrides.length > 0
+      ? mergeArray(filesystem.allowRead ?? [], allowReadOverrides)
+      : (filesystem.allowRead ?? []);
 
-  if (isPathReadAllowed(filePath, effectiveAllowRead, filesystem.denyRead ?? [], baseDirectory, { requireAllowMatch: opts.requireAllowMatch })) {
+  if (
+    isPathReadAllowed(filePath, effectiveAllowRead, filesystem.denyRead ?? [], baseDirectory, {
+      requireAllowMatch,
+    })
+  ) {
     return 'allow';
   }
 
   return 'ask';
 }
 
-function normalizeWriteOptions(options, allowWriteOverrides) {
-  if (typeof options === 'string') {
-    return {
-      baseDirectory: options,
-      allowWriteOverrides: Array.isArray(allowWriteOverrides) ? allowWriteOverrides : [],
-    };
-  }
-  return {
-    baseDirectory: options?.baseDirectory,
-    allowWriteOverrides: options?.allowWriteOverrides ?? (Array.isArray(allowWriteOverrides) ? allowWriteOverrides : []),
-  };
-}
+function evaluateWriteAccess(filePath, filesystemConfig, options) {
+  const filesystem = filesystemConfig ?? {};
+  const baseDirectory = options?.baseDirectory;
+  const allowWriteOverrides = options?.allowWriteOverrides ?? [];
 
-function evaluateWriteAccess(filePath, filesystemOrConfig, options, allowWriteOverrides) {
-  const filesystem = filesystemOrConfig && 'filesystem' in filesystemOrConfig ? filesystemOrConfig.filesystem : (filesystemOrConfig ?? {});
-  const opts = normalizeWriteOptions(options, allowWriteOverrides);
-  const baseDirectory = opts.baseDirectory;
+  const effectiveAllowWrite =
+    allowWriteOverrides.length > 0
+      ? mergeArray(filesystem.allowWrite ?? [], allowWriteOverrides)
+      : (filesystem.allowWrite ?? []);
 
-  const effectiveAllowWrite = opts.allowWriteOverrides.length > 0
-    ? mergeArray(filesystem.allowWrite ?? [], opts.allowWriteOverrides)
-    : (filesystem.allowWrite ?? []);
-
-  if (filesystem.denyWriteAlways && matchesWriteDenyPattern(filePath, filesystem.denyWriteAlways, baseDirectory, effectiveAllowWrite)) {
+  if (
+    filesystem.denyWriteAlways &&
+    matchesWriteDenyPattern(filePath, filesystem.denyWriteAlways, baseDirectory, effectiveAllowWrite)
+  ) {
     return 'denyAlways';
   }
 
-  if (filesystem.denyWrite && matchesWriteDenyPattern(filePath, filesystem.denyWrite, baseDirectory, effectiveAllowWrite)) {
+  if (
+    filesystem.denyWrite &&
+    matchesWriteDenyPattern(filePath, filesystem.denyWrite, baseDirectory, effectiveAllowWrite)
+  ) {
     return 'deny';
   }
 
-  if (effectiveAllowWrite.length > 0 && matchesPathPattern(filePath, effectiveAllowWrite, baseDirectory)) {
+  if (
+    effectiveAllowWrite.length > 0 &&
+    matchesPathPattern(filePath, effectiveAllowWrite, baseDirectory)
+  ) {
     return 'allow';
   }
 
   return 'ask';
 }
 
-function isDomainAllowed(domain, networkOrConfig, allowedDomainsOverrides) {
-  const network = networkOrConfig && 'network' in networkOrConfig ? networkOrConfig.network : (networkOrConfig ?? {});
+function isDomainAllowed(domain, networkConfig, allowedDomainsOverrides) {
+  const network = networkConfig ?? {};
   if (network.allowNetwork) return true;
   const denied = network.deniedDomains ?? [];
   if (domainMatchesAny(domain, denied)) return false;
-  const effectiveAllowed = Array.isArray(allowedDomainsOverrides) && allowedDomainsOverrides.length > 0
-    ? mergeArray(network.allowedDomains ?? [], allowedDomainsOverrides)
-    : (network.allowedDomains ?? []);
+  const effectiveAllowed =
+    Array.isArray(allowedDomainsOverrides) && allowedDomainsOverrides.length > 0
+      ? mergeArray(network.allowedDomains ?? [], allowedDomainsOverrides)
+      : (network.allowedDomains ?? []);
   return domainMatchesAny(domain, effectiveAllowed);
 }
 
-function evaluateDomainAccess(domain, networkOrConfig, options) {
-  const network = networkOrConfig && 'network' in networkOrConfig ? networkOrConfig.network : (networkOrConfig ?? {});
+function evaluateDomainAccess(domain, networkConfig, options) {
+  const network = networkConfig ?? {};
   if (network.allowNetwork) return 'allow';
-  const overrides = Array.isArray(options) ? options : options?.allowedDomainsOverrides;
+  const overrides = options?.allowedDomainsOverrides;
   const denied = network.deniedDomains ?? [];
   if (domainMatchesAny(domain, denied)) return 'deny';
-  const effectiveAllowed = Array.isArray(overrides) && overrides.length > 0
-    ? mergeArray(network.allowedDomains ?? [], overrides)
-    : (network.allowedDomains ?? []);
+  const effectiveAllowed =
+    Array.isArray(overrides) && overrides.length > 0
+      ? mergeArray(network.allowedDomains ?? [], overrides)
+      : (network.allowedDomains ?? []);
   if (domainMatchesAny(domain, effectiveAllowed)) return 'allow';
   return 'ask';
 }
@@ -1315,17 +1308,10 @@ function extractTrapBlockedPath(trapOutput, cwd = process.cwd(), operation) {
   return null;
 }
 
-function extractDeniedPath(output, options, commandArg) {
+function extractDeniedPath(output, options) {
   if (typeof output !== 'string') return null;
-  let cwd = process.cwd();
-  let command = commandArg;
-  if (typeof options === 'string') {
-    cwd = options;
-  } else if (options && typeof options === 'object') {
-    if (typeof options.cwd === 'string') cwd = options.cwd;
-    if (typeof options.command === 'string') command = options.command;
-  }
-
+  const cwd = typeof options?.cwd === 'string' ? options.cwd : process.cwd();
+  const command = typeof options?.command === 'string' ? options.command : undefined;
   // 1. Structured traps
   const landstripTraps = parseLandstripTraps(output);
   const trapped = extractTrapBlockedPath(output, cwd);

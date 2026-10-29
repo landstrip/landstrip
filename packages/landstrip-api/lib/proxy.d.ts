@@ -42,13 +42,12 @@ export function createProxyCredentials(token?: string): ProxyCredentials;
 export function createProxyUrl(port: number, token?: string | null, host?: string): string;
 
 export interface CreateProxyEnvironmentOptions {
-  token?: string | null;
-  host?: string;
-  baseEnv?: NodeJS.ProcessEnv;
+  token?: string | null | undefined;
+  host?: string | undefined;
+  baseEnv?: NodeJS.ProcessEnv | undefined;
 }
 
 export function createProxyEnvironment(
   port?: number | null,
-  options?: CreateProxyEnvironmentOptions | string | null,
-  baseEnv?: NodeJS.ProcessEnv,
+  options?: CreateProxyEnvironmentOptions,
 ): NodeJS.ProcessEnv;

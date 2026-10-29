@@ -45,7 +45,7 @@ test('createProxyUrl builds http proxy URLs with credentials and host', () => {
 
 test('createProxyEnvironment configures environment dictionary with proxy settings', () => {
   const baseEnv = { PATH: '/bin:/usr/bin', OTHER: 'value' };
-  const env = createProxyEnvironment(12345, 'secret-tok', baseEnv);
+  const env = createProxyEnvironment(12345, { token: 'secret-tok', baseEnv });
 
   assert.equal(env.PATH, '/bin:/usr/bin');
   assert.equal(env.OTHER, 'value');
@@ -62,11 +62,10 @@ test('createProxyEnvironment configures environment dictionary with proxy settin
   assert.equal(baseEnv.HTTP_PROXY, undefined);
 
   // Inactive port returns copy of baseEnv
-  const inactiveEnv = createProxyEnvironment(null, 'secret-tok', baseEnv);
+  const inactiveEnv = createProxyEnvironment(null, { token: 'secret-tok', baseEnv });
   assert.deepEqual(inactiveEnv, baseEnv);
   assert.notEqual(inactiveEnv, baseEnv);
 
-  // Options object overload
   const optionsEnv = createProxyEnvironment(54321, {
     token: 'opt-token',
     host: '127.0.0.2',

@@ -153,18 +153,18 @@ export type PathAccessDecision = 'allow' | 'ask' | 'deny' | 'denyAlways';
 export type DomainAccessDecision = 'allow' | 'ask' | 'deny';
 
 export interface EvaluateReadOptions {
-  baseDirectory?: string;
-  allowReadOverrides?: string[];
-  requireAllowMatch?: boolean;
+  baseDirectory?: string | undefined;
+  allowReadOverrides?: string[] | undefined;
+  requireAllowMatch?: boolean | undefined;
 }
 
 export interface EvaluateWriteOptions {
-  baseDirectory?: string;
-  allowWriteOverrides?: string[];
+  baseDirectory?: string | undefined;
+  allowWriteOverrides?: string[] | undefined;
 }
 
 export interface EvaluateDomainOptions {
-  allowedDomainsOverrides?: string[];
+  allowedDomainsOverrides?: string[] | undefined;
 }
 
 export function matchesPathPattern(
@@ -208,28 +208,26 @@ export function shouldPromptForWrite(
 ): boolean;
 export function evaluateReadAccess(
   filePath: string,
-  filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile | SandboxConfig | SandboxConfigFile,
-  options?: EvaluateReadOptions | string,
-  allowReadOverrides?: string[],
+  filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile,
+  options?: EvaluateReadOptions,
 ): 'allow' | 'ask' | 'deny';
 
 export function evaluateWriteAccess(
   filePath: string,
-  filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile | SandboxConfig | SandboxConfigFile,
-  options?: EvaluateWriteOptions | string,
-  allowWriteOverrides?: string[],
+  filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile,
+  options?: EvaluateWriteOptions,
 ): PathAccessDecision;
 
 export function isDomainAllowed(
   domain: string,
-  network: SandboxNetworkConfig | SandboxNetworkConfigFile | SandboxConfig | SandboxConfigFile,
+  network: SandboxNetworkConfig | SandboxNetworkConfigFile,
   allowedDomainsOverrides?: string[],
 ): boolean;
 
 export function evaluateDomainAccess(
   domain: string,
-  network: SandboxNetworkConfig | SandboxNetworkConfigFile | SandboxConfig | SandboxConfigFile,
-  options?: EvaluateDomainOptions | string[],
+  network: SandboxNetworkConfig | SandboxNetworkConfigFile,
+  options?: EvaluateDomainOptions,
 ): DomainAccessDecision;
 
 
@@ -253,12 +251,8 @@ export function extractNativeWriteDeniedPath(
 ): string | null;
 
 export interface ExtractDeniedPathOptions {
-  cwd?: string;
-  command?: string;
+  cwd?: string | undefined;
+  command?: string | undefined;
 }
 
-export function extractDeniedPath(
-  output: string,
-  options?: ExtractDeniedPathOptions | string,
-  command?: string,
-): string | null;
+export function extractDeniedPath(output: string, options?: ExtractDeniedPathOptions): string | null;

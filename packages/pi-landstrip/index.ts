@@ -659,7 +659,7 @@ export function writeEnvFile(
     lines.push(`export ${key}='${escaped}'`);
   }
   if (proxyPort !== null) {
-    const proxyVars = createProxyEnvironment(proxyPort, proxyToken);
+    const proxyVars = createProxyEnvironment(proxyPort, { token: proxyToken });
     for (const [name, value] of Object.entries(proxyVars)) {
       lines.push(`export ${name}='${value}'`);
     }
@@ -703,7 +703,7 @@ function shellEnvironment(
   proxyToken?: string,
 ): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = { ...process.env, ...env, PWD: resolve(cwd) };
-  return createProxyEnvironment(proxyPort, proxyToken, result);
+  return createProxyEnvironment(proxyPort, { token: proxyToken, baseEnv: result });
 }
 
 // The runner needs ProgramData and LOCALAPPDATA to set up the AppContainer
@@ -1330,10 +1330,9 @@ function createLandstripIntegrationWithPrompts(
   ): Promise<boolean> {
     const current = (): boolean | undefined => {
       const config = loadConfig(cwd);
-      const decision = evaluateDomainAccess(domain, config.network, [
-        ...sessionAllowedDomains,
-        ...(allowances?.domains ?? []),
-      ]);
+      const decision = evaluateDomainAccess(domain, config.network, {
+        allowedDomainsOverrides: [...sessionAllowedDomains, ...(allowances?.domains ?? [])],
+      });
       if (decision === 'deny') return false;
       if (decision === 'allow') return true;
       return undefined;
@@ -1832,7 +1831,10 @@ function createLandstripIntegrationWithPrompts(
 
     const workerPolicy = policy;
     const workerChildEnd = childEnd;
-    const workerEnv = createProxyEnvironment(proxy?.port ?? null, proxyToken, options.env ?? {});
+    const workerEnv = createProxyEnvironment(proxy?.port ?? null, {
+      token: proxyToken,
+      baseEnv: options.env ?? {},
+    });
     let spawned = false;
     let disposePromise: Promise<void> | undefined;
     const spawnWorker: LandstripSpawn = (_command, _args, spawnOptions) => {

@@ -228,7 +228,7 @@ function proxyEnv(
   proxyToken?: string | null,
 ): Record<string, string> | undefined {
   if (port === null) return undefined;
-  return createProxyEnvironment(port, proxyToken) as Record<string, string>;
+  return createProxyEnvironment(port, { token: proxyToken }) as Record<string, string>;
 }
 
 function shellQuote(value: string): string {
@@ -672,7 +672,7 @@ const plugin: Plugin.Plugin = {
       const proxy = allowNetwork
         ? null
         : await startFilterProxy({
-            isDomainAllowed: (domain) => isDomainAllowed(domain, config),
+            isDomainAllowed: (domain) => isDomainAllowed(domain, config.network),
             ...(proxyCredentials ? { authorization: proxyCredentials.authorization } : {}),
           });
       const proxyPort = proxy ? proxy.port : null;

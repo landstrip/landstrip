@@ -38,7 +38,7 @@ describe('proxy helpers in pi-landstrip', () => {
 
   it('populates environment variables when proxy is active', () => {
     const base = { FOO: 'bar' };
-    const populated = createProxyEnvironment(8080, 'test-tok', base);
+    const populated = createProxyEnvironment(8080, { token: 'test-tok', baseEnv: base });
     expect(populated.FOO).toBe('bar');
     expect(populated.HTTP_PROXY).toBe('http://landstrip:test-tok@127.0.0.1:8080');
     expect(populated.HTTPS_PROXY).toBe('http://landstrip:test-tok@127.0.0.1:8080');
@@ -50,7 +50,7 @@ describe('proxy helpers in pi-landstrip', () => {
     expect(populated.no_proxy).toBe('');
 
     // Returns unpolluted copy when port is inactive
-    const inactive = createProxyEnvironment(null, 'test-tok', base);
+    const inactive = createProxyEnvironment(null, { token: 'test-tok', baseEnv: base });
     expect(inactive).toEqual(base);
     expect(inactive).not.toBe(base);
   });

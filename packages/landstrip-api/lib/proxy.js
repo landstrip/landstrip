@@ -367,18 +367,10 @@ function createProxyUrl(port, token, host = '127.0.0.1') {
   return `http://${credentials}${host}:${port}`;
 }
 
-function createProxyEnvironment(port, options, baseEnvArg) {
-  let token = null;
-  let host = '127.0.0.1';
-  let baseEnv = baseEnvArg;
-
-  if (typeof options === 'string') {
-    token = options;
-  } else if (options && typeof options === 'object') {
-    if (typeof options.token === 'string') token = options.token;
-    if (typeof options.host === 'string') host = options.host;
-    if (options.baseEnv && typeof options.baseEnv === 'object') baseEnv = options.baseEnv;
-  }
+function createProxyEnvironment(port, options) {
+  const token = typeof options?.token === 'string' ? options.token : null;
+  const host = typeof options?.host === 'string' ? options.host : '127.0.0.1';
+  const baseEnv = options?.baseEnv && typeof options.baseEnv === 'object' ? options.baseEnv : undefined;
 
   const result = baseEnv ? { ...baseEnv } : {};
   if (!port || typeof port !== 'number' || port <= 0) {

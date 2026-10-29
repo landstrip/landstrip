@@ -282,30 +282,14 @@ export interface SandboxConfigFile {
 
 export type SandboxConfigOverrides = SandboxConfigFile;
 
-export type PathAccessDecision = 'allow' | 'ask' | 'deny' | 'denyAlways';
-
-export type DomainAccessDecision = 'allow' | 'ask' | 'deny';
-
-export interface EvaluateReadOptions {
-  baseDirectory?: string;
-  allowReadOverrides?: string[];
-  requireAllowMatch?: boolean;
-}
-
-export interface EvaluateWriteOptions {
-  baseDirectory?: string;
-  allowWriteOverrides?: string[];
-}
-
-export interface EvaluateDomainOptions {
-  allowedDomainsOverrides?: string[];
-}
-
-
-export interface ExtractDeniedPathOptions {
-  cwd?: string;
-  command?: string;
-}
+export type {
+  PathAccessDecision,
+  DomainAccessDecision,
+  EvaluateReadOptions,
+  EvaluateWriteOptions,
+  EvaluateDomainOptions,
+  ExtractDeniedPathOptions,
+} from './shared.js';
 /**
  * Canonical path to the native landstrip binary in an official Landstrip package.
  *
