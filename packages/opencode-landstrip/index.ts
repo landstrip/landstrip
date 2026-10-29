@@ -15,30 +15,33 @@ import {
   startFilterProxy,
 } from '@landstrip/landstrip-api/proxy';
 
+import type { LandstripTrap } from '@landstrip/landstrip-api';
 import {
-  type LandstripTrap,
   type SandboxConfig,
   allowsAllDomains,
+  buildLandstripPolicy,
   canonicalizePath,
   controlResponseLine,
   evaluateDomainAccess,
   evaluateReadAccess,
   evaluateWriteAccess,
-  extractDomainsFromCommand,
   extractDeniedPath,
+  extractDomainsFromCommand,
   formatLandstripTraps,
-  getConfigPaths,
   isDomainAllowed,
-  isRecord,
   isQueryTrap,
-  buildLandstripPolicy,
+  isRecord,
+  parseLandstripTraps,
+  parseTrapLine,
+  writeLandstripPolicyFile,
+} from '@landstrip/landstrip-api/shared';
+
+import {
+  getConfigPaths,
   landstripBinaryPath,
   loadConfig,
   normalizeOptions,
-  parseLandstripTraps,
-  parseTrapLine,
   readDiscoveryPort,
-  writeLandstripPolicyFile,
   trapSessionHelloLine,
 } from './shared.js';
 
@@ -414,17 +417,8 @@ function extractOriginalCommand(wrappedCommand: string): string | null {
   const pIdx = args.indexOf('-p');
   const flagIdx = args.findIndex((arg, i) => i > pIdx && (arg === '-lc' || arg === '-c'));
   if (flagIdx === -1) return null;
-  // Old query-response wrappers appended `|| <fallback>`; stop there so
-  // recovering an expired wrapper never folds a fallback into the command.
-  const end = args.indexOf('||', flagIdx + 1);
-  return (end === -1 ? args.slice(flagIdx + 1) : args.slice(flagIdx + 1, end)).join(' ');
+  return args.slice(flagIdx + 1).join(' ');
 }
-
-function getToolPath(args: Record<string, unknown>): string | undefined {
-  const filePath = args.filePath ?? args.path;
-  return typeof filePath === 'string' ? filePath : undefined;
-}
-
 function extractPatchPaths(patchText: string): string[] {
   const paths: string[] = [];
 
@@ -453,13 +447,15 @@ function evaluateToolPermissions(
   if (tool === 'read') {
     const paths = Array.isArray(args.paths)
       ? args.paths.filter((path): path is string => typeof path === 'string')
-      : [getToolPath(args)].filter((path): path is string => path !== undefined);
+      : typeof args.path === 'string'
+        ? [args.path]
+        : [];
     return paths.map((path) =>
       evaluateReadPermission(path, config, baseDirectory, effectiveAllowRead),
     );
   }
 
-  if (tool === 'glob' || tool === 'grep' || tool === 'list') {
+  if (tool === 'glob' || tool === 'grep') {
     const searchPath = typeof args.path === 'string' ? args.path : '.';
     return [evaluateReadPermission(searchPath, config, baseDirectory, effectiveAllowRead)];
   }
@@ -467,22 +463,28 @@ function evaluateToolPermissions(
   if (tool === 'write' || tool === 'edit') {
     const paths = Array.isArray(args.paths)
       ? args.paths.filter((path): path is string => typeof path === 'string')
-      : [getToolPath(args)].filter((path): path is string => path !== undefined);
+      : typeof args.path === 'string'
+        ? [args.path]
+        : [];
     return paths.map((path) =>
       evaluateWritePermission(path, config, baseDirectory, effectiveAllowWrite),
     );
   }
 
-  if ((tool === 'patch' || tool === 'apply_patch') && typeof args.patchText === 'string') {
+  if (tool === 'patch' && typeof args.patchText === 'string') {
     return extractPatchPaths(args.patchText).map((path) =>
       evaluateWritePermission(path, config, baseDirectory, effectiveAllowWrite),
     );
   }
 
-  if (tool === 'bash' && typeof args.command === 'string') {
-    return evaluateCommandDomains(args.command, config);
+  if (tool === 'shell') {
+    const commands = Array.isArray(args.commands)
+      ? args.commands.filter((command): command is string => typeof command === 'string')
+      : typeof args.command === 'string'
+        ? [args.command]
+        : [];
+    return commands.flatMap((command) => evaluateCommandDomains(command, config));
   }
-
   return [];
 }
 
@@ -745,24 +747,14 @@ const plugin: Plugin.Plugin = {
       if (!config) return;
 
       const action = evaluation.action;
-      const patterns = [...(evaluation.resources ?? [])];
+      const resources = [...(evaluation.resources ?? [])];
       const effectiveAllowRead = config.filesystem.allowRead;
       const effectiveAllowWrite = config.filesystem.allowWrite;
       const args: Record<string, unknown> = { ...evaluation.metadata };
-      if (action === 'read' || action === 'external_directory') args.paths = patterns;
-      if (action === 'write' || action === 'edit') {
-        args.paths =
-          patterns.length > 0
-            ? patterns
-            : [args.filepath ?? args.path].filter(
-                (path): path is string => typeof path === 'string',
-              );
-      }
-      if ((action === 'shell' || action === 'bash') && typeof args.command !== 'string') {
-        args.command = patterns[0];
-      }
-      const toolName =
-        action === 'shell' ? 'bash' : action === 'external_directory' ? 'read' : action;
+      if (action === 'read' || action === 'external_directory') args.paths = resources;
+      if (action === 'edit') args.paths = resources;
+      if (action === 'shell') args.commands = resources;
+      const toolName = action === 'external_directory' ? 'read' : action;
       const decisions = evaluateToolPermissions(
         toolName,
         args,

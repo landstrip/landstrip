@@ -4,79 +4,11 @@
 import { binaryPath } from '@landstrip/landstrip-api';
 import {
   deepMergeSandboxConfig,
-  extractDomainsFromCommand,
   isRecord,
   mergeArray,
   parseSandboxConfig,
 } from '@landstrip/landstrip-api/shared';
 import type { SandboxConfig, SandboxConfigOverrides } from '@landstrip/landstrip-api/shared';
-
-export type {
-  LandstripControlResponse,
-  LandstripDarwinPolicy,
-  LandstripFilesystemPolicy,
-  LandstripNetworkPolicy,
-  LandstripPathSelector,
-  LandstripPolicy,
-  LandstripTrap,
-} from '@landstrip/landstrip-api';
-export {
-  buildLandstripPolicy,
-  allowsAllDomains,
-  canonicalizeGlobPattern,
-  canonicalizePath,
-  controlResponseLine,
-  decodeLandstripTrap,
-  domainMatchesAny,
-  domainMatchesPattern,
-  expandHomePath,
-  expandPath,
-  globToRegExp,
-  formatLandstripTrap,
-  formatLandstripTraps,
-  isRecord,
-  isQueryTrap,
-  normalizePathSeparators,
-  parseLandstripTraps,
-  parseTrapLine,
-  pathUnderDirectory,
-  resolveFilesystemPatterns,
-  resolveFilesystemPolicy,
-  sessionAllows,
-  sessionScopeFor,
-  serializeLandstripPolicy,
-  writeLandstripPolicyFile,
-  deepMergeSandboxConfig,
-  mergeArray,
-  parseSandboxConfig,
-  matchesPathPattern,
-  matchPathSpecificity,
-  isPathReadAllowed,
-  isPathWriteAllowed,
-  shouldPromptForWrite,
-  evaluateReadAccess,
-  evaluateWriteAccess,
-  isDomainAllowed,
-  evaluateDomainAccess,
-  extractDomainsFromCommand,
-  extractCandidatePaths,
-  extractNativeDeniedPath,
-  extractDeniedPath,
-  type PathAccessDecision,
-  type DomainAccessDecision,
-  type EvaluateReadOptions,
-  type EvaluateWriteOptions,
-  type EvaluateDomainOptions,
-  type SandboxConfig,
-  type SandboxConfigFile,
-  type SandboxConfigOverrides,
-  type SandboxDarwinConfig,
-  type SandboxFilesystemConfig,
-  type SandboxNetworkConfig,
-  type SandboxShellConfig,
-  type SandboxWindowsConfig,
-} from '@landstrip/landstrip-api/shared';
-
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -85,21 +17,12 @@ import { dirname, isAbsolute, join } from 'node:path';
 
 const packageDir = dirname(fileURLToPath(import.meta.url));
 
-export function normalizeConfig(value: unknown): SandboxConfigOverrides {
-  return parseSandboxConfig(value);
-}
-
 export function normalizeOptions(options: unknown): SandboxConfigOverrides {
   if (!isRecord(options)) return {};
-  if (options.config === undefined) return normalizeConfig(options);
+  if (options.config === undefined) return parseSandboxConfig(options);
   if (!isRecord(options.config)) throw new Error('config must be an object');
-  return normalizeConfig(options.config);
+  return parseSandboxConfig(options.config);
 }
-
-export function deepMerge(base: SandboxConfig, overrides: SandboxConfigOverrides): SandboxConfig {
-  return deepMergeSandboxConfig(base, overrides);
-}
-
 export function getConfigPaths(baseDirectory: string): { globalPath: string; projectPath: string } {
   const configHome = process.env.XDG_CONFIG_HOME;
   const configDirectory =
@@ -114,7 +37,7 @@ export function readConfigFile(configPath: string): SandboxConfigOverrides {
   if (!existsSync(configPath)) return {};
 
   try {
-    return normalizeConfig(JSON.parse(readFileSync(configPath, 'utf-8')));
+    return parseSandboxConfig(JSON.parse(readFileSync(configPath, 'utf-8')));
   } catch (error) {
     throw new Error(
       `Could not load ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
@@ -138,14 +61,17 @@ export function loadConfig(
   const templateConfig: SandboxConfig = JSON.parse(readFileSync(templatePath, 'utf-8'));
   templateConfig.filesystem.denyWrite.push(globalPath);
   const globalOverrides = readConfigFile(globalPath);
-  const baseConfig = deepMerge(templateConfig, globalOverrides);
+  const baseConfig = deepMergeSandboxConfig(templateConfig, globalOverrides);
 
-  return deepMerge(deepMerge(baseConfig, readConfigFile(projectPath)), optionOverrides);
+  return deepMergeSandboxConfig(
+    deepMergeSandboxConfig(baseConfig, readConfigFile(projectPath)),
+    optionOverrides,
+  );
 }
 
 export function writeConfigFile(configPath: string, update: SandboxConfigOverrides): void {
   const next: Record<string, unknown> = { ...readConfigFile(configPath) };
-  for (const [key, value] of Object.entries(normalizeConfig(update))) {
+  for (const [key, value] of Object.entries(parseSandboxConfig(update))) {
     if (!isRecord(value)) {
       next[key] = value;
       continue;
@@ -181,95 +107,6 @@ export function landstripBinaryPath(): string {
     _landstripBinaryPathError = error;
     throw error;
   }
-}
-
-// Permission requests reach the plugin in slightly different shapes across the
-// server hook and the TUI event bus, so the field-fallback parsing below is the
-// single source of truth both entrypoints share.
-export function permissionType(permission: Record<string, unknown>, fallback = ''): string {
-  if (typeof permission.permission === 'string') return permission.permission;
-  if (typeof permission.action === 'string') return permission.action;
-  if (typeof permission.type === 'string') return permission.type;
-  return fallback;
-}
-
-export function permissionPattern(permission: Record<string, unknown>): string | undefined {
-  const patterns = permission.patterns;
-  if (Array.isArray(patterns))
-    return patterns.find((item): item is string => typeof item === 'string');
-
-  const pattern = permission.pattern;
-  if (typeof pattern === 'string') return pattern;
-  if (Array.isArray(pattern))
-    return pattern.find((item): item is string => typeof item === 'string');
-
-  return undefined;
-}
-
-/**
- * Every string pattern a permission carries, in declaration order, read from
- * `patterns`, `pattern`, or `resources`. The plural complement to
- * {@link permissionPattern} for callers that must inspect all patterns.
- */
-export function permissionPatterns(permission: Record<string, unknown>): string[] {
-  const patterns = permission.patterns;
-  if (Array.isArray(patterns))
-    return patterns.filter((item): item is string => typeof item === 'string');
-
-  const pattern = permission.pattern;
-  if (typeof pattern === 'string') return [pattern];
-  if (Array.isArray(pattern))
-    return pattern.filter((item): item is string => typeof item === 'string');
-
-  const resources = permission.resources;
-  if (Array.isArray(resources))
-    return resources.filter((item): item is string => typeof item === 'string');
-
-  return [];
-}
-
-// The concrete resource a permission concerns (a path or a domain), used to show
-// the user exactly what they are approving and to persist the right allowlist.
-export function permissionResource(permission: Record<string, unknown>): string | undefined {
-  const metadata = isRecord(permission.metadata) ? permission.metadata : {};
-  const type = permissionType(permission);
-  const pattern = permissionPattern(permission);
-
-  if (type === 'bash') {
-    const command = typeof metadata.command === 'string' ? metadata.command : pattern;
-    const domains = typeof command === 'string' ? extractDomainsFromCommand(command) : [];
-    return domains.length > 0 ? domains.join(', ') : (command ?? pattern);
-  }
-
-  if (typeof metadata.filepath === 'string') return metadata.filepath;
-  if (typeof metadata.path === 'string') return metadata.path;
-  return pattern;
-}
-
-export function updateForPermission(
-  permission: Record<string, unknown>,
-): SandboxConfigOverrides | null {
-  const metadata = isRecord(permission.metadata) ? permission.metadata : {};
-  const type = permissionType(permission);
-  const pattern = permissionPattern(permission);
-
-  if (type === 'bash') {
-    const command = typeof metadata.command === 'string' ? metadata.command : pattern;
-    const domains = typeof command === 'string' ? extractDomainsFromCommand(command) : [];
-    return domains.length > 0 ? { network: { allowedDomains: domains } } : null;
-  }
-
-  if (type === 'read' || type === 'glob' || type === 'grep' || type === 'list') {
-    const filePath = typeof metadata.filepath === 'string' ? metadata.filepath : pattern;
-    return filePath ? { filesystem: { allowRead: [filePath] } } : null;
-  }
-
-  if (type === 'edit' || type === 'write' || type === 'apply_patch') {
-    const filePath = typeof metadata.filepath === 'string' ? metadata.filepath : pattern;
-    return filePath ? { filesystem: { allowWrite: [filePath] } } : null;
-  }
-
-  return null;
 }
 
 export interface TrapSessionHello {

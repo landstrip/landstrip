@@ -14,23 +14,25 @@ import { createSignal, onMount } from 'solid-js';
 
 import {
   controlResponseLine,
+  isQueryTrap,
+  parseLandstripTraps,
+  sessionAllows,
+  sessionScopeFor,
+} from '@landstrip/landstrip-api/shared';
+
+import {
   decodeTrapSessionHello,
   getConfigPaths,
-  isQueryTrap,
   loadConfig,
   normalizeOptions,
   nextSandboxPermissionIndex,
-  parseLandstripTraps,
   removeDiscoveryFile,
-  sessionAllows,
   sessionAllowancesFor,
   sandboxConfigTarget,
-  sessionScopeFor,
   rootSessionIDFor,
   setSandboxConfigEnabled,
   shouldRenderSandboxPermission,
   type SessionAllowances,
-  updateForPermission,
   writeConfigFile,
   writeDiscoveryPort,
 } from './shared.js';
@@ -473,11 +475,10 @@ const tui: TuiPlugin.Definition = {
         if (action === 'allow') {
           if (choice === 'project' || choice === 'global') {
             const { globalPath, projectPath } = getConfigPaths(directory);
-            const update = updateForPermission({
-              permission: entry.operation,
-              metadata: { filepath: scope },
+            writeConfigFile(choice === 'project' ? projectPath : globalPath, {
+              filesystem:
+                entry.operation === 'read' ? { allowRead: [scope] } : { allowWrite: [scope] },
             });
-            if (update) writeConfigFile(choice === 'project' ? projectPath : globalPath, update);
           }
           if (choice !== 'once') sessionPaths.add(scope);
         }

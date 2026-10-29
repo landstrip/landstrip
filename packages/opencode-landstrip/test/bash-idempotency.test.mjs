@@ -257,7 +257,7 @@ test('permission evaluation hard-denies denyReadAlways and denyWriteAlways witho
       assert.equal(readAsk.effect, 'ask');
 
       const writeAlways = {
-        action: 'write',
+        action: 'edit',
         resources: [join(tempDir, 'never-write', 'log.txt')],
         effect: 'allow',
       };
@@ -265,7 +265,7 @@ test('permission evaluation hard-denies denyReadAlways and denyWriteAlways witho
       assert.equal(writeAlways.effect, 'deny');
 
       const writeDeny = {
-        action: 'write',
+        action: 'edit',
         resources: [join(tempDir, 'read-only', 'file.txt')],
         effect: 'allow',
       };
@@ -273,7 +273,7 @@ test('permission evaluation hard-denies denyReadAlways and denyWriteAlways witho
       assert.equal(writeDeny.effect, 'deny');
 
       const writeAllow = {
-        action: 'write',
+        action: 'edit',
         resources: [join(tempDir, 'allowed.txt')],
         effect: 'allow',
       };
@@ -575,77 +575,75 @@ const patchPermissionCases = [
   ],
 ];
 
-for (const tool of ['patch', 'apply_patch']) {
-  for (const [name, lines, blockedFile, reason] of patchPermissionCases) {
-    test(`patch permissions: ${tool} ${name}`, async () => {
-      await withPlugin(
-        {
-          enabled: true,
-          filesystem: {
-            allowWrite: ['.'],
-            denyWrite: ['blocked.txt'],
-            denyWriteAlways: ['protected.txt'],
-          },
-          network: { allowNetwork: true },
-        },
-        async ({ handlers, tempDir }) => {
-          for (const file of [
-            'existing.txt',
-            'old.txt',
-            'source.txt',
-            'protected.txt',
-            'blocked.txt',
-          ]) {
-            await writeFile(join(tempDir, file), 'before\n');
-          }
-          const patchText = ['*** Begin Patch', ...lines, '*** End Patch'].join('\n');
-          const event = {
-            id: 'patch-call',
-            sessionID: 'test-session',
-            tool,
-            input: { patchText },
-          };
-          if (blockedFile) {
-            const blockedPath = join(await realpath(tempDir), blockedFile);
-            await assert.rejects(
-              handlers.tool['execute.before'](event),
-              (error) =>
-                error.message.includes(
-                  `Sandbox: write access denied for "${blockedPath}" (${reason}).`,
-                ) && error.message.includes(join(tempDir, '.opencode', 'sandbox.json')),
-            );
-          } else {
-            await handlers.tool['execute.before'](event);
-          }
-          assert.equal(event.input.patchText, patchText);
-          for (const file of [
-            'existing.txt',
-            'old.txt',
-            'source.txt',
-            'protected.txt',
-            'blocked.txt',
-          ]) {
-            assert.equal(await readFile(join(tempDir, file), 'utf8'), 'before\n');
-          }
-        },
-      );
-    });
-  }
-
-  test(`patch permissions: ${tool} leaves execution alone when disabled`, async () => {
+for (const [name, lines, blockedFile, reason] of patchPermissionCases) {
+  test(`patch permissions: patch ${name}`, async () => {
     await withPlugin(
-      { enabled: false, filesystem: { denyWriteAlways: ['protected.txt'] } },
-      async ({ handlers }) => {
-        await handlers.tool['execute.before']({
-          id: 'disabled-patch',
+      {
+        enabled: true,
+        filesystem: {
+          allowWrite: ['.'],
+          denyWrite: ['blocked.txt'],
+          denyWriteAlways: ['protected.txt'],
+        },
+        network: { allowNetwork: true },
+      },
+      async ({ handlers, tempDir }) => {
+        for (const file of [
+          'existing.txt',
+          'old.txt',
+          'source.txt',
+          'protected.txt',
+          'blocked.txt',
+        ]) {
+          await writeFile(join(tempDir, file), 'before\n');
+        }
+        const patchText = ['*** Begin Patch', ...lines, '*** End Patch'].join('\n');
+        const event = {
+          id: 'patch-call',
           sessionID: 'test-session',
-          tool,
-          input: { patchText: '*** Begin Patch\n*** Delete File: protected.txt\n*** End Patch' },
-        });
+          tool: 'patch',
+          input: { patchText },
+        };
+        if (blockedFile) {
+          const blockedPath = join(await realpath(tempDir), blockedFile);
+          await assert.rejects(
+            handlers.tool['execute.before'](event),
+            (error) =>
+              error.message.includes(
+                `Sandbox: write access denied for "${blockedPath}" (${reason}).`,
+              ) && error.message.includes(join(tempDir, '.opencode', 'sandbox.json')),
+          );
+        } else {
+          await handlers.tool['execute.before'](event);
+        }
+        assert.equal(event.input.patchText, patchText);
+        for (const file of [
+          'existing.txt',
+          'old.txt',
+          'source.txt',
+          'protected.txt',
+          'blocked.txt',
+        ]) {
+          assert.equal(await readFile(join(tempDir, file), 'utf8'), 'before\n');
+        }
       },
     );
   });
 }
+
+test('patch permissions: patch leaves execution alone when disabled', async () => {
+  await withPlugin(
+    { enabled: false, filesystem: { denyWriteAlways: ['protected.txt'] } },
+    async ({ handlers }) => {
+      await handlers.tool['execute.before']({
+        id: 'disabled-patch',
+        sessionID: 'test-session',
+        tool: 'patch',
+        input: { patchText: '*** Begin Patch\n*** Delete File: protected.txt\n*** End Patch' },
+      });
+    },
+  );
+});
 
 test('patch permissions: V2 defers unlisted paths to host approval', async () => {
   await withPlugin({ enabled: true, filesystem: { allowWrite: ['.'] } }, async ({ handlers }) => {
