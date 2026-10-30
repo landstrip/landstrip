@@ -416,7 +416,7 @@ impl ProfileBuilder {
                             .write_carveouts
                             .patterns
                             .iter()
-                            .any(|allow| ancestor.is_under(&allow.base())))
+                            .any(|allow| ancestor.is_under(allow.base())))
                 {
                     ancestors.push(ancestor.to_path_buf());
                 }
