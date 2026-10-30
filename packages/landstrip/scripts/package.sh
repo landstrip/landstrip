@@ -128,6 +128,19 @@ if [[ -n "$prebuilt_root" ]]; then
     || die "PREBUILT_ROOT is not a directory: $prebuilt_root"
 fi
 
+if [[ -z "${SDKROOT:-}" ]]; then
+  for candidate in \
+    "$cargo_root/target/sdk" \
+    "$cargo_root/target/sdk/MacOSX.sdk" \
+    "$repo_root/packages/landstrip/target/sdk" \
+    "$repo_root/packages/landstrip/target/sdk/MacOSX.sdk"; do
+    if [[ -d "$candidate" && ( -d "$candidate/usr" || -d "$candidate/System" ) ]]; then
+      export SDKROOT="$candidate"
+      break
+    fi
+  done
+fi
+
 # platform|rust-triple|binary-name
 platforms=(
   'linux-x64|x86_64-unknown-linux-gnu|landstrip'
