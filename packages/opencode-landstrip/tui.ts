@@ -16,11 +16,11 @@ import {
   controlResponseLine,
   evaluateReadAccess,
   evaluateWriteAccess,
-  isPathReadAllowed,
-  isPathWriteAllowed,
   isQueryTrap,
+  matchesPathPattern,
   parseLandstripTraps,
-  sessionScopeFor,
+  readGrantScopesFor,
+  writeGrantScopesFor,
 } from '@landstrip/landstrip-api/shared';
 
 import {
@@ -41,10 +41,6 @@ import {
 } from './shared.js';
 
 type QueryChoice = 'once' | 'session' | 'project' | 'global' | 'deny';
-
-// No project/global option: no landstrip policy field expresses "allow this
-// address:port" the way allowRead/allowWrite express a path.
-type NetworkQueryChoice = 'once' | 'session' | 'deny';
 
 interface PromptOption<Value extends string> {
   label: string;
@@ -441,15 +437,24 @@ const tui: TuiPlugin.Definition = {
             const verb = entry.operation
               ? entry.operation[0]?.toUpperCase() + entry.operation.slice(1)
               : 'Network';
+            const isUnixSocket = path.isAbsolute(entry.target);
             return jsx(LandstripPermissionPrompt, {
               icon: '%',
               title: `${verb} ${entry.target}`,
-              options: [
-                { label: 'Allow once', value: 'once' },
-                { label: 'Allow for session', value: 'session' },
-                { label: 'Deny', value: 'deny' },
-              ],
-              onSelect: (choice: NetworkQueryChoice) => resolveNetworkQuery(entry, choice),
+              options: isUnixSocket
+                ? [
+                    { label: 'Allow once', value: 'once' },
+                    { label: 'Allow for session', value: 'session' },
+                    { label: 'Allow for project', value: 'project' },
+                    { label: 'Allow globally', value: 'global' },
+                    { label: 'Deny', value: 'deny' },
+                  ]
+                : [
+                    { label: 'Allow once', value: 'once' },
+                    { label: 'Allow for session', value: 'session' },
+                    { label: 'Deny', value: 'deny' },
+                  ],
+              onSelect: (choice: QueryChoice) => resolveNetworkQuery(entry, choice),
               onCancel: () => resolveNetworkQuery(entry, 'deny'),
               onShow: () => notifyQuery(entry),
             });
@@ -469,19 +474,23 @@ const tui: TuiPlugin.Definition = {
       const verb = entry.operation === 'read' ? 'Read' : 'Write';
       const directory = entry.directory;
       const config = loadConfig(directory, optionOverrides);
-      let scope = sessionScopeFor(entry.path, directory);
-      if (
-        entry.operation === 'read'
-          ? !isPathReadAllowed(entry.path, [scope], config.filesystem.denyRead, directory, {
-              requireAllowMatch: true,
-            })
-          : !isPathWriteAllowed(entry.path, [scope], config.filesystem.denyWrite, directory)
-      ) {
-        scope = entry.path;
-      }
       const allowances = sessionAllowancesFor(sessionAllowances, entry.sessionID);
       const sessionPaths =
         entry.operation === 'read' ? allowances.readPaths : allowances.writePaths;
+      const scopes =
+        entry.operation === 'read'
+          ? readGrantScopesFor(
+              entry.path,
+              [...config.filesystem.allowRead, ...allowances.readPaths],
+              config.filesystem.denyRead,
+              directory,
+            )
+          : writeGrantScopesFor(
+              entry.path,
+              [...config.filesystem.allowWrite, ...allowances.writePaths],
+              config.filesystem.denyWrite,
+              directory,
+            );
       let responseAction: 'allow' | 'deny' = action;
       try {
         if (action === 'allow') {
@@ -489,10 +498,12 @@ const tui: TuiPlugin.Definition = {
             const { globalPath, projectPath } = getConfigPaths(directory);
             writeConfigFile(choice === 'project' ? projectPath : globalPath, {
               filesystem:
-                entry.operation === 'read' ? { allowRead: [scope] } : { allowWrite: [scope] },
+                entry.operation === 'read' ? { allowRead: scopes } : { allowWrite: scopes },
             });
           }
-          if (choice !== 'once') sessionPaths.add(scope);
+          if (choice !== 'once') {
+            for (const scope of scopes) sessionPaths.add(scope);
+          }
         }
       } catch {
         responseAction = 'deny';
@@ -505,7 +516,7 @@ const tui: TuiPlugin.Definition = {
           message:
             responseAction === 'deny'
               ? `${verb} denied: ${entry.path}`
-              : `${verb} allowed (${choice}) under ${scope}`,
+              : `${verb} allowed (${choice}) under ${scopes.join(', ')}`,
           variant: responseAction === 'deny' ? 'warning' : 'success',
         });
       } finally {
@@ -514,23 +525,36 @@ const tui: TuiPlugin.Definition = {
       }
     }
 
-    function resolveNetworkQuery(entry: NetworkQueryEntry, choice: NetworkQueryChoice): void {
+    function resolveNetworkQuery(entry: NetworkQueryEntry, choice: QueryChoice): void {
       if (resolved.has(entry.id)) return;
       const action = choice === 'deny' ? 'deny' : 'allow';
+      let responseAction: 'allow' | 'deny' = action;
 
       try {
-        if (action === 'allow' && choice === 'session') {
-          sessionAllowancesFor(sessionAllowances, entry.sessionID).targets.add(entry.target);
+        if (action === 'allow') {
+          if (path.isAbsolute(entry.target) && (choice === 'project' || choice === 'global')) {
+            const { globalPath, projectPath } = getConfigPaths(entry.directory);
+            writeConfigFile(choice === 'project' ? projectPath : globalPath, {
+              network: { allowUnixSockets: [entry.target] },
+            });
+          }
+          if (choice !== 'once') {
+            sessionAllowancesFor(sessionAllowances, entry.sessionID).targets.add(entry.target);
+          }
         }
+      } catch {
+        responseAction = 'deny';
+      }
 
-        respondQuery(entry.socket, entry.queryId, action);
+      try {
+        respondQuery(entry.socket, entry.queryId, responseAction);
         context.ui.toast.show({
           title: 'Sandbox',
           message:
-            action === 'deny'
+            responseAction === 'deny'
               ? `${entry.operation} denied: ${entry.target}`
               : `${entry.operation} allowed (${choice}): ${entry.target}`,
-          variant: action === 'deny' ? 'warning' : 'success',
+          variant: responseAction === 'deny' ? 'warning' : 'success',
         });
       } finally {
         liveQueries.delete(entry);
@@ -605,12 +629,18 @@ const tui: TuiPlugin.Definition = {
                   trap.operation === 'read'
                     ? evaluateReadAccess(
                         trap.path,
-                        { ...config.filesystem, allowRead: [...allowances.readPaths] },
+                        {
+                          ...config.filesystem,
+                          allowRead: [...config.filesystem.allowRead, ...allowances.readPaths],
+                        },
                         { baseDirectory: sessionDirectory, requireAllowMatch: true },
                       ) === 'allow'
                     : evaluateWriteAccess(
                         trap.path,
-                        { ...config.filesystem, allowWrite: [...allowances.writePaths] },
+                        {
+                          ...config.filesystem,
+                          allowWrite: [...config.filesystem.allowWrite, ...allowances.writePaths],
+                        },
                         { baseDirectory: sessionDirectory },
                       ) === 'allow';
                 if (sessionAllowed) {
@@ -631,11 +661,19 @@ const tui: TuiPlugin.Definition = {
                 liveQueries.add(entry);
                 enqueueEntry(entry);
               } else {
-                if (allowances.targets.has(trap.target)) {
+                const socketAllowed =
+                  allowances.targets.has(trap.target) ||
+                  (path.isAbsolute(trap.target) &&
+                    (config.network.allowAllUnixSockets ||
+                      matchesPathPattern(
+                        trap.target,
+                        config.network.allowUnixSockets,
+                        sessionDirectory,
+                      )));
+                if (socketAllowed) {
                   respondQuery(socket, trap.query_id, 'allow');
                   continue;
                 }
-
                 const entry: NetworkQueryEntry = {
                   kind: 'net-query',
                   id: `landstrip-net:${socketId}:${trap.query_id}`,
