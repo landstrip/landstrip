@@ -2,19 +2,15 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 # Copyright (C) Jarkko Sakkinen 2026
 #
-# Export the darwin release outputs as a container image archive, so a Linux
-# host can package every platform without a macOS toolchain:
+# Export the macOS build container image containing the macOS SDK,
+# so a Linux host can build Darwin targets using cargo-zigbuild:
 #
-#   macOS:  ./scripts/container-export-darwin.sh
-#   Linux:  ./scripts/container-import-darwin.sh dist/landstrip-darwin-<version>.tar
+#   macOS:  ./scripts/container-export-darwin.sh [out.tar]
+#   Linux:  ./scripts/container-import-darwin.sh [out.tar]
 #
-# The archive is a root filesystem holding what `make package` publishes for
-# darwin-arm64 and darwin-x64: the ad-hoc signed binary in the npm package tree
-# and the release tarball with its receipts. Importing it creates a container
-# image with those files, and the importing host stages them with PREBUILT_ROOT.
-# No container runtime is needed here, only on the importing host.
-#
-#   PLATFORMS  darwin platforms to export (default: darwin-arm64 darwin-x64)
+# Env:
+#   SDK       Versioned SDK dir name under CLT SDKs (default: auto-detected)
+#   OUT       Target tarball path (default: dist/landstrip-darwin-build.tar)
 
 set -euo pipefail
 
@@ -26,9 +22,6 @@ cd "$repo_root"
 # shellcheck source=sha256.sh
 source "$script_dir/sha256.sh"
 
-NODE="${NODE:-node}"
-PLATFORMS="${PLATFORMS:-darwin-arm64 darwin-x64}"
-
 die() {
   printf '%s\n' "$1" >&2
   exit 1
@@ -39,50 +32,79 @@ require_command() {
 }
 
 [[ "$(uname -s)" == Darwin ]] \
-  || die "run this script on macOS: darwin release outputs need its signing step"
-for command in "$NODE" git tar; do
-  require_command "$command"
-done
+  || die "run this script on macOS: macOS build image requires the macOS SDK"
+
+require_command tar
+
+archive="${1:-${OUT:-dist/landstrip-darwin-build.tar}}"
+
+CLT_SDKS="/Library/Developer/CommandLineTools/SDKs"
+sdk_path="${SDKROOT:-}"
+
+if [[ -z "$sdk_path" ]]; then
+  if [[ -n "${SDK:-}" && -d "${CLT_SDKS}/${SDK}" ]]; then
+    sdk_path="${CLT_SDKS}/${SDK}"
+  elif command -v xcrun >/dev/null 2>&1; then
+    sdk_path="$(xcrun --show-sdk-path 2>/dev/null || true)"
+  fi
+fi
+
+if [[ -z "$sdk_path" || ! -d "$sdk_path" ]]; then
+  if [[ -d "$CLT_SDKS" ]]; then
+    for candidate in "$CLT_SDKS"/MacOSX*.sdk; do
+      if [[ -d "$candidate" && "$candidate" != *"MacOSX.sdk" ]]; then
+        sdk_path="$candidate"
+        break
+      fi
+    done
+  fi
+fi
+
+[[ -n "$sdk_path" && -d "$sdk_path" ]] \
+  || die "macOS SDK not found (install Xcode or Command Line Tools)"
+
+# Resolve symlinks to find the real SDK path
+sdk_real="$(cd "$sdk_path" && pwd -P)"
+sdk_name="$(basename "$sdk_real")"
+printf '==> packaging macOS SDK: %s (%s)\n' "$sdk_name" "$sdk_real"
 
 workdir="$(mktemp -d)"
 cleanup() {
   local status=$?
-
   rm -rf "$workdir"
   return "$status"
 }
 trap cleanup EXIT
 
-printf '==> packaging %s on this host\n' "$PLATFORMS"
-# shellcheck disable=SC2086
-NODE="$NODE" PACKAGE_STRICT=1 \
-  "$script_dir/../packages/landstrip/scripts/package.sh" $PLATFORMS
-
-version="$("$NODE" -p "require('./packages/landstrip-cli/package.json').version")"
-head_commit="$(git rev-parse HEAD)"
 rootfs="$workdir/rootfs"
-mkdir -p "$rootfs/artifacts"
+mkdir -p "$rootfs/sdk"
 
-for platform in $PLATFORMS; do
-  binary="npm/$platform/bin/landstrip"
-  artifact="artifacts/landstrip-$version-$platform.tar.gz"
+# Copy SDK contents
+cp -a "$sdk_real/." "$rootfs/sdk/"
 
-  for path in "$binary" "$artifact" "$artifact.sha256" "$artifact.commit"; do
-    [[ -f "$path" ]] || die "missing release output: $path"
-  done
-  mkdir -p "$rootfs/npm/$platform/bin"
-  cp "$binary" "$rootfs/npm/$platform/bin/landstrip"
-  cp "$artifact" "$artifact.sha256" "$artifact.commit" "$rootfs/artifacts/"
-done
+# Ensure libc++ headers are inside the SDK
+libcxx_src="/Library/Developer/CommandLineTools/usr/include/c++/v1"
+if [[ ! -f "$rootfs/sdk/usr/include/c++/v1/version" && -d "$libcxx_src" ]]; then
+  mkdir -p "$rootfs/sdk/usr/include/c++"
+  cp -a "$libcxx_src" "$rootfs/sdk/usr/include/c++/"
+fi
 
-printf 'version %s\ncommit %s\nplatforms %s\n' \
-  "$version" "$head_commit" "$PLATFORMS" >"$rootfs/manifest"
+mkdir -p "$(dirname "$archive")"
 
-archive="dist/landstrip-darwin-$version.tar"
-mkdir -p dist
-# macOS tar records com.apple.* xattrs and AppleDouble forks by default, which
-# Linux tar implementations refuse to restore. Ship plain files only.
-tar --no-xattrs --no-mac-metadata -C "$rootfs" -cf "$archive" .
+# Create the archive
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  image="landstrip-darwin-build:latest"
+  printf '==> building container image: %s\n' "$image"
+  docker import \
+    --change 'LABEL org.landstrip.description="macOS build image"' \
+    --change 'ENTRYPOINT ["/dev/null"]' \
+    - "$image" < <(tar --no-xattrs --no-mac-metadata -C "$rootfs" -cf - .) >/dev/null
+  docker save -o "$archive" "$image"
+else
+  printf '==> writing archive: %s\n' "$archive"
+  tar --no-xattrs --no-mac-metadata -C "$rootfs" -cf "$archive" .
+fi
+
 write_sha256_sidecar "$archive"
 
 printf 'exported %s\n' "$archive"

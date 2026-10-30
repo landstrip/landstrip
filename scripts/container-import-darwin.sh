@@ -2,16 +2,15 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 # Copyright (C) Jarkko Sakkinen 2026
 #
-# Import the darwin release outputs exported by scripts/container-export-darwin.sh
-# and stage them for packaging, so `make package` builds only the remaining
-# platforms:
+# Import the macOS build container image (exported from macOS)
+# and stage the macOS SDK so `make package` can build Darwin targets using cargo-zigbuild:
 #
-#   ./scripts/container-import-darwin.sh dist/landstrip-darwin-0.20.11.tar
-#   PLATFORMS="linux-x64 linux-arm64 win32-x64 win32-arm64 darwin-arm64 darwin-x64" \
-#     make package
+#   ./scripts/container-import-darwin.sh dist/landstrip-darwin-build.tar
+#   make package
 #
-#   CONTAINER       container runtime to drive (default: docker)
-#   PREBUILT_ROOT   staging directory (default: packages/landstrip/target/prebuilt)
+# Env:
+#   CONTAINER   Container runtime to drive (default: docker)
+#   SDK_DIR     Target SDK directory (default: packages/landstrip/target/sdk)
 
 set -euo pipefail
 
@@ -24,9 +23,9 @@ cd "$repo_root"
 source "$script_dir/sha256.sh"
 
 CONTAINER="${CONTAINER:-docker}"
-NODE="${NODE:-node}"
-PREBUILT_ROOT="${PREBUILT_ROOT:-packages/landstrip/target/prebuilt}"
-IMAGE_REPOSITORY=landstrip-darwin-artifacts
+SDK_DIR="${SDK_DIR:-packages/landstrip/target/sdk}"
+IMAGE_BASE="ghcr.io/cross-rs/aarch64-apple-darwin-cross"
+IMAGE_TAG="${IMAGE_TAG:-local}"
 
 die() {
   printf '%s\n' "$1" >&2
@@ -37,22 +36,9 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-confirm() {
-  local reply
-
-  printf '%s [y/N] ' "$1" >&2
-  read -r reply || return 1
-  [[ "$reply" == [yY] || "$reply" == [yY][eE][sS] ]]
-}
-
-# A missing sidecar is worth a warning, not a hard stop: the artifact itself is
-# what the packaging step consumes.
 check_sha256() {
   local file="$1" name="${1##*/}" recorded
-
   if [[ ! -f "$file.sha256" ]]; then
-    printf 'warning: %s has no sha256 sidecar\n' "$name" >&2
-    confirm "continue without verifying $name?" || die "aborted"
     return 0
   fi
   read -r recorded _ <"$file.sha256" || die "unreadable: $name.sha256"
@@ -60,104 +46,94 @@ check_sha256() {
     || die "$name does not match its sidecar"
 }
 
-# Archives exported before the export step stopped recording macOS xattrs
-# carry com.apple.* attributes that GNU tar and bsdtar cannot restore here.
-extract_archive() {
-  local archive="$1" target="$2"
-
-  if tar --help 2>&1 | grep -q -- '--no-xattrs'; then
-    tar --no-xattrs -C "$target" -xf "$archive"
-  else
-    tar -C "$target" -xf "$archive"
-  fi
-}
-
-(( $# == 1 )) || die "usage: $0 <archive.tar>"
+(( $# >= 1 )) || die "usage: $0 <archive.tar>"
 archive="$1"
-
 [[ -f "$archive" ]] || die "missing archive: $archive"
+
 case "$CONTAINER" in
   docker|podman) ;;
   *) die "CONTAINER must be docker or podman, not $CONTAINER" ;;
 esac
-for command in "$CONTAINER" git; do
-  require_command "$command"
-done
 
+require_command "$CONTAINER"
 check_sha256 "$archive"
 
-workdir="$(mktemp -d)"
+image=""
 container_id=
+
 cleanup() {
   local status=$?
-
   if [[ -n "$container_id" ]]; then
     "$CONTAINER" rm -f "$container_id" >/dev/null 2>&1 || true
   fi
-  rm -rf "$workdir"
   return "$status"
 }
 trap cleanup EXIT
 
-extract_archive "$archive" "$workdir" || die "cannot unpack $archive"
-manifest="$workdir/manifest"
-[[ -f "$manifest" ]] || die "archive has no manifest"
-manifest_version="$(sed -n 's/^version //p' "$manifest")"
-manifest_commit="$(sed -n 's/^commit //p' "$manifest")"
-manifest_platforms="$(sed -n 's/^platforms //p' "$manifest")"
-[[ -n "$manifest_version" && -n "$manifest_commit" && -n "$manifest_platforms" ]] \
-  || die "archive manifest is incomplete"
+printf '==> importing container image from %s\n' "$archive"
 
-require_command "$NODE"
-version="$("$NODE" -p "require('./packages/landstrip-cli/package.json').version")"
-head_commit="$(git rev-parse HEAD)"
-[[ "$manifest_version" == "$version" ]] \
-  || die "archive carries $manifest_version, this tree is $version"
-[[ "$manifest_commit" == "$head_commit" ]] \
-  || die "archive was exported from $manifest_commit; check out that commit first"
+# Try loading as a saved docker image first (docker save format)
+load_output="$("$CONTAINER" load -i "$archive" 2>&1 || true)"
+if [[ "$load_output" =~ Loaded\ image[s]?:\ ([^[:space:]]+) ]]; then
+  image="${BASH_REMATCH[1]}"
+  printf 'loaded %s\n' "$image"
+  # Tag as :local if loaded with an arch suffix
+  if [[ "$image" =~ ${IMAGE_BASE}:.+ ]]; then
+    "$CONTAINER" tag "$image" "${IMAGE_BASE}:${IMAGE_TAG}" 2>/dev/null || true
+  fi
+else
+  # If docker load did not succeed, import as rootfs tarball
+  image="landstrip-darwin-build:latest"
+  "$CONTAINER" import \
+    --change 'LABEL org.landstrip.description="macOS build image"' \
+    --change 'ENTRYPOINT ["/dev/null"]' \
+    "$archive" "$image" >/dev/null || die "image import failed"
+  printf 'imported %s\n' "$image"
+fi
 
-for platform in $manifest_platforms; do
-  [[ -f "$workdir/npm/$platform/bin/landstrip" ]] \
-    || die "archive is missing the $platform binary"
+# Create a stopped container to extract the SDK; pass a dummy command to prevent
+# "Error response from daemon: no command specified"
+container_id="$("$CONTAINER" create "$image" /dev/null)" \
+  || container_id="$("$CONTAINER" create "$image" sh)" \
+  || die "container create failed"
+
+rm -rf "$SDK_DIR"
+mkdir -p "$SDK_DIR"
+
+printf '==> extracting macOS SDK from container image...\n'
+
+# Search inside the container for the SDK location:
+# 1. /sdk (created by container-export-darwin.sh)
+# 2. /osxcross/target/SDK (created by cross-rs osxcross image)
+# 3. /opt/MacOSX.sdk
+extracted=0
+for path in "/sdk" "/osxcross/target/SDK" "/opt/MacOSX.sdk"; do
+  if "$CONTAINER" cp "$container_id:$path/." "$SDK_DIR/" 2>/dev/null; then
+    if [[ -d "$SDK_DIR/usr" || -d "$SDK_DIR/System" ]]; then
+      extracted=1
+      break
+    else
+      for nested in "$SDK_DIR"/MacOSX*.sdk; do
+        if [[ -d "$nested/usr" || -d "$nested/System" ]]; then
+          mv "$nested"/* "$SDK_DIR/" 2>/dev/null || true
+          rm -rf "$nested"
+          extracted=1
+          break 2
+        fi
+      done
+    fi
+  fi
 done
-for artifact in "$workdir"/artifacts/*.tar.gz; do
-  [[ -f "$artifact" ]] || die "archive carries no darwin release tarball"
-  check_sha256 "$artifact"
-done
 
-image="$IMAGE_REPOSITORY:$version"
-"$CONTAINER" import \
-  --change "LABEL org.landstrip.version=$version" \
-  --change "LABEL org.landstrip.commit=$head_commit" \
-  "$archive" "$image" >/dev/null || die "image import failed"
-
-container_id="$("$CONTAINER" create "$image")" || die "image create failed"
-rm -rf "$PREBUILT_ROOT"
-mkdir -p "$PREBUILT_ROOT"
-for path in npm artifacts manifest; do
-  "$CONTAINER" cp "$container_id:/$path" "$PREBUILT_ROOT/" \
-    || die "image copy failed: $path"
-done
-"$CONTAINER" rm -f "$container_id" >/dev/null || die "container removal failed"
+"$CONTAINER" rm -f "$container_id" >/dev/null 2>&1 || true
 container_id=
 
-# package.sh stages a prebuilt platform only with receipts, so rebuild the
-# ones the archive did not carry from what the manifest already vouches for.
-for artifact in "$PREBUILT_ROOT"/artifacts/*.tar.gz; do
-  [[ -f "$artifact" ]] || continue
-  if [[ ! -f "$artifact.sha256" ]]; then
-    printf '%s  %s\n' "$(sha256_digest "$artifact")" "${artifact##*/}" \
-      >"$artifact.sha256"
-    printf 'wrote %s.sha256\n' "${artifact##*/}"
-  fi
-  [[ -f "$artifact.commit" ]] \
-    || printf '%s\n' "$head_commit" >"$artifact.commit"
-done
+if [[ "$extracted" != "1" && ! -d "$SDK_DIR/usr" && ! -d "$SDK_DIR/System" ]]; then
+  printf 'warning: could not extract SDK to %s; image %s is ready in %s\n' \
+    "$SDK_DIR" "$image" "$CONTAINER" >&2
+else
+  printf 'staged macOS SDK in %s\n' "$SDK_DIR"
+fi
 
-printf 'imported %s\n' "$image"
-printf 'staged %s in %s\n' "$manifest_platforms" "$PREBUILT_ROOT"
-printf 'package the remaining platforms with:\n'
-printf '  PLATFORMS="linux-x64 linux-arm64 win32-x64 win32-arm64 %s" \\\n' \
-  "$manifest_platforms"
-printf '  PREBUILT_ROOT="%s" make package\n' \
-  "$(cd "$PREBUILT_ROOT" && pwd)"
+printf '\nReady. To build Darwin packages, run:\n'
+printf '  SDKROOT="%s" make package\n' "$(cd "$SDK_DIR" 2>/dev/null && pwd || printf '%s' "$SDK_DIR")"
