@@ -56,6 +56,7 @@ impl TryFrom<&AccessPolicy> for SeatbeltProfile {
 
     fn try_from(policy: &AccessPolicy) -> std::result::Result<Self, Self::Error> {
         let rendered = ProfileBuilder::render(policy).map_err(Error::seatbelt)?;
+        log::debug!("seatbelt profile:\n{rendered}");
         CString::new(rendered).map(Self).map_err(|source| {
             Error::seatbelt(format!(
                 "profile: interior nul at offset {}",
