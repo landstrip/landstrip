@@ -8,7 +8,7 @@ use serde::Serialize;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::{MAIN_SEPARATOR, Path, PathBuf};
+use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR, Path, PathBuf};
 
 #[derive(Clone, Copy)]
 struct PathSyntax {
@@ -374,13 +374,23 @@ impl GlobPatternBuf {
 
     pub(crate) fn spellings(&self) -> impl Iterator<Item = Self> + use<'_> {
         let base = self.base();
+        let lexical = base.clean_lexically();
         let canonical = base.canonicalize_existing_prefix().clean_lexically();
-        let base_str = base.to_string_lossy();
+        let lexical_str = lexical.to_string_lossy();
         let canonical_str = canonical.to_string_lossy();
-        let alias = (canonical_str != base_str)
-            .then(|| self.0.strip_prefix(base_str.as_ref()))
-            .flatten()
-            .map(|suffix| Self(format!("{canonical_str}{suffix}")));
+        let alias = (canonical != lexical)
+            .then(|| {
+                self.0.strip_prefix(lexical_str.as_ref()).map(|suffix| {
+                    let sep = if !suffix.starts_with(MAIN_SEPARATOR) && lexical_str.as_ref() != "/"
+                    {
+                        MAIN_SEPARATOR_STR
+                    } else {
+                        ""
+                    };
+                    Self(format!("{canonical_str}{sep}{suffix}"))
+                })
+            })
+            .flatten();
         std::iter::once(self.clone()).chain(alias)
     }
 }
