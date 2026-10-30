@@ -8,6 +8,7 @@ const {
   readdirSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } = require('node:fs');
 const { homedir, tmpdir } = require('node:os');
@@ -34,16 +35,20 @@ function pathUnderDirectory(filePath, dir) {
 
 function sessionAllows(prefixes, filePath) {
   for (const prefix of prefixes) {
-    if (pathUnderDirectory(filePath, prefix)) return true;
+    if (/[*?[\]]/.test(prefix)) {
+      if (matchesPathPattern(filePath, [prefix])) return true;
+    } else if (pathUnderDirectory(filePath, prefix)) {
+      return true;
+    }
   }
   return false;
 }
 
-// The broadest ancestor worth approving in one action: the immediate child of
-// `$HOME` (e.g. `~/.cargo`) for paths under the user's home, the project root
-// for paths under it, otherwise the containing directory. A file sitting
-// directly on a boundary falls back to the exact file so nothing widens
-// silently.
+// The broadest ancestor worth approving in one action: the project root for
+// paths inside it, the application directory under `$HOME` (including XDG
+// multi-app umbrella directories like `~/.cache/<app>` and `~/.config/<app>`),
+// otherwise the containing directory. A file sitting directly on a boundary
+// falls back to the exact file so nothing widens silently.
 function sessionScopeFor(filePath, baseDirectory) {
   const dir = dirname(filePath);
   const homeBoundaries = new Set([homedir()]);
@@ -53,23 +58,35 @@ function sessionScopeFor(filePath, baseDirectory) {
     // $HOME not resolvable — fall back to the raw value only.
   }
 
-  for (const boundary of homeBoundaries) {
-    if (pathUnderDirectory(dir, boundary)) {
-      const first = relative(boundary, dir).split(sep)[0];
-      if (!first) return filePath;
-      return join(boundary, first);
+  if (baseDirectory) {
+    const projectBoundaries = new Set([baseDirectory]);
+    try {
+      projectBoundaries.add(realpathSync.native(baseDirectory));
+    } catch {
+      // Project directory not resolvable — fall back to the raw value only.
+    }
+
+    for (const boundary of projectBoundaries) {
+      if (homeBoundaries.has(boundary)) continue;
+      if (pathUnderDirectory(dir, boundary)) return boundary;
     }
   }
 
-  const projectBoundaries = new Set([baseDirectory]);
-  try {
-    projectBoundaries.add(realpathSync.native(baseDirectory));
-  } catch {
-    // Project directory not resolvable — fall back to the raw value only.
-  }
-
-  for (const boundary of projectBoundaries) {
-    if (pathUnderDirectory(dir, boundary)) return boundary;
+  for (const boundary of homeBoundaries) {
+    if (pathUnderDirectory(dir, boundary)) {
+      const parts = relative(boundary, dir).split(sep).filter(Boolean);
+      if (parts.length === 0) return filePath;
+      if (parts[0] === '.cache' || parts[0] === '.config') {
+        return parts.length >= 2 ? join(boundary, parts[0], parts[1]) : filePath;
+      }
+      if (parts[0] === '.local') {
+        if (parts.length >= 3 && (parts[1] === 'share' || parts[1] === 'state')) {
+          return join(boundary, parts[0], parts[1], parts[2]);
+        }
+        return parts.length >= 2 ? join(boundary, parts[0], parts[1]) : filePath;
+      }
+      return join(boundary, parts[0]);
+    }
   }
 
   return dir;
@@ -462,6 +479,11 @@ function resolveWriteRoots(writeRoots, baseDirectory) {
     const wildcard = lexical.search(/[*?[\]]/);
     const prefix = lexical.slice(0, wildcard);
     const start = prefix.endsWith(sep) ? resolve(prefix) : dirname(prefix);
+    const tail = normalizePathSeparators(lexical.slice(wildcard));
+    if (tail.includes('**')) {
+      addRoot(start);
+      continue;
+    }
     const matcher = globToRegExp(normalizePathForComparison(lexical));
     const pending = [[start, 0]];
     let matched = false;
@@ -495,9 +517,19 @@ function resolveWriteRoots(writeRoots, baseDirectory) {
   return roots;
 }
 
+function rootCanHaveChildren(root, opaqueErrors) {
+  try {
+    return statSync(root).isDirectory();
+  } catch (error) {
+    if (!opaqueErrors.has(error.code)) throw error;
+    return true;
+  }
+}
+
 // Preserve write-root anchoring when lowering relative denies to absolute selectors.
 function resolveWriteDenyPatterns(patterns, baseDirectory, writeRoots = [], options) {
   const anchorRootName = options?.anchorRootName ?? true;
+  const opaqueErrors = new Set(['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM', 'EIO', 'ENOTCONN']);
   const resolved = resolveFilesystemPatterns(patterns, baseDirectory);
   if (!baseDirectory) return resolved;
   const lexicalBase = resolve(baseDirectory);
@@ -516,7 +548,9 @@ function resolveWriteDenyPatterns(patterns, baseDirectory, writeRoots = [], opti
           resolved.push({ literal: canonicalizePath(root, baseDirectory) });
         }
       }
-      if (root !== baseRoot && root !== lexicalBase) resolved.push(resolvePathSelector(pattern, root));
+      if (root !== baseRoot && root !== lexicalBase && rootCanHaveChildren(root, opaqueErrors)) {
+        resolved.push(resolvePathSelector(pattern, root));
+      }
     }
   }
   return resolved;
@@ -998,24 +1032,98 @@ function matchPathSpecificity(filePath, patterns, baseDirectory = process.cwd())
   return best;
 }
 
+function globBase(absPattern) {
+  const wildcard = absPattern.search(/[*?[\]]/);
+  if (wildcard === -1) return absPattern;
+  const prefix = absPattern.slice(0, wildcard);
+  const slash = prefix.lastIndexOf('/');
+  if (slash === -1) return '.';
+  if (slash === 0) return '/';
+  if (slash === 2 && /^[a-zA-Z]:\//.test(prefix)) return prefix.slice(0, 3);
+  return prefix.slice(0, slash);
+}
+
+function pathUnderNormalized(filePath, dir) {
+  const cleanDir = dir === '/' || /^[a-zA-Z]:\/$/.test(dir) ? dir : dir.replace(/\/+$/, '');
+  const cleanFile =
+    filePath === '/' || /^[a-zA-Z]:\/$/.test(filePath) ? filePath : filePath.replace(/\/+$/, '');
+  if (cleanFile === cleanDir) return true;
+  const prefix = cleanDir.endsWith('/') ? cleanDir : `${cleanDir}/`;
+  return cleanFile.startsWith(prefix);
+}
+
+function selectorCarvesOutDeny(allowPattern, denyPattern, baseDirectory) {
+  const { canonical: allowCanonical, isGlob: allowIsGlob } = resolveSelectorForMatch(
+    allowPattern,
+    baseDirectory,
+  );
+  const { canonical: denyCanonical, isGlob: denyIsGlob } = resolveSelectorForMatch(
+    denyPattern,
+    baseDirectory,
+  );
+  if (!allowIsGlob) {
+    return matchesPathPattern(allowCanonical, [denyPattern], baseDirectory);
+  }
+  const allowAbs = normalizePathForComparison(allowCanonical);
+  const denyAbs = normalizePathForComparison(denyCanonical);
+  const allowBase = globBase(allowAbs);
+  if (!denyIsGlob) {
+    return pathUnderNormalized(allowBase, denyAbs);
+  }
+  const denyBase = globBase(denyAbs);
+  if (allowBase !== denyBase) {
+    return pathUnderNormalized(allowBase, denyBase);
+  }
+  const allowTail = allowAbs.slice(allowBase.length);
+  const denyTail = denyAbs.slice(denyBase.length);
+  return (
+    allowAbs === denyAbs ||
+    (!allowTail.includes('**') && denyTail.includes('**')) ||
+    allowAbs.length >= denyAbs.length
+  );
+}
+
 function allowCarvesOutDeny(filePath, allowPatterns, denyPatterns, baseDirectory) {
   for (const denyPattern of denyPatterns) {
     if (!matchesPathPattern(filePath, [denyPattern], baseDirectory)) continue;
-    const { canonical: denyCanonical } = resolveSelectorForMatch(denyPattern, baseDirectory);
-    const carvedOut = allowPatterns.some((allowPattern) => {
-      if (!matchesPathPattern(filePath, [allowPattern], baseDirectory)) return false;
-      const { canonical: allowCanonical, isGlob: allowIsGlob } = resolveSelectorForMatch(
-        allowPattern,
-        baseDirectory,
-      );
-      if (!allowIsGlob) {
-        return matchesPathPattern(allowCanonical, [denyPattern], baseDirectory);
-      }
-      return allowCanonical.length >= denyCanonical.length;
-    });
+    const carvedOut = allowPatterns.some(
+      (allowPattern) =>
+        matchesPathPattern(filePath, [allowPattern], baseDirectory) &&
+        selectorCarvesOutDeny(allowPattern, denyPattern, baseDirectory),
+    );
     if (!carvedOut) return false;
   }
   return true;
+}
+
+function scopedGlobCarveout(filePath, scope, denyPattern, baseDirectory) {
+  if (process.platform === 'win32') return null;
+  const { canonical: denyCanonical, isGlob: denyIsGlob } = resolveSelectorForMatch(
+    denyPattern,
+    baseDirectory,
+  );
+  if (!denyIsGlob) return null;
+
+  const scopeCanonical = canonicalizePath(scope, baseDirectory);
+  const scopeNorm = normalizePathSeparators(scopeCanonical).replace(/\/+$/, '');
+  const denyNorm = normalizePathSeparators(denyCanonical);
+  const scopeCmp = normalizePathForComparison(scopeCanonical);
+  const denyBaseCmp = globBase(normalizePathForComparison(denyCanonical));
+
+  let candidate = null;
+  if (pathUnderNormalized(denyBaseCmp, scopeCmp)) {
+    candidate = denyNorm;
+  } else if (pathUnderNormalized(scopeCmp, denyBaseCmp)) {
+    const denyBaseNorm = globBase(denyNorm);
+    const suffix = denyBaseNorm === '/' ? denyNorm.slice(1) : denyNorm.slice(denyBaseNorm.length + 1);
+    if (suffix.startsWith('**/')) {
+      candidate = `${scopeNorm}/${suffix}`;
+    }
+  }
+  if (!candidate) return null;
+  if (!matchesPathPattern(filePath, [candidate], baseDirectory)) return null;
+  if (!selectorCarvesOutDeny(candidate, denyPattern, baseDirectory)) return null;
+  return candidate;
 }
 
 function isPathReadAllowed(
@@ -1056,6 +1164,85 @@ function shouldPromptForWrite(
   baseDirectory = process.cwd(),
 ) {
   return !isPathWriteAllowed(filePath, allowWrite, denyWrite, baseDirectory);
+}
+
+function writeGrantScopesFor(
+  filePath,
+  allowWrite,
+  denyWrite,
+  baseDirectory = process.cwd(),
+  scope = sessionScopeFor(filePath, baseDirectory),
+) {
+  if (scope === filePath) return [filePath];
+  const existingAllow = Array.isArray(allowWrite) ? allowWrite : [];
+  const denyPatterns = Array.isArray(denyWrite) ? denyWrite : [];
+  const withScope = [...existingAllow, scope];
+  if (isPathWriteAllowed(filePath, withScope, denyPatterns, baseDirectory)) {
+    return [scope];
+  }
+
+  const resolvedDeny = resolveWriteDenyPatterns(denyPatterns, baseDirectory, withScope, {
+    anchorRootName: false,
+  });
+  const carveouts = [];
+  for (const denyPattern of resolvedDeny) {
+    if (!matchesPathPattern(filePath, [denyPattern], baseDirectory)) continue;
+    const alreadyCarved = withScope.some(
+      (allowPattern) =>
+        matchesPathPattern(filePath, [allowPattern], baseDirectory) &&
+        selectorCarvesOutDeny(allowPattern, denyPattern, baseDirectory),
+    );
+    if (alreadyCarved) continue;
+    const carveout = scopedGlobCarveout(filePath, scope, denyPattern, baseDirectory);
+    if (!carveout) return [filePath];
+    if (!carveouts.includes(carveout)) carveouts.push(carveout);
+  }
+  if (
+    carveouts.length > 0 &&
+    isPathWriteAllowed(filePath, [...existingAllow, ...carveouts], denyPatterns, baseDirectory)
+  ) {
+    return carveouts;
+  }
+  return [filePath];
+}
+
+function readGrantScopesFor(
+  filePath,
+  allowRead,
+  denyRead,
+  baseDirectory = process.cwd(),
+  scope = sessionScopeFor(filePath, baseDirectory),
+) {
+  if (scope === filePath) return [filePath];
+  const existingAllow = Array.isArray(allowRead) ? allowRead : [];
+  const denyPatterns = Array.isArray(denyRead) ? denyRead : [];
+  const withScope = [...existingAllow, scope];
+  if (isPathReadAllowed(filePath, withScope, denyPatterns, baseDirectory, { requireAllowMatch: true })) {
+    return [scope];
+  }
+
+  const carveouts = [];
+  for (const denyPattern of denyPatterns) {
+    if (!matchesPathPattern(filePath, [denyPattern], baseDirectory)) continue;
+    const alreadyCarved = withScope.some(
+      (allowPattern) =>
+        matchesPathPattern(filePath, [allowPattern], baseDirectory) &&
+        selectorCarvesOutDeny(allowPattern, denyPattern, baseDirectory),
+    );
+    if (alreadyCarved) continue;
+    const carveout = scopedGlobCarveout(filePath, scope, denyPattern, baseDirectory);
+    if (!carveout) return [filePath];
+    if (!carveouts.includes(carveout)) carveouts.push(carveout);
+  }
+  if (
+    carveouts.length > 0 &&
+    isPathReadAllowed(filePath, [...existingAllow, ...carveouts], denyPatterns, baseDirectory, {
+      requireAllowMatch: true,
+    })
+  ) {
+    return carveouts;
+  }
+  return [filePath];
 }
 
 function evaluateReadAccess(filePath, filesystem = {}, options) {
@@ -1390,6 +1577,8 @@ module.exports = {
   isPathReadAllowed,
   isPathWriteAllowed,
   shouldPromptForWrite,
+  writeGrantScopesFor,
+  readGrantScopesFor,
   evaluateReadAccess,
   evaluateWriteAccess,
   isDomainAllowed,

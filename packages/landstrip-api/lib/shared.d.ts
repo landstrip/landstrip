@@ -209,6 +209,21 @@ export function shouldPromptForWrite(
   baseDirectory?: string,
 ): boolean;
 
+export function writeGrantScopesFor(
+  filePath: string,
+  allowWrite: LandstripPathSelector[],
+  denyWrite: LandstripPathSelector[],
+  baseDirectory?: string,
+  scope?: string,
+): string[];
+
+export function readGrantScopesFor(
+  filePath: string,
+  allowRead: LandstripPathSelector[],
+  denyRead: LandstripPathSelector[],
+  baseDirectory?: string,
+  scope?: string,
+): string[];
 export function evaluateReadAccess(
   filePath: string,
   filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile,
