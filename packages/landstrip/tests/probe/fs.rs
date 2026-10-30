@@ -119,7 +119,8 @@ impl Probe for FdMetadata {
                 let Ok(link) = std::ffi::CString::new(link) else {
                     return 2;
                 };
-                if libc::link(path.as_ptr(), link.as_ptr()) != 0 || libc::unlink(path.as_ptr()) != 0 {
+                if libc::link(path.as_ptr(), link.as_ptr()) != 0 || libc::unlink(path.as_ptr()) != 0
+                {
                     return 2;
                 }
                 libc::fchmod(file.as_raw_fd(), 0o600)
@@ -128,7 +129,8 @@ impl Probe for FdMetadata {
                 // Exercise the pinned O_PATH target, not the ordinary descriptor above.
                 let results = unsafe {
                     [
-                        libc::syscall(SYS_FCHMODAT2, libc::AT_FDCWD, path.as_ptr(), 0o600, 0) as i32,
+                        libc::syscall(SYS_FCHMODAT2, libc::AT_FDCWD, path.as_ptr(), 0o600, 0)
+                            as i32,
                         libc::fchownat(
                             libc::AT_FDCWD,
                             path.as_ptr(),
@@ -169,7 +171,8 @@ impl Probe for FdMetadata {
                     )
                 };
                 return i32::from(
-                    rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
+                    rc != -1
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
                 );
             }
             Some("fchmodat2-nofollow") => {
@@ -222,7 +225,8 @@ impl Probe for FdMetadata {
                     )
                 };
                 return i32::from(
-                    rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
+                    rc != -1
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
                 );
             }
             Some("utimensat-invalid") => {
@@ -235,7 +239,8 @@ impl Probe for FdMetadata {
                     )
                 };
                 return i32::from(
-                    rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
+                    rc != -1
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL),
                 );
             }
             Some("x32-fchmod") => {
@@ -271,7 +276,8 @@ impl Probe for FdMetadata {
                     )
                 };
                 return i32::from(
-                    rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ERANGE),
+                    rc != -1
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ERANGE),
                 );
             }
             Some("fremovexattr") => unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) },
@@ -293,13 +299,15 @@ impl Probe for FdMetadata {
             Some("chmod-null") => {
                 let rc = unsafe { libc::chmod(std::ptr::null(), 0o600) };
                 return i32::from(
-                    rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EFAULT),
+                    rc != -1
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EFAULT),
                 );
             }
             Some("chmod-empty") => {
                 let rc = unsafe { libc::chmod(c"".as_ptr(), 0o600) };
                 return i32::from(
-                    rc != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT),
+                    rc != -1
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT),
                 );
             }
             _ => return 2,
@@ -550,7 +558,8 @@ impl Probe for Openat2 {
                 };
                 // A trailing slash requires the terminal directory symlink to be followed.
                 // SAFETY: trailing is NUL-terminated.
-                let trailing_fd = unsafe { libc::open(trailing.as_ptr(), flags | libc::O_DIRECTORY) };
+                let trailing_fd =
+                    unsafe { libc::open(trailing.as_ptr(), flags | libc::O_DIRECTORY) };
                 if trailing_fd < 0 {
                     return 1;
                 }
@@ -642,7 +651,9 @@ impl Probe for Openat2 {
                     Ok(fd) => {
                         let mut file = std::fs::File::from(fd);
                         let mut contents = String::new();
-                        i32::from(file.read_to_string(&mut contents).is_err() || contents != "inside\n")
+                        i32::from(
+                            file.read_to_string(&mut contents).is_err() || contents != "inside\n",
+                        )
                     }
                     Err(_) => 1,
                 }

@@ -250,10 +250,7 @@ impl ProfileBuilder {
         regex
     }
 
-    fn render_pattern_filter(
-        pattern: &GlobPatternBuf,
-        carveouts: &Carveouts,
-    ) -> String {
+    fn render_pattern_filter(pattern: &GlobPatternBuf, carveouts: &Carveouts) -> String {
         let regex = Self::glob_to_sbpl_regex(pattern.as_str());
         let escaped = escape_sbpl_regex_literal(&regex);
         let glob = pattern.as_glob();

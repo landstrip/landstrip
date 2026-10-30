@@ -94,16 +94,19 @@ impl Carveouts {
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn matches_pattern(&self, path: &Path) -> bool {
-        self.patterns.iter().any(|pattern| pattern.matches_tree(path))
+        self.patterns
+            .iter()
+            .any(|pattern| pattern.matches_tree(path))
     }
 
     pub(crate) fn overrides_root(&self, deny_root: &Path, path: &Path) -> bool {
         self.roots
             .iter()
             .any(|carveout| carveout.as_path().overrides_deny(deny_root) && path.is_under(carveout))
-            || self.patterns.iter().any(|allow| {
-                allow.as_glob().overrides_deny(deny_root) && allow.matches_tree(path)
-            })
+            || self
+                .patterns
+                .iter()
+                .any(|allow| allow.as_glob().overrides_deny(deny_root) && allow.matches_tree(path))
     }
 
     pub(crate) fn overrides_pattern(&self, deny: &GlobPatternBuf, path: &Path) -> bool {

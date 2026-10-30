@@ -9,7 +9,9 @@ use super::{
 };
 use crate::config::{PathSelector, SandboxDarwin, SandboxFilesystem, SandboxNetwork, Settings};
 use crate::error::{Error, PathIo};
-use crate::paths::{GlobPattern, GlobPatternBuf, NormalizePatterns, NormalizeRoots, OverridesDeny, PathExt};
+use crate::paths::{
+    GlobPattern, GlobPatternBuf, NormalizePatterns, NormalizeRoots, OverridesDeny, PathExt,
+};
 use anyhow::Result;
 use std::env;
 use std::fs;
@@ -170,11 +172,8 @@ impl ResolvedDenyPaths {
             .collect();
         self.concrete.retain(|deny| !roots.contains(deny));
         let patterns = &self.patterns;
-        let matches_pattern = |path: &Path| {
-            patterns
-                .iter()
-                .any(|pattern| pattern.matches_tree(path))
-        };
+        let matches_pattern =
+            |path: &Path| patterns.iter().any(|pattern| pattern.matches_tree(path));
         self.expanded.retain(|candidate| {
             !roots
                 .iter()
@@ -764,4 +763,3 @@ fn effective_denied_roots(read_deny: &[PathBuf], read_allow: &[PathBuf]) -> Vec<
         .cloned()
         .collect()
 }
-

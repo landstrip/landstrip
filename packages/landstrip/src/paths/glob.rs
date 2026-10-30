@@ -441,8 +441,14 @@ impl OverridesDeny<GlobPattern<'_>> for GlobPattern<'_> {
             return false;
         }
         let base_str = allow_base.to_string_lossy();
-        let allow_tail = self.pattern.strip_prefix(base_str.as_ref()).unwrap_or(self.pattern);
-        let deny_tail = deny.pattern.strip_prefix(base_str.as_ref()).unwrap_or(deny.pattern);
+        let allow_tail = self
+            .pattern
+            .strip_prefix(base_str.as_ref())
+            .unwrap_or(self.pattern);
+        let deny_tail = deny
+            .pattern
+            .strip_prefix(base_str.as_ref())
+            .unwrap_or(deny.pattern);
         self.pattern == deny.pattern
             || (!allow_tail.contains("**") && deny_tail.contains("**"))
             || self.pattern.len() >= deny.pattern.len()
