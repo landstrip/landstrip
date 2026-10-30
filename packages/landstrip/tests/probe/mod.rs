@@ -5,34 +5,39 @@ pub mod fs;
 pub mod net;
 pub mod process;
 
+pub trait Probe {
+    fn run(&self, args: &mut std::env::ArgsOs) -> i32;
+}
+
 /// Dispatches a probe subcommand to its implementation.
 ///
 /// Returns `Some(exit_code)` if `subcommand` matches a known probe name,
 /// or `None` if it is not a probe command.
 pub fn dispatch(subcommand: &std::ffi::OsStr, mut args: std::env::ArgsOs) -> Option<i32> {
     let sub = subcommand.to_str()?;
-    match sub {
-        "opath" => Some(fs::opath_probe(args.next())),
-        "futimens" => Some(fs::futimens_probe(args.next())),
-        "truncate" => Some(fs::truncate_probe(args.next())),
-        "unlink" => Some(fs::unlink_probe(args.next())),
-        "exclusive-open" => Some(fs::exclusive_open_probe(args.next())),
-        "openat2" => Some(fs::openat2_probe(args.next(), args.next())),
-        "fd-metadata" => Some(fs::fd_metadata_probe(args.next(), args.next())),
-        "abstract-connect" => Some(net::abstract_connect_probe(args.next())),
-        "unix-connect" => Some(net::unix_connect_probe(args.next())),
-        "unix-bind" => Some(net::unix_bind_probe(args.next())),
-        "route-socket" => Some(net::route_socket_probe()),
-        "udp-bind" => Some(net::udp_bind_probe()),
-        "udp-local" => Some(net::udp_local_probe()),
-        "udp-remote" => Some(net::udp_remote_probe()),
-        "signal-outside" => Some(process::signal_outside_probe()),
-        "signal-thread" => Some(process::signal_thread_probe()),
-        "io-uring" => Some(process::io_uring_probe()),
-        "namespace-proc" => Some(process::namespace_proc_probe(args.next(), args.next())),
-        "namespace-network-denied" => Some(process::namespace_network_denied_probe()),
-        "namespace-lifetime" => Some(process::namespace_lifetime_probe(args.next(), args.next())),
-        "daemon" => Some(process::daemon_probe(args.next(), args.next())),
-        _ => None,
-    }
+    let probe: &dyn Probe = match sub {
+        "opath" => &fs::Opath,
+        "futimens" => &fs::Futimens,
+        "truncate" => &fs::Truncate,
+        "unlink" => &fs::Unlink,
+        "exclusive-open" => &fs::ExclusiveOpen,
+        "openat2" => &fs::Openat2,
+        "fd-metadata" => &fs::FdMetadata,
+        "abstract-connect" => &net::AbstractConnect,
+        "unix-connect" => &net::UnixConnect,
+        "unix-bind" => &net::UnixBind,
+        "route-socket" => &net::RouteSocket,
+        "udp-bind" => &net::UdpBind,
+        "udp-local" => &net::UdpLocal,
+        "udp-remote" => &net::UdpRemote,
+        "signal-outside" => &process::SignalOutside,
+        "signal-thread" => &process::SignalThread,
+        "io-uring" => &process::IoUring,
+        "namespace-proc" => &process::NamespaceProc,
+        "namespace-network-denied" => &process::NamespaceNetworkDenied,
+        "namespace-lifetime" => &process::NamespaceLifetime,
+        "daemon" => &process::Daemon,
+        _ => return None,
+    };
+    Some(probe.run(&mut args))
 }
