@@ -8,7 +8,12 @@ import {
   isDomainAllowed,
   isPathReadAllowed,
   shouldPromptForWrite,
+  sessionScopeFor,
+  writeGrantScopesFor,
+  readGrantScopesFor,
 } from '@landstrip/landstrip-api/shared';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 describe('access evaluation helpers in pi-landstrip', () => {
   const cwd = '/workspace/project';
@@ -124,5 +129,36 @@ describe('access evaluation helpers in pi-landstrip', () => {
         cwd,
       ),
     ).toBe(false);
+  });
+
+  it('calculates session scopes for project and XDG application trees', () => {
+    const home = homedir();
+    expect(sessionScopeFor('/workspace/project/src/index.ts', cwd)).toBe(cwd);
+    expect(sessionScopeFor(join(home, '.cache', 'goosedump', 'certs', 'key.pem'), cwd)).toBe(
+      join(home, '.cache', 'goosedump'),
+    );
+    expect(sessionScopeFor(join(home, '.config', 'goosedump', 'config.json'), cwd)).toBe(
+      join(home, '.config', 'goosedump'),
+    );
+    expect(sessionScopeFor(join(home, '.local', 'share', 'myapp', 'state.db'), cwd)).toBe(
+      join(home, '.local', 'share', 'myapp'),
+    );
+    expect(sessionScopeFor(join(home, '.cargo', 'bin', 'cargo'), cwd)).toBe(join(home, '.cargo'));
+  });
+
+  it('determines grant scopes with scoped glob carveouts', () => {
+    const home = homedir();
+    const certPath = join(home, '.cache', 'goosedump', 'certs', 'key.pem');
+    const appScope = join(home, '.cache', 'goosedump');
+    const denyPatterns = ['**/*.pem', '**/*.key'];
+
+    const scopes = writeGrantScopesFor(certPath, [], denyPatterns, cwd, appScope);
+    expect(scopes).toEqual([`${appScope}/**/*.pem`]);
+
+    const readHomeScopes = readGrantScopesFor(certPath, [], ['/home'], cwd, appScope);
+    expect(readHomeScopes).toEqual([appScope]);
+
+    const readGlobScopes = readGrantScopesFor(certPath, ['/'], [`${home}/**/*.pem`], cwd, appScope);
+    expect(readGlobScopes).toEqual([`${appScope}/**/*.pem`]);
   });
 });

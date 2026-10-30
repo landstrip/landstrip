@@ -61,7 +61,6 @@ import {
   isDenialTrap,
   isFilesystemTrap,
   isPathReadAllowed,
-  isPathWriteAllowed,
   isRecord,
   isQueryTrap,
   matchesPathPattern,
@@ -79,6 +78,8 @@ import {
   sessionScopeFor,
   writeLandstripPolicyFile,
   shouldPromptForWrite,
+  writeGrantScopesFor,
+  readGrantScopesFor,
   normalizeBlockedPath,
   extractNativeDeniedPath,
   extractNativeWriteDeniedPath,
@@ -122,7 +123,7 @@ import {
   workerConfigFromEnvironment,
 } from './subagents.ts';
 import { Type, type Static } from 'typebox';
-import { getPiConfigPaths } from './config.ts';
+import { getPiConfigPaths, isProjectTrusted } from './config.ts';
 import { formatError, PermissionPromptCoordinator } from './util.ts';
 import { Text } from '@earendil-works/pi-tui';
 
@@ -209,24 +210,30 @@ interface PromptOption {
   hint?: string;
 }
 
-const PERMISSION_OPTIONS: PromptOption[] = [
-  { label: 'Allow once', action: 'once' },
-  { label: 'Allow for this session', action: 'session' },
-  {
-    label: 'Allow for this project',
-    action: 'project',
-    confirm: true,
-    hint: 'save to .pi/sandbox.json',
-  },
-  {
-    label: 'Allow for all projects',
-    action: 'global',
-    confirm: true,
-    hint: 'save to ~/.pi/agent/sandbox.json',
-  },
-  { label: 'Keep blocked', action: 'abort' },
-];
-
+function permissionOptionsFor(ctx: ExtensionContext): PromptOption[] {
+  const options: PromptOption[] = [
+    { label: 'Allow once', action: 'once' },
+    { label: 'Allow for this session', action: 'session' },
+  ];
+  if (isProjectTrusted(ctx)) {
+    options.push({
+      label: 'Allow for this project',
+      action: 'project',
+      confirm: true,
+      hint: 'save to .pi/sandbox.json',
+    });
+  }
+  options.push(
+    {
+      label: 'Allow for all projects',
+      action: 'global',
+      confirm: true,
+      hint: 'save to ~/.pi/agent/sandbox.json',
+    },
+    { label: 'Keep blocked', action: 'abort' },
+  );
+  return options;
+}
 const NETWORK_PERMISSION_OPTIONS: PromptOption[] = [
   { label: 'Allow once', action: 'once' },
   { label: 'Allow for this session', action: 'session' },
@@ -613,7 +620,7 @@ function promptReadBlock(
   const title = reason
     ? `Read blocked: "${filePath}" is in denyRead (${reason})`
     : `Read blocked: "${filePath}" is not in allowRead`;
-  return showPermissionPrompt(ctx, title, PERMISSION_OPTIONS, signal, label);
+  return showPermissionPrompt(ctx, title, permissionOptionsFor(ctx), signal, label);
 }
 
 function promptWriteBlock(
@@ -626,7 +633,7 @@ function promptWriteBlock(
   const title = reason
     ? `Write blocked: "${filePath}" is in denyWrite (${reason})`
     : `Write blocked: "${filePath}" is not in allowWrite`;
-  return showPermissionPrompt(ctx, title, PERMISSION_OPTIONS, signal, label);
+  return showPermissionPrompt(ctx, title, permissionOptionsFor(ctx), signal, label);
 }
 
 // Write the full environment to a temporary shell file.
@@ -787,8 +794,10 @@ export interface LandstripIntegration extends PiLandstripRuntimeV3 {
       timeout?: number;
       signal?: AbortSignal;
       onData?: (chunk: Buffer) => void;
+      onErrorFd?: (chunk: Buffer) => void;
       env?: NodeJS.ProcessEnv;
       promptOnBlock?: boolean;
+      permissionPromptLabel?: string;
     },
     ctx: ExtensionContext,
   ): Promise<{ exitCode: number | null }>;
@@ -882,8 +891,12 @@ function createLandstripIntegrationWithPrompts(
   let subagentRuntime: SubagentRuntime | undefined = options.subagentRuntime;
   let projectConfigTrusted = false;
 
-  function loadConfig(cwd: string): ReturnType<typeof loadSandboxConfig> {
-    return loadSandboxConfig(cwd, projectConfigTrusted);
+  function isProjectConfigTrusted(ctx = activeContext): boolean {
+    return ctx ? isProjectTrusted(ctx) : projectConfigTrusted;
+  }
+
+  function loadConfig(cwd: string, ctx = activeContext): ReturnType<typeof loadSandboxConfig> {
+    return loadSandboxConfig(cwd, isProjectConfigTrusted(ctx));
   }
 
   let sandboxEnabled = false;
@@ -900,8 +913,8 @@ function createLandstripIntegrationWithPrompts(
   const sessionAllowedDomains: string[] = [];
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
+  const sessionAllowedUnixSockets: string[] = [];
   const sessionAllowedTargets: string[] = [];
-
   function getContext(ctx = activeContext): LandstripContextV3 {
     return {
       version: LANDSTRIP_RUNTIME_VERSION,
@@ -1116,15 +1129,27 @@ function createLandstripIntegrationWithPrompts(
     };
   }
 
+  function resolvePersistedConfigPath(
+    cwd: string,
+    choice: Exclude<PermissionChoice, 'abort'>,
+    ctx = activeContext,
+  ): string | undefined {
+    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+    if (choice === 'project') {
+      return isProjectConfigTrusted(ctx) ? projectPath : undefined;
+    }
+    if (choice === 'global') return globalPath;
+    return undefined;
+  }
+
   async function applyDomainChoice(
+    ctx: ExtensionContext,
     choice: Exclude<PermissionChoice, 'abort'>,
     domain: string,
     cwd: string,
     allowances?: ExecutionAllowances,
   ): Promise<void> {
-    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
-    const configPath =
-      choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
+    const configPath = resolvePersistedConfigPath(cwd, choice, ctx);
     if (configPath) {
       await addConfigValue(
         configPath,
@@ -1143,6 +1168,35 @@ function createLandstripIntegrationWithPrompts(
     if (target && !target.includes(domain)) target.push(domain);
   }
 
+  async function applyUnixSocketChoice(
+    ctx: ExtensionContext,
+    choice: Exclude<PermissionChoice, 'abort'>,
+    socketPath: string,
+    key: string,
+    cwd: string,
+    allowances?: ExecutionAllowances,
+  ): Promise<void> {
+    const configPath = resolvePersistedConfigPath(cwd, choice, ctx);
+    if (configPath) {
+      await addConfigValue(
+        configPath,
+        socketPath,
+        (config) => config.network?.allowUnixSockets ?? [],
+        (config, allowUnixSockets) => {
+          config.network = { ...config.network, allowUnixSockets };
+        },
+      );
+    }
+    if (choice === 'once') {
+      if (allowances && !allowances.targets.includes(key)) allowances.targets.push(key);
+    } else {
+      if (!sessionAllowedUnixSockets.includes(socketPath)) {
+        sessionAllowedUnixSockets.push(socketPath);
+      }
+      if (!sessionAllowedTargets.includes(key)) sessionAllowedTargets.push(key);
+    }
+  }
+
   // Breadth-first: approve the broadest reasonable ancestor of the blocked file
   // (see sessionScopeFor) instead of the exact path, so the still-running
   // command stops prompting for sibling files under the same tree. When the
@@ -1152,9 +1206,11 @@ function createLandstripIntegrationWithPrompts(
     verb: string,
     choice: Exclude<PermissionChoice, 'abort'>,
     filePath: string,
-    scope: string,
+    scopes: readonly string[],
   ): void {
-    if (scope !== filePath) notify(ctx, `${verb} allowed (${choice}): ${scope}`, 'info');
+    if (scopes.length !== 1 || scopes[0] !== filePath) {
+      notify(ctx, `${verb} allowed (${choice}): ${scopes.join(', ')}`, 'info');
+    }
   }
 
   async function applyReadChoice(
@@ -1165,36 +1221,39 @@ function createLandstripIntegrationWithPrompts(
     allowances?: ExecutionAllowances,
     scope = sessionScopeFor(filePath, cwd),
   ): Promise<void> {
-    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
-    if (
-      allowances?.explicitDenyRead &&
-      !readAllowed(
-        filePath,
-        [scope],
-        mergeArray(loadConfig(cwd).filesystem.denyRead, [
+    const config = loadConfig(cwd, ctx);
+    const effectiveDenyRead = allowances?.explicitDenyRead
+      ? mergeArray(config.filesystem.denyRead, [
           ...allowances.explicitDenyRead.patterns,
           ...[...allowances.explicitDenyRead.globRoots.values()].flat(),
-        ]),
-        cwd,
-      )
-    )
-      scope = filePath;
-    const configPath =
-      choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
+        ])
+      : config.filesystem.denyRead;
+    const scopes = readGrantScopesFor(
+      filePath,
+      getEffectiveAllowRead(config, cwd, allowances),
+      effectiveDenyRead,
+      cwd,
+      scope,
+    );
+    const configPath = resolvePersistedConfigPath(cwd, choice, ctx);
     if (configPath) {
-      await addConfigValue(
-        configPath,
-        scope,
-        (config) => config.filesystem?.allowRead ?? [],
-        (config, allowRead) => {
-          config.filesystem = { ...config.filesystem, allowRead };
-        },
-      );
+      for (const entry of scopes) {
+        await addConfigValue(
+          configPath,
+          entry,
+          (cfg) => cfg.filesystem?.allowRead ?? [],
+          (cfg, allowRead) => {
+            cfg.filesystem = { ...cfg.filesystem, allowRead };
+          },
+        );
+      }
     }
     const target = choice === 'once' ? allowances?.readPaths : sessionAllowedReadPaths;
-    if (target && !target.includes(scope)) target.push(scope);
-    allowances?.explicitDenyRead?.approvedPaths.push(scope);
-    noteScope(ctx, 'Read', choice, filePath, scope);
+    for (const entry of scopes) {
+      if (target && !target.includes(entry)) target.push(entry);
+      allowances?.explicitDenyRead?.approvedPaths.push(entry);
+    }
+    noteScope(ctx, 'Read', choice, filePath, scopes);
   }
 
   async function applyWriteChoice(
@@ -1204,26 +1263,31 @@ function createLandstripIntegrationWithPrompts(
     cwd: string,
     allowances?: ExecutionAllowances,
   ): Promise<void> {
-    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
-    let scope = sessionScopeFor(filePath, cwd);
-    if (!isPathWriteAllowed(filePath, [scope], loadConfig(cwd).filesystem.denyWrite, cwd)) {
-      scope = filePath;
-    }
-    const configPath =
-      choice === 'project' ? projectPath : choice === 'global' ? globalPath : undefined;
+    const config = loadConfig(cwd, ctx);
+    const scopes = writeGrantScopesFor(
+      filePath,
+      getEffectiveAllowWrite(config, allowances),
+      config.filesystem.denyWrite,
+      cwd,
+    );
+    const configPath = resolvePersistedConfigPath(cwd, choice, ctx);
     if (configPath) {
-      await addConfigValue(
-        configPath,
-        scope,
-        (config) => config.filesystem?.allowWrite ?? [],
-        (config, allowWrite) => {
-          config.filesystem = { ...config.filesystem, allowWrite };
-        },
-      );
+      for (const entry of scopes) {
+        await addConfigValue(
+          configPath,
+          entry,
+          (cfg) => cfg.filesystem?.allowWrite ?? [],
+          (cfg, allowWrite) => {
+            cfg.filesystem = { ...cfg.filesystem, allowWrite };
+          },
+        );
+      }
     }
     const target = choice === 'once' ? allowances?.writePaths : sessionAllowedWritePaths;
-    if (target && !target.includes(scope)) target.push(scope);
-    noteScope(ctx, 'Write', choice, filePath, scope);
+    for (const entry of scopes) {
+      if (target && !target.includes(entry)) target.push(entry);
+    }
+    noteScope(ctx, 'Write', choice, filePath, scopes);
   }
 
   async function authorizeFilesystemToolAccess(
@@ -1263,7 +1327,7 @@ function createLandstripIntegrationWithPrompts(
     };
 
     const current = (): FilesystemToolAuthorization | undefined => {
-      const config = loadConfig(ctx.cwd);
+      const config = loadConfig(ctx.cwd, ctx);
       if (!config.enabled) return { allowed: true, prompted: false };
       for (const access of normalized) {
         const denied =
@@ -1296,13 +1360,13 @@ function createLandstripIntegrationWithPrompts(
     return permissionPrompts.resolve(
       current,
       async (promptSignal) => {
-        const blocked = blockedAccesses(loadConfig(ctx.cwd));
+        const blocked = blockedAccesses(loadConfig(ctx.cwd, ctx));
         const paths = blocked.map(({ operation, path }) => `${operation}: ${path}`).join('\n');
         const note = options.authorizationNote ? `\n\n${options.authorizationNote}` : '';
         const choice = await showPermissionPrompt(
           ctx,
           `Filesystem policy blocked this tool call:\n${paths}${note}`,
-          PERMISSION_OPTIONS,
+          permissionOptionsFor(ctx),
           promptSignal,
         );
         if (choice === 'abort' || promptSignal.aborted) {
@@ -1329,7 +1393,7 @@ function createLandstripIntegrationWithPrompts(
     signal?: AbortSignal,
   ): Promise<boolean> {
     const current = (): boolean | undefined => {
-      const config = loadConfig(cwd);
+      const config = loadConfig(cwd, ctx);
       const decision = evaluateDomainAccess(domain, config.network, {
         allowedDomainsOverrides: [...sessionAllowedDomains, ...(allowances?.domains ?? [])],
       });
@@ -1345,12 +1409,12 @@ function createLandstripIntegrationWithPrompts(
         const choice = await showPermissionPrompt(
           ctx,
           `Network blocked: "${domain}" is not in the allowed domains list`,
-          PERMISSION_OPTIONS,
+          permissionOptionsFor(ctx),
           promptSignal,
           allowances?.permissionPromptLabel,
         );
         if (choice === 'abort' || promptSignal.aborted) return false;
-        await applyDomainChoice(choice, domain, cwd, allowances);
+        await applyDomainChoice(ctx, choice, domain, cwd, allowances);
         return true;
       },
       signal,
@@ -1362,8 +1426,9 @@ function createLandstripIntegrationWithPrompts(
     proxyPort: number | null,
     audience: PolicyAudience,
     allowances?: ExecutionAllowances,
+    ctx = activeContext,
   ): LandstripPolicy {
-    const config = loadConfig(cwd);
+    const config = loadConfig(cwd, ctx);
     const readPolicy = resolveProcessReadPolicy(
       audience,
       config.shell.readAccess,
@@ -1375,7 +1440,13 @@ function createLandstripIntegrationWithPrompts(
     );
 
     return assembleLandstripPolicy({
-      network: config.network,
+      network: {
+        ...config.network,
+        allowUnixSockets: mergeAllowances(
+          config.network.allowUnixSockets,
+          sessionAllowedUnixSockets,
+        ),
+      },
       filesystem: {
         ...readPolicy,
         denyReadAlways: mergeArray(config.filesystem.denyReadAlways, allowances?.protectedPaths),
@@ -1394,9 +1465,10 @@ function createLandstripIntegrationWithPrompts(
     proxyPort: number | null,
     audience: PolicyAudience,
     allowances?: ExecutionAllowances,
+    ctx = activeContext,
   ): { dir: string; path: string } {
     return writeLandstripPolicyFile(
-      buildLandstripPolicy(cwd, proxyPort, audience, allowances),
+      buildLandstripPolicy(cwd, proxyPort, audience, allowances, ctx),
       'pi-landstrip-',
     );
   }
@@ -1411,7 +1483,7 @@ function createLandstripIntegrationWithPrompts(
   ): Promise<{ port: number; stop: () => Promise<void> }> {
     return startFilterProxy({
       isDomainAllowed: async (domain) => {
-        const config = loadConfig(cwd);
+        const config = loadConfig(cwd, ctx);
         if (domainMatchesAny(domain, config.network.deniedDomains)) return false;
         return ensureDomainAllowed(ctx, domain, cwd, allowances, signal);
       },
@@ -1456,17 +1528,32 @@ function createLandstripIntegrationWithPrompts(
     signal?: AbortSignal,
     readScope?: string,
   ): Promise<TrapQueryResult> {
-    // The broker knows only address:port, and no sandbox field can express a grant
-    // for one non-loopback endpoint: allowedDomains is enforced by the proxy,
-    // allowLocalBinding grants all loopback endpoints, and allowNetwork disables
-    // network enforcement. So a non-loopback connection is granted for the session
-    // or not at all.
+    // Non-loopback IP endpoints only carry address:port and can only be granted
+    // for the current command or session. Filesystem Unix domain sockets carry
+    // their socket path and can also be persisted to network.allowUnixSockets.
     if (trap.kind !== 'filesystem') {
       const key = `${trap.operation}\u0000${trap.target}`;
-      const current = (): TrapQueryResult | undefined =>
-        sessionAllowedTargets.includes(key) || allowances.targets.includes(key)
-          ? { action: 'allow' }
-          : undefined;
+      const isUnixSocket = isAbsolute(trap.target);
+      const socketPath = isUnixSocket ? normalizeBlockedPath(trap.target, cwd) : trap.target;
+      const current = (): TrapQueryResult | undefined => {
+        if (sessionAllowedTargets.includes(key) || allowances.targets.includes(key)) {
+          return { action: 'allow' };
+        }
+        if (isUnixSocket) {
+          const config = loadConfig(cwd, ctx);
+          if (
+            config.network.allowAllUnixSockets ||
+            matchesPattern(
+              socketPath,
+              mergeAllowances(config.network.allowUnixSockets, sessionAllowedUnixSockets),
+              cwd,
+            )
+          ) {
+            return { action: 'allow' };
+          }
+        }
+        return undefined;
+      };
       const existing = current();
       if (existing) return existing;
       if (!ctx.hasUI || !promptOnBlock) return { action: 'deny', reason: 'unprompted' };
@@ -1476,15 +1563,21 @@ function createLandstripIntegrationWithPrompts(
         async (promptSignal) => {
           const choice = await showPermissionPrompt(
             ctx,
-            `Network blocked: ${trap.operation} "${trap.target}"`,
-            NETWORK_PERMISSION_OPTIONS,
+            isUnixSocket
+              ? `Unix socket blocked: ${trap.operation} "${socketPath}"`
+              : `Network blocked: ${trap.operation} "${trap.target}"`,
+            isUnixSocket ? permissionOptionsFor(ctx) : NETWORK_PERMISSION_OPTIONS,
             promptSignal,
             allowances.permissionPromptLabel,
           );
           if (choice === 'abort' || promptSignal.aborted)
             return { action: 'deny', reason: 'rejected' };
-          const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
-          if (!targets.includes(key)) targets.push(key);
+          if (isUnixSocket) {
+            await applyUnixSocketChoice(ctx, choice, socketPath, key, cwd, allowances);
+          } else {
+            const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
+            if (!targets.includes(key)) targets.push(key);
+          }
           return { action: 'allow' };
         },
         signal,
@@ -1496,7 +1589,7 @@ function createLandstripIntegrationWithPrompts(
       if (matchesPattern(path, allowances.protectedPaths ?? [], cwd)) {
         return { action: 'deny', reason: 'hard-deny' };
       }
-      const config = loadConfig(cwd);
+      const config = loadConfig(cwd, ctx);
       if (
         trap.operation === 'read' &&
         matchesPattern(path, config.filesystem.denyReadAlways, cwd)
@@ -1563,7 +1656,7 @@ function createLandstripIntegrationWithPrompts(
     return permissionPrompts.resolve(
       current,
       async (promptSignal) => {
-        const config = loadConfig(cwd);
+        const config = loadConfig(cwd, ctx);
         const choice =
           trap.operation === 'read'
             ? await promptReadBlock(
@@ -1743,7 +1836,7 @@ function createLandstripIntegrationWithPrompts(
       options.command,
       options.cwd,
     );
-    const config = loadConfig(options.cwd);
+    const config = loadConfig(options.cwd, options.ctx);
     const explicitDenyGlobRoots = new Map<string, string[]>();
     processAllowances.explicitDenyRead = {
       patterns: config.explicitDenyRead,
@@ -1908,7 +2001,10 @@ function createLandstripIntegrationWithPrompts(
   async function prepareProcess(
     options: LandstripProcessOptions,
   ): Promise<LandstripPreparedProcess> {
-    if (process.platform === 'win32' && (getNoSandboxFlag() || !loadConfig(options.cwd).enabled)) {
+    if (
+      process.platform === 'win32' &&
+      (getNoSandboxFlag() || !loadConfig(options.cwd, options.ctx).enabled)
+    ) {
       throw new Error('Generic process preparation requires sandboxing on Windows');
     }
     return prepareManagedProcess({
@@ -2035,7 +2131,7 @@ function createLandstripIntegrationWithPrompts(
         if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
 
         const provider = activeShellProvider();
-        const config = loadConfig(cwd);
+        const config = loadConfig(cwd, ctx);
         const { token: proxyToken, authorization: proxyAuthorization } = createProxyCredentials();
         const proxy = shouldStartProxy(config)
           ? await startProxy(
@@ -2085,7 +2181,7 @@ function createLandstripIntegrationWithPrompts(
             invocation.executable,
             cwd,
           );
-          policy = writePolicyFile(cwd, proxy?.port ?? null, 'shell', processAllowances);
+          policy = writePolicyFile(cwd, proxy?.port ?? null, 'shell', processAllowances, ctx);
           landstripArgs = ['run', '-p', policy.path];
           if (process.platform !== 'win32') landstripArgs.push('--trap', '3');
           landstripArgs.push('--', invocation.executable, ...invocation.args);
@@ -2371,7 +2467,7 @@ function createLandstripIntegrationWithPrompts(
       return [...new Set(formatLandstripTraps(landstripErrors).split('\n'))].join('\n');
     };
     const blockedReadPathForRetry = (nativeOutput: string): string | null => {
-      const config = loadConfig(ctx.cwd);
+      const config = loadConfig(ctx.cwd, ctx);
       if (!enforcesShellReadPolicy(config.shell.readAccess)) return null;
 
       const trappedPath = extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'read');
@@ -2399,7 +2495,7 @@ function createLandstripIntegrationWithPrompts(
           getEffectiveAllowWrite(config, allowances),
         );
       const current = (): boolean | undefined => {
-        const config = loadConfig(ctx.cwd);
+        const config = loadConfig(ctx.cwd, ctx);
         if (
           operation === 'read'
             ? matchesPattern(blockedPath, config.filesystem.denyReadAlways, ctx.cwd)
@@ -2426,7 +2522,7 @@ function createLandstripIntegrationWithPrompts(
       const access = await permissionPrompts.resolve(
         current,
         async (promptSignal) => {
-          const config = loadConfig(ctx.cwd);
+          const config = loadConfig(ctx.cwd, ctx);
           const choice =
             operation === 'read'
               ? await promptReadBlock(
@@ -2461,7 +2557,7 @@ function createLandstripIntegrationWithPrompts(
         signal,
       );
       if (!access) {
-        const config = loadConfig(ctx.cwd);
+        const config = loadConfig(ctx.cwd, ctx);
         if (operation === 'write' && isWriteDeniedAlways(config)) {
           notify(
             ctx,
@@ -2472,7 +2568,7 @@ function createLandstripIntegrationWithPrompts(
         return null;
       }
 
-      const config = loadConfig(ctx.cwd);
+      const config = loadConfig(ctx.cwd, ctx);
       if (operation === 'write' && isWriteDeniedAlways(config)) {
         notify(
           ctx,
@@ -2632,7 +2728,7 @@ function createLandstripIntegrationWithPrompts(
   }
 
   function enableSandbox(ctx: ExtensionContext): boolean {
-    const config = loadConfig(ctx.cwd);
+    const config = loadConfig(ctx.cwd, ctx);
 
     if (!SUPPORTED_PLATFORMS.has(process.platform)) {
       sandboxEnabled = false;
@@ -2674,7 +2770,7 @@ function createLandstripIntegrationWithPrompts(
       return false;
     }
 
-    const config = loadConfig(ctx.cwd);
+    const config = loadConfig(ctx.cwd, ctx);
     if (!config.enabled) {
       disableSandbox(ctx);
       return false;
@@ -2803,10 +2899,10 @@ function createLandstripIntegrationWithPrompts(
       sessionAllowedDomains.length = 0;
       sessionAllowedReadPaths.length = 0;
       sessionAllowedWritePaths.length = 0;
+      sessionAllowedUnixSockets.length = 0;
       sessionAllowedTargets.length = 0;
       unsandboxedWorkerWarningShown = false;
-      const trustContext = ctx as ExtensionContext & { isProjectTrusted?: () => boolean };
-      projectConfigTrusted = trustContext.isProjectTrusted?.() ?? false;
+      projectConfigTrusted = isProjectTrusted(ctx);
       if (getNoSandboxFlag()) {
         disableSandbox(ctx);
         notify(ctx, 'Sandbox disabled via --no-sandbox', 'warning');
@@ -2814,7 +2910,7 @@ function createLandstripIntegrationWithPrompts(
         return;
       }
 
-      const config = loadConfig(ctx.cwd);
+      const config = loadConfig(ctx.cwd, ctx);
       if (!config.enabled) {
         disableSandbox(ctx);
         notify(ctx, 'Sandbox disabled via config', 'info');
@@ -2839,7 +2935,7 @@ function createLandstripIntegrationWithPrompts(
     scope: SandboxConfigScope,
   ): Promise<void> {
     await writeSandboxConfigEnabled(ctx.cwd, enabled, scope);
-    const effectiveEnabled = loadConfig(ctx.cwd).enabled;
+    const effectiveEnabled = loadConfig(ctx.cwd, ctx).enabled;
     if (!effectiveEnabled) {
       disableSandbox(ctx);
     } else if (!getNoSandboxFlag()) {
@@ -2908,13 +3004,29 @@ function createLandstripIntegrationWithPrompts(
         timeout?: number;
         signal?: AbortSignal;
         onData?: (chunk: Buffer) => void;
+        onErrorFd?: (chunk: Buffer) => void;
         env?: NodeJS.ProcessEnv;
         promptOnBlock?: boolean;
+        permissionPromptLabel?: string;
       },
       ctx: ExtensionContext,
     ): Promise<{ exitCode: number | null }> {
+      const allowances: ExecutionAllowances = {
+        permissionPromptLabel: execOptions.permissionPromptLabel,
+        domains: [],
+        readPaths: [],
+        writePaths: [],
+        targets: [],
+      };
       const ops = ensureSandboxState(ctx)
-        ? createLandstripBashOps(ctx, { promptOnBlock: execOptions.promptOnBlock ?? false })
+        ? createLandstripBashOps(
+            ctx,
+            {
+              promptOnBlock: execOptions.promptOnBlock ?? false,
+              onErrorFd: execOptions.onErrorFd,
+            },
+            allowances,
+          )
         : externalShellProvider !== undefined
           ? createProviderBashOps()
           : createLocalBashOperations();

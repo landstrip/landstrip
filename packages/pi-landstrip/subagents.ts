@@ -42,7 +42,12 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from '@earendil-works/pi-tui';
-import { canonicalizeHost, canonicalizePath } from '@landstrip/landstrip-api/shared';
+import {
+  canonicalizeHost,
+  canonicalizePath,
+  formatLandstripTraps,
+  parseLandstripTraps,
+} from '@landstrip/landstrip-api/shared';
 import { Type } from 'typebox';
 
 import {
@@ -763,7 +768,8 @@ function taskProgress(task: TaskRecord): string[] {
 }
 
 function workerDialogTitle(task: TaskRecord, title?: string): string {
-  const label = `@${task.agent} · ${task.description} · ${task.id.slice(0, 8)}`;
+  const actor = task.kind === 'command' || task.agent === 'bash' ? '$ bash' : `@${task.agent}`;
+  const label = `${actor} · ${task.description} · ${task.id.slice(0, 8)}`;
   return title === undefined ? label : `${label}\n${title}`;
 }
 
@@ -3230,13 +3236,18 @@ export class SubagentRuntime implements CommandSubagentRuntime {
 
     const runPromise = (async () => {
       try {
+        let trapBuffer = '';
         const result = await this.integration.runSandboxedCommand!(
           params.command,
           ctx.cwd,
           {
             timeout: params.timeout,
             signal: controller.signal,
-            promptOnBlock: false,
+            promptOnBlock: ctx.hasUI,
+            permissionPromptLabel: workerDialogTitle(task),
+            onErrorFd: (chunk: Buffer) => {
+              trapBuffer += chunk.toString('utf8');
+            },
             onData: (chunk: Buffer) => {
               try {
                 writeSync(outputFd, chunk);
@@ -3246,7 +3257,14 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           },
           ctx,
         );
-
+        const traps = parseLandstripTraps(trapBuffer);
+        if (traps.length > 0) {
+          const formatted = [...new Set(formatLandstripTraps(traps).split('\n'))].join('\n');
+          try {
+            writeSync(outputFd, Buffer.from(`${formatted}\n`, 'utf8'));
+          } catch {}
+          this.notifyTaskUpdate();
+        }
         task.exitCode = result.exitCode;
         if (task.state !== 'cancelled') {
           task.state = result.exitCode === 0 ? 'completed' : 'error';
