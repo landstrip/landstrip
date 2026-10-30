@@ -6,8 +6,8 @@
 use super::unix::close_inherited_fds;
 use crate::config::SandboxDarwin;
 use crate::error::Error;
-use crate::paths::{GlobPattern, PathExt};
-use crate::policy::{AccessPolicy, NetworkAccess, ReadAccess, UnixSocketAccess};
+use crate::paths::{GlobPatternBuf, OverridesDeny, PathExt};
+use crate::policy::{AccessPolicy, Carveouts, NetworkAccess, ReadAccess, UnixSocketAccess};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -250,17 +250,27 @@ impl ProfileBuilder {
         regex
     }
 
-    fn render_pattern_filter(pattern: &str, carveouts: &[PathBuf]) -> String {
-        let regex = Self::glob_to_sbpl_regex(pattern);
+    fn render_pattern_filter(
+        pattern: &GlobPatternBuf,
+        carveouts: &Carveouts,
+    ) -> String {
+        let regex = Self::glob_to_sbpl_regex(pattern.as_str());
         let escaped = escape_sbpl_regex_literal(&regex);
-        let glob = GlobPattern::new(pattern);
+        let glob = pattern.as_glob();
         let filter = format!("(regex #\"{escaped}\")");
         let matching_carveouts: Vec<&Path> = carveouts
+            .roots
             .iter()
             .map(PathBuf::as_path)
             .filter(|carveout| glob.matches_tree(carveout))
             .collect();
-        if matching_carveouts.is_empty() {
+        let matching_patterns: Vec<&str> = carveouts
+            .patterns
+            .iter()
+            .filter(|allow| allow.overrides_deny(&glob))
+            .map(GlobPatternBuf::as_str)
+            .collect();
+        if matching_carveouts.is_empty() && matching_patterns.is_empty() {
             return filter;
         }
 
@@ -268,6 +278,11 @@ impl ProfileBuilder {
         for carveout in matching_carveouts {
             let escaped_carveout = escape_sbpl_literal(&carveout.to_string_lossy());
             let _ = write!(wrapped, " (require-not (subpath \"{escaped_carveout}\"))");
+        }
+        for allow in matching_patterns {
+            let allow_regex = Self::glob_to_sbpl_regex(allow);
+            let escaped_allow = escape_sbpl_regex_literal(&allow_regex);
+            let _ = write!(wrapped, " (require-not (regex #\"{escaped_allow}\"))");
         }
         wrapped.push(')');
         wrapped
@@ -278,6 +293,11 @@ impl ProfileBuilder {
         for root in &policy.write_roots {
             let escaped = escape_sbpl_literal(&root.to_string_lossy());
             writeln!(self.sb, "(allow file-write* (subpath \"{escaped}\"))")?;
+        }
+        for pattern in &policy.write_carveouts.patterns {
+            let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+            let escaped = escape_sbpl_regex_literal(&regex);
+            writeln!(self.sb, "(allow file-write* (regex #\"{escaped}\"))")?;
         }
         if policy.macos.allow_pty {
             writeln!(self.sb, "(allow pseudo-tty)")?;
@@ -295,10 +315,21 @@ impl ProfileBuilder {
                 "(deny file-write* (subpath \"{escaped}\"){message})"
             )?;
         }
-        for carveout in &policy.write_carveouts {
+        for carveout in &policy.write_carveouts.roots {
             if carveout.is_under_any(&policy.write_denied_roots) {
                 let escaped = escape_sbpl_literal(&carveout.to_string_lossy());
                 writeln!(self.sb, "(allow file-write* (subpath \"{escaped}\"))")?;
+            }
+        }
+        for pattern in &policy.write_carveouts.patterns {
+            if policy
+                .write_denied_roots
+                .iter()
+                .any(|root| pattern.overrides_deny(root.as_path()))
+            {
+                let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+                let escaped = escape_sbpl_regex_literal(&regex);
+                writeln!(self.sb, "(allow file-write* (regex #\"{escaped}\"))")?;
             }
         }
 
@@ -316,7 +347,7 @@ impl ProfileBuilder {
             )?;
         }
         for pattern in &policy.write_denied_always_patterns {
-            let regex = Self::glob_to_sbpl_regex(pattern);
+            let regex = Self::glob_to_sbpl_regex(pattern.as_str());
             let escaped = escape_sbpl_regex_literal(&regex);
             writeln!(
                 self.sb,
@@ -324,7 +355,7 @@ impl ProfileBuilder {
             )?;
         }
 
-        if !policy.write_roots.is_empty() {
+        if !policy.write_roots.is_empty() || policy.write_carveouts.has_patterns() {
             self.write_unlink_rules(policy)?;
         }
 
@@ -378,11 +409,16 @@ impl ProfileBuilder {
             .iter()
             .chain(policy.read_denied_patterns.iter())
         {
-            let base = GlobPattern::new(pattern).base();
+            let base = pattern.base();
             for ancestor in base.ancestors() {
                 if ancestor != Path::new("/")
                     && !is_granted_root(ancestor)
-                    && ancestor.is_under_any(&policy.write_roots)
+                    && (ancestor.is_under_any(&policy.write_roots)
+                        || policy
+                            .write_carveouts
+                            .patterns
+                            .iter()
+                            .any(|allow| ancestor.is_under(&allow.base())))
                 {
                     ancestors.push(ancestor.to_path_buf());
                 }
@@ -411,13 +447,26 @@ impl ProfileBuilder {
                     let escaped = escape_sbpl_literal(&root.to_string_lossy());
                     writeln!(self.sb, "(allow file-read* (subpath \"{escaped}\"))")?;
                 }
+                for pattern in &policy.read_carveouts.patterns {
+                    let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+                    let escaped = escape_sbpl_regex_literal(&regex);
+                    writeln!(self.sb, "(allow file-read* (regex #\"{escaped}\"))")?;
+                }
                 if policy.macos.allow_pty {
                     writeln!(
                         self.sb,
                         "(allow file-read* (literal \"/dev/ptmx\") (regex #\"^/dev/ttys\"))"
                     )?;
                 }
-                self.parent_dir_rules(roots)?;
+                let mut parent_roots = roots.clone();
+                parent_roots.extend(
+                    policy
+                        .read_carveouts
+                        .patterns
+                        .iter()
+                        .map(GlobPatternBuf::base),
+                );
+                self.parent_dir_rules(&parent_roots)?;
                 self.symlink_metadata_rules(&policy.read_symlinks)?;
             }
         }
@@ -431,9 +480,43 @@ impl ProfileBuilder {
                 self.message
             )?;
         }
+        for carveout in &policy.read_carveouts.roots {
+            if carveout.is_under_any(&policy.read_denied_roots) {
+                let escaped = escape_sbpl_literal(&carveout.to_string_lossy());
+                writeln!(self.sb, "(allow file-read* (subpath \"{escaped}\"))")?;
+            }
+        }
+        for pattern in &policy.read_carveouts.patterns {
+            if policy
+                .read_denied_roots
+                .iter()
+                .any(|root| pattern.overrides_deny(root.as_path()))
+            {
+                let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+                let escaped = escape_sbpl_regex_literal(&regex);
+                writeln!(self.sb, "(allow file-read* (regex #\"{escaped}\"))")?;
+            }
+        }
         for pattern in &policy.read_denied_patterns {
             let filter = Self::render_pattern_filter(pattern, &policy.read_carveouts);
             writeln!(self.sb, "(deny file-read* {filter}{})", self.message)?;
+        }
+        for root in &policy.read_denied_always_roots {
+            let escaped = escape_sbpl_literal(&root.to_string_lossy());
+            writeln!(
+                self.sb,
+                "(deny file-read* (subpath \"{escaped}\"){})",
+                self.message
+            )?;
+        }
+        for pattern in &policy.read_denied_always_patterns {
+            let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+            let escaped = escape_sbpl_regex_literal(&regex);
+            writeln!(
+                self.sb,
+                "(deny file-read* (regex #\"{escaped}\"){})",
+                self.message
+            )?;
         }
 
         Ok(())

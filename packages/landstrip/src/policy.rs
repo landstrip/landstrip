@@ -26,7 +26,7 @@ use crate::config::{AppContainerMode, SandboxDarwin};
 use crate::error::Error;
 #[cfg(target_os = "linux")]
 use crate::paths::NormalizeRoots;
-use crate::paths::{GlobPattern, PathExt};
+use crate::paths::{GlobPattern, GlobPatternBuf, OverridesDeny, PathExt};
 #[cfg(target_os = "linux")]
 use nix::sys::stat::fstat;
 use serde::Serialize;
@@ -54,16 +54,16 @@ pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
     pub(crate) write_denied_roots: Vec<PathBuf>,
     pub(crate) write_denied_always_roots: Box<[PathBuf]>,
-    pub(crate) write_denied_always_patterns: Box<[String]>,
-    pub(crate) write_denied_patterns: Vec<String>,
-    pub(crate) write_carveouts: Vec<PathBuf>,
+    pub(crate) write_denied_always_patterns: Box<[GlobPatternBuf]>,
+    pub(crate) write_denied_patterns: Vec<GlobPatternBuf>,
+    pub(crate) write_carveouts: Carveouts,
     pub(crate) write_denied_links: DeniedLinks,
     pub(crate) read_access: ReadAccess,
     pub(crate) read_denied_roots: Vec<PathBuf>,
-    pub(crate) read_denied_patterns: Vec<String>,
-    pub(crate) read_carveouts: Vec<PathBuf>,
+    pub(crate) read_denied_patterns: Vec<GlobPatternBuf>,
+    pub(crate) read_carveouts: Carveouts,
     pub(crate) read_denied_always_roots: Box<[PathBuf]>,
-    pub(crate) read_denied_always_patterns: Box<[String]>,
+    pub(crate) read_denied_always_patterns: Box<[GlobPatternBuf]>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) read_symlinks: Vec<PathBuf>,
     pub(crate) network_access: NetworkAccess,
@@ -77,6 +77,44 @@ pub(crate) struct AccessPolicy {
     pub(crate) allow_windows_loopback: bool,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) allow_windows_additive_grants: bool,
+}
+
+#[derive(Debug, Default, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Carveouts {
+    pub(crate) roots: Vec<PathBuf>,
+    pub(crate) patterns: Vec<GlobPatternBuf>,
+}
+
+impl Carveouts {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn has_patterns(&self) -> bool {
+        !self.patterns.is_empty()
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn matches_pattern(&self, path: &Path) -> bool {
+        self.patterns.iter().any(|pattern| pattern.matches_tree(path))
+    }
+
+    pub(crate) fn overrides_root(&self, deny_root: &Path, path: &Path) -> bool {
+        self.roots
+            .iter()
+            .any(|carveout| carveout.as_path().overrides_deny(deny_root) && path.is_under(carveout))
+            || self.patterns.iter().any(|allow| {
+                allow.as_glob().overrides_deny(deny_root) && allow.matches_tree(path)
+            })
+    }
+
+    pub(crate) fn overrides_pattern(&self, deny: &GlobPatternBuf, path: &Path) -> bool {
+        self.roots
+            .iter()
+            .any(|carveout| carveout.overrides_deny(deny) && path.is_under(carveout))
+            || self
+                .patterns
+                .iter()
+                .any(|allow| allow.overrides_deny(deny) && allow.matches_tree(path))
+    }
 }
 
 /// How strongly a denied link is protected: `always` links cannot be removed
@@ -158,11 +196,12 @@ pub(crate) enum DenialReason {
 // The write broker that consults these lives only in the Linux seccomp path.
 #[cfg(target_os = "linux")]
 impl AccessPolicy {
-    /// Whether a write to `canonical` lands in the `denyWrite` deny-list. Glob
-    /// patterns in `write_denied_patterns` are evaluated dynamically so files
-    /// created after sandbox startup are also blocked.
     pub(crate) fn write_denied(&self) -> DenyRuleSet<'_> {
-        DenyRuleSet::new(&self.write_denied_roots, &self.write_denied_patterns)
+        DenyRuleSet::with_carveouts(
+            &self.write_denied_roots,
+            &self.write_denied_patterns,
+            &self.write_carveouts,
+        )
     }
 
     pub(crate) fn write_denied_always(&self) -> DenyRuleSet<'_> {
@@ -173,7 +212,11 @@ impl AccessPolicy {
     }
 
     pub(crate) fn read_denied(&self) -> DenyRuleSet<'_> {
-        DenyRuleSet::new(&self.read_denied_roots, &self.read_denied_patterns)
+        DenyRuleSet::with_carveouts(
+            &self.read_denied_roots,
+            &self.read_denied_patterns,
+            &self.read_carveouts,
+        )
     }
 
     pub(crate) fn read_denied_always(&self) -> DenyRuleSet<'_> {
@@ -184,22 +227,7 @@ impl AccessPolicy {
     }
 
     pub(crate) fn is_write_denied(&self, canonical: &Path) -> bool {
-        self.is_write_denied_always(canonical, canonical)
-            || self.write_denied_roots.iter().any(|root| {
-                canonical.is_under(root)
-                    && !self
-                        .write_carveouts
-                        .iter()
-                        .any(|carveout| carveout.is_under(root) && canonical.is_under(carveout))
-            })
-            || self.write_denied_patterns.iter().any(|pattern| {
-                let glob = GlobPattern::new(pattern);
-                glob.matches_tree(canonical)
-                    && !self
-                        .write_carveouts
-                        .iter()
-                        .any(|carveout| canonical.is_under(carveout) && glob.matches_tree(carveout))
-            })
+        self.is_write_denied_always(canonical, canonical) || self.write_denied().matches(canonical)
     }
 
     /// A denied subtree is only as strong as the symlinks leading into it:
@@ -217,16 +245,7 @@ impl AccessPolicy {
     }
 
     pub(crate) fn is_read_denied(&self, path: &Path) -> bool {
-        path.is_under_any(&self.read_denied_roots)
-            || self.is_read_denied_always(path)
-            || self.read_denied_patterns.iter().any(|pattern| {
-                let glob = GlobPattern::new(pattern);
-                glob.matches_tree(path)
-                    && !self
-                        .read_carveouts
-                        .iter()
-                        .any(|carveout| path.is_under(carveout) && glob.matches_tree(carveout))
-            })
+        self.is_read_denied_always(path) || self.read_denied().matches(path)
     }
 
     pub(crate) fn is_read_denied_always(&self, path: &Path) -> bool {
@@ -234,11 +253,11 @@ impl AccessPolicy {
     }
 
     pub(crate) fn has_read_denied_under(&self, dir: &Path) -> bool {
-        self.read_denied().has_denied_under(dir)
+        self.has_read_denied_always_under(dir) || self.read_denied().has_denied_under(dir)
     }
 
     pub(crate) fn has_write_denied_under(&self, dir: &Path) -> bool {
-        self.write_denied().has_denied_under(dir)
+        self.has_write_denied_always_under(dir) || self.write_denied().has_denied_under(dir)
     }
 
     pub(crate) fn has_read_denied_always_under(&self, dir: &Path) -> bool {
@@ -261,7 +280,10 @@ impl AccessPolicy {
     ) -> Option<DenialReason> {
         if self.is_write_denied(canonical) {
             Some(DenialReason::DenyMatch)
-        } else if surface_allow_miss && !canonical.is_under_any(&self.write_roots) {
+        } else if surface_allow_miss
+            && !canonical.is_under_any(&self.write_roots)
+            && !self.write_carveouts.matches_pattern(canonical)
+        {
             Some(DenialReason::AllowMiss)
         } else {
             None
@@ -274,7 +296,7 @@ impl AccessPolicy {
             ReadAccess::AllowRoots(roots) => {
                 if self.is_read_denied(path) {
                     Some(DenialReason::DenyMatch)
-                } else if path.is_under_any(roots) {
+                } else if path.is_under_any(roots) || self.read_carveouts.matches_pattern(path) {
                     None
                 } else {
                     Some(DenialReason::AllowMiss)
@@ -563,30 +585,93 @@ impl AccessPolicy {
 #[derive(Clone, Copy)]
 pub(crate) struct DenyRuleSet<'a> {
     roots: &'a [PathBuf],
-    patterns: &'a [String],
+    patterns: &'a [GlobPatternBuf],
+    carveouts: Option<&'a Carveouts>,
 }
 
 impl<'a> DenyRuleSet<'a> {
-    pub(crate) fn new(roots: &'a [PathBuf], patterns: &'a [String]) -> Self {
-        Self { roots, patterns }
+    pub(crate) fn new(roots: &'a [PathBuf], patterns: &'a [GlobPatternBuf]) -> Self {
+        Self {
+            roots,
+            patterns,
+            carveouts: None,
+        }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn with_carveouts(
+        roots: &'a [PathBuf],
+        patterns: &'a [GlobPatternBuf],
+        carveouts: &'a Carveouts,
+    ) -> Self {
+        Self {
+            roots,
+            patterns,
+            carveouts: Some(carveouts),
+        }
+    }
+
+    pub(crate) fn roots(self) -> &'a [PathBuf] {
+        self.roots
+    }
+
+    pub(crate) fn patterns(self) -> &'a [GlobPatternBuf] {
+        self.patterns
     }
 
     pub(crate) fn matches(self, path: &Path) -> bool {
-        path.is_under_any(self.roots) || self.matches_patterns(path)
+        self.roots.iter().any(|root| {
+            path.is_under(root)
+                && !self
+                    .carveouts
+                    .is_some_and(|carveouts| carveouts.overrides_root(root, path))
+        }) || self.matches_patterns(path)
     }
 
     pub(crate) fn matches_patterns(self, path: &Path) -> bool {
-        self.patterns
-            .iter()
-            .any(|pattern| GlobPattern::new(pattern).matches_tree(path))
+        self.patterns.iter().any(|pattern| {
+            pattern.matches_tree(path)
+                && !self
+                    .carveouts
+                    .is_some_and(|carveouts| carveouts.overrides_pattern(pattern, path))
+        })
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn has_denied_under(self, dir: &Path) -> bool {
-        self.roots.iter().any(|root| root.is_under(dir))
-            || self
-                .patterns
+        let root_denied = self
+            .roots
+            .iter()
+            .any(|root| root.is_under(dir) && (self.carveouts.is_none() || self.matches(root)));
+        root_denied
+            || self.patterns.iter().any(|pattern| match self.carveouts {
+                None => pattern.as_glob().matches_under(dir),
+                Some(carveouts) => {
+                    !carveouts.patterns.contains(pattern)
+                        && pattern
+                            .as_glob()
+                            .has_unexcused_under(dir, |candidate| self.matches(candidate))
+                }
+            })
+    }
+}
+
+impl OverridesDeny<DenyRuleSet<'_>> for Path {
+    fn overrides_deny(&self, deny: &DenyRuleSet<'_>) -> bool {
+        deny.roots().iter().any(|root| self.overrides_deny(root))
+            || deny
+                .patterns()
                 .iter()
-                .any(|pattern| GlobPattern::new(pattern).matches_under(dir))
+                .any(|pattern| self.overrides_deny(pattern))
+    }
+}
+
+impl OverridesDeny<DenyRuleSet<'_>> for GlobPattern<'_> {
+    fn overrides_deny(&self, deny: &DenyRuleSet<'_>) -> bool {
+        deny.roots().iter().any(|root| self.overrides_deny(root))
+            || deny
+                .patterns()
+                .iter()
+                .any(|pattern| self.overrides_deny(pattern))
     }
 }

@@ -109,6 +109,21 @@ impl PathSelector {
         let raw = self.as_str();
         !Path::new(raw).has_root() && raw != "~" && !raw.starts_with("~/")
     }
+
+    pub(crate) fn literal_path(path: &Path) -> Self {
+        Self::Literal {
+            literal: path.to_string_lossy().into_owned(),
+        }
+    }
+
+    pub(crate) fn join_under(&self, root: &Path) -> Self {
+        let joined = root.join(self.as_str()).to_string_lossy().into_owned();
+        match self {
+            Self::Literal { .. } => Self::Literal { literal: joined },
+            Self::Glob { .. } => Self::Glob { glob: joined },
+            Self::Bare(_) => Self::Bare(joined),
+        }
+    }
 }
 
 impl AsRef<str> for PathSelector {

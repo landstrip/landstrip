@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub(crate) mod glob;
 
-pub(crate) use glob::GlobPattern;
+pub(crate) use glob::{GlobPattern, GlobPatternBuf, NormalizePatterns, OverridesDeny};
 
 pub(crate) trait PathExt {
     fn is_under(&self, root: impl AsRef<Path>) -> bool;
@@ -23,6 +23,7 @@ pub(crate) trait PathExt {
     fn normalize(&self) -> PathBuf;
     fn clean_lexically(&self) -> PathBuf;
     fn canonicalize_existing_prefix(&self) -> PathBuf;
+    fn spellings(&self) -> impl Iterator<Item = PathBuf>;
 }
 
 impl PathExt for Path {
@@ -90,10 +91,30 @@ impl PathExt for Path {
 
         normalized
     }
+
+    fn spellings(&self) -> impl Iterator<Item = PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            let lexical = self.clean_lexically();
+            let canonical = self.canonicalize_existing_prefix().clean_lexically();
+            let alias = (canonical != lexical).then_some(canonical);
+            std::iter::once(lexical).chain(alias)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            std::iter::once(self.normalize()).chain(None)
+        }
+    }
 }
 
 pub(crate) trait NormalizeRoots {
     fn normalize_roots(&mut self);
+
+    #[cfg(target_os = "windows")]
+    fn retain_windows_allow_roots(&mut self);
+
+    #[cfg(target_os = "windows")]
+    fn retain_windows_deny_roots(&mut self);
 }
 
 impl NormalizeRoots for Vec<PathBuf> {
@@ -103,5 +124,15 @@ impl NormalizeRoots for Vec<PathBuf> {
         }
         self.sort_unstable();
         self.dedup();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn retain_windows_allow_roots(&mut self) {
+        self.retain(|path| path.try_exists().unwrap_or(false));
+    }
+
+    #[cfg(target_os = "windows")]
+    fn retain_windows_deny_roots(&mut self) {
+        self.retain(|path| path.parent().is_some() && path.try_exists().unwrap_or(true));
     }
 }

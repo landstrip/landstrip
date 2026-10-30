@@ -579,6 +579,7 @@ impl PathAccessEntry {
         for path in &policy.write_denied_roots {
             let carved: Vec<&Path> = policy
                 .write_carveouts
+                .roots
                 .iter()
                 .map(PathBuf::as_path)
                 .filter(|carveout| carveout.is_strictly_under(path))

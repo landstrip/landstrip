@@ -53,6 +53,7 @@ pub(crate) fn execute(
     }
 
     let needs_fs_broker = !policy.write_roots.is_empty()
+        || policy.write_carveouts.has_patterns()
         || !matches!(policy.read_access, ReadAccess::Unrestricted)
         || trap_fd.is_some();
 

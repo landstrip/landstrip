@@ -4,6 +4,8 @@
 use super::PathExt;
 use crate::error::{Error, PathIo};
 use anyhow::Result;
+use serde::Serialize;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
@@ -58,6 +60,11 @@ impl<'a> GlobPattern<'a> {
         s.bytes().any(Self::is_glob_byte)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn is_recursive(&self) -> bool {
+        self.pattern.contains("**")
+    }
+
     pub(crate) fn base(&self) -> PathBuf {
         let Some(glob_at) = self.pattern.bytes().position(Self::is_glob_byte) else {
             return PathBuf::from(self.pattern);
@@ -103,6 +110,24 @@ impl<'a> GlobPattern<'a> {
         }
         let mut matches = Vec::new();
         self.collect_matches(root, &mut matches, 0).is_err() || !matches.is_empty()
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn has_unexcused_under(
+        &self,
+        root: &Path,
+        mut is_denied: impl FnMut(&Path) -> bool,
+    ) -> bool {
+        let base = self.base();
+        if base.is_under(root) {
+            return true;
+        }
+        if !root.is_under(&base) {
+            return false;
+        }
+        let mut matches = Vec::new();
+        self.collect_matches(root, &mut matches, 0).is_err()
+            || matches.iter().any(|candidate| is_denied(candidate))
     }
 
     pub(crate) fn expand(&self) -> Result<Vec<PathBuf>> {
@@ -313,5 +338,155 @@ impl<'a> GlobPattern<'a> {
         }
 
         false
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub(crate) struct GlobPatternBuf(String);
+
+impl GlobPatternBuf {
+    pub(crate) fn new(pattern: impl Into<String>) -> Self {
+        Self(pattern.into())
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn as_glob(&self) -> GlobPattern<'_> {
+        GlobPattern::new(&self.0)
+    }
+
+    pub(crate) fn base(&self) -> PathBuf {
+        self.as_glob().base()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_recursive(&self) -> bool {
+        self.as_glob().is_recursive()
+    }
+
+    pub(crate) fn matches_tree(&self, path: &Path) -> bool {
+        self.as_glob().matches_tree(path)
+    }
+
+    pub(crate) fn spellings(&self) -> impl Iterator<Item = Self> + use<'_> {
+        let base = self.base();
+        let canonical = base.canonicalize_existing_prefix().clean_lexically();
+        let base_str = base.to_string_lossy();
+        let canonical_str = canonical.to_string_lossy();
+        let alias = (canonical_str != base_str)
+            .then(|| self.0.strip_prefix(base_str.as_ref()))
+            .flatten()
+            .map(|suffix| Self(format!("{canonical_str}{suffix}")));
+        std::iter::once(self.clone()).chain(alias)
+    }
+}
+
+impl AsRef<str> for GlobPatternBuf {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for GlobPatternBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+pub(crate) trait NormalizePatterns {
+    fn normalize_patterns(&mut self);
+}
+
+impl NormalizePatterns for Vec<GlobPatternBuf> {
+    fn normalize_patterns(&mut self) {
+        self.sort_unstable();
+        self.dedup();
+    }
+}
+
+pub(crate) trait OverridesDeny<Rhs: ?Sized> {
+    fn overrides_deny(&self, deny: &Rhs) -> bool;
+}
+
+impl OverridesDeny<Path> for Path {
+    fn overrides_deny(&self, deny: &Path) -> bool {
+        self.is_under(deny)
+    }
+}
+
+impl OverridesDeny<GlobPattern<'_>> for Path {
+    fn overrides_deny(&self, deny: &GlobPattern<'_>) -> bool {
+        deny.matches_tree(self)
+    }
+}
+
+impl OverridesDeny<Path> for GlobPattern<'_> {
+    fn overrides_deny(&self, deny: &Path) -> bool {
+        self.base().is_under(deny)
+    }
+}
+
+impl OverridesDeny<GlobPattern<'_>> for GlobPattern<'_> {
+    fn overrides_deny(&self, deny: &GlobPattern<'_>) -> bool {
+        let allow_base = self.base();
+        let deny_base = deny.base();
+        if allow_base.is_strictly_under(&deny_base) {
+            return true;
+        }
+        if allow_base != deny_base {
+            return false;
+        }
+        let base_str = allow_base.to_string_lossy();
+        let allow_tail = self.pattern.strip_prefix(base_str.as_ref()).unwrap_or(self.pattern);
+        let deny_tail = deny.pattern.strip_prefix(base_str.as_ref()).unwrap_or(deny.pattern);
+        self.pattern == deny.pattern
+            || (!allow_tail.contains("**") && deny_tail.contains("**"))
+            || self.pattern.len() >= deny.pattern.len()
+    }
+}
+
+impl OverridesDeny<PathBuf> for Path {
+    fn overrides_deny(&self, deny: &PathBuf) -> bool {
+        self.overrides_deny(deny.as_path())
+    }
+}
+
+impl OverridesDeny<GlobPatternBuf> for Path {
+    fn overrides_deny(&self, deny: &GlobPatternBuf) -> bool {
+        self.overrides_deny(&deny.as_glob())
+    }
+}
+
+impl OverridesDeny<PathBuf> for GlobPattern<'_> {
+    fn overrides_deny(&self, deny: &PathBuf) -> bool {
+        self.overrides_deny(deny.as_path())
+    }
+}
+
+impl OverridesDeny<GlobPatternBuf> for GlobPattern<'_> {
+    fn overrides_deny(&self, deny: &GlobPatternBuf) -> bool {
+        self.overrides_deny(&deny.as_glob())
+    }
+}
+
+impl<Rhs: ?Sized> OverridesDeny<Rhs> for PathBuf
+where
+    Path: OverridesDeny<Rhs>,
+{
+    fn overrides_deny(&self, deny: &Rhs) -> bool {
+        self.as_path().overrides_deny(deny)
+    }
+}
+
+impl<Rhs: ?Sized> OverridesDeny<Rhs> for GlobPatternBuf
+where
+    for<'a> GlobPattern<'a>: OverridesDeny<Rhs>,
+{
+    fn overrides_deny(&self, deny: &Rhs) -> bool {
+        self.as_glob().overrides_deny(deny)
     }
 }
