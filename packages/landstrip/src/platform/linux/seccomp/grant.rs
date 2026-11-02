@@ -2,7 +2,6 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::error::{BrokerError, SysResult};
-use super::fs::SYS_FCHMODAT2;
 use super::network::{SocketAddrCall, TargetSocket};
 use super::notify::{NotificationChannel, NotificationResponse};
 use super::process::ResolvedPath;
@@ -16,6 +15,9 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
+
+pub(super) const SYS_FCHMODAT2: i64 = 452;
+
 pub(super) enum Grant {
     Open(OpenGrant),
     // Preparation failures still await the policy decision before being returned.
@@ -71,22 +73,23 @@ impl SocketGrant {
         }
     }
 
+    fn call_addr(&self) -> SysResult<i64> {
+        let len =
+            libc::socklen_t::try_from(self.addr.len()).map_err(|_| BrokerError::InvalidAddress)?;
+        let rc = unsafe { (self.call)(self.sock.as_raw_fd(), self.addr.as_ptr().cast(), len) };
+        if rc < 0 {
+            return Err(Errno::last().into());
+        }
+        Ok(i64::from(rc))
+    }
+
     pub(super) fn apply(&self, notify: NotificationChannel<'_>, id: u64) {
-        let rc = match broker_addr_call(self.sock.as_raw_fd(), &self.addr, self.call) {
+        let rc = match self.call_addr() {
             Ok(value) => NotificationResponse::success(id, value),
             Err(error) => NotificationResponse::error(id, error.errno()),
         };
         let _ = notify.respond(rc);
     }
-}
-
-fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> Result<i64, BrokerError> {
-    let len = libc::socklen_t::try_from(addr.len()).map_err(|_| BrokerError::InvalidAddress)?;
-    let rc = unsafe { call(sock, addr.as_ptr().cast(), len) };
-    if rc < 0 {
-        return Err(Errno::last().into());
-    }
-    Ok(i64::from(rc))
 }
 
 pub(super) struct OpenGrant {
@@ -307,21 +310,13 @@ pub(super) enum MutationGrant {
         flags: u32,
     },
     Link {
-        from: MutationTarget,
+        from: MetadataTarget,
         to: Anchor,
         flags: i32,
     },
-    Chmod {
-        target: OwnedFd,
-        mode: u32,
-    },
     Metadata {
-        target: MutationTarget,
-        mutation: PathMutation,
-    },
-    Fd {
-        target: OwnedFd,
-        mutation: FdMutation,
+        target: MetadataTarget,
+        op: MetadataOp,
     },
 }
 
@@ -367,7 +362,7 @@ impl MutationGrant {
             }
             Self::Link { from, to, flags } => {
                 let rc = match from {
-                    MutationTarget::Entry(at) => unsafe {
+                    MetadataTarget::Entry(at) => unsafe {
                         libc::linkat(
                             at.dir.as_raw_fd(),
                             at.name.as_ptr(),
@@ -376,8 +371,8 @@ impl MutationGrant {
                             flags & !libc::AT_SYMLINK_FOLLOW,
                         )
                     },
-                    MutationTarget::Pinned(_) => {
-                        let path = from.path()?;
+                    MetadataTarget::Pinned(fd) | MetadataTarget::Descriptor(fd) => {
+                        let path = ProcFd::new(fd.as_fd()).c_path()?;
                         unsafe {
                             libc::linkat(
                                 libc::AT_FDCWD,
@@ -391,12 +386,7 @@ impl MutationGrant {
                 };
                 Errno::result(rc)?;
             }
-            Self::Chmod { target, mode } => {
-                let path = ProcFd::new(target.as_fd()).c_path()?;
-                Errno::result(unsafe { libc::chmod(path.as_ptr(), *mode) })?;
-            }
-            Self::Metadata { target, mutation } => mutation.run(target)?,
-            Self::Fd { target, mutation } => mutation.run(target.as_raw_fd())?,
+            Self::Metadata { target, op } => op.run(target)?,
         }
         Ok(())
     }
@@ -410,13 +400,14 @@ impl MutationGrant {
     }
 }
 
-pub(super) enum MutationTarget {
+pub(super) enum MetadataTarget {
     Entry(Anchor),
     Pinned(OwnedFd),
+    Descriptor(OwnedFd),
 }
 
-impl MutationTarget {
-    pub(super) fn new(anchor: Anchor, no_follow: bool) -> SysResult<Self> {
+impl MetadataTarget {
+    pub(super) fn from_anchor(anchor: Anchor, no_follow: bool) -> SysResult<Self> {
         if no_follow {
             Ok(Self::Entry(anchor))
         } else {
@@ -424,133 +415,72 @@ impl MutationTarget {
         }
     }
 
-    fn path(&self) -> SysResult<CString> {
-        match self {
-            Self::Entry(at) => at.path(),
-            Self::Pinned(fd) => ProcFd::new(fd.as_fd()).c_path(),
-        }
-    }
-
-    fn at_path(&self) -> (BorrowedFd<'_>, &CStr, i32) {
+    fn at_args(&self, fd_flags: i32) -> (BorrowedFd<'_>, &CStr, i32) {
         match self {
             Self::Entry(at) => (at.dir.as_fd(), &at.name, libc::AT_SYMLINK_NOFOLLOW),
             Self::Pinned(fd) => (fd.as_fd(), c"", libc::AT_EMPTY_PATH),
+            Self::Descriptor(fd) => (fd.as_fd(), c"", fd_flags),
         }
     }
-}
 
-pub(super) enum PathMutation {
-    ChmodAt {
-        mode: u32,
-    },
-    Chown {
-        uid: u32,
-        gid: u32,
-    },
-    ChownAt {
-        uid: u32,
-        gid: u32,
-    },
-    Utimes {
-        times: Option<[libc::timespec; 2]>,
-    },
-    SetXattr {
-        name: CString,
-        value: Vec<u8>,
-        flags: i32,
-    },
-    RemoveXattr {
-        name: CString,
-    },
-}
-
-impl PathMutation {
-    fn run(&self, target: &MutationTarget) -> SysResult<()> {
-        match self {
-            Self::ChmodAt { mode } => {
-                let (dir, name, target_flags) = target.at_path();
-                Errno::result(unsafe {
-                    libc::syscall(
-                        SYS_FCHMODAT2,
-                        dir.as_raw_fd(),
-                        name.as_ptr(),
-                        *mode,
-                        target_flags,
-                    )
-                })?;
-            }
-            Self::Chown { uid, gid } => {
-                let rc = match target {
-                    MutationTarget::Entry(at) => unsafe {
-                        libc::fchownat(
-                            at.dir.as_raw_fd(),
-                            at.name.as_ptr(),
-                            *uid,
-                            *gid,
-                            libc::AT_SYMLINK_NOFOLLOW,
-                        )
-                    },
-                    MutationTarget::Pinned(_) => {
-                        let path = target.path()?;
-                        unsafe { libc::chown(path.as_ptr(), *uid, *gid) }
-                    }
-                };
-                Errno::result(rc)?;
-            }
-            Self::ChownAt { uid, gid } => {
-                let (dir, name, target_flags) = target.at_path();
-                Errno::result(unsafe {
-                    libc::fchownat(dir.as_raw_fd(), name.as_ptr(), *uid, *gid, target_flags)
-                })?;
-            }
-            Self::Utimes { times } => {
-                let times = times.as_ref().map_or(ptr::null(), |t| t.as_ptr());
-                let rc = match target {
-                    MutationTarget::Entry(at) => unsafe {
-                        libc::utimensat(
-                            at.dir.as_raw_fd(),
-                            at.name.as_ptr(),
-                            times,
-                            libc::AT_SYMLINK_NOFOLLOW,
-                        )
-                    },
-                    MutationTarget::Pinned(_) => {
-                        let path = target.path()?;
-                        unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times, 0) }
-                    }
-                };
-                Errno::result(rc)?;
-            }
-            Self::SetXattr { name, value, flags } => {
-                let path = target.path()?;
-                let call = match target {
-                    MutationTarget::Entry(_) => libc::lsetxattr,
-                    MutationTarget::Pinned(_) => libc::setxattr,
-                };
-                Errno::result(unsafe {
-                    call(
+    fn set_xattr(&self, name: &CStr, value: &[u8], flags: i32) -> SysResult<()> {
+        let rc = match self {
+            Self::Entry(at) => {
+                let path = at.path()?;
+                unsafe {
+                    libc::lsetxattr(
                         path.as_ptr(),
                         name.as_ptr(),
                         value.as_ptr().cast(),
                         value.len(),
-                        *flags,
+                        flags,
                     )
-                })?;
+                }
             }
-            Self::RemoveXattr { name } => {
-                let path = target.path()?;
-                let call = match target {
-                    MutationTarget::Entry(_) => libc::lremovexattr,
-                    MutationTarget::Pinned(_) => libc::removexattr,
-                };
-                Errno::result(unsafe { call(path.as_ptr(), name.as_ptr()) })?;
+            Self::Pinned(fd) => {
+                let path = ProcFd::new(fd.as_fd()).c_path()?;
+                unsafe {
+                    libc::setxattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        flags,
+                    )
+                }
             }
-        }
+            Self::Descriptor(fd) => unsafe {
+                libc::fsetxattr(
+                    fd.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    flags,
+                )
+            },
+        };
+        Errno::result(rc)?;
+        Ok(())
+    }
+
+    fn remove_xattr(&self, name: &CStr) -> SysResult<()> {
+        let rc = match self {
+            Self::Entry(at) => {
+                let path = at.path()?;
+                unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) }
+            }
+            Self::Pinned(fd) => {
+                let path = ProcFd::new(fd.as_fd()).c_path()?;
+                unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) }
+            }
+            Self::Descriptor(fd) => unsafe { libc::fremovexattr(fd.as_raw_fd(), name.as_ptr()) },
+        };
+        Errno::result(rc)?;
         Ok(())
     }
 }
 
-pub(super) enum FdMutation {
+pub(super) enum MetadataOp {
     Chmod {
         mode: u32,
     },
@@ -580,34 +510,92 @@ pub(super) enum FdMutation {
     },
 }
 
-impl FdMutation {
-    pub(super) fn run(&self, target: RawFd) -> SysResult<()> {
-        let rc = match self {
-            Self::Chmod { mode } => unsafe { libc::fchmod(target, *mode) },
-            Self::Chown { uid, gid } => unsafe { libc::fchown(target, *uid, *gid) },
-            Self::ChmodAt { mode, flags } => unsafe {
-                let rc = libc::syscall(SYS_FCHMODAT2, target, c"".as_ptr(), *mode, *flags);
-                if rc < 0 { -1 } else { 0 }
+impl MetadataOp {
+    fn run(&self, target: &MetadataTarget) -> SysResult<()> {
+        match self {
+            Self::Chmod { mode } => match target {
+                MetadataTarget::Entry(at) => {
+                    Errno::result(unsafe {
+                        libc::syscall(
+                            SYS_FCHMODAT2,
+                            at.dir.as_raw_fd(),
+                            at.name.as_ptr(),
+                            *mode,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    })?;
+                }
+                MetadataTarget::Pinned(fd) => {
+                    let path = ProcFd::new(fd.as_fd()).c_path()?;
+                    Errno::result(unsafe { libc::chmod(path.as_ptr(), *mode) })?;
+                }
+                MetadataTarget::Descriptor(fd) => {
+                    Errno::result(unsafe { libc::fchmod(fd.as_raw_fd(), *mode) })?;
+                }
             },
-            Self::ChownAt { uid, gid, flags } => unsafe {
-                libc::fchownat(target, c"".as_ptr(), *uid, *gid, *flags)
-            },
+            Self::ChmodAt { mode, flags } => {
+                let (dir, name, target_flags) = target.at_args(*flags);
+                Errno::result(unsafe {
+                    libc::syscall(
+                        SYS_FCHMODAT2,
+                        dir.as_raw_fd(),
+                        name.as_ptr(),
+                        *mode,
+                        target_flags,
+                    )
+                })?;
+            }
+            Self::Chown { uid, gid } => {
+                let rc = match target {
+                    MetadataTarget::Entry(at) => unsafe {
+                        libc::fchownat(
+                            at.dir.as_raw_fd(),
+                            at.name.as_ptr(),
+                            *uid,
+                            *gid,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    },
+                    MetadataTarget::Pinned(fd) => {
+                        let path = ProcFd::new(fd.as_fd()).c_path()?;
+                        unsafe { libc::chown(path.as_ptr(), *uid, *gid) }
+                    }
+                    MetadataTarget::Descriptor(fd) => unsafe {
+                        libc::fchown(fd.as_raw_fd(), *uid, *gid)
+                    },
+                };
+                Errno::result(rc)?;
+            }
+            Self::ChownAt { uid, gid, flags } => {
+                let (dir, name, target_flags) = target.at_args(*flags);
+                Errno::result(unsafe {
+                    libc::fchownat(dir.as_raw_fd(), name.as_ptr(), *uid, *gid, target_flags)
+                })?;
+            }
             Self::Utimes { times } => {
                 let times = times.as_ref().map_or(ptr::null(), |value| value.as_ptr());
-                unsafe { libc::futimens(target, times) }
+                let rc = match target {
+                    MetadataTarget::Entry(at) => unsafe {
+                        libc::utimensat(
+                            at.dir.as_raw_fd(),
+                            at.name.as_ptr(),
+                            times,
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    },
+                    MetadataTarget::Pinned(fd) => {
+                        let path = ProcFd::new(fd.as_fd()).c_path()?;
+                        unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times, 0) }
+                    }
+                    MetadataTarget::Descriptor(fd) => unsafe {
+                        libc::futimens(fd.as_raw_fd(), times)
+                    },
+                };
+                Errno::result(rc)?;
             }
-            Self::SetXattr { name, value, flags } => unsafe {
-                libc::fsetxattr(
-                    target,
-                    name.as_ptr(),
-                    value.as_ptr().cast(),
-                    value.len(),
-                    *flags,
-                )
-            },
-            Self::RemoveXattr { name } => unsafe { libc::fremovexattr(target, name.as_ptr()) },
-        };
-        Errno::result(rc)?;
+            Self::SetXattr { name, value, flags } => target.set_xattr(name, value, *flags)?,
+            Self::RemoveXattr { name } => target.remove_xattr(name)?,
+        }
         Ok(())
     }
 }

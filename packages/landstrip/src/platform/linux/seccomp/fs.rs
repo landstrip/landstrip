@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::error::{BrokerError, SysResult};
-use super::grant::{FdMutation, Grant, MutationGrant, MutationTarget, OpenGrant, PathMutation};
+use super::grant::{Grant, MetadataOp, MetadataTarget, MutationGrant, OpenGrant, SYS_FCHMODAT2};
 use super::notify::NotificationResult;
 use super::process::{MissingTarget, ResolvedPath, TargetProcess};
 use super::procfs::OpenHow;
@@ -12,8 +12,6 @@ use crate::policy::{AccessPolicy, DenialReason};
 use crate::trap::{FilesystemDenial, ProcessContext, TrapOperation};
 use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-
-pub(super) const SYS_FCHMODAT2: i64 = 452;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(super) mod legacy_syscall {
@@ -1102,18 +1100,21 @@ fn handle_fd_mutation(
 
     let target = mutation_target_fd(&process, args[0].to_i32(), spec.kind)?;
     let filesystem = process.filesystem()?;
-    let mutation = spec.kind.fd_mutation(&process, args)?;
+    let op = spec.kind.metadata_op(&process, args)?;
     let Some(requested_path) = filesystem.label_opt(target.as_fd())? else {
-        return Ok(NotificationResult::grant(MutationGrant::Fd {
-            target,
-            mutation,
+        return Ok(NotificationResult::grant(MutationGrant::Metadata {
+            target: MetadataTarget::Descriptor(target),
+            op,
         }));
     };
     let resolved = requested_path.clone();
     let lexical = requested_path.clean_lexically();
     let hard_write_denied = policy.write_denials.is_denied_always(&resolved, &lexical);
     let reason = policy.write_reason(&resolved, true);
-    let operation = MutationGrant::Fd { target, mutation };
+    let operation = MutationGrant::Metadata {
+        target: MetadataTarget::Descriptor(target),
+        op,
+    };
 
     let Some(reason) = reason else {
         return Ok(NotificationResult::grant(operation));
@@ -1205,7 +1206,7 @@ impl MutationSyscall {
                 } else {
                     0
                 };
-                MutationTarget::new(at, no_follow).map(|from| MutationGrant::Link {
+                MetadataTarget::from_anchor(at, no_follow).map(|from| MutationGrant::Link {
                     from,
                     to,
                     flags,
@@ -1219,81 +1220,50 @@ impl MutationSyscall {
                 target,
                 length: args[1].cast_signed(),
             }),
-            MutationSyscall::Fchmodat => at.into_target().map(|target| MutationGrant::Chmod {
-                target,
-                mode: args[2].to_u32(),
-            }),
-            MutationSyscall::Chmod => at.into_target().map(|target| MutationGrant::Chmod {
-                target,
-                mode: args[1].to_u32(),
-            }),
             _ => {
-                let mutation = self.path_mutation(process, args)?;
-                MutationTarget::new(at, no_follow)
-                    .map(|target| MutationGrant::Metadata { target, mutation })
+                let op = self.metadata_op(process, args)?;
+                MetadataTarget::from_anchor(at, no_follow)
+                    .map(|target| MutationGrant::Metadata { target, op })
             }
         };
 
         Ok(Grant::Mutation(operation))
     }
 
-    fn path_mutation(self, process: &TargetProcess, args: &[u64; 6]) -> SysResult<PathMutation> {
+    fn metadata_op(self, process: &TargetProcess, args: &[u64; 6]) -> SysResult<MetadataOp> {
         Ok(match self {
-            Self::Fchmodat2 => PathMutation::ChmodAt {
-                mode: args[2].to_u32(),
-            },
-            Self::Fchownat => PathMutation::ChownAt {
-                uid: args[2].to_u32(),
-                gid: args[3].to_u32(),
-            },
-            Self::Chown | Self::Lchown => PathMutation::Chown {
-                uid: args[1].to_u32(),
-                gid: args[2].to_u32(),
-            },
-            Self::Utimensat => PathMutation::Utimes {
-                times: process.read_times(args[2])?,
-            },
-            Self::Setxattr | Self::Lsetxattr => PathMutation::SetXattr {
-                name: process.read_xattr_name(args[1])?,
-                value: process.read_bytes(args[2], args[3])?,
-                flags: args[4].to_i32(),
-            },
-            Self::Removexattr | Self::Lremovexattr => PathMutation::RemoveXattr {
-                name: process.read_xattr_name(args[1])?,
-            },
-            _ => return Err(BrokerError::syscall(libc::EINVAL)),
-        })
-    }
-
-    fn fd_mutation(self, process: &TargetProcess, args: &[u64; 6]) -> SysResult<FdMutation> {
-        Ok(match self {
-            Self::Fchmod => FdMutation::Chmod {
+            Self::Chmod | Self::Fchmod => MetadataOp::Chmod {
                 mode: args[1].to_u32(),
             },
-            Self::Fchmodat2 => FdMutation::ChmodAt {
+            Self::Fchmodat => MetadataOp::Chmod {
+                mode: args[2].to_u32(),
+            },
+            Self::Fchmodat2 => MetadataOp::ChmodAt {
                 mode: args[2].to_u32(),
                 flags: args[3].to_i32(),
             },
-            Self::Fchown => FdMutation::Chown {
+            Self::Chown | Self::Lchown | Self::Fchown => MetadataOp::Chown {
                 uid: args[1].to_u32(),
                 gid: args[2].to_u32(),
             },
-            Self::Fchownat => FdMutation::ChownAt {
+            Self::Fchownat => MetadataOp::ChownAt {
                 uid: args[2].to_u32(),
                 gid: args[3].to_u32(),
                 flags: args[4].to_i32(),
             },
-            Self::Utimensat => FdMutation::Utimes {
+            Self::Utimensat => MetadataOp::Utimes {
                 times: process.read_times(args[2])?,
             },
-            Self::Fsetxattr => FdMutation::SetXattr {
+            Self::Setxattr | Self::Lsetxattr | Self::Fsetxattr => MetadataOp::SetXattr {
                 name: process.read_xattr_name(args[1])?,
                 value: process.read_bytes(args[2], args[3])?,
                 flags: args[4].to_i32(),
             },
-            Self::Fremovexattr => FdMutation::RemoveXattr {
-                name: process.read_xattr_name(args[1])?,
-            },
+            Self::Removexattr | Self::Lremovexattr | Self::Fremovexattr => {
+                MetadataOp::RemoveXattr {
+                    name: process.read_xattr_name(args[1])?,
+                }
+            }
             _ => return Err(BrokerError::syscall(libc::EINVAL)),
         })
     }
