@@ -41,19 +41,17 @@ impl PathExt for Path {
             return canonical;
         }
 
-        let mut existing = self.to_path_buf();
+        let mut existing = self;
         let mut missing = Vec::new();
-        while !existing.as_os_str().is_empty() {
-            if let Ok(canonical) = fs::canonicalize(&existing) {
-                let mut result = canonical;
-                result.extend(missing.into_iter().rev());
-                return result;
-            }
-            if let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) {
-                missing.push(name.to_os_string());
-                existing = parent.to_path_buf();
-            } else {
+        while let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) {
+            missing.push(name);
+            existing = parent;
+            if existing.as_os_str().is_empty() {
                 break;
+            }
+            if let Ok(mut canonical) = fs::canonicalize(existing) {
+                canonical.extend(missing.into_iter().rev());
+                return canonical;
             }
         }
 
