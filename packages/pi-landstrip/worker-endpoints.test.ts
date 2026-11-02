@@ -143,13 +143,18 @@ sandboxTest.for(
     const agentDir = temporaryDirectory('pi-landstrip-endpoint-agent-');
     vi.stubEnv('PI_CODING_AGENT_DIR', agentDir);
     const authPath = join(agentDir, 'auth.json');
+    const hardDeniedPath = join(agentDir, 'immutable.txt');
     writeFileSync(authPath, 'parent-auth-secret');
     writeFileSync(
       join(agentDir, 'sandbox.json'),
       JSON.stringify({
         enabled: true,
         network: { allowedDomains: [], deniedDomains: denied ? [host] : [] },
-        filesystem: { allowRead: [authPath], allowWrite: [agentDir, authPath] },
+        filesystem: {
+          allowRead: [authPath],
+          allowWrite: [agentDir, authPath],
+          denyWriteAlways: [hardDeniedPath],
+        },
       }),
     );
     let requests = 0;
@@ -200,17 +205,20 @@ sandboxTest.for(
             `
           import http from 'node:http';
           import { readFileSync, openSync, closeSync, mkdirSync } from 'node:fs';
+          import { writeFile } from 'node:fs/promises';
           for (const access of [
             () => readFileSync(${JSON.stringify(authPath)}),
             () => closeSync(openSync(${JSON.stringify(authPath)}, 'a')),
             () => mkdirSync(${JSON.stringify(`${authPath}.lock`)}),
+            () => closeSync(openSync(${JSON.stringify(hardDeniedPath)}, 'a')),
+            () => writeFile(${JSON.stringify(hardDeniedPath)}, 'x'),
           ]) {
             let denied = false;
-            try { access(); } catch (error) {
+            try { await access(); } catch (error) {
               if (!['EACCES', 'EPERM'].includes(error.code)) throw error;
               denied = true;
             }
-            if (!denied) throw new Error('Parent auth access permitted');
+            if (!denied) throw new Error('Hard-denied access permitted');
           }
           const proxy = new URL(process.env.HTTP_PROXY);
           const authorization = Buffer.from(decodeURIComponent(proxy.username) + ':' + decodeURIComponent(proxy.password)).toString('base64');
@@ -242,6 +250,8 @@ sandboxTest.for(
                 ['read', authPath],
                 ['write', authPath],
                 ['write', `${authPath}.lock`],
+                ['write', hardDeniedPath],
+                ['write', hardDeniedPath],
               ].map(([operation, path]) =>
                 expect.objectContaining({
                   kind: 'filesystem',
@@ -255,13 +265,9 @@ sandboxTest.for(
                 }),
               ),
             );
-            expect(f.ctx.ui.notify).toHaveBeenCalledTimes(2);
+            expect(f.ctx.ui.notify).toHaveBeenCalledTimes(1);
             expect(f.ctx.ui.notify).toHaveBeenCalledWith(
-              expect.stringMatching(/^landstrip: filesystem write denied /),
-              'error',
-            );
-            expect(f.ctx.ui.notify).not.toHaveBeenCalledWith(
-              expect.stringContaining('filesystem read denied'),
+              `landstrip: filesystem write denied (${hardDeniedPath}) [seccomp]`,
               'error',
             );
           } else {

@@ -1744,7 +1744,6 @@ function createLandstripIntegrationWithPrompts(
         if (!isQueryTrap(trap)) {
           if (
             isFilesystemTrap(trap) &&
-            trap.operation === 'read' &&
             matchesPattern(
               normalizeBlockedPath(trap.path, cwd),
               allowances.protectedPaths ?? [],
