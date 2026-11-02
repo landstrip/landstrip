@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::error::{BrokerError, SysResult};
-use super::grant::{Grant, SocketGrant};
+use super::grant::{Grant, SocketAddrCall, SocketGrant};
 use super::notify::NotificationResult;
 use super::process::{MissingTarget, TargetProcess};
 use super::procfs::ProcFd;
@@ -15,10 +15,6 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-
-pub(super) type SocketAddrCall =
-    unsafe extern "C" fn(libc::c_int, *const libc::sockaddr, libc::socklen_t) -> libc::c_int;
-
 #[derive(Debug)]
 pub(super) struct TargetSocket {
     pub(super) sock: OwnedFd,
@@ -189,8 +185,12 @@ impl TargetSocket {
         denials.deny(
             Denial::Network(operation, target, process),
             true,
-            Some(Grant::from(SocketGrant::new(self, call))),
+            Some(Grant::from(self.into_grant(call))),
         )
+    }
+
+    fn into_grant(self, call: SocketAddrCall) -> SocketGrant {
+        SocketGrant::new(self.sock, self.addr, call, None)
     }
 }
 
@@ -204,10 +204,7 @@ pub(super) fn handle_bind(
     match socket.info.kind() {
         SocketKind::Tcp | SocketKind::Udp => {
             if policy.network_access.is_unrestricted() {
-                return Ok(NotificationResult::grant(SocketGrant::new(
-                    socket,
-                    libc::bind,
-                )));
+                return Ok(NotificationResult::grant(socket.into_grant(libc::bind)));
             }
             if !policy.network_access.allows_local_binding() {
                 if let Ok(endpoint) = socket.ip_endpoint() {
@@ -232,20 +229,14 @@ pub(super) fn handle_bind(
                 );
             }
 
-            Ok(NotificationResult::grant(SocketGrant::new(
-                socket,
-                libc::bind,
-            )))
+            Ok(NotificationResult::grant(socket.into_grant(libc::bind)))
         }
-        SocketKind::Unix => handle_unix_bind(policy, request.pid, socket, denials),
-        SocketKind::NotSupported if policy.network_access.is_unrestricted() => Ok(
-            NotificationResult::grant(SocketGrant::new(socket, libc::bind)),
-        ),
+        SocketKind::Unix => UnixSocketOp::Bind.handle(policy, request.pid, socket, denials),
+        SocketKind::NotSupported if policy.network_access.is_unrestricted() => {
+            Ok(NotificationResult::grant(socket.into_grant(libc::bind)))
+        }
         SocketKind::NotSupported => Err(BrokerError::AddressFamilyNotSupported),
-        SocketKind::Other => Ok(NotificationResult::grant(SocketGrant::new(
-            socket,
-            libc::bind,
-        ))),
+        SocketKind::Other => Ok(NotificationResult::grant(socket.into_grant(libc::bind))),
     }
 }
 
@@ -278,20 +269,14 @@ pub(super) fn handle_connect(
                 );
             }
 
-            Ok(NotificationResult::grant(SocketGrant::new(
-                socket,
-                libc::connect,
-            )))
+            Ok(NotificationResult::grant(socket.into_grant(libc::connect)))
         }
         SocketKind::Udp => {
             if policy.network_access.is_unrestricted() {
                 return Ok(NotificationResult::Continue);
             }
             if socket.family()? == libc::AF_UNSPEC {
-                return Ok(NotificationResult::grant(SocketGrant::new(
-                    socket,
-                    libc::connect,
-                )));
+                return Ok(NotificationResult::grant(socket.into_grant(libc::connect)));
             }
             let endpoint = socket.ip_endpoint()?;
             if !endpoint.loopback || !policy.network_access.allows_local_binding() {
@@ -304,12 +289,9 @@ pub(super) fn handle_connect(
                 );
             }
 
-            Ok(NotificationResult::grant(SocketGrant::new(
-                socket,
-                libc::connect,
-            )))
+            Ok(NotificationResult::grant(socket.into_grant(libc::connect)))
         }
-        SocketKind::Unix => handle_unix_connect(policy, request.pid, socket, denials),
+        SocketKind::Unix => UnixSocketOp::Connect.handle(policy, request.pid, socket, denials),
         SocketKind::Other => Ok(NotificationResult::Continue),
         SocketKind::NotSupported if policy.network_access.is_unrestricted() => {
             Ok(NotificationResult::Continue)
@@ -422,146 +404,101 @@ pub(super) fn handle_sendmmsg(
     Ok(NotificationResult::Continue)
 }
 
-fn handle_unix_connect(
-    policy: &AccessPolicy,
-    pid: u32,
-    mut socket: TargetSocket,
-    denials: &mut Denials<'_>,
-) -> SysResult<NotificationResult> {
-    let process = TargetProcess::from_raw(pid);
-    let Some(path) = socket.unix_path() else {
-        if matches!(
-            policy.network_access.unix_socket_access(),
-            UnixSocketAccess::Unrestricted
-        ) {
-            return Ok(NotificationResult::Continue);
-        }
-        return denials.deny(
-            Denial::Network(
-                NetworkOperation::Connect,
-                "abstract".to_owned(),
-                process.context(),
-            ),
-            false,
-            None,
-        );
-    };
-    let filesystem = process.filesystem()?;
-    let target = filesystem.resolve(libc::AT_FDCWD, &path, true, MissingTarget::Disallow, 0)?;
-    let anchor = target.anchor.ok_or(BrokerError::SystemCall {
-        errno: libc::ENOENT,
-    })?;
-    let access = policy.unix_path_access(&target.label, anchor.target.as_ref().map(AsFd::as_fd));
-    if let UnixPathAccess::Supervisor = access {
-        return denials.deny(
-            Denial::Network(
-                NetworkOperation::Connect,
-                target.label.to_string_lossy().into_owned(),
-                process.context(),
-            ),
-            false,
-            None,
-        );
-    }
-    let object = anchor.target.as_ref().ok_or(BrokerError::InvalidAddress)?;
-    socket.rewrite_unix_path(&ProcFd::new(object.as_fd()).proc_path())?;
-    let grant = SocketGrant {
-        sock: socket.sock,
-        addr: socket.addr,
-        call: libc::connect,
-        _path: Some(anchor),
-    };
-    if let UnixPathAccess::Denied = access {
-        return denials.deny(
-            Denial::Network(
-                NetworkOperation::Connect,
-                target.label.to_string_lossy().into_owned(),
-                process.context(),
-            ),
-            true,
-            Some(Grant::from(grant)),
-        );
-    }
-
-    Ok(NotificationResult::grant(grant))
+#[derive(Clone, Copy)]
+enum UnixSocketOp {
+    Connect,
+    Bind,
 }
 
-fn handle_unix_bind(
-    policy: &AccessPolicy,
-    pid: u32,
-    mut socket: TargetSocket,
-    denials: &mut Denials<'_>,
-) -> SysResult<NotificationResult> {
-    let process = TargetProcess::from_raw(pid);
-    let Some(path) = socket.unix_path() else {
-        if matches!(
-            policy.network_access.unix_socket_access(),
-            UnixSocketAccess::Unrestricted
-        ) {
-            return Ok(NotificationResult::grant(SocketGrant::new(
-                socket,
-                libc::bind,
-            )));
+impl UnixSocketOp {
+    fn operation(self) -> NetworkOperation {
+        match self {
+            Self::Connect => NetworkOperation::Connect,
+            Self::Bind => NetworkOperation::Bind,
         }
-        return denials.deny(
-            Denial::Network(
-                NetworkOperation::Bind,
-                "abstract".to_owned(),
-                process.context(),
-            ),
-            false,
-            None,
-        );
-    };
-    let filesystem = process.filesystem()?;
-    let target = filesystem.resolve(libc::AT_FDCWD, &path, false, MissingTarget::File, 0)?;
-    let anchor = target.anchor.ok_or(BrokerError::SystemCall {
-        errno: libc::ENOENT,
-    })?;
-    let access = policy.unix_path_access(&target.label, anchor.target.as_ref().map(AsFd::as_fd));
-    if let UnixPathAccess::Supervisor = access {
-        return denials.deny(
-            Denial::Network(
-                NetworkOperation::Bind,
-                target.label.to_string_lossy().into_owned(),
-                process.context(),
-            ),
-            false,
-            None,
-        );
-    }
-    if policy.write_reason(&target.label, true).is_some() {
-        return denials.deny(
-            Denial::Network(
-                NetworkOperation::Bind,
-                target.label.to_string_lossy().into_owned(),
-                process.context(),
-            ),
-            false,
-            None,
-        );
-    }
-    let broker_path = anchor.path()?;
-    socket.rewrite_unix_path(Path::new(OsStr::from_bytes(broker_path.as_bytes())))?;
-    let grant = SocketGrant {
-        sock: socket.sock,
-        addr: socket.addr,
-        call: libc::bind,
-        _path: Some(anchor),
-    };
-    if let UnixPathAccess::Denied = access {
-        return denials.deny(
-            Denial::Network(
-                NetworkOperation::Bind,
-                target.label.to_string_lossy().into_owned(),
-                process.context(),
-            ),
-            true,
-            Some(Grant::from(grant)),
-        );
     }
 
-    Ok(NotificationResult::grant(grant))
+    fn call(self) -> SocketAddrCall {
+        match self {
+            Self::Connect => libc::connect,
+            Self::Bind => libc::bind,
+        }
+    }
+
+    fn handle(
+        self,
+        policy: &AccessPolicy,
+        pid: u32,
+        mut socket: TargetSocket,
+        denials: &mut Denials<'_>,
+    ) -> SysResult<NotificationResult> {
+        let process = TargetProcess::from_raw(pid);
+        let operation = self.operation();
+        let Some(path) = socket.unix_path() else {
+            if matches!(
+                policy.network_access.unix_socket_access(),
+                UnixSocketAccess::Unrestricted
+            ) {
+                return Ok(match self {
+                    Self::Connect => NotificationResult::Continue,
+                    Self::Bind => NotificationResult::grant(socket.into_grant(libc::bind)),
+                });
+            }
+            return denials.deny(
+                Denial::Network(operation, "abstract".to_owned(), process.context()),
+                false,
+                None,
+            );
+        };
+        let filesystem = process.filesystem()?;
+        let (follow, missing) = match self {
+            Self::Connect => (true, MissingTarget::Disallow),
+            Self::Bind => (false, MissingTarget::File),
+        };
+        let target = filesystem.resolve(libc::AT_FDCWD, &path, follow, missing, 0)?;
+        let anchor = target.anchor.ok_or(BrokerError::SystemCall {
+            errno: libc::ENOENT,
+        })?;
+        let access =
+            policy.unix_path_access(&target.label, anchor.target.as_ref().map(AsFd::as_fd));
+        if matches!(access, UnixPathAccess::Supervisor)
+            || (matches!(self, Self::Bind) && policy.write_reason(&target.label, true).is_some())
+        {
+            return denials.deny(
+                Denial::Network(
+                    operation,
+                    target.label.to_string_lossy().into_owned(),
+                    process.context(),
+                ),
+                false,
+                None,
+            );
+        }
+        match self {
+            Self::Connect => {
+                let object = anchor.target.as_ref().ok_or(BrokerError::InvalidAddress)?;
+                socket.rewrite_unix_path(&ProcFd::new(object.as_fd()).proc_path())?;
+            }
+            Self::Bind => {
+                let broker_path = anchor.path()?;
+                socket.rewrite_unix_path(Path::new(OsStr::from_bytes(broker_path.as_bytes())))?;
+            }
+        }
+        let grant = SocketGrant::new(socket.sock, socket.addr, self.call(), Some(anchor));
+        if let UnixPathAccess::Denied = access {
+            return denials.deny(
+                Denial::Network(
+                    operation,
+                    target.label.to_string_lossy().into_owned(),
+                    process.context(),
+                ),
+                true,
+                Some(Grant::from(grant)),
+            );
+        }
+
+        Ok(NotificationResult::grant(grant))
+    }
 }
 
 impl IpEndpoint {

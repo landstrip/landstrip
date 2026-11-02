@@ -2,7 +2,6 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::error::{BrokerError, SysResult};
-use super::network::{SocketAddrCall, TargetSocket};
 use super::notify::{NotificationChannel, NotificationResponse};
 use super::process::ResolvedPath;
 use super::procfs::{Anchor, OpenHow, ProcFd};
@@ -17,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 pub(super) const SYS_FCHMODAT2: i64 = 452;
+
+pub(super) type SocketAddrCall =
+    unsafe extern "C" fn(libc::c_int, *const libc::sockaddr, libc::socklen_t) -> libc::c_int;
 
 pub(super) enum Grant {
     Open(OpenGrant),
@@ -57,19 +59,24 @@ impl From<SocketGrant> for Grant {
 }
 
 pub(super) struct SocketGrant {
-    pub(super) sock: OwnedFd,
-    pub(super) addr: Vec<u8>,
-    pub(super) call: SocketAddrCall,
-    pub(super) _path: Option<Anchor>,
+    sock: OwnedFd,
+    addr: Vec<u8>,
+    call: SocketAddrCall,
+    _path: Option<Anchor>,
 }
 
 impl SocketGrant {
-    pub(super) fn new(socket: TargetSocket, call: SocketAddrCall) -> Self {
+    pub(super) fn new(
+        sock: OwnedFd,
+        addr: Vec<u8>,
+        call: SocketAddrCall,
+        path: Option<Anchor>,
+    ) -> Self {
         Self {
-            sock: socket.sock,
-            addr: socket.addr,
+            sock,
+            addr,
             call,
-            _path: None,
+            _path: path,
         }
     }
 
