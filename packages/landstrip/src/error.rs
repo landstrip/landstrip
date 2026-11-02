@@ -34,83 +34,97 @@ pub(crate) enum Mechanism {
     Windowsuser,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(prefix = "POLICY_", serialize_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum PolicyViolation {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    UnrestrictedRead,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    DenyReadAlwaysUnsupported,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    DenyWriteAlwaysUnsupported,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    LocalBindingUnsupported,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    UnixSocketUnsupported,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    UnixSocketPath,
+    InvalidPort,
+    EmptyPath,
+    InvalidMachLookup,
+    InvalidLogTag,
+    HomeUnavailable,
+    TraversalDepth,
+}
+
+impl PolicyViolation {
+    pub(crate) fn code(self) -> &'static str {
+        self.into()
+    }
+
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::UnrestrictedRead => {
+                "unrestricted reads are unsupported by the active Windows sandbox"
+            }
+            Self::DenyReadAlwaysUnsupported => "denyReadAlways is unsupported on Windows",
+            Self::DenyWriteAlwaysUnsupported => "denyWriteAlways is unsupported on Windows",
+            Self::LocalBindingUnsupported => {
+                "local binding is unsupported by the active Windows sandbox"
+            }
+            Self::UnixSocketUnsupported => {
+                "Unix socket policy is unsupported by the active Windows sandbox"
+            }
+            Self::UnixSocketPath => "an allowed Unix socket path exists but is not a socket",
+            Self::InvalidPort => "proxy ports must be between 1 and 65535",
+            Self::EmptyPath => "policy paths must not be empty",
+            Self::InvalidMachLookup => {
+                "Mach service lookup names must not be empty or bare wildcards"
+            }
+            Self::InvalidLogTag => {
+                "Darwin logTag must not be empty or contain quotes, backslashes, or control characters"
+            }
+            Self::HomeUnavailable => {
+                "the home directory is unavailable for a tilde-prefixed policy path"
+            }
+            Self::TraversalDepth => "policy path traversal exceeded its maximum depth",
+        }
+    }
+}
+
 /// A landstrip error identified by a stable, machine-routable code.
-///
-/// Variants name the stage that failed, not the operating system that reported
-/// it: the same code is raised by every backend that has the same stage, and the
-/// platform detail rides along as data (`mechanism`, `source`) instead of
-/// multiplying the code space.
-///
-/// `Display` renders the `SCREAMING_SNAKE_CASE` code followed by the variant's
-/// discriminating data, and [`StdError::source`] exposes the underlying cause so
-/// `anyhow`'s alternate format appends it.
 #[derive(Debug, strum::IntoStaticStr)]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum Error {
-    /// A filesystem access the policy denies. Only the Linux broker mediates
-    /// individual accesses, so only it raises this.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    FilesystemDenied,
-    /// A network access the policy denies. Linux broker only, as above.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    NetworkDenied,
-    /// Command line arguments landstrip cannot act on.
     #[strum(serialize = "USAGE_ERROR")]
     Usage {
         message: String,
     },
-    /// A policy document that is not well-formed JSON or YAML.
     PolicyParseFailed {
         source: Cause,
     },
-    /// The filesystem refused a read the policy resolution needs.
     PolicyIoFailed {
         source: io::Error,
     },
-    /// A policy the platform sandbox cannot enforce, rejected before launch.
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    PolicyUnrestrictedRead,
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    PolicyDenyReadAlwaysUnsupported,
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    PolicyDenyWriteAlwaysUnsupported,
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    PolicyLocalBindingUnsupported,
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    PolicyUnixSocketUnsupported,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    PolicyUnixSocketPath,
-    PolicyInvalidPort,
-    PolicyEmptyPath,
-    PolicyInvalidMachLookup,
-    PolicyInvalidLogTag,
-    PolicyHomeUnavailable,
-    PolicyTraversalDepth,
-    /// The sandbox could not be installed on the process.
+    Policy(PolicyViolation),
     SandboxSetupFailed {
         mechanism: Mechanism,
         source: Cause,
     },
-    /// Supervising the sandboxed child failed: the broker loop, a wait, or the
-    /// descriptor handoff.
     #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     SuperviseFailed {
         source: Cause,
     },
-    /// The sandbox was installed but the tool did not start.
     LaunchFailed {
         tool: PathBuf,
         source: Cause,
     },
-    /// The host Job Object rejected both nested assignment and safe breakaway.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     HostJobIncompatible {
         source: Cause,
     },
-    /// A value the kernel interface cannot represent.
     #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     IntegerTooLarge,
-    /// An operating system landstrip has no sandbox backend for.
     #[cfg_attr(
         any(target_os = "linux", target_os = "macos", target_os = "windows"),
         allow(dead_code)
@@ -118,15 +132,20 @@ pub(crate) enum Error {
     PlatformUnsupported,
 }
 
+impl From<PolicyViolation> for Error {
+    fn from(violation: PolicyViolation) -> Self {
+        Self::Policy(violation)
+    }
+}
+
 impl Error {
-    /// The errno a policy denial surfaces inside the sandboxed child. The single
-    /// source of truth for the broker deny response and the trap `errno` field.
-    /// Only the Linux broker mediates individual accesses; the static-profile
-    /// platforms leave the errno to the kernel.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) const DENIAL_ERRNO: i32 = libc::EACCES;
 
-    /// A sandbox mechanism landstrip could not install on the process.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) const DENIAL_ERRNO_NAME: &'static str = Self::errno_symbol(Self::DENIAL_ERRNO)
+        .expect("DENIAL_ERRNO must map to a POSIX errno name");
+
     pub(crate) fn sandbox_setup(mechanism: Mechanism, source: impl Into<Cause>) -> Self {
         Self::SandboxSetupFailed {
             mechanism,
@@ -144,7 +163,6 @@ impl Error {
         Self::sandbox_setup(Mechanism::Landlock, source)
     }
 
-    /// Supervising the sandboxed child failed.
     #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     pub(crate) fn supervise(source: impl Into<Cause>) -> Self {
         Self::SuperviseFailed {
@@ -152,7 +170,11 @@ impl Error {
         }
     }
 
-    /// The sandbox was installed but the tool did not start.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn supervise_errno(errno: nix::errno::Errno) -> Self {
+        Self::supervise(io::Error::from_raw_os_error(errno as i32))
+    }
+
     pub(crate) fn launch(tool: impl Into<PathBuf>, source: impl Into<Cause>) -> Self {
         Self::LaunchFailed {
             tool: tool.into(),
@@ -166,56 +188,48 @@ impl Error {
         }
     }
 
-    /// The stable, machine-routable code.
-    pub(crate) fn code(&self) -> &'static str {
-        self.into()
+    pub(crate) fn policy_io(source: io::Error) -> Self {
+        Self::PolicyIoFailed { source }
     }
 
-    /// The fallback message for a policy-validation rejection. `None` means the
-    /// error is operational and must remain a trap.
-    pub(crate) fn policy_validation_message(&self) -> Option<&'static str> {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::PolicyParseFailed { .. } => Some("policy document is not valid JSON or YAML"),
-            Self::PolicyUnrestrictedRead => {
-                Some("unrestricted reads are unsupported by the active Windows sandbox")
+            Self::Policy(violation) => violation.code(),
+            other => other.into(),
+        }
+    }
+
+    pub(crate) fn validation_message(&self) -> Option<String> {
+        match self {
+            Self::PolicyParseFailed { .. } => {
+                let rendered = self.message();
+                if rendered == self.code() {
+                    Some("policy document is not valid JSON or YAML".to_owned())
+                } else {
+                    Some(rendered)
+                }
             }
-            Self::PolicyDenyReadAlwaysUnsupported => {
-                Some("denyReadAlways is unsupported on Windows")
-            }
-            Self::PolicyDenyWriteAlwaysUnsupported => {
-                Some("denyWriteAlways is unsupported on Windows")
-            }
-            Self::PolicyLocalBindingUnsupported => {
-                Some("local binding is unsupported by the active Windows sandbox")
-            }
-            Self::PolicyUnixSocketUnsupported => {
-                Some("Unix socket policy is unsupported by the active Windows sandbox")
-            }
-            Self::PolicyUnixSocketPath => {
-                Some("an allowed Unix socket path exists but is not a socket")
-            }
-            Self::PolicyInvalidPort => Some("proxy ports must be between 1 and 65535"),
-            Self::PolicyEmptyPath => Some("policy paths must not be empty"),
-            Self::PolicyInvalidMachLookup => {
-                Some("Mach service lookup names must not be empty or bare wildcards")
-            }
-            Self::PolicyInvalidLogTag => Some(
-                "Darwin logTag must not be empty or contain quotes, backslashes, or control characters",
-            ),
-            Self::PolicyHomeUnavailable => {
-                Some("the home directory is unavailable for a tilde-prefixed policy path")
-            }
-            Self::PolicyTraversalDepth => Some("policy path traversal exceeded its maximum depth"),
+            Self::Policy(violation) => Some(violation.message().to_owned()),
             Self::SandboxSetupFailed {
                 mechanism: Mechanism::Namespace,
                 ..
-            } => Some("requested namespace isolation is unavailable"),
-            Self::PlatformUnsupported => Some("the current platform is unsupported"),
+            } => {
+                let rendered = self.message();
+                if rendered == self.code() {
+                    Some("requested namespace isolation is unavailable".to_owned())
+                } else {
+                    Some(rendered)
+                }
+            }
+            Self::SandboxSetupFailed {
+                mechanism: Mechanism::Windowsuser,
+                ..
+            } => Some(self.message()),
+            Self::PlatformUnsupported => Some("the current platform is unsupported".to_owned()),
             _ => None,
         }
     }
 
-    /// The errno the cause carries, or `None` when it carries none.
     #[cfg(unix)]
     pub(crate) fn errno(&self) -> Option<i32> {
         StdError::source(self)?
@@ -223,24 +237,19 @@ impl Error {
             .raw_os_error()
     }
 
-    /// Windows reports Win32 status codes. They share the numeric space of POSIX
-    /// errnos without sharing their meaning — `ERROR_ACCESS_DENIED` is 5, which
-    /// is `EIO`, and `ERROR_INVALID_DATA` is 13, which is `EACCES`, landstrip's
-    /// own denial errno — so nothing is mapped here rather than mapped wrongly.
     #[cfg(not(unix))]
     pub(crate) fn errno(&self) -> Option<i32> {
         let _ = self;
         None
     }
 
-    /// The variant's discriminating data, or `None` when the code says it all.
-    /// The cause, where there is one, is reached through [`StdError::source`].
     pub(crate) fn detail(&self) -> Option<String> {
         match self {
             Self::Usage { message } => Some(message.clone()),
+            Self::Policy(violation) => Some(violation.message().to_owned()),
             Self::LaunchFailed { tool, .. } => Some(tool.display().to_string()),
             Self::HostJobIncompatible { .. } => Some(
-                "Landstrip is running inside a Job Object that prevents creating the sandbox job; start Pi outside the debugger or configure it to permit child-process breakaway"
+                "Landstrip is running inside a Job Object that prevents creating the sandbox job; start the host process outside the debugger or configure it to permit child-process breakaway"
                     .to_owned(),
             ),
             _ => None,
@@ -248,7 +257,7 @@ impl Error {
     }
 
     pub(crate) fn errno_name(&self) -> Option<&'static str> {
-        self.errno().and_then(errno_name)
+        self.errno().and_then(Self::errno_symbol)
     }
 
     pub(crate) fn message(&self) -> String {
@@ -275,28 +284,26 @@ impl Error {
             .chain()
             .find_map(<dyn StdError + 'static>::downcast_ref::<Self>)
     }
-}
 
-/// The symbolic name of `errno`, or `None` when it has no POSIX name (a Win32
-/// status, say).
-fn errno_name(errno: i32) -> Option<&'static str> {
-    match errno {
-        libc::E2BIG => Some("E2BIG"),
-        libc::EACCES => Some("EACCES"),
-        libc::EAGAIN => Some("EAGAIN"),
-        libc::EBADF => Some("EBADF"),
-        libc::EFAULT => Some("EFAULT"),
-        libc::EINVAL => Some("EINVAL"),
-        libc::EIO => Some("EIO"),
-        libc::EISDIR => Some("EISDIR"),
-        libc::ELOOP => Some("ELOOP"),
-        libc::ENAMETOOLONG => Some("ENAMETOOLONG"),
-        libc::ENOENT => Some("ENOENT"),
-        libc::ENOEXEC => Some("ENOEXEC"),
-        libc::ENOMEM => Some("ENOMEM"),
-        libc::ENOTDIR => Some("ENOTDIR"),
-        libc::EPERM => Some("EPERM"),
-        _ => None,
+    const fn errno_symbol(errno: i32) -> Option<&'static str> {
+        match errno {
+            libc::E2BIG => Some("E2BIG"),
+            libc::EACCES => Some("EACCES"),
+            libc::EAGAIN => Some("EAGAIN"),
+            libc::EBADF => Some("EBADF"),
+            libc::EFAULT => Some("EFAULT"),
+            libc::EINVAL => Some("EINVAL"),
+            libc::EIO => Some("EIO"),
+            libc::EISDIR => Some("EISDIR"),
+            libc::ELOOP => Some("ELOOP"),
+            libc::ENAMETOOLONG => Some("ENAMETOOLONG"),
+            libc::ENOENT => Some("ENOENT"),
+            libc::ENOEXEC => Some("ENOEXEC"),
+            libc::ENOMEM => Some("ENOMEM"),
+            libc::ENOTDIR => Some("ENOTDIR"),
+            libc::EPERM => Some("EPERM"),
+            _ => None,
+        }
     }
 }
 
@@ -332,8 +339,8 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::PolicyIoFailed { source } => Some(source),
-            Self::PolicyParseFailed { source }
+            Self::PolicyIoFailed { source, .. } => Some(source),
+            Self::PolicyParseFailed { source, .. }
             | Self::SandboxSetupFailed { source, .. }
             | Self::SuperviseFailed { source }
             | Self::LaunchFailed { source, .. }
@@ -344,14 +351,7 @@ impl StdError for Error {
 }
 
 impl Serialize for Error {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_str(self.code())
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl From<nix::errno::Errno> for Error {
-    fn from(errno: nix::errno::Errno) -> Self {
-        Self::supervise(io::Error::from_raw_os_error(errno as i32))
     }
 }

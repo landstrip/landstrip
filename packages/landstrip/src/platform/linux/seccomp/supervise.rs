@@ -354,7 +354,7 @@ impl Supervisor<'_> {
                     Ok(WaitStatus::StillAlive) => break,
                     Ok(status) => return Ok(denials.emit(status)),
                     Err(Errno::EINTR) => {}
-                    Err(error) => return Err(LandstripError::from(error).into()),
+                    Err(error) => return Err(LandstripError::supervise_errno(error).into()),
                 }
             }
 
@@ -376,7 +376,7 @@ impl Supervisor<'_> {
                     match waitpid(self.child, None) {
                         Ok(status) => return Ok(denials.emit(status)),
                         Err(Errno::EINTR) => {}
-                        Err(error) => return Err(LandstripError::from(error).into()),
+                        Err(error) => return Err(LandstripError::supervise_errno(error).into()),
                     }
                 }
             }
@@ -416,7 +416,9 @@ impl Supervisor<'_> {
                                 Ok(WaitStatus::StillAlive) => break,
                                 Ok(status) => return Ok(denials.emit(status)),
                                 Err(Errno::EINTR) => {}
-                                Err(error) => return Err(LandstripError::from(error).into()),
+                                Err(error) => {
+                                    return Err(LandstripError::supervise_errno(error).into());
+                                }
                             }
                         }
                         return Err(source);
@@ -497,7 +499,7 @@ fn poll_broker_fds(
                 ]);
             }
             Err(Errno::EINTR) => {}
-            Err(error) => return Err(LandstripError::from(error).into()),
+            Err(error) => return Err(LandstripError::supervise_errno(error).into()),
         }
     }
 }

@@ -9,7 +9,7 @@ mod restricted_user;
 
 pub(crate) use restricted_user::{manage, run_worker, status};
 
-use crate::error::{Error, Mechanism};
+use crate::error::{Error, Mechanism, PolicyViolation};
 use crate::paths::PathExt;
 use crate::policy::{AccessPolicy, ReadAccess};
 use anyhow::{Context, Result};
@@ -554,7 +554,7 @@ impl PathAccessEntry {
         let read_roots = match &policy.read_access {
             ReadAccess::AllowRoots(read_roots) => read_roots,
             ReadAccess::Unrestricted => {
-                return Err(Error::PolicyUnrestrictedRead.into());
+                return Err(Error::from(PolicyViolation::UnrestrictedRead).into());
             }
         };
         let mut entries = Vec::new();
@@ -673,10 +673,8 @@ impl PathAccessEntry {
                 inherit: false,
                 propagate: false,
             });
-            for entry in
-                fs::read_dir(&current).map_err(|source| Error::PolicyIoFailed { source })?
-            {
-                let entry = entry.map_err(|source| Error::PolicyIoFailed { source })?;
+            for entry in fs::read_dir(&current).map_err(Error::policy_io)? {
+                let entry = entry.map_err(Error::policy_io)?;
                 stack.push(entry.path());
             }
         }

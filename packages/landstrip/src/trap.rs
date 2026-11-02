@@ -17,7 +17,10 @@ use std::path::PathBuf;
 
 /// The code reported for an error the landstrip code space cannot name.
 const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
-
+#[cfg(target_os = "linux")]
+const FILESYSTEM_DENIED: &str = "FILESYSTEM_DENIED";
+#[cfg(target_os = "linux")]
+const NETWORK_DENIED: &str = "NETWORK_DENIED";
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,14 +129,14 @@ impl FilesystemDenial {
         let suggested_grant = self.operation.suggested_grant(&path);
         let (state, query_id) = TrapState::from_query_id(query_id);
         Trap::Filesystem(Box::new(FilesystemTrap {
-            code: Error::FilesystemDenied.code(),
+            code: FILESYSTEM_DENIED,
             state,
             query_id,
             operation: self.operation,
             path: path.into_owned(),
             requested_path: self.requested_path.to_string_lossy().into_owned(),
             syscall: self.syscall,
-            errno: "EACCES",
+            errno: Error::DENIAL_ERRNO_NAME,
             flags: self.flags,
             reason: self.reason,
             suggested_grant,
@@ -212,13 +215,13 @@ impl Trap {
         let syscall = operation.into();
         let (state, query_id) = TrapState::from_query_id(query_id);
         Self::Network(Box::new(NetworkTrap {
-            code: Error::NetworkDenied.code(),
+            code: NETWORK_DENIED,
             state,
             query_id,
             operation,
             target,
             syscall,
-            errno: "EACCES",
+            errno: Error::DENIAL_ERRNO_NAME,
             mechanism: Mechanism::Seccomp,
             process,
         }))

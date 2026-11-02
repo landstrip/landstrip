@@ -29,9 +29,10 @@ pub(super) struct Subreaper {
 
 impl Subreaper {
     pub(super) fn acquire() -> Result<Self> {
-        let was_subreaper = prctl::get_child_subreaper().map_err(LandstripError::from)?;
+        let was_subreaper =
+            prctl::get_child_subreaper().map_err(LandstripError::supervise_errno)?;
         if !was_subreaper {
-            prctl::set_child_subreaper(true).map_err(LandstripError::from)?;
+            prctl::set_child_subreaper(true).map_err(LandstripError::supervise_errno)?;
         }
         Ok(Self {
             restore_needed: !was_subreaper,
@@ -61,7 +62,7 @@ impl Subreaper {
         };
         let restore = if mem::take(&mut self.restore_needed) {
             prctl::set_child_subreaper(false)
-                .map_err(LandstripError::from)
+                .map_err(LandstripError::supervise_errno)
                 .map_err(Into::into)
         } else {
             Ok(())
@@ -95,7 +96,7 @@ impl Subreaper {
                 match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
                     Err(Errno::ECHILD) => return Ok(()),
                     Ok(_) | Err(Errno::EINTR) => continue,
-                    Err(error) => return Err(LandstripError::from(error).into()),
+                    Err(error) => return Err(LandstripError::supervise_errno(error).into()),
                 }
             }
 
@@ -110,14 +111,14 @@ impl Subreaper {
                 }
             }
             if let Some(error) = kill_error {
-                return Err(LandstripError::from(error).into());
+                return Err(LandstripError::supervise_errno(error).into());
             }
 
             loop {
                 match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
                     Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
                     Ok(_) | Err(Errno::EINTR) => {}
-                    Err(error) => return Err(LandstripError::from(error).into()),
+                    Err(error) => return Err(LandstripError::supervise_errno(error).into()),
                 }
             }
             std::thread::yield_now();

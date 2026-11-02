@@ -74,7 +74,7 @@ impl AsRawFd for NotifySocket {
 impl NotifySocket {
     fn pair(handoff_by_pidfd: bool) -> Result<(Self, Self)> {
         let (parent, child) = UnixStream::pair().map_err(LandstripError::supervise)?;
-        setsockopt(&parent, sockopt::PassCred, &true).map_err(LandstripError::from)?;
+        setsockopt(&parent, sockopt::PassCred, &true).map_err(LandstripError::supervise_errno)?;
         // File uses read/write; UnixStream's sendto would block on our own notify filter.
         Ok((
             Self {
@@ -110,7 +110,7 @@ impl NotifySocket {
                 ) {
                     Ok(_) => break,
                     Err(Errno::EINTR) => {}
-                    Err(error) => return Err(LandstripError::from(error).into()),
+                    Err(error) => return Err(LandstripError::supervise_errno(error).into()),
                 }
             }
         }
@@ -154,11 +154,11 @@ impl NotifySocket {
             ) {
                 Ok(message) => message,
                 Err(Errno::EINTR) => continue,
-                Err(error) => return Err(LandstripError::from(error).into()),
+                Err(error) => return Err(LandstripError::supervise_errno(error).into()),
             };
             let mut fd = None;
             let mut sender = None;
-            for control in message.cmsgs().map_err(LandstripError::from)? {
+            for control in message.cmsgs().map_err(LandstripError::supervise_errno)? {
                 match control {
                     ControlMessageOwned::ScmRights(fds) => fd = fds.first().copied(),
                     ControlMessageOwned::ScmCredentials(credentials) => {

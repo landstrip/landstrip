@@ -23,7 +23,7 @@ pub(crate) mod resolver;
 
 use crate::config::{AppContainerMode, SandboxDarwin};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::error::Error;
+use crate::error::{Error, PolicyViolation};
 #[cfg(target_os = "linux")]
 use crate::paths::NormalizeRoots;
 use crate::paths::{GlobPattern, GlobPatternBuf, OverridesDeny, PathExt};
@@ -324,7 +324,7 @@ impl AccessPolicy {
                             path.display()
                         );
                     }
-                    _ => return Err(Error::PolicyUnixSocketPath),
+                    _ => return Err(PolicyViolation::UnixSocketPath.into()),
                 }
             }
         }
@@ -341,12 +341,12 @@ impl AccessPolicy {
     /// with no network access.
     pub(crate) fn validate(&self) -> std::result::Result<(), Error> {
         if matches!(self.read_access, ReadAccess::Unrestricted) {
-            return Err(Error::PolicyUnrestrictedRead);
+            return Err(PolicyViolation::UnrestrictedRead.into());
         }
 
         let network = &self.network_access;
         if !network.unix_socket_access().is_denied() {
-            return Err(Error::PolicyUnixSocketUnsupported);
+            return Err(PolicyViolation::UnixSocketUnsupported.into());
         }
 
         if network.is_unrestricted() {
@@ -354,7 +354,7 @@ impl AccessPolicy {
         }
 
         if network.allows_local_binding() {
-            return Err(Error::PolicyLocalBindingUnsupported);
+            return Err(PolicyViolation::LocalBindingUnsupported.into());
         }
 
         Ok(())

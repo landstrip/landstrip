@@ -85,13 +85,13 @@ impl TryFrom<anyhow::Result<()>> for PolicyValidationReport {
                 let Some(engine_error) = Error::find_in(&error) else {
                     return Err(error);
                 };
-                let Some(fallback_message) = engine_error.policy_validation_message() else {
+                let Some(fallback_message) = engine_error.validation_message() else {
                     return Err(error);
                 };
                 let code = engine_error.code();
                 let rendered_message = format!("{error:#}");
                 let message = if rendered_message == code {
-                    fallback_message.to_owned()
+                    fallback_message
                 } else {
                     rendered_message
                 };

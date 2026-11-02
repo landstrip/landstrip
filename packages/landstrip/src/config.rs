@@ -297,7 +297,7 @@ fn read_policy_bytes(exe: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(PathBuf::from(stream)) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(Error::PolicyIoFailed { source }.into()),
+        Err(source) => Err(Error::policy_io(source).into()),
     }
 }
 
@@ -311,10 +311,8 @@ fn read_policy_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let c_path =
-        CString::new(path.as_os_str().as_bytes()).map_err(|source| Error::PolicyIoFailed {
-            source: io::Error::new(io::ErrorKind::InvalidInput, source),
-        })?;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|source| Error::policy_io(io::Error::new(io::ErrorKind::InvalidInput, source)))?;
 
     // SAFETY: c_path and EXECUTABLE_POLICY_XATTR are live NUL-terminated C strings;
     // a null value pointer with size 0 only queries the attribute's length.
@@ -333,8 +331,11 @@ fn read_policy_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
         return Ok(Some(Vec::new()));
     }
 
-    let needed = usize::try_from(needed).map_err(|_| Error::PolicyIoFailed {
-        source: io::Error::new(io::ErrorKind::InvalidData, "xattr size does not fit usize"),
+    let needed = usize::try_from(needed).map_err(|_| {
+        Error::policy_io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "xattr size does not fit usize",
+        ))
     })?;
     let mut buffer = vec![0u8; needed];
     // SAFETY: buffer is valid for writes of its own length, which is passed
@@ -351,8 +352,11 @@ fn read_policy_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
         return classify_xattr_error();
     }
 
-    let got = usize::try_from(got).map_err(|_| Error::PolicyIoFailed {
-        source: io::Error::new(io::ErrorKind::InvalidData, "xattr size does not fit usize"),
+    let got = usize::try_from(got).map_err(|_| {
+        Error::policy_io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "xattr size does not fit usize",
+        ))
     })?;
     buffer.truncate(got);
     Ok(Some(buffer))
@@ -372,7 +376,7 @@ fn classify_xattr_error() -> Result<Option<Vec<u8>>> {
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
         Some(code) if code == missing || code == libc::ENOENT => Ok(None),
-        _ => Err(Error::PolicyIoFailed { source: error }.into()),
+        _ => Err(Error::policy_io(error).into()),
     }
 }
 

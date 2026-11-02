@@ -107,7 +107,7 @@ impl<'a> NotificationChannel<'a> {
             match unsafe { seccomp_notif_recv(self.0.as_raw_fd(), ptr::addr_of_mut!(request)) } {
                 Ok(_) => return Ok(request),
                 Err(Errno::EINTR) => {}
-                Err(error) => return Err(LandstripError::from(error).into()),
+                Err(error) => return Err(LandstripError::supervise_errno(error).into()),
             }
         }
     }
@@ -119,7 +119,7 @@ impl<'a> NotificationChannel<'a> {
                 Ok(_) => return Ok(true),
                 Err(Errno::EINTR) => {}
                 Err(Errno::ENOENT) => return Ok(false),
-                Err(error) => return Err(LandstripError::from(error).into()),
+                Err(error) => return Err(LandstripError::supervise_errno(error).into()),
             }
         }
     }
@@ -130,7 +130,7 @@ impl<'a> NotificationChannel<'a> {
             match unsafe { seccomp_notif_send(self.0.as_raw_fd(), ptr::addr_of_mut!(response)) } {
                 Ok(_) => return Ok(()),
                 Err(Errno::EINTR) => {}
-                Err(error) => return Err(LandstripError::from(error).into()),
+                Err(error) => return Err(LandstripError::supervise_errno(error).into()),
             }
         }
     }
@@ -139,7 +139,7 @@ impl<'a> NotificationChannel<'a> {
         // SAFETY: addfd points to an initialized struct.
         unsafe { seccomp_notif_addfd(self.0.as_raw_fd(), addfd) }
             .map(|_| ())
-            .map_err(|error| LandstripError::from(error).into())
+            .map_err(|error| LandstripError::supervise_errno(error).into())
     }
 }
 
