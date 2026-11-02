@@ -3,7 +3,7 @@
 
 use super::super::signals::ForwardSignals;
 use super::error::{BrokerError, SysResult};
-use super::fs::{MUTATION_SYSCALLS, handle_access, handle_mutation, handle_openat, legacy_syscall};
+use super::fs::{MUTATION_SYSCALLS, handle_access, handle_mutation, handle_openat};
 use super::grant::Grant;
 use super::network::{handle_bind, handle_connect, handle_sendmmsg, handle_sendmsg, handle_sendto};
 use super::notify::{NotificationChannel, NotificationResponse, NotificationResult, QueryDecision};
@@ -143,7 +143,6 @@ pub(super) enum HandleResult {
 
 pub(super) struct NotificationContext<'a> {
     pub(super) policy: &'a AccessPolicy,
-    pub(super) syscalls: &'a NotificationSyscalls,
     pub(super) notify_filesystem: bool,
     pub(super) mount_namespace: NamespaceId,
 }
@@ -151,30 +150,24 @@ pub(super) struct NotificationContext<'a> {
 impl NotificationContext<'_> {
     fn handle(&self, request: &libc::seccomp_notif, denials: &mut Denials<'_>) -> HandleResult {
         let syscall = i64::from(request.data.nr);
-        let result = if syscall == self.syscalls.bind {
-            handle_bind(self.policy, request, denials)
-        } else if syscall == self.syscalls.connect {
-            handle_connect(self.policy, request, denials)
-        } else if syscall == self.syscalls.sendto {
-            handle_sendto(request, denials)
-        } else if syscall == self.syscalls.sendmsg {
-            handle_sendmsg(request, denials)
-        } else if syscall == self.syscalls.sendmmsg {
-            handle_sendmmsg(request, denials)
-        } else if self.notify_filesystem && self.syscalls.is_open(syscall) {
-            handle_openat(self.policy, request, denials)
-        } else if self.syscalls.is_access(syscall) {
-            handle_access(self.policy, request, denials)
-        } else if self.notify_filesystem && self.syscalls.is_handle_syscall(syscall) {
-            Err(BrokerError::PolicyDenied)
-        } else if self.notify_filesystem
-            || MUTATION_SYSCALLS
-                .iter()
-                .any(|spec| !spec.landlock_backed && spec.nr == Some(syscall))
-        {
-            handle_mutation(self.policy, request, denials)
-        } else {
-            Ok(NotificationResult::Continue)
+        let result = match SyscallClass::classify(syscall) {
+            Some(SyscallClass::Bind) => handle_bind(self.policy, request, denials),
+            Some(SyscallClass::Connect) => handle_connect(self.policy, request, denials),
+            Some(SyscallClass::Sendto) => handle_sendto(request, denials),
+            Some(SyscallClass::Sendmsg) => handle_sendmsg(request, denials),
+            Some(SyscallClass::Sendmmsg) => handle_sendmmsg(request, denials),
+            Some(SyscallClass::Open) if self.notify_filesystem => {
+                handle_openat(self.policy, request, denials)
+            }
+            Some(SyscallClass::Access) => handle_access(self.policy, request, denials),
+            Some(SyscallClass::Handle) if self.notify_filesystem => Err(BrokerError::PolicyDenied),
+            Some(SyscallClass::Mutation { landlock_backed })
+                if self.notify_filesystem || !landlock_backed =>
+            {
+                handle_mutation(self.policy, request, denials)
+            }
+            Some(SyscallClass::Open | SyscallClass::Handle | SyscallClass::Mutation { .. })
+            | None => Ok(NotificationResult::Continue),
         };
         match result {
             Ok(NotificationResult::Continue) => {
@@ -217,84 +210,92 @@ impl NamespaceId {
     }
 }
 
-pub(crate) struct NotificationSyscalls {
-    pub(crate) bind: i64,
-    pub(crate) connect: i64,
-    pub(crate) socket: i64,
-    pub(crate) sendto: i64,
-    pub(crate) sendmsg: i64,
-    pub(crate) sendmmsg: i64,
-    pub(crate) io_uring_setup: i64,
-    pub(crate) io_uring_enter: i64,
-    pub(crate) io_uring_register: i64,
-    openat: i64,
-    openat2: i64,
-    open: Option<i64>,
-    access: Option<i64>,
-    faccessat: i64,
-    faccessat2: i64,
-    name_to_handle_at: i64,
-    open_by_handle_at: i64,
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum SyscallClass {
+    Bind,
+    Connect,
+    Sendto,
+    Sendmsg,
+    Sendmmsg,
+    Open,
+    Access,
+    Handle,
+    Mutation { landlock_backed: bool },
 }
 
-impl NotificationSyscalls {
-    pub(crate) fn new() -> Self {
-        Self {
-            bind: libc::SYS_bind,
-            connect: libc::SYS_connect,
-            socket: libc::SYS_socket,
-            sendto: libc::SYS_sendto,
-            sendmsg: libc::SYS_sendmsg,
-            sendmmsg: libc::SYS_sendmmsg,
-            io_uring_setup: libc::SYS_io_uring_setup,
-            io_uring_enter: libc::SYS_io_uring_enter,
-            io_uring_register: libc::SYS_io_uring_register,
-            openat: libc::SYS_openat,
-            openat2: libc::SYS_openat2,
-            open: legacy_syscall::OPEN,
-            access: legacy_syscall::ACCESS,
-            faccessat: libc::SYS_faccessat,
-            faccessat2: libc::SYS_faccessat2,
-            name_to_handle_at: libc::SYS_name_to_handle_at,
-            open_by_handle_at: libc::SYS_open_by_handle_at,
+impl SyscallClass {
+    pub(super) const ACCESS: &[i64] = &[
+        libc::SYS_faccessat,
+        libc::SYS_faccessat2,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        libc::SYS_access,
+    ];
+
+    pub(super) const FILESYSTEM: &[i64] = &[
+        libc::SYS_openat,
+        libc::SYS_openat2,
+        libc::SYS_name_to_handle_at,
+        libc::SYS_open_by_handle_at,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        libc::SYS_open,
+    ];
+
+    pub(super) const DATAGRAM_SEND: &[i64] =
+        &[libc::SYS_sendto, libc::SYS_sendmsg, libc::SYS_sendmmsg];
+
+    pub(super) fn notified(
+        policy: &AccessPolicy,
+        needs_filesystem: bool,
+    ) -> impl Iterator<Item = i64> {
+        let restricted = !policy.network_access.is_unrestricted();
+        let datagram = if restricted && policy.network_access.allows_local_binding() {
+            Self::DATAGRAM_SEND
+        } else {
+            &[]
+        };
+        let filesystem = if needs_filesystem {
+            Self::FILESYSTEM
+        } else {
+            &[]
+        };
+        policy
+            .network_access
+            .needs_bind_broker()
+            .then_some(libc::SYS_bind)
+            .into_iter()
+            .chain(std::iter::once(libc::SYS_connect))
+            .chain(Self::ACCESS.iter().copied())
+            .chain(datagram.iter().copied())
+            .chain(filesystem.iter().copied())
+            .chain(
+                MUTATION_SYSCALLS
+                    .iter()
+                    .filter(move |spec| needs_filesystem || !spec.landlock_backed)
+                    .filter_map(|spec| spec.nr),
+            )
+    }
+
+    pub(super) fn classify(syscall: i64) -> Option<Self> {
+        match syscall {
+            libc::SYS_bind => Some(Self::Bind),
+            libc::SYS_connect => Some(Self::Connect),
+            libc::SYS_sendto => Some(Self::Sendto),
+            libc::SYS_sendmsg => Some(Self::Sendmsg),
+            libc::SYS_sendmmsg => Some(Self::Sendmmsg),
+            libc::SYS_openat | libc::SYS_openat2 => Some(Self::Open),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            libc::SYS_open => Some(Self::Open),
+            libc::SYS_faccessat | libc::SYS_faccessat2 => Some(Self::Access),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            libc::SYS_access => Some(Self::Access),
+            libc::SYS_name_to_handle_at | libc::SYS_open_by_handle_at => Some(Self::Handle),
+            _ => MUTATION_SYSCALLS
+                .iter()
+                .find(|spec| spec.nr == Some(syscall))
+                .map(|spec| Self::Mutation {
+                    landlock_backed: spec.landlock_backed,
+                }),
         }
-    }
-
-    fn is_open(&self, syscall: i64) -> bool {
-        syscall == self.openat
-            || syscall == self.openat2
-            || self.open.is_some_and(|open| open == syscall)
-    }
-
-    fn is_access(&self, syscall: i64) -> bool {
-        syscall == self.faccessat
-            || syscall == self.faccessat2
-            || self.access.is_some_and(|access| access == syscall)
-    }
-
-    fn is_handle_syscall(&self, syscall: i64) -> bool {
-        syscall == self.name_to_handle_at || syscall == self.open_by_handle_at
-    }
-
-    pub(crate) fn access_syscalls(&self) -> Vec<i64> {
-        let mut nrs = vec![self.faccessat, self.faccessat2];
-        if let Some(access) = self.access {
-            nrs.push(access);
-        }
-        nrs
-    }
-
-    pub(crate) fn filesystem_syscalls(&self) -> Vec<i64> {
-        let mut nrs = vec![
-            self.openat,
-            self.openat2,
-            self.name_to_handle_at,
-            self.open_by_handle_at,
-        ];
-        if let Some(open) = self.open {
-            nrs.push(open);
-        }
-        nrs
     }
 }
 
@@ -321,7 +322,6 @@ pub(super) struct Supervisor<'a> {
     pub(super) policy: &'a AccessPolicy,
     pub(super) child: Pid,
     pub(super) notify_fd: BorrowedFd<'a>,
-    pub(super) syscalls: &'a NotificationSyscalls,
     pub(super) notify_filesystem: bool,
     pub(super) trap_fd: Option<&'a TrapFd>,
     pub(super) mount_namespace: NamespaceId,
@@ -342,7 +342,6 @@ impl Supervisor<'_> {
             .map(AsFd::as_fd);
         let ctx = NotificationContext {
             policy: self.policy,
-            syscalls: self.syscalls,
             notify_filesystem: self.notify_filesystem,
             mount_namespace: self.mount_namespace,
         };

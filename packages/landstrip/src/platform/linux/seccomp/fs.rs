@@ -14,7 +14,7 @@ use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub(super) mod legacy_syscall {
+mod legacy_syscall {
     pub const OPEN: Option<i64> = Some(libc::SYS_open);
     pub const ACCESS: Option<i64> = Some(libc::SYS_access);
     pub const RENAME: Option<i64> = Some(libc::SYS_rename);
@@ -31,7 +31,7 @@ pub(super) mod legacy_syscall {
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-pub(super) mod legacy_syscall {
+mod legacy_syscall {
     pub const OPEN: Option<i64> = None;
     pub const ACCESS: Option<i64> = None;
     pub const RENAME: Option<i64> = None;

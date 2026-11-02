@@ -8,7 +8,6 @@
 //! filter that traps the syscalls the broker mediates. This layer is pure
 //! policy-to-program translation; it does not run the notification loop.
 
-use super::seccomp::NotificationSyscalls;
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::policy::{AccessPolicy, UnixSocketAccess};
 use anyhow::Result;
@@ -138,14 +137,13 @@ pub(super) struct FilterSet {
 impl FilterSet {
     pub(super) fn new(
         policy: &AccessPolicy,
-        syscalls: &NotificationSyscalls,
-        notify_syscalls: &[i64],
+        notify_syscalls: impl IntoIterator<Item = i64>,
     ) -> Result<Self> {
         let restricted = !policy.network_access.is_unrestricted();
         let allow_local_binding = policy.network_access.allows_local_binding();
         let unix_sockets = policy.network_access.unix_socket_access().into();
-        let errno = build_errno_filter(syscalls, restricted, allow_local_binding, unix_sockets)?;
-        let eperm = build_io_uring_deny(syscalls)?;
+        let errno = build_errno_filter(restricted, allow_local_binding, unix_sockets)?;
+        let eperm = build_io_uring_deny()?;
         let mut clone3_builder = FilterBuilder::new();
         clone3_builder.add_unconditional(libc::SYS_clone3);
         let enosys_code =
@@ -174,17 +172,16 @@ impl FilterSet {
 }
 
 fn build_errno_filter(
-    syscalls: &NotificationSyscalls,
     needs_network: bool,
     allow_local_binding: bool,
     unix_sockets: UnixSocketFilter,
 ) -> Result<Option<BpfProgram>> {
     let mut builder = FilterBuilder::new();
     if needs_network {
-        builder.add_socket_family_filter(syscalls.socket, allow_local_binding)?;
-        builder.add_network_bypass_filters(syscalls)?;
+        builder.add_socket_family_filter(libc::SYS_socket, allow_local_binding)?;
+        builder.add_network_bypass_filters()?;
     }
-    builder.add_unix_socket_filters(syscalls.socket, unix_sockets)?;
+    builder.add_unix_socket_filters(libc::SYS_socket, unix_sockets)?;
     if builder.is_empty() {
         return Ok(None);
     }
@@ -197,12 +194,12 @@ fn build_errno_filter(
 /// brokered syscalls. Legacy timestamp syscalls also bypass Landlock and the
 /// pathname broker. Deny these entry points with `EPERM` in a separate program
 /// because seccompiler binds one action per filter.
-fn build_io_uring_deny(syscalls: &NotificationSyscalls) -> Result<BpfProgram> {
+fn build_io_uring_deny() -> Result<BpfProgram> {
     let mut builder = FilterBuilder::new();
-    builder.add_unconditional(syscalls.io_uring_setup);
-    builder.add_unconditional(syscalls.io_uring_enter);
-    builder.add_unconditional(syscalls.io_uring_register);
     for syscall in [
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
         libc::SYS_unshare,
         libc::SYS_setns,
         libc::SYS_mount,
@@ -249,8 +246,10 @@ fn build_io_uring_deny(syscalls: &NotificationSyscalls) -> Result<BpfProgram> {
     builder.build(SeccompAction::Errno(eperm))
 }
 
-fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
-    let mut program = BpfProgram::with_capacity(syscalls.len() * 2 + 7);
+fn build_notify_filter(syscalls: impl IntoIterator<Item = i64>) -> Result<BpfProgram> {
+    let syscalls = syscalls.into_iter();
+    let (lower, _) = syscalls.size_hint();
+    let mut program = BpfProgram::with_capacity(lower * 2 + 7);
     let load = u16::try_from(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS)
         .map_err(|_| LandstripError::IntegerTooLarge)?;
     let jump_eq = u16::try_from(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K)
@@ -274,7 +273,7 @@ fn build_notify_filter(syscalls: &[i64]) -> Result<BpfProgram> {
         program.push(bpf_stmt(ret, libc::SECCOMP_RET_KILL_PROCESS));
     }
     for syscall in syscalls {
-        let syscall = u32::try_from(*syscall).map_err(|_| LandstripError::IntegerTooLarge)?;
+        let syscall = u32::try_from(syscall).map_err(|_| LandstripError::IntegerTooLarge)?;
         program.push(bpf_jump(jump_eq, syscall, 0, 1));
         program.push(bpf_stmt(ret, libc::SECCOMP_RET_USER_NOTIF));
     }
@@ -350,13 +349,13 @@ fn load_program(program: &BpfProgram, flags: libc::c_ulong) -> Result<Option<Own
 }
 
 impl FilterBuilder {
-    fn add_network_bypass_filters(&mut self, syscalls: &NotificationSyscalls) -> Result<()> {
+    fn add_network_bypass_filters(&mut self) -> Result<()> {
         let fastopen =
             u64::try_from(libc::MSG_FASTOPEN).map_err(|_| LandstripError::IntegerTooLarge)?;
         for (syscall, flags) in [
-            (syscalls.sendto, 3),
-            (syscalls.sendmsg, 2),
-            (syscalls.sendmmsg, 3),
+            (libc::SYS_sendto, 3),
+            (libc::SYS_sendmsg, 2),
+            (libc::SYS_sendmmsg, 3),
         ] {
             self.add_conditional_rule(
                 syscall,

@@ -27,7 +27,6 @@ mod subreaper;
 mod supervise;
 
 pub(crate) use notify::ensure_notification_supported;
-pub(crate) use supervise::NotificationSyscalls;
 
 use super::filter::FilterSet;
 use super::landlock::LandlockRuleset;
@@ -39,7 +38,6 @@ use crate::policy::AccessPolicy;
 use crate::trap::Trap;
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
-use fs::MUTATION_SYSCALLS;
 use nix::errno::Errno;
 use nix::sys::socket::{
     ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg, setsockopt, sockopt,
@@ -56,8 +54,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use subreaper::Subreaper;
-use supervise::{NamespaceId, Supervisor};
-
+use supervise::{NamespaceId, Supervisor, SyscallClass};
 enum NotifyStartup<'a> {
     Ready(BorrowedFd<'a>, NamespaceId),
     Trap(String),
@@ -248,33 +245,9 @@ pub(super) fn run_broker(
 ) -> Result<i32> {
     ensure_notification_supported()?;
 
-    let syscalls = NotificationSyscalls::new();
-    let restricted = !policy.network_access.is_unrestricted();
-    let allow_local_binding = policy.network_access.allows_local_binding();
-    let handoff_by_pidfd = restricted && allow_local_binding;
-
-    let mut notify_syscalls = Vec::new();
-    if policy.network_access.needs_bind_broker() {
-        notify_syscalls.push(syscalls.bind);
-    }
-    notify_syscalls.push(syscalls.connect);
-    notify_syscalls.extend(syscalls.access_syscalls());
-    if restricted && allow_local_binding {
-        notify_syscalls.push(syscalls.sendto);
-        notify_syscalls.push(syscalls.sendmsg);
-        notify_syscalls.push(syscalls.sendmmsg);
-    }
-    if needs_filesystem {
-        notify_syscalls.extend(syscalls.filesystem_syscalls());
-    }
-    notify_syscalls.extend(
-        MUTATION_SYSCALLS
-            .iter()
-            .filter(|spec| needs_filesystem || !spec.landlock_backed)
-            .filter_map(|spec| spec.nr),
-    );
-    let filters = FilterSet::new(policy, &syscalls, &notify_syscalls)?;
-    let notify_filesystem = needs_filesystem;
+    let handoff_by_pidfd =
+        !policy.network_access.is_unrestricted() && policy.network_access.allows_local_binding();
+    let filters = FilterSet::new(policy, SyscallClass::notified(policy, needs_filesystem))?;
     let (mut parent, mut child_sock) = NotifySocket::pair(handoff_by_pidfd)?;
     let launch = Launch::new().map_err(|error| {
         LandstripError::sandbox_setup(Mechanism::Namespace, error.into_boxed_dyn_error())
@@ -340,8 +313,7 @@ pub(super) fn run_broker(
                         policy,
                         child,
                         notify_fd: notify,
-                        syscalls: &syscalls,
-                        notify_filesystem,
+                        notify_filesystem: needs_filesystem,
                         trap_fd,
                         mount_namespace: namespace,
                         signals: Some(&mut signals),
