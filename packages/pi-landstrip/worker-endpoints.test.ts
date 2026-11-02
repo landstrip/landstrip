@@ -7,7 +7,11 @@ import { createServer } from 'node:http';
 import { join } from 'node:path';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { parseTrapLine } from '@landstrip/landstrip-api/shared';
+import {
+  formatLandstripTraps,
+  parseLandstripTraps,
+  parseTrapLine,
+} from '@landstrip/landstrip-api/shared';
 import { afterEach, expect, test, vi } from 'vitest';
 
 import {
@@ -283,3 +287,36 @@ sandboxTest.for(
     }
   },
 );
+
+test('formatLandstripTraps deduplicates identical formatted trap lines across PIDs', () => {
+  const makeTrap = (operation: 'read' | 'write', path: string, pid: number): string =>
+    JSON.stringify({
+      kind: 'filesystem',
+      code: 'FILESYSTEM_DENIED',
+      state: 'info',
+      query_id: '0',
+      operation,
+      syscall: operation === 'write' ? 'mkdirat' : 'openat',
+      flags: [],
+      path,
+      requested_path: path,
+      errno: 'EACCES',
+      mechanism: 'seccomp',
+      reason: 'deny_match',
+      suggested_grant: operation === 'read' ? { allowRead: path } : { allowWrite: path },
+      process: { pid, exe: '/usr/bin/node', cwd: '/tmp' },
+    });
+  const traps = parseLandstripTraps(
+    [
+      makeTrap('write', '/tmp/secret.lock', 1001),
+      makeTrap('write', '/tmp/secret.lock', 1002),
+      makeTrap('read', '/tmp/other', 1002),
+    ].join('\n'),
+  );
+  expect(formatLandstripTraps(traps)).toBe(
+    [
+      'landstrip: filesystem write denied (/tmp/secret.lock) [seccomp]',
+      'landstrip: filesystem read denied (/tmp/other) [seccomp]',
+    ].join('\n'),
+  );
+});

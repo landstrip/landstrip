@@ -3318,7 +3318,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         );
         const traps = parseLandstripTraps(trapBuffer);
         if (traps.length > 0) {
-          const formatted = [...new Set(formatLandstripTraps(traps).split('\n'))].join('\n');
+          const formatted = formatLandstripTraps(traps);
           try {
             writeSync(outputFd, Buffer.from(`${formatted}\n`, 'utf8'));
           } catch {}

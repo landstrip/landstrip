@@ -1705,7 +1705,10 @@ function createLandstripIntegrationWithPrompts(
     const decoder = new StringDecoder('utf8');
     let buffer = '';
     let prompts = Promise.resolve();
+    const reportedErrors = new Set<string>();
     const reportTrapError = (message: string): void => {
+      if (reportedErrors.has(message)) return;
+      reportedErrors.add(message);
       notify(ctx, message, 'error');
       if (!ctx.hasUI) console.error(`pi-landstrip: ${message}`);
     };
@@ -2464,7 +2467,7 @@ function createLandstripIntegrationWithPrompts(
     const formatTrapErrors = (): string | null => {
       const landstripErrors = parseLandstripTraps(landstripErrorOutput);
       if (landstripErrors.length === 0) return null;
-      return [...new Set(formatLandstripTraps(landstripErrors).split('\n'))].join('\n');
+      return formatLandstripTraps(landstripErrors);
     };
     const blockedReadPathForRetry = (nativeOutput: string): string | null => {
       const config = loadConfig(ctx.cwd, ctx);

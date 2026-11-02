@@ -306,7 +306,7 @@ function formatLandstripTrap(trap) {
 }
 
 function formatLandstripTraps(traps) {
-  return traps.map(formatLandstripTrap).join('\n');
+  return [...new Set(traps.map(formatLandstripTrap))].join('\n');
 }
 
 // Relative entries (notably ".") resolve against the caller-supplied base
