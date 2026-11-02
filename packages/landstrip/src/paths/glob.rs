@@ -66,11 +66,11 @@ impl<'a> GlobPattern<'a> {
     }
 
     pub(crate) fn base(&self) -> PathBuf {
-        let Some(glob_at) = self.pattern.bytes().position(Self::is_glob_byte) else {
-            return PathBuf::from(self.pattern);
-        };
-        let prefix = &self.pattern[..glob_at];
-        let mut base = if prefix.as_bytes().last() == Some(&(MAIN_SEPARATOR as u8)) {
+        let (prefix, tail) = self.split_literal_prefix();
+        if tail.is_empty() {
+            return PathBuf::from(prefix);
+        }
+        let mut base = if prefix.ends_with(MAIN_SEPARATOR) {
             PathBuf::from(prefix)
         } else {
             Path::new(prefix)
@@ -79,39 +79,78 @@ impl<'a> GlobPattern<'a> {
         };
 
         if base.as_os_str().is_empty() {
-            base.push(MAIN_SEPARATOR.to_string());
+            base.push(MAIN_SEPARATOR_STR);
         }
 
         base
     }
 
+    fn split_literal_prefix(&self) -> (&'a str, &'a [u8]) {
+        let at = self
+            .pattern
+            .bytes()
+            .position(Self::is_glob_byte)
+            .unwrap_or(self.pattern.len());
+        (&self.pattern[..at], &self.pattern.as_bytes()[at..])
+    }
+
+    fn strip_literal_prefix<'b>(&self, prefix: &[u8], text: &'b [u8]) -> Option<&'b [u8]> {
+        let (head, tail) = text.split_at_checked(prefix.len())?;
+        prefix
+            .iter()
+            .zip(head)
+            .all(|(&expected, &actual)| self.syntax.matches_byte(expected, actual))
+            .then_some(tail)
+    }
+
+    fn matches_tail(
+        &self,
+        pattern_tail: &[u8],
+        text_tail: &[u8],
+        memo: &mut Vec<Option<bool>>,
+    ) -> bool {
+        if pattern_tail.is_empty() {
+            return text_tail.is_empty();
+        }
+        let needed = (pattern_tail.len() + 1) * (text_tail.len() + 1);
+        memo.clear();
+        memo.resize(needed, None);
+        self.matches_at(pattern_tail, text_tail, 0, 0, memo)
+    }
+
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn matches_path(&self, path: &Path) -> bool {
+        let (prefix, pattern_tail) = self.split_literal_prefix();
         let path_bytes = path.to_string_lossy();
-        let pattern_bytes = self.pattern.as_bytes();
-        let path_len = path_bytes.len();
-        let pattern_len = pattern_bytes.len();
-        let mut memo = vec![None; (pattern_len + 1) * (path_len + 1)];
-        self.matches_at(pattern_bytes, path_bytes.as_bytes(), 0, 0, &mut memo)
+        let Some(text_tail) = self.strip_literal_prefix(prefix.as_bytes(), path_bytes.as_bytes())
+        else {
+            return false;
+        };
+        let mut memo = Vec::new();
+        self.matches_tail(pattern_tail, text_tail, &mut memo)
     }
 
     pub(crate) fn matches_tree(&self, path: &Path) -> bool {
-        path.ancestors().any(|ancestor| self.matches_path(ancestor))
+        let (prefix, pattern_tail) = self.split_literal_prefix();
+        let mut memo = Vec::new();
+        for ancestor in path.ancestors() {
+            let path_bytes = ancestor.to_string_lossy();
+            let Some(text_tail) =
+                self.strip_literal_prefix(prefix.as_bytes(), path_bytes.as_bytes())
+            else {
+                continue;
+            };
+            if self.matches_tail(pattern_tail, text_tail, &mut memo) {
+                return true;
+            }
+        }
+        false
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn matches_under(&self, root: &Path) -> bool {
-        let base = self.base();
-        if base.is_under(root) {
-            return true;
-        }
-        if !root.is_under(&base) {
-            return false;
-        }
-        let mut matches = Vec::new();
-        self.collect_matches(root, &mut matches, 0).is_err() || !matches.is_empty()
+        self.has_unexcused_under(root, |_| true)
     }
-
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn has_unexcused_under(
         &self,
