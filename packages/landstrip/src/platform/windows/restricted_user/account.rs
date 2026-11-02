@@ -3,8 +3,8 @@
 
 //! Local sandbox account provisioning.
 
-use super::state::{self, Account, NetworkMode};
-use super::{ToWideNul, encode_hex, sid_string, win32_error};
+use super::super::win32::{LocalSid, OsStatus, ToWideNul};
+use super::state::{Account, Hex, NetworkMode, SecretWide};
 use anyhow::{Context, Result, bail};
 use std::io;
 use std::ptr;
@@ -31,7 +31,7 @@ pub(super) fn provision(name: &str, network_mode: NetworkMode) -> Result<Account
 
     let result = (|| {
         let sid = lookup_sid(name)?;
-        let encrypted_password = state::protect_password(&password)?;
+        let encrypted_password = SecretWide::encrypt(&password)?;
         Ok(Account {
             name: name.to_owned(),
             sid,
@@ -58,7 +58,7 @@ pub(super) fn remove(name: &str) -> Result<()> {
     if status == NERR_Success || status == 2221 {
         return Ok(());
     }
-    Err(win32_error(status)).with_context(|| {
+    Err(OsStatus::from_code(status)).with_context(|| {
         format!(
             "delete sandbox account {}",
             String::from_utf16_lossy(&name[..name.len().saturating_sub(1)])
@@ -104,13 +104,13 @@ pub(super) fn lookup_sid(name: &str) -> Result<String> {
         return Err(io::Error::last_os_error()).context("query sandbox account SID");
     }
 
-    unsafe { sid_string(sid.as_mut_ptr().cast()) }.context("format sandbox account SID")
+    unsafe { LocalSid::format(sid.as_mut_ptr().cast()) }.context("format sandbox account SID")
 }
 
 pub(super) fn random_identifier(bytes: usize) -> Result<String> {
     let mut random = vec![0_u8; bytes];
     fill_random(&mut random)?;
-    Ok(encode_hex(&random))
+    Ok(Hex::encode(&random))
 }
 
 fn create(name: &str, password: &str) -> Result<()> {
@@ -138,7 +138,7 @@ fn create(name: &str, password: &str) -> Result<()> {
     };
     password_wide.zeroize();
     if status != NERR_Success {
-        return Err(win32_error(status))
+        return Err(OsStatus::from_code(status))
             .with_context(|| format!("create sandbox account (field {parameter_error})"));
     }
     Ok(())

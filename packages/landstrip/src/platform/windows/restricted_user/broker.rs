@@ -3,23 +3,17 @@
 
 //! Elevated broker that starts a worker under a leased local account.
 
-use super::state::{self, Account};
-use super::{SandboxJob, ToWideNul, own_handle, quote_command_arg, wait_process_exit};
+use super::super::process::{CommandLine, SandboxJob, SpawnedProcess};
+use super::super::win32::ToWideNul;
+use super::state::{Account, SecretWide};
 use crate::error::{Error as LandstripError, Mechanism};
-use anyhow::{Context, Result};
-use std::ffi::OsStr;
+use anyhow::Result;
 use std::io;
 use std::mem;
-use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::ptr;
-use windows_sys::Win32::System::Console::{
-    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-};
-use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CreateProcessWithLogonW, LOGON_WITH_PROFILE, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
 };
 
 pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path) -> Result<u32> {
@@ -31,25 +25,15 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
         .into());
     }
     let executable = runner_path.to_wide_nul();
-    let command_line = format!(
-        "{} {}",
-        quote(runner_path.as_os_str())?,
-        quote(request_path.as_os_str())?
-    );
-    let mut command_line = command_line.to_wide_nul();
+    let mut command_line = CommandLine::encode(runner_path.as_os_str(), [request_path.as_os_str()])
+        .map_err(|msg| LandstripError::sandbox_setup(Mechanism::Windowsuser, msg))?;
     let username = account.name.to_wide_nul();
-    let domain = "".to_wide_nul();
-    let password = state::unprotect_password(&account.encrypted_password)?;
-    let current_directory = std::env::current_dir()?;
-    let current_directory = current_directory.to_wide_nul();
+    let domain = [0_u16];
+    let password = SecretWide::decrypt(&account.encrypted_password)?;
+    let current_directory = std::env::current_dir()?.to_wide_nul();
     let job = SandboxJob::new(Mechanism::Windowsuser)?;
+    let startup = SpawnedProcess::std_startup_info()?;
 
-    let mut startup = unsafe { mem::zeroed::<STARTUPINFOW>() };
-    startup.cb = u32::try_from(mem::size_of::<STARTUPINFOW>())?;
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    startup.hStdOutput = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    startup.hStdError = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
     let mut process_info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
     let ok = unsafe {
         CreateProcessWithLogonW(
@@ -73,33 +57,7 @@ pub(super) fn launch(account: &Account, runner_path: &Path, request_path: &Path)
         )
         .into());
     }
-    let process = unsafe { own_handle(process_info.hProcess) };
-    let thread = unsafe { own_handle(process_info.hThread) };
-    if unsafe { AssignProcessToJobObject(job.as_raw(), process.as_raw_handle()) } == 0 {
-        let error = io::Error::last_os_error();
-        unsafe {
-            TerminateProcess(process.as_raw_handle(), 1);
-        }
-        return Err(LandstripError::sandbox_setup(
-            Mechanism::Windowsuser,
-            format!("AssignProcessToJobObject: {error}"),
-        )
-        .into());
-    }
-    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-        return Err(LandstripError::sandbox_setup(
-            Mechanism::Windowsuser,
-            format!("ResumeThread: {}", io::Error::last_os_error()),
-        )
-        .into());
-    }
-    wait_process_exit(&process)
-}
-
-fn quote(value: &OsStr) -> Result<String> {
-    let value = value
-        .to_str()
-        .context("restricted-user worker path is not valid Unicode")?;
-    quote_command_arg(value)
-        .map_err(|msg| LandstripError::sandbox_setup(Mechanism::Windowsuser, msg).into())
+    let spawned = unsafe { SpawnedProcess::from_raw(process_info) };
+    spawned.assign_to_job(&job, Mechanism::Windowsuser)?;
+    spawned.resume_and_wait(Mechanism::Windowsuser)
 }

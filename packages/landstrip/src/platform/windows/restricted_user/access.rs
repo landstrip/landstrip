@@ -3,13 +3,14 @@
 
 //! Temporary filesystem grants for a leased sandbox account.
 
-use super::{LocalSid, PathAccessEntry, is_locked_error, is_missing_error, path_access_failed};
+use super::super::acl::PathAccessEntry;
+use super::super::win32::{LocalSid, OsStatus};
 use crate::error::{Error as LandstripError, Mechanism};
 use crate::policy::AccessPolicy;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
+use windows_sys::Win32::Security::Authorization::{GRANT_ACCESS, REVOKE_ACCESS};
 use windows_sys::Win32::Security::PSID;
 use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
 
@@ -73,11 +74,11 @@ fn apply_restricted_entry(entry: &PathAccessEntry, sid: PSID) -> Result<bool> {
         Err((api, error))
             if (api == "GetNamedSecurityInfoW" || !entry.propagate)
                 && entry.access_mode == GRANT_ACCESS
-                && is_locked_error(&error) =>
+                && OsStatus::is_locked(&error) =>
         {
             Ok(false)
         }
-        Err((api, error)) => Err(path_access_failed(
+        Err((api, error)) => Err(PathAccessEntry::format_error(
             Mechanism::Windowsuser,
             &entry.path,
             entry.access_mode,
@@ -91,11 +92,11 @@ fn apply_restricted_entry(entry: &PathAccessEntry, sid: PSID) -> Result<bool> {
 fn revoke_restricted_entry(entry: &PathAccessEntry, sid: PSID) -> Result<()> {
     match entry.revoke(sid) {
         Ok(()) => Ok(()),
-        Err((api, error)) if api != "SetEntriesInAclW" && is_missing_error(&error) => Ok(()),
-        Err((api, error)) => Err(path_access_failed(
+        Err((api, error)) if api != "SetEntriesInAclW" && OsStatus::is_missing(&error) => Ok(()),
+        Err((api, error)) => Err(PathAccessEntry::format_error(
             Mechanism::Windowsuser,
             &entry.path,
-            windows_sys::Win32::Security::Authorization::REVOKE_ACCESS,
+            REVOKE_ACCESS,
             api,
             &error,
         )

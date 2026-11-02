@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use super::{AppContainerProfile, LookupRoots, ProcThreadAttributeList, current_process_in_job};
+use super::{AppContainerProfile, LookupRoots, ProcThreadAttributeList};
 use crate::config::AppContainerMode;
 use crate::error::Mechanism;
 use crate::outcome::WindowsStatusReport;
-use crate::platform::windows::{
-    OwnedSecurityDescriptor, SandboxJob, ToWideNul, null_device, own_handle, wait_process_exit,
-};
+use crate::platform::windows::null_device;
+use crate::platform::windows::process::{BreakawayError, SandboxJob, SpawnedProcess};
+use crate::platform::windows::win32::{OwnedSecurityDescriptor, ToWideNul};
 use anyhow::{Context, Result, anyhow, bail};
 use std::io;
 use std::mem;
-use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER};
+use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows_sys::Win32::Security::{
     AccessCheck, DuplicateToken, GENERIC_MAPPING, GetTokenInformation, ImpersonateLoggedOnUser,
     PRIVILEGE_SET, RevertToSelf, SECURITY_CAPABILITIES, SecurityImpersonation, TOKEN_DUPLICATE,
@@ -22,10 +22,9 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED;
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW,
-    EXTENDED_STARTUPINFO_PRESENT, OpenProcessToken,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenProcessToken,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTUPINFOEXW,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTUPINFOEXW,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
@@ -81,43 +80,23 @@ fn probe(mode: AppContainerMode) -> Result<()> {
     let executable = std::env::current_exe()
         .context("locate executable for suspended AppContainer probe")?
         .to_wide_nul();
-    let mut create = |flags| -> io::Result<PROCESS_INFORMATION> {
-        let mut info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
-        if unsafe {
-            CreateProcessW(
-                executable.as_ptr(),
-                ptr::null_mut(),
-                ptr::null(),
-                ptr::null(),
-                0,
-                flags,
-                ptr::null(),
-                ptr::null(),
-                (&raw mut startup).cast(),
-                &raw mut info,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(info)
-    };
-    let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW;
-    let info = match create(flags) {
-        Err(error)
-            if error.raw_os_error() == Some(ERROR_ACCESS_DENIED.cast_signed())
-                && current_process_in_job()? =>
-        {
-            create(flags | CREATE_BREAKAWAY_FROM_JOB)
-        }
-        result => result,
-    }
+    let spawned = SpawnedProcess::create_extended(
+        Some(&executable),
+        None,
+        false,
+        CREATE_SUSPENDED | CREATE_NO_WINDOW,
+        None,
+        &mut startup,
+    )
+    .map_err(BreakawayError::into_io)
     .context("create suspended AppContainer probe")?;
-    let process = unsafe { own_handle(info.hProcess) };
-    let _thread = unsafe { own_handle(info.hThread) };
+    let SpawnedProcess {
+        process,
+        thread: _thread,
+    } = spawned;
     let result = ProbeToken::try_from(&process).and_then(|token| token.spawn_probe(mode));
     drop(job);
-    let cleanup = wait_process_exit(&process)
+    let cleanup = SpawnedProcess::wait_exit(&process)
         .map(|_| ())
         .context("reap suspended AppContainer probe");
     match (result, cleanup) {
@@ -147,7 +126,7 @@ impl<'a> TryFrom<BorrowedHandle<'a>> for ProbeToken {
         {
             return Err(io::Error::last_os_error()).context("open AppContainer probe token");
         }
-        let primary = unsafe { own_handle(primary) };
+        let primary = unsafe { OwnedHandle::from_raw_handle(primary) };
         let mut token = ptr::null_mut();
         if unsafe {
             DuplicateToken(
@@ -159,7 +138,7 @@ impl<'a> TryFrom<BorrowedHandle<'a>> for ProbeToken {
         {
             return Err(io::Error::last_os_error()).context("duplicate AppContainer probe token");
         }
-        let token = unsafe { own_handle(token) };
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
         let mut is_app_container = 0_u32;
         let mut returned = 0;
         let size = u32::try_from(mem::size_of_val(&is_app_container))?;

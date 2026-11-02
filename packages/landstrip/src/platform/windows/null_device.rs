@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use super::{LocalSid, NamedMutex, OwnedLocal, ToWideNul, own_handle, win32_error};
+use super::win32::{LocalSid, NamedMutex, OsStatus, OwnedLocal, ToWideNul};
 use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
 use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::{
@@ -36,7 +36,7 @@ fn open(path: &str, desired_access: u32) -> io::Result<OwnedHandle> {
     if handle == INVALID_HANDLE_VALUE || handle.is_null() {
         return Err(io::Error::last_os_error());
     }
-    Ok(unsafe { own_handle(handle) })
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
 }
 
 pub(super) fn prepare() -> Result<()> {
@@ -59,7 +59,7 @@ pub(super) fn prepare() -> Result<()> {
         )
     };
     if status != 0 {
-        return Err(win32_error(status)).context("GetSecurityInfo for Device Null");
+        return Err(OsStatus::from_code(status)).context("GetSecurityInfo for Device Null");
     }
     let _descriptor = unsafe { OwnedLocal::from_raw(descriptor) };
     if old_dacl.is_null() {
@@ -92,7 +92,7 @@ pub(super) fn prepare() -> Result<()> {
         )
     };
     if status != 0 {
-        return Err(win32_error(status)).context("SetEntriesInAclW for Device Null");
+        return Err(OsStatus::from_code(status)).context("SetEntriesInAclW for Device Null");
     }
     let new_dacl = unsafe { OwnedLocal::from_raw(new_dacl) };
     if new_dacl.as_ptr::<std::ffi::c_void>().is_null() {
@@ -110,7 +110,7 @@ pub(super) fn prepare() -> Result<()> {
         )
     };
     if status != 0 {
-        return Err(win32_error(status)).context("SetSecurityInfo for Device Null");
+        return Err(OsStatus::from_code(status)).context("SetSecurityInfo for Device Null");
     }
     Ok(())
 }

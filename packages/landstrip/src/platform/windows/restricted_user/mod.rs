@@ -12,13 +12,6 @@ mod state;
 mod wfp;
 mod worker;
 
-pub(super) use super::{
-    LocalSid, NamedMutex, OwnedLocal, OwnedSecurityDescriptor, PathAccessEntry, SandboxJob,
-    ToWideNul, current_process_token, decode_hex, encode_hex, is_locked_error, is_missing_error,
-    join_command_line, own_handle, path_access_failed, quote_command_arg, sid_string, token_user,
-    wait_process_exit, win32_error,
-};
-
 use crate::error::{Error, Mechanism};
 use crate::policy::AccessPolicy;
 use anyhow::Result;
@@ -26,7 +19,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
 
-pub(crate) use manage::{manage, status};
+pub(super) use manage::{install, status, uninstall};
 pub(super) use state::Installation;
 pub(crate) use worker::run as run_worker;
 
@@ -39,7 +32,9 @@ pub(super) fn execute(
 ) -> Result<i32> {
     installation.ensure_ready()?;
     let network_mode = installation.resolve_network_mode(policy)?;
-    let lease = lease::Lease::acquire(installation, network_mode)?;
+    let store = state::StateStore::locate()
+        .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
+    let lease = lease::Lease::acquire(&store, installation, network_mode)?;
     // Loopback stays closed for the account unless this run's policy names the
     // ports, and then only for as long as the run lasts.
     let permits = match network_mode {
@@ -51,11 +46,9 @@ pub(super) fn execute(
         .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?,
         state::NetworkMode::Unrestricted => None,
     };
-    let state_dir = state::state_dir()
-        .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     let request_id = account::random_identifier(16)
         .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
-    let request_path = state_dir.join("runs").join(format!("{request_id}.json"));
+    let request_path = store.runs_dir().join(format!("{request_id}.json"));
     let grants = access::GrantPlan::new(policy, &request_path)?;
     worker::write_request(&request_path, &lease.account().sid, tool, args, cwd)
         .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;

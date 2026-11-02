@@ -7,11 +7,9 @@ mod doctor;
 
 pub(super) use doctor::{probe_null_device, status};
 
-use super::{
-    LocalSid, NamedMutex, PathAccessEntry, SandboxJob, ToWideNul, is_locked_error,
-    join_command_line, own_handle, path_access_failed, quote_command_arg, set_path_access,
-    wait_process_exit, win32_error, win32_status,
-};
+use super::acl::PathAccessEntry;
+use super::process::{BreakawayError, CommandLine, SandboxJob, SpawnedProcess};
+use super::win32::{LocalSid, NamedMutex, OsStatus, ToWideNul};
 use crate::config::AppContainerMode;
 use crate::error::{Cause, Error as LandstripError, Mechanism, PolicyViolation};
 use crate::policy::{AccessPolicy, ReadAccess};
@@ -22,15 +20,15 @@ use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::mem;
-use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
-    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, GENERIC_READ,
-    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::NetworkManagement::WindowsFirewall::{
     NetworkIsolationGetAppContainerConfig, NetworkIsolationSetAppContainerConfig,
@@ -50,16 +48,14 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_CHAR,
     FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType, OPEN_EXISTING,
 };
-use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapFree};
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
+    DeleteProcThreadAttributeList, GetCurrentProcess, InitializeProcThreadAttributeList,
     LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, PROCESS_SYNCHRONIZE,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_SYNCHRONIZE, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
@@ -159,7 +155,7 @@ fn appcontainer_moniker(tool: &OsStr, policy: &AccessPolicy, loopback: bool) -> 
 }
 
 pub(super) struct AppContainerProfile {
-    sid: PSID,
+    sid: OwnedSid,
     moniker: Vec<u16>,
     delete_on_drop: bool,
 }
@@ -181,6 +177,7 @@ impl AppContainerProfile {
 
         Ok(())
     }
+
     fn new(moniker: &str, delete_on_drop: bool) -> Result<Self> {
         let moniker = moniker.to_wide_nul();
         let display = "landstrip".to_wide_nul();
@@ -199,7 +196,7 @@ impl AppContainerProfile {
 
         if hr == 0 {
             return Ok(Self {
-                sid,
+                sid: OwnedSid(sid),
                 moniker,
                 delete_on_drop,
             });
@@ -220,14 +217,14 @@ impl AppContainerProfile {
         }
 
         Ok(Self {
-            sid,
+            sid: OwnedSid(sid),
             moniker,
             delete_on_drop,
         })
     }
 
     fn sid(&self) -> PSID {
-        self.sid
+        self.sid.0
     }
 }
 
@@ -235,9 +232,6 @@ impl Drop for AppContainerProfile {
     fn drop(&mut self) {
         if self.delete_on_drop && !self.moniker.is_empty() {
             unsafe { DeleteAppContainerProfile(self.moniker.as_ptr()) };
-        }
-        if !self.sid.is_null() {
-            unsafe { FreeSid(self.sid) };
         }
     }
 }
@@ -369,7 +363,7 @@ fn process_is_running(pid: u32) -> bool {
     if handle.is_null() {
         return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
     }
-    let process = unsafe { own_handle(handle) };
+    let process = unsafe { OwnedHandle::from_raw_handle(handle) };
     matches!(
         unsafe { WaitForSingleObject(process.as_raw_handle(), 0) },
         WAIT_TIMEOUT | WAIT_FAILED
@@ -443,9 +437,11 @@ fn update_loopback_config(add: Option<PSID>, remove: &[PSID]) -> Result<()> {
     };
     let status = unsafe { NetworkIsolationSetAppContainerConfig(count, entries_ptr) };
     if status != 0 {
-        return Err(
-            LandstripError::sandbox_setup(Mechanism::Appcontainer, win32_error(status)).into(),
-        );
+        return Err(LandstripError::sandbox_setup(
+            Mechanism::Appcontainer,
+            OsStatus::from_code(status),
+        )
+        .into());
     }
     Ok(())
 }
@@ -474,7 +470,7 @@ impl LoopbackConfig {
         if status != 0 {
             return Err(LandstripError::sandbox_setup(
                 Mechanism::Appcontainer,
-                win32_error(status),
+                OsStatus::from_code(status),
             )
             .into());
         }
@@ -596,20 +592,14 @@ impl LookupRoots {
         let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
         for root in &self.0 {
             for sid in &sids {
-                set_path_access(
-                    root,
-                    sid.as_ptr(),
-                    ancestor_access,
-                    GRANT_ACCESS,
-                    false,
-                    false,
-                )
-                .map_err(|(api, error)| {
-                    anyhow::anyhow!(
-                        "grant AppContainer lookup access on {}: {api} failed: {error}",
-                        root.display()
-                    )
-                })?;
+                PathAccessEntry::grant(root, ancestor_access, false)
+                    .apply(sid.as_ptr())
+                    .map_err(|(api, error)| {
+                        anyhow::anyhow!(
+                            "grant AppContainer lookup access on {}: {api} failed: {error}",
+                            root.display()
+                        )
+                    })?;
             }
         }
         Ok(())
@@ -637,7 +627,7 @@ impl LookupRoots {
                     )
                 });
             }
-            unsafe { CloseHandle(handle) };
+            drop(unsafe { OwnedHandle::from_raw_handle(handle) });
         }
         Ok(())
     }
@@ -662,13 +652,13 @@ fn apply_appcontainer_entry(entry: &PathAccessEntry, sid: PSID) -> Result<()> {
         Err((api, error))
             if api != "SetEntriesInAclW"
                 && entry.access_mode == GRANT_ACCESS
-                && is_locked_error(&error) =>
+                && OsStatus::is_locked(&error) =>
         {
             // Skipping an inaccessible grant or descendant during propagation is
             // fail-closed because AppContainer SIDs have no access by default.
             Ok(())
         }
-        Err((api, error)) => Err(path_access_failed(
+        Err((api, error)) => Err(PathAccessEntry::format_error(
             Mechanism::Appcontainer,
             &entry.path,
             entry.access_mode,
@@ -755,7 +745,7 @@ fn inheritable_standard_handle(
         )
         .into());
     }
-    let duplicate = unsafe { own_handle(duplicate) };
+    let duplicate = unsafe { OwnedHandle::from_raw_handle(duplicate) };
     if duplicate.as_raw_handle() as isize <= 0
         || !is_io_file_type(unsafe { GetFileType(duplicate.as_raw_handle()) })
     {
@@ -792,8 +782,8 @@ fn inheritable_null_handle(direction: StandardHandleDirection) -> Result<OwnedHa
         )
         .into());
     }
-    if !is_io_file_type(unsafe { GetFileType(handle) }) {
-        unsafe { CloseHandle(handle) };
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    if !is_io_file_type(unsafe { GetFileType(handle.as_raw_handle()) }) {
         return Err(LandstripError::sandbox_setup(
             Mechanism::Appcontainer,
             "NUL did not produce an I/O handle",
@@ -801,7 +791,7 @@ fn inheritable_null_handle(direction: StandardHandleDirection) -> Result<OwnedHa
         .into());
     }
 
-    Ok(unsafe { own_handle(handle) })
+    Ok(handle)
 }
 
 fn is_io_file_type(file_type: u32) -> bool {
@@ -824,10 +814,8 @@ fn create_process_in_appcontainer(
     const MITIGATION_POLICY: u64 = (1u64 << 32)  // DisableExtensionPoints
         | (1u64 << 48)  // FontDisable
         | (1u64 << 52); // ImageLoadNoRemote
-    let command_line = join_command_line(tool, args, |arg| {
-        quote_command_arg(&arg.to_string_lossy())
-            .map_err(|message| LandstripError::launch(tool, message))
-    })?;
+    let mut command_line = CommandLine::encode(tool, args.iter().map(OsString::as_os_str))
+        .map_err(|message| LandstripError::launch(tool, message))?;
     let mut startup_info = unsafe { mem::zeroed::<STARTUPINFOEXW>() };
     startup_info.StartupInfo.cb = u32::try_from(mem::size_of::<STARTUPINFOEXW>())
         .map_err(|_| LandstripError::IntegerTooLarge)?;
@@ -877,97 +865,27 @@ fn create_process_in_appcontainer(
     }
 
     startup_info.lpAttributeList = attribute_list.as_mut_ptr();
-    let process_info = launch_process(
-        &command_line,
-        cwd,
-        tool,
-        &mut startup_info,
-        current_process_in_job()?,
-    )?;
-    drop(standard_handles);
-
-    let process = unsafe { own_handle(process_info.hProcess) };
-    let thread = unsafe { own_handle(process_info.hThread) };
-    drop(thread);
-    wait_process_exit(&process)
-}
-
-fn current_process_in_job() -> Result<bool> {
-    let mut in_job = 0;
-    let ok = unsafe { IsProcessInJob(GetCurrentProcess(), ptr::null_mut(), &raw mut in_job) };
-    if ok == 0 {
-        return Err(LandstripError::sandbox_setup(
-            Mechanism::Appcontainer,
-            io::Error::last_os_error(),
-        )
-        .into());
-    }
-    Ok(in_job != 0)
-}
-
-fn launch_process(
-    command_line: &str,
-    cwd: &Path,
-    tool: &OsStr,
-    startup_info: &mut STARTUPINFOEXW,
-    in_host_job: bool,
-) -> Result<PROCESS_INFORMATION> {
-    match create_process(
-        command_line,
-        cwd,
-        startup_info,
-        EXTENDED_STARTUPINFO_PRESENT,
-    ) {
-        Ok(process_info) => Ok(process_info),
-        Err(source) if in_host_job && win32_status(&source) == Some(ERROR_ACCESS_DENIED) => {
-            create_process(
-                command_line,
-                cwd,
-                startup_info,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_BREAKAWAY_FROM_JOB,
-            )
-            .map_err(|source| {
-                if win32_status(&source) == Some(ERROR_ACCESS_DENIED) {
-                    LandstripError::HostJobIncompatible {
-                        source: source.into(),
-                    }
-                    .into()
-                } else {
-                    LandstripError::launch(tool, source).into()
-                }
-            })
-        }
-        Err(source) => Err(LandstripError::launch(tool, source).into()),
-    }
-}
-
-fn create_process(
-    command_line: &str,
-    cwd: &Path,
-    startup_info: &mut STARTUPINFOEXW,
-    creation_flags: u32,
-) -> io::Result<PROCESS_INFORMATION> {
-    let mut command_line = command_line.to_wide_nul();
     let cwd = cwd.as_os_str().to_wide_nul();
-    let mut process_info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
-    let created = unsafe {
-        CreateProcessW(
-            ptr::null(),
-            command_line.as_mut_ptr(),
-            ptr::null(),
-            ptr::null(),
-            1,
-            creation_flags,
-            ptr::null(),
-            cwd.as_ptr(),
-            (&raw mut *startup_info).cast(),
-            &raw mut process_info,
-        )
-    };
-    if created == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(process_info)
+    let spawned = SpawnedProcess::create_extended(
+        None,
+        Some(command_line.as_mut_slice()),
+        true,
+        0,
+        Some(&cwd),
+        &mut startup_info,
+    )
+    .map_err(|error| match error {
+        BreakawayError::IncompatibleJob(source) => LandstripError::HostJobIncompatible {
+            source: source.into(),
+        },
+        BreakawayError::JobQuery(source) => {
+            LandstripError::sandbox_setup(Mechanism::Appcontainer, source)
+        }
+        BreakawayError::Os(source) => LandstripError::launch(tool, source),
+    })?;
+    drop(standard_handles);
+    drop(spawned.thread);
+    SpawnedProcess::wait_exit(&spawned.process)
 }
 
 struct ProcThreadAttributeList {

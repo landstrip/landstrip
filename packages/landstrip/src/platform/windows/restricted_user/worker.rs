@@ -3,11 +3,9 @@
 
 //! Restricted-account worker process.
 
-use super::state;
-use super::{
-    OwnedSecurityDescriptor, ToWideNul, current_process_token, join_command_line, own_handle,
-    quote_command_arg, sid_string, token_user, wait_process_exit,
-};
+use super::super::process::{CommandLine, SpawnedProcess};
+use super::super::win32::{OwnedSecurityDescriptor, ProcessToken, ToWideNul};
+use super::state::StateStore;
 use crate::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -16,7 +14,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::mem;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr;
 use windows_sys::Win32::Security::{
@@ -24,15 +22,11 @@ use windows_sys::Win32::Security::{
     PROTECTED_DACL_SECURITY_INFORMATION, SetKernelObjectSecurity, TOKEN_ASSIGN_PRIMARY,
     TOKEN_DUPLICATE, TOKEN_QUERY,
 };
-use windows_sys::Win32::System::Console::{
-    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-};
 use windows_sys::Win32::System::Environment::{FreeEnvironmentStringsW, GetEnvironmentStringsW};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
-    GetCurrentThread, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW,
+    GetCurrentThread, PROCESS_INFORMATION,
 };
-
 const REQUEST_VERSION: u32 = 2;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -74,7 +68,7 @@ pub(super) fn write_request(
         file.write_all(b"\n")?;
         file.sync_all()?;
         drop(file);
-        state::protect_path(path)
+        StateStore::protect_path(path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(path);
@@ -89,7 +83,8 @@ pub(crate) fn run(path: &Path) -> Result<i32> {
     if request.version != REQUEST_VERSION {
         bail!("unsupported restricted-user worker request version");
     }
-    verify_current_sid(&request.account_sid)?;
+    let process_token = open_worker_token()?;
+    verify_current_sid(&process_token, &request.account_sid)?;
 
     let tool = OsString::from_wide(&request.tool);
     let args = request
@@ -98,30 +93,25 @@ pub(crate) fn run(path: &Path) -> Result<i32> {
         .map(|arg| OsString::from_wide(arg))
         .collect::<Vec<_>>();
     let cwd = OsString::from_wide(&request.cwd);
-    let exit_code = launch(&tool, &args, &cwd, &request.environment)?;
+    let exit_code = launch(&process_token, &tool, &args, &cwd, &request.environment)?;
     Ok(exit_code.cast_signed())
 }
 
-fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> Result<u32> {
+fn launch(
+    process_token: &ProcessToken,
+    tool: &OsStr,
+    args: &[OsString],
+    cwd: &OsStr,
+    environment: &[u16],
+) -> Result<u32> {
     harden_worker_objects()?;
-    let restricted_token = create_restricted_token()?;
+    let restricted_token = create_restricted_token(process_token)?;
 
-    let command_line = join_command_line(tool, args, |arg| {
-        let arg = arg
-            .to_str()
-            .context("restricted-user command line is not valid Unicode")?;
-        quote_command_arg(arg)
-            .map_err(|_| anyhow::anyhow!("restricted-user command line contains an interior NUL"))
-    })?;
-    let mut command_line = command_line.to_wide_nul();
+    let mut command_line = CommandLine::encode(tool, args.iter().map(OsString::as_os_str))
+        .map_err(|message| LandstripError::launch(tool, message))?;
     let cwd = cwd.to_wide_nul();
     let environment = merge_profile_environment(environment, &worker_profile_vars())?;
-    let mut startup = unsafe { mem::zeroed::<STARTUPINFOW>() };
-    startup.cb = u32::try_from(mem::size_of::<STARTUPINFOW>())?;
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    startup.hStdOutput = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-    startup.hStdError = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    let startup = SpawnedProcess::std_startup_info()?;
     let mut process_info = unsafe { mem::zeroed::<PROCESS_INFORMATION>() };
     let ok = unsafe {
         CreateProcessAsUserW(
@@ -141,19 +131,11 @@ fn launch(tool: &OsStr, args: &[OsString], cwd: &OsStr, environment: &[u16]) -> 
     if ok == 0 {
         return Err(LandstripError::launch(tool, io::Error::last_os_error()).into());
     }
-    let process = unsafe { own_handle(process_info.hProcess) };
-    let thread = unsafe { own_handle(process_info.hThread) };
-    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-        return Err(LandstripError::sandbox_setup(
-            Mechanism::Windowsuser,
-            format!("ResumeThread: {}", io::Error::last_os_error()),
-        )
-        .into());
-    }
-    wait_process_exit(&process)
+    let spawned = unsafe { SpawnedProcess::from_raw(process_info) };
+    spawned.resume_and_wait(Mechanism::Windowsuser)
 }
 
-fn create_restricted_token() -> Result<OwnedHandle> {
+fn create_restricted_token(process_token: &ProcessToken) -> Result<OwnedHandle> {
     // Strip all privileges from the worker's own primary token. landstrip's
     // filesystem write boundary is the dedicated SAM user's DACL (apply() in
     // access.rs), not the token's restricting-SID list: the DACL grants the
@@ -162,17 +144,10 @@ fn create_restricted_token() -> Result<OwnedHandle> {
     // the privilege-stripping, which defends the DACL against
     // SeBackupPrivilege / SeRestorePrivilege bypass. An empty restricting-SID
     // list (count 0, pointer NULL) is the textbook-valid minimal call.
-    let process_token = current_process_token(TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY)
-        .map_err(|source| {
-            LandstripError::sandbox_setup(
-                Mechanism::Windowsuser,
-                format!("OpenProcessToken: {source}"),
-            )
-        })?;
     let mut restricted_token = ptr::null_mut();
     let ok = unsafe {
         CreateRestrictedToken(
-            process_token.as_raw_handle(),
+            process_token.as_raw(),
             DISABLE_MAX_PRIVILEGE,
             0,
             ptr::null(),
@@ -190,7 +165,7 @@ fn create_restricted_token() -> Result<OwnedHandle> {
         )
         .into());
     }
-    Ok(unsafe { own_handle(restricted_token) })
+    Ok(unsafe { OwnedHandle::from_raw_handle(restricted_token) })
 }
 
 fn harden_worker_objects() -> Result<()> {
@@ -329,25 +304,19 @@ fn merge_profile_environment(
     Ok(merged)
 }
 
-fn verify_current_sid(expected: &str) -> Result<()> {
-    let token = current_process_token(TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY)
-        .map_err(|source| {
-            LandstripError::sandbox_setup(
-                Mechanism::Windowsuser,
-                format!("OpenProcessToken: {source}"),
-            )
-        })?;
-    let user = token_user(token.as_raw_handle()).map_err(|source| {
+fn open_worker_token() -> Result<ProcessToken> {
+    ProcessToken::current(TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY).map_err(|source| {
         LandstripError::sandbox_setup(
             Mechanism::Windowsuser,
-            format!("GetTokenInformation: {source}"),
+            format!("OpenProcessToken: {source}"),
         )
-    })?;
-    let actual = unsafe { sid_string(user.User.Sid) }.map_err(|source| {
-        LandstripError::sandbox_setup(
-            Mechanism::Windowsuser,
-            format!("ConvertSidToStringSidW: {source}"),
-        )
+        .into()
+    })
+}
+
+fn verify_current_sid(token: &ProcessToken, expected: &str) -> Result<()> {
+    let actual = token.user_sid_string().map_err(|source| {
+        LandstripError::sandbox_setup(Mechanism::Windowsuser, format!("TokenUser: {source}"))
     })?;
     if !actual.eq_ignore_ascii_case(expected) {
         bail!("restricted-user worker account SID does not match request");

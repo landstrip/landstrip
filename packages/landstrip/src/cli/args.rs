@@ -5,7 +5,7 @@ use crate::config::{PolicyFormat, Settings};
 #[allow(unused_imports)]
 use crate::error::{Error, Mechanism};
 #[cfg(target_os = "windows")]
-use crate::platform::WindowsCommand;
+use crate::platform::{RESTRICTED_USER_RUNNER, WindowsCommand};
 use crate::policy::AccessPolicy;
 #[cfg(unix)]
 use crate::trap_fd::TrapFd;
@@ -22,8 +22,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 const PROGRAM_NAME: &str = "landstrip";
-#[cfg(target_os = "windows")]
-const RESTRICTED_USER_RUNNER: &str = "landstrip-restricted-user-runner.exe";
 
 #[derive(Debug)]
 pub(super) struct Invocation {

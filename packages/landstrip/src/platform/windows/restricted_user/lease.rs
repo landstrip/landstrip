@@ -3,9 +3,9 @@
 
 //! Exclusive account leasing and crash-recovery journals.
 
-use super::NamedMutex;
+use super::super::win32::NamedMutex;
 use super::access::GrantPlan;
-use super::state::{self, Account, Installation, NetworkMode};
+use super::state::{Account, Installation, NetworkMode, StateStore};
 use crate::error::{Error as LandstripError, Mechanism};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,6 @@ struct Journal {
     account_sid: String,
     grants: GrantPlan,
 }
-
 pub(super) struct Lease<'a> {
     account: &'a Account,
     _mutex: NamedMutex,
@@ -28,6 +27,7 @@ pub(super) struct Lease<'a> {
 
 impl<'a> Lease<'a> {
     pub(super) fn acquire(
+        store: &StateStore,
         installation: &'a Installation,
         network_mode: NetworkMode,
     ) -> Result<Self> {
@@ -36,7 +36,7 @@ impl<'a> Lease<'a> {
             .iter()
             .filter(|account| account.network_mode == network_mode)
         {
-            if let Some(lease) = Self::try_account(installation, account)? {
+            if let Some(lease) = Self::try_account(store, installation, account)? {
                 lease.recover_stale()?;
                 return Ok(lease);
             }
@@ -60,7 +60,7 @@ impl<'a> Lease<'a> {
             account_sid: self.account.sid.clone(),
             grants: grants.clone(),
         };
-        state::write_protected_json(&self.journal_path, &journal, "lease journal")
+        StateStore::write_json(&self.journal_path, &journal, "lease journal")
     }
 
     pub(super) fn clear_journal(&self) -> Result<()> {
@@ -71,10 +71,12 @@ impl<'a> Lease<'a> {
         }
     }
 
-    fn try_account(installation: &Installation, account: &'a Account) -> Result<Option<Self>> {
-        let journal_path = state::state_dir()?
-            .join("leases")
-            .join(format!("{}.json", account.name));
+    fn try_account(
+        store: &StateStore,
+        installation: &Installation,
+        account: &'a Account,
+    ) -> Result<Option<Self>> {
+        let journal_path = store.leases_dir().join(format!("{}.json", account.name));
         let name = format!(
             "Global\\LandstripRestrictedUser-{}-{}",
             installation.id, account.name
@@ -112,22 +114,22 @@ impl<'a> Lease<'a> {
             .context("recover stale restricted-user filesystem grants")?;
         self.clear_journal()
     }
-}
 
-pub(super) fn recover_all(installation: &Installation) -> Result<()> {
-    let mut leases = Vec::with_capacity(installation.accounts.len());
-    for account in &installation.accounts {
-        let lease = Lease::try_account(installation, account)?.ok_or_else(|| {
-            LandstripError::sandbox_setup(
-                Mechanism::Windowsuser,
-                io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!("restricted-user account {} is busy", account.name),
-                ),
-            )
-        })?;
-        lease.recover_stale()?;
-        leases.push(lease);
+    pub(super) fn recover_all(store: &StateStore, installation: &'a Installation) -> Result<()> {
+        let mut leases = Vec::with_capacity(installation.accounts.len());
+        for account in &installation.accounts {
+            let lease = Self::try_account(store, installation, account)?.ok_or_else(|| {
+                LandstripError::sandbox_setup(
+                    Mechanism::Windowsuser,
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("restricted-user account {} is busy", account.name),
+                    ),
+                )
+            })?;
+            lease.recover_stale()?;
+            leases.push(lease);
+        }
+        Ok(())
     }
-    Ok(())
 }

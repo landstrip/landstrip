@@ -3,21 +3,20 @@
 
 //! Persistent installation state and DPAPI-protected account credentials.
 
-use super::account;
-use super::{
-    OwnedLocal, OwnedSecurityDescriptor, ToWideNul, current_process_token, decode_hex, encode_hex,
-    sid_string, token_user, win32_error,
+use super::super::win32::{
+    AtomicFile, OsStatus, OwnedLocal, OwnedSecurityDescriptor, ProcessToken, ToWideNul,
 };
+use super::account;
 use crate::error::{Error as LandstripError, Mechanism, PolicyViolation};
 use crate::policy::AccessPolicy;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
@@ -25,11 +24,7 @@ use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
-    TOKEN_QUERY,
-};
-use windows_sys::Win32::Storage::FileSystem::{
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY,
 };
 use zeroize::Zeroize;
 
@@ -71,6 +66,77 @@ pub(in crate::platform::windows) struct Installation {
 pub(super) struct SecretWide(Vec<u16>);
 
 impl SecretWide {
+    pub(super) fn encrypt(password: &str) -> Result<String> {
+        let mut clear = password.as_bytes().to_vec();
+        let clear_len = u32::try_from(clear.len()).context("password is too long")?;
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: clear_len,
+            pbData: clear.as_mut_ptr(),
+        };
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        let result = unsafe {
+            CryptProtectData(
+                &raw const input,
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &raw mut output,
+            )
+        };
+        clear.zeroize();
+        if result == 0 {
+            return Err(io::Error::last_os_error()).context("protect sandbox account credential");
+        }
+
+        let size = output.cbData as usize;
+        let output = unsafe { OwnedLocal::from_raw(output.pbData) };
+        let protected = unsafe { Hex::encode(std::slice::from_raw_parts(output.as_ptr(), size)) };
+        Ok(protected)
+    }
+
+    pub(super) fn decrypt(protected: &str) -> Result<Self> {
+        let mut protected = Hex::decode(protected)
+            .map_err(anyhow::Error::msg)
+            .context("protected password is not valid hexadecimal")?;
+        let protected_len =
+            u32::try_from(protected.len()).context("protected password is too long")?;
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: protected_len,
+            pbData: protected.as_mut_ptr(),
+        };
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        let result = unsafe {
+            CryptUnprotectData(
+                &raw const input,
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &raw mut output,
+            )
+        };
+        protected.zeroize();
+        if result == 0 {
+            return Err(io::Error::last_os_error()).context("unprotect sandbox account credential");
+        }
+
+        let size = output.cbData as usize;
+        let output = unsafe { OwnedLocal::from_raw(output.pbData) };
+        let mut clear = unsafe { std::slice::from_raw_parts(output.as_ptr(), size).to_vec() };
+        let wide = std::str::from_utf8(&clear)
+            .context("sandbox password is not UTF-8")
+            .map(|password| {
+                let mut wide = OsStr::new(password).encode_wide().collect::<Vec<_>>();
+                wide.push(0);
+                Self(wide)
+            });
+        clear.zeroize();
+        wide
+    }
+
     pub(super) fn as_ptr(&self) -> *const u16 {
         self.0.as_ptr()
     }
@@ -82,9 +148,162 @@ impl Drop for SecretWide {
     }
 }
 
+pub(super) struct Hex;
+
+impl Hex {
+    pub(super) fn encode(bytes: &[u8]) -> String {
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(&mut output, "{byte:02x}");
+        }
+        output
+    }
+
+    fn decode(value: &str) -> std::result::Result<Vec<u8>, &'static str> {
+        if !value.len().is_multiple_of(2) {
+            return Err("hex string must contain an even number of digits");
+        }
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let text = std::str::from_utf8(pair).map_err(|_| "invalid UTF-8 in hex string")?;
+                u8::from_str_radix(text, 16).map_err(|_| "invalid hexadecimal digit")
+            })
+            .collect()
+    }
+}
+
+pub(super) struct StateStore {
+    root: PathBuf,
+}
+
+impl StateStore {
+    pub(super) fn locate() -> Result<Self> {
+        let base = env::var_os("ProgramData").context("Windows ProgramData is unavailable")?;
+        Ok(Self {
+            root: PathBuf::from(base).join(STATE_DIRECTORY),
+        })
+    }
+
+    pub(super) fn state_path(&self) -> PathBuf {
+        self.root.join(STATE_FILE)
+    }
+
+    pub(super) fn leases_dir(&self) -> PathBuf {
+        self.root.join("leases")
+    }
+
+    pub(super) fn runs_dir(&self) -> PathBuf {
+        self.root.join("runs")
+    }
+
+    pub(super) fn init_runtime_dirs(&self) -> Result<()> {
+        for runtime_directory in [self.leases_dir(), self.runs_dir()] {
+            fs::create_dir_all(&runtime_directory).with_context(|| {
+                format!(
+                    "create restricted-user runtime directory {}",
+                    runtime_directory.display()
+                )
+            })?;
+            Self::protect_path(&runtime_directory)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_json(path: &Path, value: &impl Serialize, label: &str) -> Result<()> {
+        let directory = path
+            .parent()
+            .with_context(|| format!("{label} path has no parent"))?;
+        fs::create_dir_all(directory)
+            .with_context(|| format!("create {label} directory {}", directory.display()))?;
+        Self::protect_path(directory)?;
+
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let bytes = serde_json::to_vec_pretty(value)?;
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary)
+                .with_context(|| format!("create {label} {}", temporary.display()))?;
+            file.write_all(&bytes)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            drop(file);
+            Self::protect_path(&temporary)?;
+
+            AtomicFile::replace(&temporary, path)
+                .with_context(|| format!("replace restricted-user file {}", path.display()))?;
+            Self::protect_path(path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    pub(super) fn protect_path(path: &Path) -> Result<()> {
+        let owner_sid = ProcessToken::current(TOKEN_QUERY)
+            .context("open current process token")?
+            .user_sid_string()
+            .context("query current user SID")?;
+        let sddl = format!("D:P(A;;FA;;;SY)(A;;FA;;;{owner_sid})");
+        let descriptor = OwnedSecurityDescriptor::from_sddl(&sddl)
+            .context("build restricted-user state DACL")?;
+        let dacl = descriptor
+            .dacl()
+            .context("get restricted-user state DACL")?;
+        let path = path.to_wide_nul();
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                path.as_ptr().cast_mut(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(OsStatus::from_code(status)).context("protect restricted-user state DACL");
+        }
+        Ok(())
+    }
+
+    pub(super) fn remove(&self) -> Result<()> {
+        for runtime_directory in [self.leases_dir(), self.runs_dir()] {
+            match fs::remove_dir_all(&runtime_directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "remove restricted-user runtime directory {}",
+                            runtime_directory.display()
+                        )
+                    });
+                }
+            }
+        }
+
+        let path = self.state_path();
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("remove restricted-user installation state"),
+        }
+
+        let _ = fs::remove_dir(&self.root);
+        Ok(())
+    }
+}
+
 impl Installation {
-    pub(super) fn load() -> Result<Self> {
-        let path = state_path()?;
+    pub(super) fn load_from(store: &StateStore) -> Result<Self> {
+        let path = store.state_path();
         let bytes = fs::read(&path)
             .with_context(|| format!("restricted-user installation state {}", path.display()))?;
         let installation: Self = serde_json::from_slice(&bytes)
@@ -101,7 +320,12 @@ impl Installation {
     }
 
     pub(super) fn load_optional() -> Result<Option<Self>> {
-        match Self::load() {
+        let store = StateStore::locate()?;
+        Self::load_optional_from(&store)
+    }
+
+    pub(super) fn load_optional_from(store: &StateStore) -> Result<Option<Self>> {
+        match Self::load_from(store) {
             Ok(installation) => Ok(Some(installation)),
             Err(error)
                 if error
@@ -162,9 +386,9 @@ impl Installation {
         Ok(NetworkMode::Restricted)
     }
 
-    pub(super) fn save(&self) -> Result<()> {
-        let path = state_path()?;
-        write_protected_json(&path, self, "restricted-user state")
+    pub(super) fn save(&self, store: &StateStore) -> Result<()> {
+        let path = store.state_path();
+        StateStore::write_json(&path, self, "restricted-user state")
     }
 
     pub(super) fn health(&self) -> (bool, bool) {
@@ -198,223 +422,4 @@ impl Installation {
         }
         Ok(())
     }
-}
-
-pub(super) fn state_dir() -> Result<PathBuf> {
-    let base = env::var_os("ProgramData").context("Windows ProgramData is unavailable")?;
-    Ok(PathBuf::from(base).join(STATE_DIRECTORY))
-}
-
-fn state_path() -> Result<PathBuf> {
-    Ok(state_dir()?.join(STATE_FILE))
-}
-
-pub(super) fn initialize_runtime_directories() -> Result<()> {
-    let directory = state_dir()?;
-    for name in ["leases", "runs"] {
-        let runtime_directory = directory.join(name);
-        fs::create_dir_all(&runtime_directory).with_context(|| {
-            format!(
-                "create restricted-user runtime directory {}",
-                runtime_directory.display()
-            )
-        })?;
-        protect_path(&runtime_directory)?;
-    }
-    Ok(())
-}
-
-pub(super) fn write_protected_json(path: &Path, value: &impl Serialize, label: &str) -> Result<()> {
-    let directory = path
-        .parent()
-        .with_context(|| format!("{label} path has no parent"))?;
-    fs::create_dir_all(directory)
-        .with_context(|| format!("create {label} directory {}", directory.display()))?;
-    protect_path(directory)?;
-
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let bytes = serde_json::to_vec_pretty(value)?;
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temporary)
-            .with_context(|| format!("create {label} {}", temporary.display()))?;
-        file.write_all(&bytes)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        drop(file);
-        protect_path(&temporary)?;
-
-        replace_file(&temporary, path)?;
-        protect_path(path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-fn replace_file(temporary: &Path, path: &Path) -> Result<()> {
-    let temporary_wide = temporary.to_wide_nul();
-    let path_wide = path.to_wide_nul();
-    if unsafe {
-        MoveFileExW(
-            temporary_wide.as_ptr(),
-            path_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error())
-            .with_context(|| format!("replace restricted-user file {}", path.display()));
-    }
-    Ok(())
-}
-
-pub(super) fn remove() -> Result<()> {
-    let directory = state_dir()?;
-    let path = directory.join(STATE_FILE);
-    {
-        for name in ["leases", "runs"] {
-            let runtime_directory = directory.join(name);
-            match fs::remove_dir_all(&runtime_directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "remove restricted-user runtime directory {}",
-                            runtime_directory.display()
-                        )
-                    });
-                }
-            }
-        }
-    }
-
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("remove restricted-user installation state"),
-    }
-
-    let _ = fs::remove_dir(&directory);
-    Ok(())
-}
-
-pub(super) fn protect_password(password: &str) -> Result<String> {
-    let mut clear = password.as_bytes().to_vec();
-    let clear_len = u32::try_from(clear.len()).context("password is too long")?;
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: clear_len,
-        pbData: clear.as_mut_ptr(),
-    };
-    let mut output = CRYPT_INTEGER_BLOB::default();
-    let result = unsafe {
-        CryptProtectData(
-            &raw const input,
-            ptr::null(),
-            ptr::null(),
-            ptr::null(),
-            ptr::null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &raw mut output,
-        )
-    };
-    clear.zeroize();
-    if result == 0 {
-        return Err(io::Error::last_os_error()).context("protect sandbox account credential");
-    }
-
-    let size = output.cbData as usize;
-    let output = unsafe { OwnedLocal::from_raw(output.pbData) };
-    let protected = unsafe { encode_hex(std::slice::from_raw_parts(output.as_ptr(), size)) };
-    Ok(protected)
-}
-
-pub(super) fn unprotect_password(protected: &str) -> Result<SecretWide> {
-    let mut protected = decode_hex(protected)
-        .map_err(anyhow::Error::msg)
-        .context("protected password is not valid hexadecimal")?;
-    let protected_len = u32::try_from(protected.len()).context("protected password is too long")?;
-    let input = CRYPT_INTEGER_BLOB {
-        cbData: protected_len,
-        pbData: protected.as_mut_ptr(),
-    };
-    let mut output = CRYPT_INTEGER_BLOB::default();
-    let result = unsafe {
-        CryptUnprotectData(
-            &raw const input,
-            ptr::null_mut(),
-            ptr::null(),
-            ptr::null(),
-            ptr::null(),
-            CRYPTPROTECT_UI_FORBIDDEN,
-            &raw mut output,
-        )
-    };
-    protected.zeroize();
-    if result == 0 {
-        return Err(io::Error::last_os_error()).context("unprotect sandbox account credential");
-    }
-
-    let size = output.cbData as usize;
-    let output = unsafe { OwnedLocal::from_raw(output.pbData) };
-    let mut clear = unsafe { std::slice::from_raw_parts(output.as_ptr(), size).to_vec() };
-    let wide = std::str::from_utf8(&clear)
-        .context("sandbox password is not UTF-8")
-        .map(|password| {
-            let mut wide = OsStr::new(password).encode_wide().collect::<Vec<_>>();
-            wide.push(0);
-            SecretWide(wide)
-        });
-    clear.zeroize();
-    wide
-}
-
-pub(super) fn protect_path(path: &Path) -> Result<()> {
-    let owner_sid = current_user_sid_string()?;
-    let descriptor = format!("D:P(A;;FA;;;SY)(A;;FA;;;{owner_sid})");
-    let descriptor = OwnedSecurityDescriptor::from_sddl(&descriptor)
-        .context("build restricted-user state DACL")?;
-
-    let mut dacl: *mut ACL = ptr::null_mut();
-    let mut dacl_present: i32 = 0;
-    let mut dacl_defaulted: i32 = 0;
-    if unsafe {
-        GetSecurityDescriptorDacl(
-            descriptor.as_ptr(),
-            &raw mut dacl_present,
-            &raw mut dacl,
-            &raw mut dacl_defaulted,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error()).context("get restricted-user state DACL");
-    }
-
-    let path = path.to_wide_nul();
-    let status = unsafe {
-        SetNamedSecurityInfoW(
-            path.as_ptr().cast_mut(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            dacl,
-            ptr::null_mut(),
-        )
-    };
-    if status != 0 {
-        return Err(win32_error(status)).context("protect restricted-user state DACL");
-    }
-    Ok(())
-}
-
-fn current_user_sid_string() -> Result<String> {
-    let token = current_process_token(TOKEN_QUERY).context("open current process token")?;
-    let user = token_user(token.as_raw_handle()).context("query current user SID")?;
-    unsafe { sid_string(user.User.Sid) }.context("format current user SID")
 }

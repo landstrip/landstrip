@@ -42,7 +42,7 @@ pub(crate) use linux::execute;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::execute;
 #[cfg(target_os = "windows")]
-pub(crate) use windows::{execute, manage as manage_windows, run_worker};
+pub(crate) use windows::{RESTRICTED_USER_RUNNER, execute, manage as manage_windows, run_worker};
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_wraps, reason = "uniform platform validate API")]
