@@ -12,6 +12,8 @@ use crate::error::{Error, PathIo, PolicyViolation, Result};
 use crate::paths::{
     GlobPattern, GlobPatternBuf, NormalizePatterns, NormalizeRoots, OverridesDeny, PathExt,
 };
+use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
@@ -70,11 +72,87 @@ struct ResolvedDenyPaths {
     concrete: Vec<PathBuf>,
     expanded: Vec<PathBuf>,
     patterns: Vec<GlobPatternBuf>,
+    check_paths: Vec<PathBuf>,
 }
 
 struct ResolvedAllowPaths {
     roots: Vec<PathBuf>,
     patterns: Vec<GlobPatternBuf>,
+}
+
+struct WriteAnchorRoot {
+    path: PathBuf,
+    is_dir: OnceCell<bool>,
+}
+
+impl WriteAnchorRoot {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            is_dir: OnceCell::new(),
+        }
+    }
+
+    fn is_dir(&self) -> bool {
+        *self
+            .is_dir
+            .get_or_init(|| fs::metadata(&self.path).is_ok_and(|md| md.is_dir()))
+    }
+}
+
+#[derive(Default)]
+struct SymlinkAncestorCollector {
+    checked: HashMap<PathBuf, Vec<PathBuf>>,
+    links: Vec<DeniedLink>,
+}
+
+impl SymlinkAncestorCollector {
+    fn collect(&mut self, check_paths: &[PathBuf], tier: DenialTier) {
+        let mut current = PathBuf::new();
+        for check_path in check_paths {
+            current.clear();
+            for component in check_path.components() {
+                current.push(component);
+                let spellings = if let Some(cached) = self.checked.get(&current) {
+                    cached.as_slice()
+                } else {
+                    let computed = match fs::symlink_metadata(&current) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            Self::link_spellings(&current)
+                        }
+                        _ => Vec::new(),
+                    };
+                    self.checked.entry(current.clone()).or_insert(computed)
+                };
+                self.links.extend(
+                    spellings
+                        .iter()
+                        .cloned()
+                        .map(|path| DeniedLink::new(path, tier)),
+                );
+            }
+        }
+    }
+
+    fn finish(self) -> DeniedLinks {
+        DeniedLinks::new(self.links)
+    }
+
+    fn link_spellings(link: &Path) -> Vec<PathBuf> {
+        let lexical = link.clean_lexically();
+        let canonical = match (lexical.parent(), lexical.file_name()) {
+            (Some(parent), Some(name)) => fs::canonicalize(parent)
+                .ok()
+                .map(|parent| parent.join(name)),
+            _ => None,
+        };
+        let mut spellings = Vec::with_capacity(2);
+        if let Some(canonical) = canonical.filter(|canonical| *canonical != lexical) {
+            spellings.push(canonical);
+        }
+        spellings.push(lexical);
+        spellings
+    }
 }
 
 impl ResolvedDenyPaths {
@@ -312,16 +390,18 @@ impl PolicyResolver {
         #[cfg(target_os = "windows")]
         allow.retain_windows_allow_roots();
 
-        let mut anchor_roots = allow.clone();
-        anchor_roots.extend(resolved_allow.patterns.iter().map(GlobPatternBuf::base));
-        anchor_roots.normalize_roots();
+        let mut anchor_paths = allow.clone();
+        anchor_paths.extend(resolved_allow.patterns.iter().map(GlobPatternBuf::base));
+        anchor_paths.normalize_roots();
+        let mut anchor_roots: Vec<WriteAnchorRoot> =
+            anchor_paths.into_iter().map(WriteAnchorRoot::new).collect();
 
         let always_selectors =
             Self::anchor_write_deny_selectors(&filesystem.deny_write_always, &anchor_roots, true);
         let mut resolved_always = self.resolve_deny_paths(&always_selectors, true)?;
         resolved_always.merge_expanded();
         allow.retain(|path| !resolved_always.matches(path));
-        anchor_roots.retain(|path| !resolved_always.matches(path));
+        anchor_roots.retain(|root| !resolved_always.matches(&root.path));
 
         let deny_selectors =
             Self::anchor_write_deny_selectors(&filesystem.deny_write, &anchor_roots, false);
@@ -330,17 +410,10 @@ impl PolicyResolver {
         let carveouts =
             resolved_deny.apply_write_carveouts(&resolved_always, &allow, &resolved_allow.patterns);
 
-        let mut denied_links: Vec<DeniedLink> = self
-            .collect_symlink_ancestors(&deny_selectors)?
-            .into_iter()
-            .map(|path| DeniedLink::new(path, DenialTier::Queryable))
-            .collect();
-        denied_links.extend(
-            self.collect_symlink_ancestors(&always_selectors)?
-                .into_iter()
-                .map(|path| DeniedLink::new(path, DenialTier::Always)),
-        );
-        let denied_links = DeniedLinks::new(denied_links);
+        let mut symlink_ancestors = SymlinkAncestorCollector::default();
+        symlink_ancestors.collect(&resolved_deny.check_paths, DenialTier::Queryable);
+        symlink_ancestors.collect(&resolved_always.check_paths, DenialTier::Always);
+        let denied_links = symlink_ancestors.finish();
 
         resolved_deny.merge_always(&resolved_always, &mut allow);
         #[allow(unused_mut)]
@@ -497,7 +570,7 @@ impl PolicyResolver {
 
     fn anchor_write_deny_selectors(
         paths: &[PathSelector],
-        write_allow: &[PathBuf],
+        write_allow: &[WriteAnchorRoot],
         anchor_root_name: bool,
     ) -> Vec<PathSelector> {
         let mut anchored = Vec::with_capacity(paths.len() * (1 + write_allow.len()));
@@ -509,7 +582,7 @@ impl PolicyResolver {
                 let pattern = GlobPattern::new(&relative_str);
                 for root in write_allow {
                     if anchor_root_name
-                        && root.file_name().is_some_and(|name| {
+                        && root.path.file_name().is_some_and(|name| {
                             let name = Path::new(name);
                             if selector.is_literal() {
                                 relative == name
@@ -518,12 +591,12 @@ impl PolicyResolver {
                             }
                         })
                     {
-                        anchored.push(PathSelector::literal_path(root));
+                        anchored.push(PathSelector::literal_path(&root.path));
                     }
-                    if !fs::metadata(root).is_ok_and(|md| md.is_dir()) {
+                    if !root.is_dir() {
                         continue;
                     }
-                    anchored.push(selector.join_under(root));
+                    anchored.push(selector.join_under(&root.path));
                 }
             }
         }
@@ -538,18 +611,22 @@ impl PolicyResolver {
         let mut concrete: Vec<PathBuf> = Vec::new();
         let mut expanded: Vec<PathBuf> = Vec::new();
         let mut patterns: Vec<GlobPatternBuf> = Vec::new();
+        let mut check_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
 
         for selector in paths {
             let resolved = self.resolve_sandbox_path(selector.as_str())?;
             let resolved_str = resolved.to_string_lossy();
             if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
+                let glob = GlobPattern::new(&resolved_str);
+                check_paths.push(glob.base());
                 if expand_globs {
-                    for candidate in GlobPattern::new(&resolved_str).expand()? {
+                    for candidate in glob.expand()? {
                         expanded.extend(candidate.spellings());
                     }
                 }
                 patterns.extend(GlobPatternBuf::new(resolved_str.into_owned()).spellings());
             } else {
+                check_paths.push(resolved.clone());
                 concrete.extend(resolved.spellings());
             }
         }
@@ -562,47 +639,8 @@ impl PolicyResolver {
             concrete,
             expanded,
             patterns,
+            check_paths,
         })
-    }
-
-    fn collect_symlink_ancestors(&self, paths: &[PathSelector]) -> Result<Vec<PathBuf>> {
-        let mut links = Vec::new();
-        for selector in paths {
-            let resolved = self.resolve_sandbox_path(selector.as_str())?;
-            let resolved_str = resolved.to_string_lossy();
-            let check_path = if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
-                GlobPattern::new(&resolved_str).base()
-            } else {
-                resolved
-            };
-            let mut current = PathBuf::new();
-            for component in check_path.components() {
-                current.push(component);
-                match fs::symlink_metadata(&current) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        links.extend(Self::link_spellings(&current));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        links.sort_unstable();
-        links.dedup();
-        Ok(links)
-    }
-
-    fn link_spellings(link: &Path) -> impl Iterator<Item = PathBuf> {
-        let lexical = link.clean_lexically();
-        let canonical = match (lexical.parent(), lexical.file_name()) {
-            (Some(parent), Some(name)) => fs::canonicalize(parent)
-                .ok()
-                .map(|parent| parent.join(name)),
-            _ => None,
-        };
-        canonical
-            .filter(|canonical| *canonical != lexical)
-            .into_iter()
-            .chain(std::iter::once(lexical))
     }
 
     fn lower_network_policy(&self, network: &SandboxNetwork) -> Result<NetworkAccess> {
