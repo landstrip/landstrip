@@ -5,15 +5,17 @@
 
 use super::unix::close_inherited_fds;
 use crate::config::SandboxDarwin;
-use crate::error::Error;
+use crate::error::{Error, PolicyViolation};
 use crate::paths::{GlobPatternBuf, OverridesDeny, PathExt};
 use crate::policy::{AccessPolicy, Carveouts, NetworkAccess, ReadAccess, UnixSocketAccess};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt::{self, Write};
+use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,6 +39,10 @@ pub(crate) fn execute(
     command.args(args).current_dir(cwd);
     let error = command.exec();
     Err(Error::launch(tool, error).into())
+}
+
+pub(crate) fn validate(policy: &AccessPolicy) -> crate::error::Result<()> {
+    SeatbeltProfile::validate_policy(policy)
 }
 
 pub(crate) fn doctor() -> Result<()> {
@@ -67,6 +73,24 @@ impl TryFrom<&AccessPolicy> for SeatbeltProfile {
 }
 
 impl SeatbeltProfile {
+    fn validate_policy(policy: &AccessPolicy) -> crate::error::Result<()> {
+        if let UnixSocketAccess::AllowPaths(paths) = policy.network_access.unix_socket_access() {
+            for path in paths {
+                match fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_socket() => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        log::debug!(
+                            "macos: allowUnixSockets path absent, skipping {}",
+                            path.display()
+                        );
+                    }
+                    _ => return Err(PolicyViolation::UnixSocketPath.into()),
+                }
+            }
+        }
+
+        Ok(())
+    }
     fn apply(&self) -> Result<()> {
         let mut errorbuf = ptr::null_mut();
 

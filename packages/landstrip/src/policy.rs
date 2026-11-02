@@ -22,8 +22,6 @@
 pub(crate) mod resolver;
 
 use crate::config::{AppContainerMode, SandboxDarwin};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use crate::error::{Error, PolicyViolation};
 #[cfg(target_os = "linux")]
 use crate::paths::NormalizeRoots;
 use crate::paths::{GlobPattern, GlobPatternBuf, OverridesDeny, PathExt};
@@ -34,16 +32,12 @@ use serde::Serialize;
 use std::env;
 #[cfg(target_os = "linux")]
 use std::ffi::OsStr;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(target_os = "macos")]
-use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::BorrowedFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(target_os = "macos")]
-use std::os::unix::fs::FileTypeExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -306,58 +300,6 @@ impl AccessPolicy {
                 }
             }
         }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl AccessPolicy {
-    /// Reject policies macOS Seatbelt cannot enforce: an existing non-socket
-    /// `allowUnixSockets` path.
-    pub(crate) fn validate(&self) -> std::result::Result<(), Error> {
-        if let UnixSocketAccess::AllowPaths(paths) = self.network_access.unix_socket_access() {
-            for path in paths {
-                match fs::symlink_metadata(path) {
-                    Ok(metadata) if metadata.file_type().is_socket() => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        log::debug!(
-                            "macos: allowUnixSockets path absent, skipping {}",
-                            path.display()
-                        );
-                    }
-                    _ => return Err(PolicyViolation::UnixSocketPath.into()),
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl AccessPolicy {
-    /// Reject policies the Windows `AppContainer` cannot enforce: unrestricted
-    /// read, a local TCP bind, or a non-empty Unix socket allowlist. Connect
-    /// proxy ports are accepted but unenforceable, so the container then runs
-    /// with no network access.
-    pub(crate) fn validate(&self) -> std::result::Result<(), Error> {
-        if matches!(self.read_access, ReadAccess::Unrestricted) {
-            return Err(PolicyViolation::UnrestrictedRead.into());
-        }
-
-        let network = &self.network_access;
-        if !network.unix_socket_access().is_denied() {
-            return Err(PolicyViolation::UnixSocketUnsupported.into());
-        }
-
-        if network.is_unrestricted() {
-            return Ok(());
-        }
-
-        if network.allows_local_binding() {
-            return Err(PolicyViolation::LocalBindingUnsupported.into());
-        }
-
-        Ok(())
     }
 }
 

@@ -29,14 +29,13 @@ pub(crate) fn doctor() -> Result<()> {
     namespace::probe()
 }
 
-pub(crate) fn validate() -> Result<()> {
+pub(crate) fn check_host() -> crate::error::Result<()> {
     namespace::probe().map_err(|error| {
         crate::error::Error::sandbox_setup(
             crate::error::Mechanism::Namespace,
             error.into_boxed_dyn_error(),
         )
-    })?;
-    Ok(())
+    })
 }
 
 pub(crate) fn execute(

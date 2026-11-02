@@ -95,8 +95,6 @@ impl Settings {
             allow_windows_loopback: windows.allow_loopback,
             allow_windows_additive_grants: windows.allow_additive_grants,
         };
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        policy.validate()?;
         Ok(policy)
     }
 }

@@ -13,8 +13,8 @@ use super::{
     wait_process_exit, win32_error, win32_status,
 };
 use crate::config::AppContainerMode;
-use crate::error::{Cause, Error as LandstripError, Mechanism};
-use crate::policy::AccessPolicy;
+use crate::error::{Cause, Error as LandstripError, Mechanism, PolicyViolation};
+use crate::policy::{AccessPolicy, ReadAccess};
 use anyhow::{Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::{OsStr, OsString, c_void};
@@ -158,13 +158,29 @@ fn appcontainer_moniker(tool: &OsStr, policy: &AccessPolicy, loopback: bool) -> 
     }
 }
 
-struct AppContainerProfile {
+pub(super) struct AppContainerProfile {
     sid: PSID,
     moniker: Vec<u16>,
     delete_on_drop: bool,
 }
 
 impl AppContainerProfile {
+    pub(super) fn validate_policy(policy: &AccessPolicy) -> crate::error::Result<()> {
+        if matches!(policy.read_access, ReadAccess::Unrestricted) {
+            return Err(PolicyViolation::UnrestrictedRead.into());
+        }
+
+        let network = &policy.network_access;
+        if !network.unix_socket_access().is_denied() {
+            return Err(PolicyViolation::UnixSocketUnsupported.into());
+        }
+
+        if !network.is_unrestricted() && network.allows_local_binding() {
+            return Err(PolicyViolation::LocalBindingUnsupported.into());
+        }
+
+        Ok(())
+    }
     fn new(moniker: &str, delete_on_drop: bool) -> Result<Self> {
         let moniker = moniker.to_wide_nul();
         let display = "landstrip".to_wide_nul();

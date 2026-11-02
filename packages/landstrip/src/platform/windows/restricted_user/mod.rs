@@ -26,33 +26,25 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
 
-pub(super) use manage::active_implementation;
 pub(crate) use manage::{manage, status};
+pub(super) use state::Installation;
 pub(crate) use worker::run as run_worker;
 
-pub(super) fn is_installed() -> Result<bool> {
-    Ok(state::Installation::load_optional()?.is_some())
-}
 pub(super) fn execute(
+    installation: &state::Installation,
     policy: &AccessPolicy,
     cwd: &Path,
     tool: &OsStr,
     args: &[OsString],
 ) -> Result<i32> {
-    let installation = state::Installation::load_ready()?;
-    refuse_additive_grants(policy)?;
-    let network_mode = if policy.network_access.is_unrestricted() {
-        state::NetworkMode::Unrestricted
-    } else {
-        installation.validate_restricted_network(policy)?;
-        state::NetworkMode::Restricted
-    };
-    let lease = lease::Lease::acquire(&installation, network_mode)?;
+    installation.ensure_ready()?;
+    let network_mode = installation.resolve_network_mode(policy)?;
+    let lease = lease::Lease::acquire(installation, network_mode)?;
     // Loopback stays closed for the account unless this run's policy names the
     // ports, and then only for as long as the run lasts.
     let permits = match network_mode {
         state::NetworkMode::Restricted => wfp::RunPermits::add(
-            &installation,
+            installation,
             &lease.account().sid,
             policy.network_access.connect_tcp_ports(),
         )
@@ -111,27 +103,9 @@ pub(super) fn execute(
     Ok(exit_code.cast_signed())
 }
 
-pub(super) fn validate(policy: &AccessPolicy) -> Result<()> {
-    let installation = state::Installation::load_ready()?;
-    refuse_additive_grants(policy)?;
-    if !policy.network_access.is_unrestricted() {
-        installation.validate_restricted_network(policy)?;
-    }
-    Ok(())
-}
-
-/// A leased account keeps its own `Users` rights, so an `allowRead`/`allowWrite`
-/// allowlist is only ever tightened, never enforced, by the grants applied here.
-/// Refuse to run such a policy unless the caller accepts that difference.
-fn refuse_additive_grants(policy: &AccessPolicy) -> Result<()> {
-    if policy.allow_windows_additive_grants {
-        return Ok(());
-    }
-    Err(Error::sandbox_setup(
-        Mechanism::Windowsuser,
-        "restricted-user isolation cannot enforce allowRead/allowWrite allowlists; \
-         set windows.allowAdditiveGrants to accept additive grants or uninstall it \
-         to use the AppContainer backend",
-    )
-    .into())
+pub(super) fn validate(
+    installation: &state::Installation,
+    policy: &AccessPolicy,
+) -> crate::error::Result<()> {
+    installation.validate_policy(policy)
 }

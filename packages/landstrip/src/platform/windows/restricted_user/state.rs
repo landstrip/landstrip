@@ -8,7 +8,7 @@ use super::{
     OwnedLocal, OwnedSecurityDescriptor, ToWideNul, current_process_token, decode_hex, encode_hex,
     sid_string, token_user, win32_error,
 };
-use crate::error::{Error as LandstripError, Mechanism};
+use crate::error::{Error as LandstripError, Mechanism, PolicyViolation};
 use crate::policy::AccessPolicy;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,7 @@ pub(super) struct Account {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct Installation {
+pub(in crate::platform::windows) struct Installation {
     pub(super) version: u32,
     pub(super) id: String,
     pub(super) proxy_port_low: u16,
@@ -114,17 +114,52 @@ impl Installation {
         }
     }
 
-    pub(super) fn load_ready() -> Result<Self> {
-        let installation = Self::load()
-            .map_err(|source| LandstripError::sandbox_setup(Mechanism::Windowsuser, source))?;
-        if !installation.complete {
+    pub(in crate::platform::windows) fn load_installed() -> crate::error::Result<Option<Self>> {
+        Self::load_optional().map_err(|error| {
+            LandstripError::sandbox_setup(Mechanism::Windowsuser, error.into_boxed_dyn_error())
+        })
+    }
+
+    pub(super) fn ensure_ready(&self) -> crate::error::Result<()> {
+        if !self.complete {
             return Err(LandstripError::sandbox_setup(
                 Mechanism::Windowsuser,
                 "restricted-user installation is incomplete",
-            )
-            .into());
+            ));
         }
-        Ok(installation)
+        Ok(())
+    }
+
+    pub(super) fn validate_policy(&self, policy: &AccessPolicy) -> crate::error::Result<()> {
+        self.ensure_ready()?;
+        let (accounts_healthy, runner_healthy) = self.health();
+        if !accounts_healthy || !runner_healthy {
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                "restricted-user installation is unhealthy",
+            ));
+        }
+        let _ = self.resolve_network_mode(policy)?;
+        Ok(())
+    }
+
+    pub(super) fn resolve_network_mode(
+        &self,
+        policy: &AccessPolicy,
+    ) -> crate::error::Result<NetworkMode> {
+        if !policy.allow_windows_additive_grants {
+            return Err(LandstripError::sandbox_setup(
+                Mechanism::Windowsuser,
+                "restricted-user isolation cannot enforce allowRead/allowWrite allowlists; \
+                 set windows.allowAdditiveGrants to accept additive grants or uninstall it \
+                 to use the AppContainer backend",
+            ));
+        }
+        if policy.network_access.is_unrestricted() {
+            return Ok(NetworkMode::Unrestricted);
+        }
+        self.validate_restricted_network(policy)?;
+        Ok(NetworkMode::Restricted)
     }
 
     pub(super) fn save(&self) -> Result<()> {
@@ -140,20 +175,15 @@ impl Installation {
         (accounts_healthy, self.runner_path.is_file())
     }
 
-    pub(super) fn validate_restricted_network(&self, policy: &AccessPolicy) -> Result<()> {
+    fn validate_restricted_network(&self, policy: &AccessPolicy) -> crate::error::Result<()> {
         if policy.allow_windows_loopback {
             return Err(LandstripError::sandbox_setup(
                 Mechanism::Windowsuser,
                 "windows.allowLoopback is not supported by restricted-user isolation",
-            )
-            .into());
+            ));
         }
         if policy.network_access.allows_local_binding() {
-            return Err(LandstripError::sandbox_setup(
-                Mechanism::Windowsuser,
-                "allowLocalBinding is not supported by restricted-user isolation",
-            )
-            .into());
+            return Err(PolicyViolation::LocalBindingUnsupported.into());
         }
         if policy
             .network_access
@@ -164,8 +194,7 @@ impl Installation {
             return Err(LandstripError::sandbox_setup(
                 Mechanism::Windowsuser,
                 "restricted-user proxy port is outside the installed proxy port range",
-            )
-            .into());
+            ));
         }
         Ok(())
     }

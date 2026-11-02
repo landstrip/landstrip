@@ -245,17 +245,6 @@ pub(crate) fn status() -> Result<WindowsStatusReport> {
     })
 }
 
-pub(in crate::platform::windows) fn active_implementation() -> Result<&'static str> {
-    let Some(installation) = Installation::load_optional()? else {
-        return Ok("appContainer");
-    };
-    let (accounts_healthy, runner_healthy) = installation.health();
-    if !installation.complete || !accounts_healthy || !runner_healthy {
-        bail!("restricted-user installation is unhealthy");
-    }
-    Ok("restrictedUser")
-}
-
 fn install_runner() -> Result<PathBuf> {
     let program_files = env::var_os("ProgramFiles")
         .map(PathBuf::from)

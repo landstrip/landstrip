@@ -749,17 +749,17 @@ pub(crate) fn execute(
     tool: &OsStr,
     args: &[OsString],
 ) -> Result<i32> {
-    if restricted_user::is_installed()? {
-        restricted_user::execute(policy, cwd, tool, args)
+    if let Some(installation) = restricted_user::Installation::load_installed()? {
+        restricted_user::execute(&installation, policy, cwd, tool, args)
     } else {
         appcontainer::execute(policy, cwd, tool, args)
     }
 }
 
-pub(crate) fn validate(policy: &AccessPolicy) -> Result<()> {
-    if restricted_user::is_installed()? {
-        restricted_user::active_implementation()?;
-        restricted_user::validate(policy)?;
+pub(crate) fn validate(policy: &AccessPolicy) -> crate::error::Result<()> {
+    appcontainer::AppContainerProfile::validate_policy(policy)?;
+    if let Some(installation) = restricted_user::Installation::load_installed()? {
+        restricted_user::validate(&installation, policy)?;
     }
     Ok(())
 }

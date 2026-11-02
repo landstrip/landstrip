@@ -45,24 +45,31 @@ pub(crate) use macos::execute;
 pub(crate) use windows::{execute, manage as manage_windows, run_worker};
 
 #[cfg(target_os = "linux")]
-pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
-    linux::validate()
-}
-
-#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_wraps, reason = "uniform platform validate API")]
-pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
+pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> crate::error::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn validate(policy: &crate::policy::AccessPolicy) -> crate::error::Result<()> {
+    macos::validate(policy)
+}
+
 #[cfg(target_os = "windows")]
-pub(crate) fn validate(policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
+pub(crate) fn validate(policy: &crate::policy::AccessPolicy) -> crate::error::Result<()> {
     windows::validate(policy)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> anyhow::Result<()> {
-    Err(crate::error::Error::PlatformUnsupported.into())
+pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> crate::error::Result<()> {
+    Err(crate::error::Error::PlatformUnsupported)
+}
+
+pub(crate) fn check(policy: &crate::policy::AccessPolicy) -> crate::error::Result<()> {
+    validate(policy)?;
+    #[cfg(target_os = "linux")]
+    linux::check_host()?;
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
