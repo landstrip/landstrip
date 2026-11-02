@@ -724,10 +724,14 @@ pub(super) fn handle_access(
     };
     let writes = access.mode.writes();
     let reads = access.mode.reads();
-    let hard_write_denied = writes && policy.is_write_denied_always(&target.label, &target.lexical);
+    let hard_write_denied = writes
+        && policy
+            .write_denials
+            .is_denied_always(&target.label, &target.lexical);
     let hard_read_denied = reads
-        && (policy.is_read_denied_always(&target.label)
-            || policy.is_read_denied_always(&target.lexical));
+        && policy
+            .read_denials
+            .is_denied_always(&target.label, &target.lexical);
     let allow_query = !hard_write_denied && !hard_read_denied;
     let denial = |operation, reason| AccessDenial {
         operation,
@@ -741,16 +745,7 @@ pub(super) fn handle_access(
     if writes && let Some(reason) = policy.write_reason(&target.label, true) {
         return denial(TrapOperation::Write, reason).deny(denials, allow_query);
     }
-    if reads
-        && let Some(reason) = policy
-            .read_reason(&target.label)
-            .or_else(|| {
-                policy
-                    .is_read_denied(&target.lexical)
-                    .then_some(DenialReason::DenyMatch)
-            })
-            .or_else(|| hard_read_denied.then_some(DenialReason::DenyMatch))
-    {
+    if reads && let Some(reason) = policy.read_access_reason(&target.label, &target.lexical) {
         return denial(TrapOperation::Read, reason).deny(denials, allow_query);
     }
 
@@ -781,9 +776,9 @@ pub(super) fn handle_openat(
     let wants_write = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0;
     let reports_write = flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) != 0;
     let wants_read = flags & libc::O_WRONLY == 0;
-    let hard_read_denied = wants_read
-        && (policy.is_read_denied_always(&resolved) || policy.is_read_denied_always(&lexical));
-    let hard_write_denied = wants_write && policy.is_write_denied_always(&resolved, &lexical);
+    let hard_read_denied = wants_read && policy.read_denials.is_denied_always(&resolved, &lexical);
+    let hard_write_denied =
+        wants_write && policy.write_denials.is_denied_always(&resolved, &lexical);
     let allow_query = !hard_read_denied && !hard_write_denied;
     // Hard policy denials still apply to future descendants with missing parents.
     if !hard_read_denied
@@ -811,16 +806,7 @@ pub(super) fn handle_openat(
         }
         .deny(denials, allow_query);
     }
-    if wants_read
-        && let Some(reason) = policy
-            .read_reason(&resolved)
-            .or_else(|| {
-                policy
-                    .is_read_denied(&lexical)
-                    .then_some(DenialReason::DenyMatch)
-            })
-            .or_else(|| hard_read_denied.then_some(DenialReason::DenyMatch))
-    {
+    if wants_read && let Some(reason) = policy.read_access_reason(&resolved, &lexical) {
         return OpenDenial {
             operation: TrapOperation::Read,
             path: resolved,
@@ -889,7 +875,9 @@ fn name_change_denial(
     }
     if spec.kind.is_removal() {
         let (source, _) = paths.first()?;
-        let denied = policy.is_read_denied(&source.label) || policy.is_read_denied(&source.lexical);
+        let denied = policy
+            .read_denials
+            .is_denied_pair(&source.label, &source.lexical);
         return denied.then(|| DenialAt::read(0, DenialReason::DenyMatch));
     }
     if !spec.kind.is_reparent() {
@@ -898,7 +886,8 @@ fn name_change_denial(
     let read_denial = |target: &ResolvedPath| {
         policy.read_reason(&target.label).or_else(|| {
             policy
-                .has_read_denied_under(&target.label)
+                .read_denials
+                .has_denied_under(&target.label)
                 .then_some(DenialReason::DenyMatch)
         })
     };
@@ -1021,7 +1010,7 @@ pub(super) fn handle_mutation(
             denial = Some(DenialAt::write(index, reason));
             break;
         }
-        if spec.kind.is_reparent() && policy.has_write_denied_under(&target.label) {
+        if spec.kind.is_reparent() && policy.write_denials.has_denied_under(&target.label) {
             denial = Some(DenialAt::write(index, DenialReason::DenyMatch));
             break;
         }
@@ -1029,15 +1018,19 @@ pub(super) fn handle_mutation(
     let hard_read_denial = (spec.kind.is_reparent() || spec.kind.is_removal())
         .then(|| {
             paths.iter().position(|(target, _)| {
-                policy.is_read_denied_always(&target.label)
-                    || policy.is_read_denied_always(&target.lexical)
-                    || policy.has_read_denied_always_under(&target.label)
+                policy
+                    .read_denials
+                    .is_denied_always(&target.label, &target.lexical)
+                    || policy.read_denials.has_denied_always_under(&target.label)
             })
         })
         .flatten();
     let hard_write_denial = paths.iter().position(|(target, _)| {
-        policy.is_write_denied_always(&target.label, &target.lexical)
-            || (spec.kind.is_reparent() && policy.has_write_denied_always_under(&target.label))
+        policy
+            .write_denials
+            .is_denied_always(&target.label, &target.lexical)
+            || (spec.kind.is_reparent()
+                && policy.write_denials.has_denied_always_under(&target.label))
     });
     let hard_link_denial = (spec.kind.is_removal() || spec.kind.is_reparent())
         .then(|| {
@@ -1120,7 +1113,7 @@ fn handle_fd_mutation(
     };
     let resolved = requested_path.clone();
     let lexical = requested_path.clean_lexically();
-    let hard_write_denied = policy.is_write_denied_always(&resolved, &lexical);
+    let hard_write_denied = policy.write_denials.is_denied_always(&resolved, &lexical);
     let reason = policy.write_reason(&resolved, true);
     let operation = MutationGrant::Fd { target, mutation };
 

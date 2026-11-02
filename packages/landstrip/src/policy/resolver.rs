@@ -4,8 +4,8 @@
 #[cfg(target_os = "linux")]
 use super::SupervisorSocketSet;
 use super::{
-    AccessPolicy, Carveouts, DenialTier, DeniedLink, DeniedLinks, DenyRuleSet, IpBindAccess,
-    NetworkAccess, ReadAccess, UnixSocketAccess,
+    AccessPolicy, Carveouts, DenialScope, DenialTier, DeniedLink, DeniedLinks, DenyRuleSet,
+    IpBindAccess, NetworkAccess, ReadAccess, UnixSocketAccess,
 };
 use crate::config::{PathSelector, SandboxDarwin, SandboxFilesystem, SandboxNetwork, Settings};
 use crate::error::{Error, PathIo, PolicyViolation, Result};
@@ -19,94 +19,46 @@ use std::path::{Path, PathBuf};
 
 impl Settings {
     pub(crate) fn resolve(&self, policy_base: &Path) -> Result<AccessPolicy> {
-        let filesystem = &self.filesystem;
-        let network = &self.network;
-        let windows = &self.windows;
         #[cfg(target_os = "windows")]
-        if !filesystem.deny_read_always.is_empty() {
+        if !self.filesystem.deny_read_always.is_empty() {
             return Err(PolicyViolation::DenyReadAlwaysUnsupported.into());
         }
         #[cfg(target_os = "windows")]
-        if !filesystem.deny_write_always.is_empty() {
+        if !self.filesystem.deny_write_always.is_empty() {
             return Err(PolicyViolation::DenyWriteAlwaysUnsupported.into());
         }
         let resolver = PolicyResolver::new(policy_base)?;
-
-        let write = resolver.resolve_write_policy(filesystem)?;
-
-        let resolved_read_allow = resolver.resolve_allow_paths(&filesystem.allow_read)?;
-        let mut read_allow = resolved_read_allow.roots;
-        #[cfg(target_os = "windows")]
-        read_allow.retain_windows_allow_roots();
-        let mut resolved_read_deny = resolver.resolve_deny_paths(&filesystem.deny_read, true)?;
-        resolved_read_deny.merge_expanded();
-        let mut read_denied_roots =
-            effective_denied_roots(&resolved_read_deny.concrete, &read_allow);
-        let mut resolved_read_always =
-            resolver.resolve_deny_paths(&filesystem.deny_read_always, true)?;
-        resolved_read_always.merge_expanded();
-        let read_carveouts = Carveouts {
-            roots: resolved_read_deny.carveouts(&resolved_read_always, &read_allow),
-            patterns: if cfg!(target_os = "windows") {
-                Vec::new()
-            } else {
-                resolved_read_deny.carveout_patterns(&resolved_read_allow.patterns)
-            },
-        };
-        resolved_read_deny.merge_always(&resolved_read_always, &mut read_allow);
-        let read_deny = resolved_read_deny.concrete;
-        let read_denied_patterns = resolved_read_deny.patterns;
-        let read_denied_always_roots = resolved_read_always.concrete;
-        let read_denied_always_patterns = resolved_read_always.patterns;
-        // Windows cannot attach deny entries to missing paths or volume roots.
-        #[cfg(target_os = "windows")]
-        read_denied_roots.retain_windows_deny_roots();
-
-        let lowered_read = lower_read_access(
-            &read_allow,
-            &read_deny,
-            &read_denied_patterns,
-            &read_denied_roots,
-        )?;
-        let (read_access, read_symlinks) = (lowered_read.access, lowered_read.symlinks);
-        read_denied_roots.extend(read_denied_always_roots.iter().cloned());
-        read_denied_roots.normalize_roots();
-        let policy = AccessPolicy {
+        let write = resolver.resolve_write_policy(&self.filesystem)?;
+        let read = resolver.resolve_read_policy(&self.filesystem)?;
+        Ok(AccessPolicy {
             write_roots: write.roots,
-            write_denied_roots: write.denied_roots,
-            write_denied_always_roots: write.denied_always_roots,
-            write_denied_always_patterns: write.denied_always_patterns,
-            write_denied_patterns: write.denied_patterns,
-            write_carveouts: write.carveouts,
+            write_denials: write.denials,
             write_denied_links: write.denied_links,
-            read_access,
-            read_denied_roots,
-            read_denied_patterns,
-            read_carveouts,
-            read_denied_always_roots: read_denied_always_roots.into_boxed_slice(),
-            read_denied_always_patterns: read_denied_always_patterns.into_boxed_slice(),
-            read_symlinks,
-            network_access: resolver.lower_network_policy(network)?,
+            read_access: read.access,
+            read_denials: read.denials,
+            read_symlinks: read.symlinks,
+            network_access: resolver.lower_network_policy(&self.network)?,
             #[cfg(target_os = "linux")]
             supervisor_sockets: resolver
-                .resolve_supervisor_sockets(network.supervisor_sockets.as_deref())?,
+                .resolve_supervisor_sockets(self.network.supervisor_sockets.as_deref())?,
             macos: self.macos.normalize()?,
-            app_container_mode: windows.app_container_mode,
-            allow_windows_loopback: windows.allow_loopback,
-            allow_windows_additive_grants: windows.allow_additive_grants,
-        };
-        Ok(policy)
+            app_container_mode: self.windows.app_container_mode,
+            allow_windows_loopback: self.windows.allow_loopback,
+            allow_windows_additive_grants: self.windows.allow_additive_grants,
+        })
     }
 }
 
 struct ResolvedWritePolicy {
     roots: Vec<PathBuf>,
-    denied_roots: Vec<PathBuf>,
-    denied_always_roots: Box<[PathBuf]>,
-    denied_always_patterns: Box<[GlobPatternBuf]>,
-    denied_patterns: Vec<GlobPatternBuf>,
-    carveouts: Carveouts,
+    denials: DenialScope,
     denied_links: DeniedLinks,
+}
+
+struct ResolvedReadPolicy {
+    access: ReadAccess,
+    denials: DenialScope,
+    symlinks: Vec<PathBuf>,
 }
 
 struct LoweredReadAccess {
@@ -139,6 +91,14 @@ impl ResolvedDenyPaths {
         self.concrete.normalize_roots();
     }
 
+    fn uncarved_roots(&self, allow: &[PathBuf]) -> Vec<PathBuf> {
+        self.concrete
+            .iter()
+            .filter(|deny| !allow.iter().any(|allow| allow.is_under(deny)))
+            .cloned()
+            .collect()
+    }
+
     fn carveouts(&self, always: &Self, allow: &[PathBuf]) -> Vec<PathBuf> {
         allow
             .iter()
@@ -148,6 +108,9 @@ impl ResolvedDenyPaths {
     }
 
     fn carveout_patterns(&self, allow_patterns: &[GlobPatternBuf]) -> Vec<GlobPatternBuf> {
+        if cfg!(target_os = "windows") {
+            return Vec::new();
+        }
         let rules = self.as_rules();
         allow_patterns
             .iter()
@@ -177,11 +140,7 @@ impl ResolvedDenyPaths {
                 .any(|carveout| candidate.is_under(carveout) && matches_pattern(carveout))
         });
         self.merge_expanded();
-        let patterns = if cfg!(target_os = "windows") {
-            Vec::new()
-        } else {
-            self.carveout_patterns(allow_patterns)
-        };
+        let patterns = self.carveout_patterns(allow_patterns);
         Carveouts { roots, patterns }
     }
 
@@ -194,128 +153,108 @@ impl ResolvedDenyPaths {
     }
 }
 
-#[cfg(target_os = "windows")]
-struct WindowsWriteRoots {
-    allow: Vec<PathBuf>,
-    deny: Vec<PathBuf>,
-}
+impl LoweredReadAccess {
+    fn lower(
+        read_allow: &[PathBuf],
+        read_deny: &[PathBuf],
+        read_denied_patterns: &[GlobPatternBuf],
+        read_denied_roots: &[PathBuf],
+    ) -> Result<Self> {
+        let fs_root = Path::new("/").normalize();
+        #[cfg(target_os = "windows")]
+        if read_allow.contains(&fs_root) {
+            return Err(PolicyViolation::UnrestrictedRead.into());
+        }
 
-#[cfg(target_os = "windows")]
-fn lower_windows_write_access(
-    write_allow: &[PathBuf],
-    mut write_deny: Vec<PathBuf>,
-) -> WindowsWriteRoots {
-    write_deny.retain_windows_deny_roots();
-
-    let mut carved_writes = write_allow.to_vec();
-    carved_writes.normalize_roots();
-
-    WindowsWriteRoots {
-        allow: carved_writes,
-        deny: write_deny,
+        let has_dynamic_patterns =
+            cfg!(not(target_os = "windows")) && !read_denied_patterns.is_empty();
+        let has_windows_allow_roots = cfg!(target_os = "windows") && !read_allow.is_empty();
+        if read_deny.is_empty() && !has_dynamic_patterns && !has_windows_allow_roots {
+            Ok(Self {
+                access: ReadAccess::Unrestricted,
+                symlinks: Vec::new(),
+            })
+        } else if (has_dynamic_patterns && read_deny.is_empty())
+            || (read_allow.contains(&fs_root)
+                && !read_deny
+                    .iter()
+                    .any(|deny| read_allow.iter().any(|allow| allow.is_strictly_under(deny))))
+        {
+            Ok(Self {
+                access: ReadAccess::AllowRoots(vec![fs_root]),
+                symlinks: Vec::new(),
+            })
+        } else {
+            Self::restricted(read_allow, read_deny, read_denied_roots)
+        }
     }
-}
 
-fn lower_read_access(
-    read_allow: &[PathBuf],
-    read_deny: &[PathBuf],
-    read_denied_patterns: &[GlobPatternBuf],
-    read_denied_roots: &[PathBuf],
-) -> Result<LoweredReadAccess> {
-    let fs_root = Path::new("/").normalize();
     #[cfg(target_os = "windows")]
-    if read_allow.contains(&fs_root) {
-        return Err(PolicyViolation::UnrestrictedRead.into());
-    }
-
-    let has_dynamic_patterns = cfg!(not(target_os = "windows")) && !read_denied_patterns.is_empty();
-    let has_windows_allow_roots = cfg!(target_os = "windows") && !read_allow.is_empty();
-    if read_deny.is_empty() && !has_dynamic_patterns && !has_windows_allow_roots {
-        Ok(LoweredReadAccess {
-            access: ReadAccess::Unrestricted,
-            symlinks: Vec::new(),
-        })
-    } else if (has_dynamic_patterns && read_deny.is_empty())
-        || (read_allow.contains(&fs_root)
-            && !read_deny
-                .iter()
-                .any(|deny| read_allow.iter().any(|allow| allow.is_strictly_under(deny))))
-    {
-        Ok(LoweredReadAccess {
-            access: ReadAccess::AllowRoots(vec![fs_root]),
-            symlinks: Vec::new(),
-        })
-    } else {
-        lower_restricted_read_access(read_allow, read_deny, read_denied_roots)
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn lower_restricted_read_access(
-    read_allow: &[PathBuf],
-    read_deny: &[PathBuf],
-    read_denied_roots: &[PathBuf],
-) -> Result<LoweredReadAccess> {
-    let mut carve_denials: Vec<PathBuf> = read_deny
-        .iter()
-        .filter(|deny| {
-            deny.parent().is_some()
-                && !read_denied_roots.contains(deny)
-                && read_allow.iter().any(|allow| allow.is_strictly_under(deny))
-        })
-        .cloned()
-        .collect();
-    carve_denials.normalize_roots();
-
-    let mut roots = Vec::new();
-    let mut symlinks = Vec::new();
-    for allow in read_allow {
-        let nested_denials: Vec<PathBuf> = carve_denials
+    fn restricted(
+        read_allow: &[PathBuf],
+        read_deny: &[PathBuf],
+        read_denied_roots: &[PathBuf],
+    ) -> Result<Self> {
+        let mut carve_denials: Vec<PathBuf> = read_deny
             .iter()
-            .filter(|deny| deny.is_strictly_under(allow))
+            .filter(|deny| {
+                deny.parent().is_some()
+                    && !read_denied_roots.contains(deny)
+                    && read_allow.iter().any(|allow| allow.is_strictly_under(deny))
+            })
             .cloned()
             .collect();
-        if nested_denials.is_empty() {
-            roots.push(allow.clone());
-        } else {
-            let scan = scan_allowed_root(allow, &nested_denials, true, 0)?;
-            roots.extend(scan.roots);
-            symlinks.extend(scan.symlinks);
+        carve_denials.normalize_roots();
+
+        let mut roots = Vec::new();
+        let mut symlinks = Vec::new();
+        for allow in read_allow {
+            let nested_denials: Vec<PathBuf> = carve_denials
+                .iter()
+                .filter(|deny| deny.is_strictly_under(allow))
+                .cloned()
+                .collect();
+            if nested_denials.is_empty() {
+                roots.push(allow.clone());
+            } else {
+                let scan = RootScan::scan(allow, &nested_denials)?;
+                roots.extend(scan.roots);
+                symlinks.extend(scan.symlinks);
+            }
         }
+        roots.normalize_roots();
+        symlinks.normalize_roots();
+        Ok(Self {
+            access: ReadAccess::AllowRoots(roots),
+            symlinks,
+        })
     }
-    roots.normalize_roots();
-    symlinks.normalize_roots();
-    Ok(LoweredReadAccess {
-        access: ReadAccess::AllowRoots(roots),
-        symlinks,
-    })
-}
 
-#[cfg(not(target_os = "windows"))]
-fn lower_restricted_read_access(
-    read_allow: &[PathBuf],
-    read_deny: &[PathBuf],
-    _read_denied_roots: &[PathBuf],
-) -> Result<LoweredReadAccess> {
-    let mut denied = read_deny.to_vec();
-    denied.normalize_roots();
-    let scan = scan_allowed_root(Path::new("/"), &denied, true, 0)?;
-    let mut roots = scan.roots;
-    let mut symlinks = scan.symlinks;
+    #[cfg(not(target_os = "windows"))]
+    fn restricted(
+        read_allow: &[PathBuf],
+        read_deny: &[PathBuf],
+        _read_denied_roots: &[PathBuf],
+    ) -> Result<Self> {
+        let mut denied = read_deny.to_vec();
+        denied.normalize_roots();
+        let scan = RootScan::scan(Path::new("/"), &denied)?;
+        let mut roots = scan.roots;
+        let mut symlinks = scan.symlinks;
 
-    for allow in read_allow {
-        if allow.as_path() != Path::new("/") {
-            roots.push(allow.clone());
+        for allow in read_allow {
+            if allow.as_path() != Path::new("/") {
+                roots.push(allow.clone());
+            }
         }
+        roots.normalize_roots();
+        symlinks.normalize_roots();
+        Ok(Self {
+            access: ReadAccess::AllowRoots(roots),
+            symlinks,
+        })
     }
-    roots.normalize_roots();
-    symlinks.normalize_roots();
-    Ok(LoweredReadAccess {
-        access: ReadAccess::AllowRoots(roots),
-        symlinks,
-    })
 }
-
 impl SandboxDarwin {
     fn normalize(&self) -> Result<Self> {
         let mut allow_mach_lookup = Vec::with_capacity(self.allow_mach_lookup.len());
@@ -368,72 +307,102 @@ impl PolicyResolver {
     }
 
     fn resolve_write_policy(&self, filesystem: &SandboxFilesystem) -> Result<ResolvedWritePolicy> {
-        let resolved_write_allow = self.resolve_allow_paths(&filesystem.allow_write)?;
-        let mut write_allow = resolved_write_allow.roots;
-        // Missing Windows allow roots cannot receive ACL entries. Dropping them is
-        // fail-closed because sandbox SIDs receive no access to those paths.
+        let resolved_allow = self.resolve_allow_paths(&filesystem.allow_write)?;
+        let mut allow = resolved_allow.roots;
         #[cfg(target_os = "windows")]
-        write_allow.retain_windows_allow_roots();
-        let mut write_anchor_roots = write_allow.clone();
-        write_anchor_roots.extend(
-            resolved_write_allow
-                .patterns
-                .iter()
-                .map(GlobPatternBuf::base),
-        );
-        write_anchor_roots.normalize_roots();
-        let write_always_selectors = Self::anchor_write_deny_selectors(
-            &filesystem.deny_write_always,
-            &write_anchor_roots,
-            true,
-        );
-        let mut resolved_write_always = self.resolve_deny_paths(&write_always_selectors, true)?;
-        resolved_write_always.merge_expanded();
-        write_allow.retain(|path| !resolved_write_always.matches(path));
-        write_anchor_roots.retain(|path| !resolved_write_always.matches(path));
-        let write_deny_selectors =
-            Self::anchor_write_deny_selectors(&filesystem.deny_write, &write_anchor_roots, false);
-        // Linux mediates denyWrite globs dynamically; expanding them here can scan
-        // an entire project before even starting a simple command.
-        let mut resolved_write_deny =
-            self.resolve_deny_paths(&write_deny_selectors, !cfg!(target_os = "linux"))?;
-        let carveouts = resolved_write_deny.apply_write_carveouts(
-            &resolved_write_always,
-            &write_allow,
-            &resolved_write_allow.patterns,
-        );
+        allow.retain_windows_allow_roots();
+
+        let mut anchor_roots = allow.clone();
+        anchor_roots.extend(resolved_allow.patterns.iter().map(GlobPatternBuf::base));
+        anchor_roots.normalize_roots();
+
+        let always_selectors =
+            Self::anchor_write_deny_selectors(&filesystem.deny_write_always, &anchor_roots, true);
+        let mut resolved_always = self.resolve_deny_paths(&always_selectors, true)?;
+        resolved_always.merge_expanded();
+        allow.retain(|path| !resolved_always.matches(path));
+        anchor_roots.retain(|path| !resolved_always.matches(path));
+
+        let deny_selectors =
+            Self::anchor_write_deny_selectors(&filesystem.deny_write, &anchor_roots, false);
+        let mut resolved_deny =
+            self.resolve_deny_paths(&deny_selectors, !cfg!(target_os = "linux"))?;
+        let carveouts =
+            resolved_deny.apply_write_carveouts(&resolved_always, &allow, &resolved_allow.patterns);
+
         let mut denied_links: Vec<DeniedLink> = self
-            .collect_symlink_ancestors(&write_deny_selectors)?
+            .collect_symlink_ancestors(&deny_selectors)?
             .into_iter()
             .map(|path| DeniedLink::new(path, DenialTier::Queryable))
             .collect();
         denied_links.extend(
-            self.collect_symlink_ancestors(&write_always_selectors)?
+            self.collect_symlink_ancestors(&always_selectors)?
                 .into_iter()
                 .map(|path| DeniedLink::new(path, DenialTier::Always)),
         );
         let denied_links = DeniedLinks::new(denied_links);
-        resolved_write_deny.merge_always(&resolved_write_always, &mut write_allow);
-        let write_deny = resolved_write_deny.concrete;
-        let denied_patterns = resolved_write_deny.patterns;
-        let mut denied_always_roots = resolved_write_always.concrete;
-        denied_always_roots.normalize_roots();
-        let denied_always_patterns = resolved_write_always.patterns;
 
+        resolved_deny.merge_always(&resolved_always, &mut allow);
+        #[allow(unused_mut)]
+        let mut denied_roots = resolved_deny.concrete;
         #[cfg(target_os = "windows")]
-        let (write_allow, write_deny) = {
-            let write_roots = lower_windows_write_access(&write_allow, write_deny);
-            (write_roots.allow, write_roots.deny)
-        };
+        denied_roots.retain_windows_deny_roots();
+        let mut always_roots = resolved_always.concrete;
+        always_roots.normalize_roots();
 
         Ok(ResolvedWritePolicy {
-            roots: write_allow,
-            denied_roots: write_deny,
-            denied_always_roots: denied_always_roots.into_boxed_slice(),
-            denied_always_patterns: denied_always_patterns.into_boxed_slice(),
-            denied_patterns,
-            carveouts,
+            roots: allow,
+            denials: DenialScope {
+                roots: denied_roots,
+                patterns: resolved_deny.patterns,
+                carveouts,
+                always_roots: always_roots.into_boxed_slice(),
+                always_patterns: resolved_always.patterns.into_boxed_slice(),
+            },
             denied_links,
+        })
+    }
+
+    fn resolve_read_policy(&self, filesystem: &SandboxFilesystem) -> Result<ResolvedReadPolicy> {
+        let resolved_allow = self.resolve_allow_paths(&filesystem.allow_read)?;
+        let mut allow = resolved_allow.roots;
+        #[cfg(target_os = "windows")]
+        allow.retain_windows_allow_roots();
+
+        let mut resolved_deny = self.resolve_deny_paths(&filesystem.deny_read, true)?;
+        resolved_deny.merge_expanded();
+        let mut denied_roots = resolved_deny.uncarved_roots(&allow);
+
+        let mut resolved_always = self.resolve_deny_paths(&filesystem.deny_read_always, true)?;
+        resolved_always.merge_expanded();
+        let carveouts = Carveouts {
+            roots: resolved_deny.carveouts(&resolved_always, &allow),
+            patterns: resolved_deny.carveout_patterns(&resolved_allow.patterns),
+        };
+        resolved_deny.merge_always(&resolved_always, &mut allow);
+
+        #[cfg(target_os = "windows")]
+        denied_roots.retain_windows_deny_roots();
+
+        let lowered = LoweredReadAccess::lower(
+            &allow,
+            &resolved_deny.concrete,
+            &resolved_deny.patterns,
+            &denied_roots,
+        )?;
+        denied_roots.extend(resolved_always.concrete.iter().cloned());
+        denied_roots.normalize_roots();
+
+        Ok(ResolvedReadPolicy {
+            access: lowered.access,
+            denials: DenialScope {
+                roots: denied_roots,
+                patterns: resolved_deny.patterns,
+                carveouts,
+                always_roots: resolved_always.concrete.into_boxed_slice(),
+                always_patterns: resolved_always.patterns.into_boxed_slice(),
+            },
+            symlinks: lowered.symlinks,
         })
     }
 
@@ -683,82 +652,70 @@ struct RootScan {
     symlinks: Vec<PathBuf>,
 }
 
-fn scan_allowed_root(
-    root: &Path,
-    denied: &[PathBuf],
-    is_explicit_root: bool,
-    depth: u32,
-) -> Result<RootScan> {
-    let mut results = Vec::new();
-    let mut symlinks = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), is_explicit_root, depth)];
+impl RootScan {
+    fn scan(root: &Path, denied: &[PathBuf]) -> Result<Self> {
+        let mut results = Vec::new();
+        let mut symlinks = Vec::new();
+        let mut stack = vec![(root.to_path_buf(), true, 0u32)];
 
-    while let Some((current, is_explicit, depth)) = stack.pop() {
-        if depth >= MAX_TRAVERSAL_DEPTH {
-            return Err(PolicyViolation::TraversalDepth.into());
-        }
+        while let Some((current, is_explicit, depth)) = stack.pop() {
+            if depth >= MAX_TRAVERSAL_DEPTH {
+                return Err(PolicyViolation::TraversalDepth.into());
+            }
 
-        if current.is_under_any(denied) {
-            continue;
-        }
-
-        let has_denied_descendant = denied
-            .iter()
-            .any(|denied_root| denied_root.is_strictly_under(&current));
-
-        let metadata = match fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.is_opaque() => {
-                results.push(current);
+            if current.is_under_any(denied) {
                 continue;
             }
-            Err(source) => return Err(Error::policy_io(source)),
-        };
-        let file_type = metadata.file_type();
 
-        if file_type.is_symlink() && !is_explicit {
-            symlinks.push(current.clean_lexically());
-            continue;
-        }
-        if !has_denied_descendant || !file_type.is_dir() {
-            results.push(current);
-            continue;
-        }
+            let has_denied_descendant = denied
+                .iter()
+                .any(|denied_root| denied_root.is_strictly_under(&current));
 
-        let entries = match fs::read_dir(&current) {
-            Ok(entries) => entries,
-            Err(error)
-                if error.kind() == io::ErrorKind::PermissionDenied
-                    || error.is_transport_failed() =>
-            {
-                results.push(current);
-                continue;
-            }
-            Err(source) => return Err(Error::policy_io(source)),
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) if error.is_transport_failed() => {
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if error.is_opaque() => {
+                    results.push(current);
                     continue;
                 }
                 Err(source) => return Err(Error::policy_io(source)),
             };
-            let child = entry.path();
-            stack.push((child, false, depth + 1));
+            let file_type = metadata.file_type();
+
+            if file_type.is_symlink() && !is_explicit {
+                symlinks.push(current.clean_lexically());
+                continue;
+            }
+            if !has_denied_descendant || !file_type.is_dir() {
+                results.push(current);
+                continue;
+            }
+
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(error)
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        || error.is_transport_failed() =>
+                {
+                    results.push(current);
+                    continue;
+                }
+                Err(source) => return Err(Error::policy_io(source)),
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) if error.is_transport_failed() => {
+                        continue;
+                    }
+                    Err(source) => return Err(Error::policy_io(source)),
+                };
+                stack.push((entry.path(), false, depth + 1));
+            }
         }
+
+        Ok(Self {
+            roots: results,
+            symlinks,
+        })
     }
-
-    Ok(RootScan {
-        roots: results,
-        symlinks,
-    })
-}
-
-fn effective_denied_roots(read_deny: &[PathBuf], read_allow: &[PathBuf]) -> Vec<PathBuf> {
-    read_deny
-        .iter()
-        .filter(|deny| !read_allow.iter().any(|allow| allow.is_under(deny)))
-        .cloned()
-        .collect()
 }

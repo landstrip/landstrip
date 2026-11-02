@@ -7,7 +7,9 @@ use super::unix::close_inherited_fds;
 use crate::config::SandboxDarwin;
 use crate::error::{Error, PolicyViolation};
 use crate::paths::{GlobPatternBuf, OverridesDeny, PathExt};
-use crate::policy::{AccessPolicy, Carveouts, NetworkAccess, ReadAccess, UnixSocketAccess};
+use crate::policy::{
+    AccessPolicy, Carveouts, DenialScope, NetworkAccess, ReadAccess, UnixSocketAccess,
+};
 use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -91,6 +93,7 @@ impl SeatbeltProfile {
 
         Ok(())
     }
+
     fn apply(&self) -> Result<()> {
         let mut errorbuf = ptr::null_mut();
 
@@ -310,13 +313,51 @@ impl ProfileBuilder {
         wrapped
     }
 
-    fn write_rules(&mut self, policy: &AccessPolicy) -> fmt::Result {
+    fn denial_rules(&mut self, action: &str, scope: &DenialScope) -> fmt::Result {
         let message = &self.message;
+        for root in &scope.roots {
+            let escaped = escape_sbpl_literal(&root.to_string_lossy());
+            writeln!(self.sb, "(deny {action} (subpath \"{escaped}\"){message})")?;
+        }
+        for carveout in &scope.carveouts.roots {
+            if carveout.is_under_any(&scope.roots) {
+                let escaped = escape_sbpl_literal(&carveout.to_string_lossy());
+                writeln!(self.sb, "(allow {action} (subpath \"{escaped}\"))")?;
+            }
+        }
+        for pattern in &scope.carveouts.patterns {
+            if scope
+                .roots
+                .iter()
+                .any(|root| pattern.overrides_deny(root.as_path()))
+            {
+                let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+                let escaped = escape_sbpl_regex_literal(&regex);
+                writeln!(self.sb, "(allow {action} (regex #\"{escaped}\"))")?;
+            }
+        }
+        for pattern in &scope.patterns {
+            let filter = Self::render_pattern_filter(pattern, &scope.carveouts);
+            writeln!(self.sb, "(deny {action} {filter}{message})")?;
+        }
+        for root in &scope.always_roots {
+            let escaped = escape_sbpl_literal(&root.to_string_lossy());
+            writeln!(self.sb, "(deny {action} (subpath \"{escaped}\"){message})")?;
+        }
+        for pattern in &scope.always_patterns {
+            let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+            let escaped = escape_sbpl_regex_literal(&regex);
+            writeln!(self.sb, "(deny {action} (regex #\"{escaped}\"){message})")?;
+        }
+        Ok(())
+    }
+
+    fn write_rules(&mut self, policy: &AccessPolicy) -> fmt::Result {
         for root in &policy.write_roots {
             let escaped = escape_sbpl_literal(&root.to_string_lossy());
             writeln!(self.sb, "(allow file-write* (subpath \"{escaped}\"))")?;
         }
-        for pattern in &policy.write_carveouts.patterns {
+        for pattern in &policy.write_denials.carveouts.patterns {
             let regex = Self::glob_to_sbpl_regex(pattern.as_str());
             let escaped = escape_sbpl_regex_literal(&regex);
             writeln!(self.sb, "(allow file-write* (regex #\"{escaped}\"))")?;
@@ -328,56 +369,9 @@ impl ProfileBuilder {
                 "(allow file-ioctl file-write* (literal \"/dev/ptmx\") (regex #\"^/dev/ttys\"))"
             )?;
         }
-        // Deny rules follow the allow rules so SBPL's last-match-wins precedence
-        // subtracts the denied subtrees from the granted write roots.
-        for root in &policy.write_denied_roots {
-            let escaped = escape_sbpl_literal(&root.to_string_lossy());
-            writeln!(
-                self.sb,
-                "(deny file-write* (subpath \"{escaped}\"){message})"
-            )?;
-        }
-        for carveout in &policy.write_carveouts.roots {
-            if carveout.is_under_any(&policy.write_denied_roots) {
-                let escaped = escape_sbpl_literal(&carveout.to_string_lossy());
-                writeln!(self.sb, "(allow file-write* (subpath \"{escaped}\"))")?;
-            }
-        }
-        for pattern in &policy.write_carveouts.patterns {
-            if policy
-                .write_denied_roots
-                .iter()
-                .any(|root| pattern.overrides_deny(root.as_path()))
-            {
-                let regex = Self::glob_to_sbpl_regex(pattern.as_str());
-                let escaped = escape_sbpl_regex_literal(&regex);
-                writeln!(self.sb, "(allow file-write* (regex #\"{escaped}\"))")?;
-            }
-        }
+        self.denial_rules("file-write*", &policy.write_denials)?;
 
-        // Regex rules are evaluated at syscall time, so unlike expand_glob_path
-        // they also cover paths created after sandbox_init.
-        for pattern in &policy.write_denied_patterns {
-            let filter = Self::render_pattern_filter(pattern, &policy.write_carveouts);
-            writeln!(self.sb, "(deny file-write* {filter}{message})")?;
-        }
-        for root in &policy.write_denied_always_roots {
-            let escaped = escape_sbpl_literal(&root.to_string_lossy());
-            writeln!(
-                self.sb,
-                "(deny file-write* (subpath \"{escaped}\"){message})"
-            )?;
-        }
-        for pattern in &policy.write_denied_always_patterns {
-            let regex = Self::glob_to_sbpl_regex(pattern.as_str());
-            let escaped = escape_sbpl_regex_literal(&regex);
-            writeln!(
-                self.sb,
-                "(deny file-write* (regex #\"{escaped}\"){message})"
-            )?;
-        }
-
-        if !policy.write_roots.is_empty() || policy.write_carveouts.has_patterns() {
+        if !policy.write_roots.is_empty() || policy.write_denials.carveouts.has_patterns() {
             self.write_unlink_rules(policy)?;
         }
 
@@ -386,15 +380,15 @@ impl ProfileBuilder {
 
     fn write_unlink_rules(&mut self, policy: &AccessPolicy) -> fmt::Result {
         let message = &self.message;
-        for root in &policy.read_denied_roots {
+        for root in &policy.read_denials.roots {
             let escaped = escape_sbpl_literal(&root.to_string_lossy());
             writeln!(
                 self.sb,
                 "(deny file-write-unlink (subpath \"{escaped}\"){message})"
             )?;
         }
-        for pattern in &policy.read_denied_patterns {
-            let filter = Self::render_pattern_filter(pattern, &policy.read_carveouts);
+        for pattern in &policy.read_denials.patterns {
+            let filter = Self::render_pattern_filter(pattern, &policy.read_denials.carveouts);
             writeln!(self.sb, "(deny file-write-unlink {filter}{message})")?;
         }
         for link in policy.write_denied_links.iter() {
@@ -413,9 +407,10 @@ impl ProfileBuilder {
         // denies.
         let is_granted_root = |p: &Path| policy.write_roots.iter().any(|root| root.as_path() == p);
         for root in policy
-            .write_denied_roots
+            .write_denials
+            .roots
             .iter()
-            .chain(policy.read_denied_roots.iter())
+            .chain(policy.read_denials.roots.iter())
         {
             for ancestor in root.ancestors().skip(1) {
                 if ancestor != Path::new("/")
@@ -427,9 +422,10 @@ impl ProfileBuilder {
             }
         }
         for pattern in policy
-            .write_denied_patterns
+            .write_denials
+            .patterns
             .iter()
-            .chain(policy.read_denied_patterns.iter())
+            .chain(policy.read_denials.patterns.iter())
         {
             let base = pattern.base();
             for ancestor in base.ancestors() {
@@ -437,7 +433,8 @@ impl ProfileBuilder {
                     && !is_granted_root(ancestor)
                     && (ancestor.is_under_any(&policy.write_roots)
                         || policy
-                            .write_carveouts
+                            .write_denials
+                            .carveouts
                             .patterns
                             .iter()
                             .any(|allow| ancestor.is_under(allow.base())))
@@ -469,7 +466,7 @@ impl ProfileBuilder {
                     let escaped = escape_sbpl_literal(&root.to_string_lossy());
                     writeln!(self.sb, "(allow file-read* (subpath \"{escaped}\"))")?;
                 }
-                for pattern in &policy.read_carveouts.patterns {
+                for pattern in &policy.read_denials.carveouts.patterns {
                     let regex = Self::glob_to_sbpl_regex(pattern.as_str());
                     let escaped = escape_sbpl_regex_literal(&regex);
                     writeln!(self.sb, "(allow file-read* (regex #\"{escaped}\"))")?;
@@ -483,7 +480,8 @@ impl ProfileBuilder {
                 let mut parent_roots = roots.clone();
                 parent_roots.extend(
                     policy
-                        .read_carveouts
+                        .read_denials
+                        .carveouts
                         .patterns
                         .iter()
                         .map(GlobPatternBuf::base),
@@ -492,55 +490,7 @@ impl ProfileBuilder {
                 self.symlink_metadata_rules(&policy.read_symlinks)?;
             }
         }
-        // Deny rules follow the allow rules so SBPL's last-match-wins
-        // precedence subtracts the denied subtrees from the read grants.
-        for root in &policy.read_denied_roots {
-            let escaped = escape_sbpl_literal(&root.to_string_lossy());
-            writeln!(
-                self.sb,
-                "(deny file-read* (subpath \"{escaped}\"){})",
-                self.message
-            )?;
-        }
-        for carveout in &policy.read_carveouts.roots {
-            if carveout.is_under_any(&policy.read_denied_roots) {
-                let escaped = escape_sbpl_literal(&carveout.to_string_lossy());
-                writeln!(self.sb, "(allow file-read* (subpath \"{escaped}\"))")?;
-            }
-        }
-        for pattern in &policy.read_carveouts.patterns {
-            if policy
-                .read_denied_roots
-                .iter()
-                .any(|root| pattern.overrides_deny(root.as_path()))
-            {
-                let regex = Self::glob_to_sbpl_regex(pattern.as_str());
-                let escaped = escape_sbpl_regex_literal(&regex);
-                writeln!(self.sb, "(allow file-read* (regex #\"{escaped}\"))")?;
-            }
-        }
-        for pattern in &policy.read_denied_patterns {
-            let filter = Self::render_pattern_filter(pattern, &policy.read_carveouts);
-            writeln!(self.sb, "(deny file-read* {filter}{})", self.message)?;
-        }
-        for root in &policy.read_denied_always_roots {
-            let escaped = escape_sbpl_literal(&root.to_string_lossy());
-            writeln!(
-                self.sb,
-                "(deny file-read* (subpath \"{escaped}\"){})",
-                self.message
-            )?;
-        }
-        for pattern in &policy.read_denied_always_patterns {
-            let regex = Self::glob_to_sbpl_regex(pattern.as_str());
-            let escaped = escape_sbpl_regex_literal(&regex);
-            writeln!(
-                self.sb,
-                "(deny file-read* (regex #\"{escaped}\"){})",
-                self.message
-            )?;
-        }
-
+        self.denial_rules("file-read*", &policy.read_denials)?;
         Ok(())
     }
 

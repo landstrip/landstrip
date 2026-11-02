@@ -46,18 +46,10 @@ use std::path::{Path, PathBuf};
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
-    pub(crate) write_denied_roots: Vec<PathBuf>,
-    pub(crate) write_denied_always_roots: Box<[PathBuf]>,
-    pub(crate) write_denied_always_patterns: Box<[GlobPatternBuf]>,
-    pub(crate) write_denied_patterns: Vec<GlobPatternBuf>,
-    pub(crate) write_carveouts: Carveouts,
+    pub(crate) write_denials: DenialScope,
     pub(crate) write_denied_links: DeniedLinks,
     pub(crate) read_access: ReadAccess,
-    pub(crate) read_denied_roots: Vec<PathBuf>,
-    pub(crate) read_denied_patterns: Vec<GlobPatternBuf>,
-    pub(crate) read_carveouts: Carveouts,
-    pub(crate) read_denied_always_roots: Box<[PathBuf]>,
-    pub(crate) read_denied_always_patterns: Box<[GlobPatternBuf]>,
+    pub(crate) read_denials: DenialScope,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) read_symlinks: Vec<PathBuf>,
     pub(crate) network_access: NetworkAccess,
@@ -78,6 +70,51 @@ pub(crate) struct AccessPolicy {
 pub(crate) struct Carveouts {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) patterns: Vec<GlobPatternBuf>,
+}
+
+#[derive(Debug, Default, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DenialScope {
+    pub(crate) roots: Vec<PathBuf>,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(crate) patterns: Vec<GlobPatternBuf>,
+    pub(crate) carveouts: Carveouts,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(crate) always_roots: Box<[PathBuf]>,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub(crate) always_patterns: Box<[GlobPatternBuf]>,
+}
+
+#[cfg(target_os = "linux")]
+impl DenialScope {
+    pub(crate) fn denied(&self) -> DenyRuleSet<'_> {
+        DenyRuleSet::with_carveouts(&self.roots, &self.patterns, &self.carveouts)
+    }
+
+    pub(crate) fn always(&self) -> DenyRuleSet<'_> {
+        DenyRuleSet::new(&self.always_roots, &self.always_patterns)
+    }
+
+    pub(crate) fn is_denied(&self, path: &Path) -> bool {
+        self.always().matches(path) || self.denied().matches(path)
+    }
+
+    pub(crate) fn is_denied_pair(&self, canonical: &Path, lexical: &Path) -> bool {
+        self.is_denied(canonical) || (lexical != canonical && self.is_denied(lexical))
+    }
+
+    pub(crate) fn is_denied_always(&self, canonical: &Path, lexical: &Path) -> bool {
+        let always = self.always();
+        always.matches(canonical) || (lexical != canonical && always.matches(lexical))
+    }
+
+    pub(crate) fn has_denied_under(&self, dir: &Path) -> bool {
+        self.has_denied_always_under(dir) || self.denied().has_denied_under(dir)
+    }
+
+    pub(crate) fn has_denied_always_under(&self, dir: &Path) -> bool {
+        self.always().has_denied_under(dir)
+    }
 }
 
 impl Carveouts {
@@ -193,42 +230,6 @@ pub(crate) enum DenialReason {
 // The write broker that consults these lives only in the Linux seccomp path.
 #[cfg(target_os = "linux")]
 impl AccessPolicy {
-    pub(crate) fn write_denied(&self) -> DenyRuleSet<'_> {
-        DenyRuleSet::with_carveouts(
-            &self.write_denied_roots,
-            &self.write_denied_patterns,
-            &self.write_carveouts,
-        )
-    }
-
-    pub(crate) fn write_denied_always(&self) -> DenyRuleSet<'_> {
-        DenyRuleSet::new(
-            &self.write_denied_always_roots,
-            &self.write_denied_always_patterns,
-        )
-    }
-
-    pub(crate) fn read_denied(&self) -> DenyRuleSet<'_> {
-        DenyRuleSet::with_carveouts(
-            &self.read_denied_roots,
-            &self.read_denied_patterns,
-            &self.read_carveouts,
-        )
-    }
-
-    pub(crate) fn read_denied_always(&self) -> DenyRuleSet<'_> {
-        DenyRuleSet::new(
-            &self.read_denied_always_roots,
-            &self.read_denied_always_patterns,
-        )
-    }
-
-    pub(crate) fn is_write_denied(&self, canonical: &Path) -> bool {
-        self.is_write_denied_always(canonical, canonical) || self.write_denied().matches(canonical)
-    }
-
-    /// A denied subtree is only as strong as the symlinks leading into it:
-    /// unlinking or renaming a link would re-point the denied path.
     pub(crate) fn is_denied_link(&self, path: &Path) -> bool {
         self.write_denied_links.contains(path)
     }
@@ -237,49 +238,16 @@ impl AccessPolicy {
         self.write_denied_links.contains_always(path)
     }
 
-    pub(crate) fn is_write_denied_always(&self, canonical: &Path, lexical: &Path) -> bool {
-        self.write_denied_always().matches(canonical) || self.write_denied_always().matches(lexical)
-    }
-
-    pub(crate) fn is_read_denied(&self, path: &Path) -> bool {
-        self.is_read_denied_always(path) || self.read_denied().matches(path)
-    }
-
-    pub(crate) fn is_read_denied_always(&self, path: &Path) -> bool {
-        self.read_denied_always().matches(path)
-    }
-
-    pub(crate) fn has_read_denied_under(&self, dir: &Path) -> bool {
-        self.has_read_denied_always_under(dir) || self.read_denied().has_denied_under(dir)
-    }
-
-    pub(crate) fn has_write_denied_under(&self, dir: &Path) -> bool {
-        self.has_write_denied_always_under(dir) || self.write_denied().has_denied_under(dir)
-    }
-
-    pub(crate) fn has_read_denied_always_under(&self, dir: &Path) -> bool {
-        self.read_denied_always().has_denied_under(dir)
-    }
-
-    pub(crate) fn has_write_denied_always_under(&self, dir: &Path) -> bool {
-        self.write_denied_always().has_denied_under(dir)
-    }
-
-    /// Why a write to `canonical` is mediated, or `None` when the policy permits
-    /// it. `allow_miss` (outside every `allowWrite` root) is reported only when
-    /// `surface_allow_miss` is set: content syscalls leave it to Landlock unless
-    /// a query can resolve it, but metadata syscalls Landlock does not cover must
-    /// always surface it so the broker can gate them.
     pub(crate) fn write_reason(
         &self,
         canonical: &Path,
         surface_allow_miss: bool,
     ) -> Option<DenialReason> {
-        if self.is_write_denied(canonical) {
+        if self.write_denials.is_denied(canonical) {
             Some(DenialReason::DenyMatch)
         } else if surface_allow_miss
             && !canonical.is_under_any(&self.write_roots)
-            && !self.write_carveouts.matches_pattern(canonical)
+            && !self.write_denials.carveouts.matches_pattern(canonical)
         {
             Some(DenialReason::AllowMiss)
         } else {
@@ -291,15 +259,29 @@ impl AccessPolicy {
         match &self.read_access {
             ReadAccess::Unrestricted => None,
             ReadAccess::AllowRoots(roots) => {
-                if self.is_read_denied(path) {
+                if self.read_denials.is_denied(path) {
                     Some(DenialReason::DenyMatch)
-                } else if path.is_under_any(roots) || self.read_carveouts.matches_pattern(path) {
+                } else if path.is_under_any(roots)
+                    || self.read_denials.carveouts.matches_pattern(path)
+                {
                     None
                 } else {
                     Some(DenialReason::AllowMiss)
                 }
             }
         }
+    }
+
+    pub(crate) fn read_access_reason(
+        &self,
+        canonical: &Path,
+        lexical: &Path,
+    ) -> Option<DenialReason> {
+        self.read_reason(canonical).or_else(|| {
+            self.read_denials
+                .is_denied_pair(canonical, lexical)
+                .then_some(DenialReason::DenyMatch)
+        })
     }
 }
 

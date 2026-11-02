@@ -576,9 +576,10 @@ impl PathAccessEntry {
         }
         // Placed after grant entries so the resulting DACL has DENY before
         // GRANT in access-evaluation order.
-        for path in &policy.write_denied_roots {
+        for path in &policy.write_denials.roots {
             let carved: Vec<&Path> = policy
-                .write_carveouts
+                .write_denials
+                .carveouts
                 .roots
                 .iter()
                 .map(PathBuf::as_path)
@@ -602,7 +603,7 @@ impl PathAccessEntry {
                 )?;
             }
         }
-        for path in &policy.read_denied_roots {
+        for path in &policy.read_denials.roots {
             // Traverse (`FILE_TRAVERSE`/`FILE_GENERIC_EXECUTE` on a directory) is
             // deliberately absent: a granted write root nested in a read-denied
             // subtree must stay writable, as it does under Seatbelt and Landlock.
