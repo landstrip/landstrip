@@ -5,80 +5,17 @@ use super::error::{BrokerError, SysResult};
 use super::fs::SYS_FCHMODAT2;
 use super::network::{SocketAddrCall, TargetSocket};
 use super::notify::{NotificationChannel, NotificationResponse};
-use super::process::{ResolvedPath, fd_label_under_root, label_under_root};
+use super::process::ResolvedPath;
+use super::procfs::{Anchor, OpenHow, ProcFd};
 use crate::error::Error as LandstripError;
 use crate::policy::AccessPolicy;
 use nix::errno::Errno;
 use nix::sys::stat::fstat;
-use std::ffi::{CStr, CString};
-use std::fs;
+use std::ffi::{CStr, CString, OsStr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-
-pub(super) const OPEN_HOW_SIZE: usize = 24;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(super) struct OpenHow {
-    pub(super) flags: u64,
-    pub(super) mode: u64,
-    pub(super) resolve: u64,
-}
-
-impl OpenHow {
-    pub(super) fn openat2(&self, dirfd: RawFd, path: &CStr) -> SysResult<OwnedFd> {
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_openat2,
-                dirfd,
-                path.as_ptr(),
-                ptr::addr_of!(*self),
-                OPEN_HOW_SIZE,
-            )
-        };
-        let fd = Errno::result(rc)?;
-        let fd = RawFd::try_from(fd).map_err(|_| BrokerError::syscall(libc::EMFILE))?;
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-
-    fn validate(&self) -> SysResult<()> {
-        match self.openat2(libc::AT_FDCWD, c"") {
-            Err(BrokerError::SystemCall {
-                errno: libc::ENOENT,
-            }) => Ok(()),
-            Err(err) => Err(err),
-            Ok(_) => Err(BrokerError::syscall(libc::EIO)),
-        }
-    }
-}
-
-impl TryFrom<&[u8]> for OpenHow {
-    type Error = BrokerError;
-
-    fn try_from(buf: &[u8]) -> SysResult<Self> {
-        if buf.len() < OPEN_HOW_SIZE {
-            return Err(BrokerError::InvalidAddress);
-        }
-        if buf[OPEN_HOW_SIZE..].iter().any(|byte| *byte != 0) {
-            return Err(BrokerError::SystemCall { errno: libc::E2BIG });
-        }
-
-        let how = Self {
-            flags: u64::from_ne_bytes(buf[0..8].try_into().map_err(|_| BrokerError::BadAddress)?),
-            mode: u64::from_ne_bytes(buf[8..16].try_into().map_err(|_| BrokerError::BadAddress)?),
-            resolve: u64::from_ne_bytes(
-                buf[16..24]
-                    .try_into()
-                    .map_err(|_| BrokerError::BadAddress)?,
-            ),
-        };
-        how.validate()?;
-        Ok(how)
-    }
-}
-
 pub(super) enum Grant {
     Open(OpenGrant),
     // Preparation failures still await the policy decision before being returned.
@@ -152,33 +89,11 @@ fn broker_addr_call(sock: RawFd, addr: &[u8], call: SocketAddrCall) -> Result<i6
     Ok(i64::from(rc))
 }
 
-pub(super) struct Anchor {
-    pub(super) dir: OwnedFd,
-    pub(super) name: CString,
-    pub(super) target: Option<OwnedFd>,
-}
-
-impl Anchor {
-    pub(super) fn into_target(self) -> SysResult<OwnedFd> {
-        let fd = self
-            .target
-            .ok_or_else(|| BrokerError::syscall(libc::ENOENT))?;
-        validate_nofollow_target(fd.as_fd(), libc::O_NOFOLLOW)?;
-        Ok(fd)
-    }
-
-    pub(super) fn path(&self) -> SysResult<CString> {
-        let mut path = format!("/proc/self/fd/{}/", self.dir.as_raw_fd()).into_bytes();
-        path.extend_from_slice(self.name.as_bytes());
-        Ok(CString::new(path)?)
-    }
-}
-
 pub(super) struct OpenGrant {
     pub(super) flags: i32,
     pub(super) kind: OpenKind,
     label: PathBuf,
-    root: OwnedFd,
+    root_label: PathBuf,
 }
 
 impl OpenGrant {
@@ -203,7 +118,7 @@ impl OpenGrant {
                 if flags & libc::O_CREAT != 0 && flags & libc::O_EXCL != 0 {
                     return Err(BrokerError::syscall(libc::EEXIST));
                 }
-                validate_nofollow_target(handle.as_fd(), flags)?;
+                ProcFd::new(handle.as_fd()).validate_nofollow(flags)?;
                 if flags & libc::O_DIRECTORY != 0 {
                     let stat = fstat(&handle)?;
                     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
@@ -223,7 +138,7 @@ impl OpenGrant {
             flags,
             kind,
             label: resolved.label,
-            root: resolved.root,
+            root_label: resolved.root_label,
         })
     }
 
@@ -236,7 +151,7 @@ impl OpenGrant {
                 let flags = (self.flags
                     & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_TRUNC))
                     | libc::O_CLOEXEC;
-                reopen_fd(handle.as_fd(), flags)
+                ProcFd::new(handle.as_fd()).reopen(flags)
             }
             OpenKind::Create {
                 anchor,
@@ -268,8 +183,7 @@ impl OpenGrant {
     }
 
     fn check_policy(&self, policy: &AccessPolicy, fd: BorrowedFd<'_>) -> SysResult<()> {
-        let root = open_fd_path(self.root.as_fd())?;
-        if let Some(label) = fd_label_under_root(&root, fd)? {
+        if let Some(label) = ProcFd::new(fd).label_under_root_opt(&self.root_label)? {
             self.check_label(policy, &label)?;
         }
         Ok(())
@@ -299,9 +213,9 @@ impl OpenGrant {
             match &self.kind {
                 OpenKind::Reopen(handle) => self.check_policy(policy, handle.as_fd())?,
                 OpenKind::Create { anchor, .. } => {
-                    let root = open_fd_path(self.root.as_fd())?;
-                    let label = label_under_root(&root, anchor.dir.as_fd())?
-                        .join(std::ffi::OsStr::from_bytes(anchor.name.as_bytes()));
+                    let label = ProcFd::new(anchor.dir.as_fd())
+                        .label_under_root(&self.root_label)?
+                        .join(OsStr::from_bytes(anchor.name.as_bytes()));
                     self.check_label(policy, &label)?;
                 }
             }
@@ -313,7 +227,8 @@ impl OpenGrant {
                     if self.flags & libc::O_ACCMODE == libc::O_RDONLY {
                         // Linux also permits O_RDONLY|O_TRUNC; do not give the
                         // target a writable descriptor just to truncate it.
-                        let writable = reopen_fd(fd.as_fd(), libc::O_WRONLY | libc::O_CLOEXEC)?;
+                        let writable =
+                            ProcFd::new(fd.as_fd()).reopen(libc::O_WRONLY | libc::O_CLOEXEC)?;
                         self.check_policy(policy, writable.as_fd())?;
                         let rc = unsafe { libc::ftruncate(writable.as_raw_fd(), 0) };
                         Errno::result(rc)?;
@@ -434,7 +349,8 @@ impl MutationGrant {
                 })?;
             }
             Self::Truncate { target, length } => {
-                let writable = reopen_fd(target.as_fd(), libc::O_WRONLY | libc::O_CLOEXEC)?;
+                let writable =
+                    ProcFd::new(target.as_fd()).reopen(libc::O_WRONLY | libc::O_CLOEXEC)?;
                 Errno::result(unsafe { libc::ftruncate(writable.as_raw_fd(), *length) })?;
             }
             Self::Rename { from, to, flags } => {
@@ -476,7 +392,7 @@ impl MutationGrant {
                 Errno::result(rc)?;
             }
             Self::Chmod { target, mode } => {
-                let path = CString::new(format!("/proc/self/fd/{}", target.as_raw_fd()))?;
+                let path = ProcFd::new(target.as_fd()).c_path()?;
                 Errno::result(unsafe { libc::chmod(path.as_ptr(), *mode) })?;
             }
             Self::Metadata { target, mutation } => mutation.run(target)?,
@@ -511,7 +427,7 @@ impl MutationTarget {
     fn path(&self) -> SysResult<CString> {
         match self {
             Self::Entry(at) => at.path(),
-            Self::Pinned(fd) => Ok(CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))?),
+            Self::Pinned(fd) => ProcFd::new(fd.as_fd()).c_path(),
         }
     }
 
@@ -694,35 +610,4 @@ impl FdMutation {
         Errno::result(rc)?;
         Ok(())
     }
-}
-
-pub(super) fn open_path(path: &Path, flags: i32) -> SysResult<OwnedFd> {
-    let cpath = CString::new(path.as_os_str().as_bytes())?;
-    let fd = unsafe { libc::open(cpath.as_ptr(), flags) };
-    let fd = Errno::result(fd)?;
-    let fd = RawFd::try_from(fd).map_err(|_| BrokerError::syscall(libc::EMFILE))?;
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn reopen_fd(fd: BorrowedFd<'_>, flags: i32) -> SysResult<OwnedFd> {
-    open_path(
-        &Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string()),
-        flags,
-    )
-}
-
-pub(super) fn open_fd_path(fd: BorrowedFd<'_>) -> SysResult<PathBuf> {
-    fs::read_link(Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string()))
-        .map_err(BrokerError::from)
-}
-
-pub(super) fn validate_nofollow_target(handle: BorrowedFd<'_>, flags: i32) -> SysResult<()> {
-    if flags & libc::O_NOFOLLOW == 0 || flags & libc::O_PATH != 0 {
-        return Ok(());
-    }
-    let stat = fstat(handle)?;
-    if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
-        return Err(BrokerError::syscall(libc::ELOOP));
-    }
-    Ok(())
 }

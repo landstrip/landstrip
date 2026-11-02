@@ -2,138 +2,21 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::error::{BrokerError, SysResult};
-use crate::error::Error as LandstripError;
+use super::procfs::{Anchor, OpenHow, ProcFd};
 use crate::paths::PathExt;
 use crate::trap::ProcessContext;
-use anyhow::Result;
 use nix::errno::Errno;
-use nix::sys::prctl;
 use nix::sys::stat::fstat;
 use nix::sys::uio::{RemoteIoVec, process_vm_readv};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr};
 use std::fs;
-use std::io::{self, IoSliceMut};
+use std::io::IoSliceMut;
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-
-pub(super) struct Subreaper {
-    restore_needed: bool,
-    cleanup_pending: bool,
-    listener: Option<OwnedFd>,
-}
-
-impl Subreaper {
-    pub(super) fn acquire() -> Result<Self> {
-        let was_subreaper =
-            prctl::get_child_subreaper().map_err(LandstripError::supervise_errno)?;
-        if !was_subreaper {
-            prctl::set_child_subreaper(true).map_err(LandstripError::supervise_errno)?;
-        }
-        Ok(Self {
-            restore_needed: !was_subreaper,
-            cleanup_pending: false,
-            listener: None,
-        })
-    }
-
-    pub(super) fn track_descendants(&mut self) {
-        self.cleanup_pending = true;
-    }
-
-    pub(super) fn retain_listener(&mut self, listener: OwnedFd) -> BorrowedFd<'_> {
-        let listener: &OwnedFd = self.listener.insert(listener);
-        listener.as_fd()
-    }
-
-    pub(super) fn finish(mut self) -> Result<()> {
-        self.teardown()
-    }
-
-    fn teardown(&mut self) -> Result<()> {
-        let cleanup = if mem::take(&mut self.cleanup_pending) {
-            Self::cleanup_descendants()
-        } else {
-            Ok(())
-        };
-        let restore = if mem::take(&mut self.restore_needed) {
-            prctl::set_child_subreaper(false)
-                .map_err(LandstripError::supervise_errno)
-                .map_err(Into::into)
-        } else {
-            Ok(())
-        };
-        if cleanup.is_err()
-            && let Err(error) = &restore
-        {
-            log::error!("restore subreaper: {error:#}");
-        }
-        cleanup.and(restore)
-    }
-
-    fn child_pids() -> Result<Vec<Pid>> {
-        let children =
-            fs::read_to_string("/proc/thread-self/children").map_err(LandstripError::supervise)?;
-        children
-            .split_whitespace()
-            .map(|pid| {
-                pid.parse::<i32>().map(Pid::from_raw).map_err(|error| {
-                    LandstripError::supervise(io::Error::new(io::ErrorKind::InvalidData, error))
-                        .into()
-                })
-            })
-            .collect()
-    }
-
-    fn cleanup_descendants() -> Result<()> {
-        loop {
-            let children = Self::child_pids()?;
-            if children.is_empty() {
-                match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                    Err(Errno::ECHILD) => return Ok(()),
-                    Ok(_) | Err(Errno::EINTR) => continue,
-                    Err(error) => return Err(LandstripError::supervise_errno(error).into()),
-                }
-            }
-
-            let mut kill_error = None;
-            for child in children {
-                // SAFETY: child came from the kernel's direct-child list.
-                if unsafe { libc::kill(child.as_raw(), libc::SIGKILL) } == -1 {
-                    let error = Errno::last();
-                    if error != Errno::ESRCH && kill_error.is_none() {
-                        kill_error = Some(error);
-                    }
-                }
-            }
-            if let Some(error) = kill_error {
-                return Err(LandstripError::supervise_errno(error).into());
-            }
-
-            loop {
-                match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
-                    Ok(_) | Err(Errno::EINTR) => {}
-                    Err(error) => return Err(LandstripError::supervise_errno(error).into()),
-                }
-            }
-            std::thread::yield_now();
-        }
-    }
-}
-
-impl Drop for Subreaper {
-    fn drop(&mut self) {
-        if let Err(error) = self.teardown() {
-            log::error!("subreaper teardown: {error:#}");
-        }
-    }
-}
-
 pub(super) struct TargetProcess {
     pub(super) pid: Pid,
 }
@@ -344,12 +227,13 @@ impl TargetProcess {
         Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
     }
 
+    pub(super) fn open_proc(&self, entry: &str, flags: i32) -> SysResult<OwnedFd> {
+        ProcFd::open_path(&self.proc_path(entry), flags)
+    }
+
     pub(super) fn filesystem(&self) -> SysResult<TargetFilesystem<'_>> {
-        let root = super::grant::open_path(
-            &self.proc_path("root"),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )?;
-        let root_label = super::grant::open_fd_path(root.as_fd())?;
+        let root = self.open_proc("root", libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)?;
+        let root_label = ProcFd::new(root.as_fd()).read_link()?;
         Ok(TargetFilesystem {
             process: self,
             root,
@@ -359,10 +243,7 @@ impl TargetProcess {
 
     pub(super) fn open_dirfd(&self, dirfd: RawFd) -> SysResult<OwnedFd> {
         if dirfd == libc::AT_FDCWD {
-            return super::grant::open_path(
-                &self.proc_path("cwd"),
-                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            );
+            return self.open_proc("cwd", libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC);
         }
         self.duplicate_fd(dirfd)
     }
@@ -380,8 +261,8 @@ pub(super) struct ResolvedPath {
     pub(super) label: PathBuf,
     pub(super) trailing_slash: bool,
     pub(super) anonymous: bool,
-    pub(super) anchor: Option<super::grant::Anchor>,
-    pub(super) root: OwnedFd,
+    pub(super) anchor: Option<Anchor>,
+    pub(super) root_label: PathBuf,
 }
 
 impl ResolvedPath {
@@ -402,10 +283,14 @@ pub(super) struct TargetFilesystem<'a> {
 
 impl TargetFilesystem<'_> {
     pub(super) fn label(&self, fd: BorrowedFd<'_>) -> SysResult<PathBuf> {
-        label_under_root(&self.root_label, fd)
+        ProcFd::new(fd).label_under_root(&self.root_label)
     }
 
-    fn proc_alias(&self, name: &[u8]) -> SysResult<Vec<u8>> {
+    pub(super) fn label_opt(&self, fd: BorrowedFd<'_>) -> SysResult<Option<PathBuf>> {
+        ProcFd::new(fd).label_under_root_opt(&self.root_label)
+    }
+
+    fn proc_aliases(&self) -> SysResult<(Vec<u8>, Vec<u8>)> {
         let status = fs::read_to_string(self.process.proc_path("status"))?;
         let id = |field: &str| -> SysResult<&str> {
             let value = status
@@ -423,18 +308,23 @@ impl TargetFilesystem<'_> {
             Ok(value)
         };
         let group_id = id("NStgid:")?;
-        if name == b"self" {
-            return Ok(group_id.as_bytes().to_vec());
-        }
         let thread_id = id("NSpid:")?;
-        Ok(format!("{group_id}/task/{thread_id}").into_bytes())
+        Ok((
+            group_id.as_bytes().to_vec(),
+            format!("{group_id}/task/{thread_id}").into_bytes(),
+        ))
+    }
+
+    fn proc_alias(&self, name: &[u8]) -> SysResult<Vec<u8>> {
+        let (group, thread) = self.proc_aliases()?;
+        Ok(if name == b"self" { group } else { thread })
     }
 
     fn directory_stack(&self, base: BorrowedFd<'_>) -> SysResult<Vec<OwnedFd>> {
         let mut dirs = vec![self.root.try_clone()?];
         for component in self.label(base)?.components().skip(1) {
             let name = CString::new(component.as_os_str().as_bytes())?;
-            let how = super::grant::OpenHow {
+            let how = OpenHow {
                 flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
                 mode: 0,
                 resolve: 0x04 | 0x02 | 0x08,
@@ -464,7 +354,7 @@ impl TargetFilesystem<'_> {
     }
 
     fn proc_root(&self) -> SysResult<OwnedFd> {
-        super::grant::OpenHow {
+        OpenHow {
             flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
             mode: 0,
             resolve: 0x04 | 0x02 | 0x08,
@@ -473,24 +363,24 @@ impl TargetFilesystem<'_> {
     }
 
     fn proc_magic(&self, parent: BorrowedFd<'_>, component: &[u8]) -> SysResult<Option<OwnedFd>> {
-        let how = super::grant::OpenHow {
+        let how = OpenHow {
             flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
             mode: 0,
             resolve: 0x04 | 0x02 | 0x08,
         };
         let proc = self.proc_root()?;
-        for alias in [b"self".as_slice(), b"thread-self".as_slice()] {
-            let task = self.proc_alias(alias)?;
+        let (group, thread) = self.proc_aliases()?;
+        for task in [group, thread] {
             let task = CString::new(task)?;
             let task = how.openat2(proc.as_raw_fd(), &task)?;
             if same_object(parent, task.as_fd())? {
                 return match component {
                     b"root" => Ok(Some(self.root.try_clone()?)),
                     b"cwd" => Ok(Some(self.process.open_dirfd(libc::AT_FDCWD)?)),
-                    b"exe" => Ok(Some(super::grant::open_path(
-                        &self.process.proc_path("exe"),
-                        libc::O_PATH | libc::O_CLOEXEC,
-                    )?)),
+                    b"exe" => Ok(Some(
+                        self.process
+                            .open_proc("exe", libc::O_PATH | libc::O_CLOEXEC)?,
+                    )),
                     _ => Ok(None),
                 };
             }
@@ -575,7 +465,7 @@ impl TargetFilesystem<'_> {
                 &component
             })?;
             let parent = dirs.last().ok_or_else(|| BrokerError::syscall(libc::EIO))?;
-            let how = super::grant::OpenHow {
+            let how = OpenHow {
                 flags: (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
                 mode: 0,
                 resolve: 0x02 | 0x08,
@@ -600,7 +490,7 @@ impl TargetFilesystem<'_> {
                             trailing_slash,
                             anonymous: false,
                             anchor: None,
-                            root: self.root.try_clone()?,
+                            root_label: self.root_label.clone(),
                         });
                     }
                     None
@@ -647,26 +537,25 @@ impl TargetFilesystem<'_> {
                                 {
                                     return Err(BrokerError::syscall(libc::ENOTDIR));
                                 }
-                                let (label, anonymous) =
-                                    match fd_label_under_root(&self.root_label, target.as_fd())? {
-                                        Some(label) => (label, false),
-                                        None => (
-                                            self.label(parent.as_fd())?
-                                                .join(OsStr::from_bytes(name.as_bytes())),
-                                            true,
-                                        ),
-                                    };
+                                let (label, anonymous) = match self.label_opt(target.as_fd())? {
+                                    Some(label) => (label, false),
+                                    None => (
+                                        self.label(parent.as_fd())?
+                                            .join(OsStr::from_bytes(name.as_bytes())),
+                                        true,
+                                    ),
+                                };
                                 return Ok(ResolvedPath {
                                     lexical,
                                     label,
                                     trailing_slash,
                                     anonymous,
-                                    anchor: Some(super::grant::Anchor {
+                                    anchor: Some(Anchor {
                                         dir: parent.try_clone()?,
                                         name,
                                         target: Some(target),
                                     }),
-                                    root: self.root.try_clone()?,
+                                    root_label: self.root_label.clone(),
                                 });
                             }
                         }
@@ -726,12 +615,12 @@ impl TargetFilesystem<'_> {
                 label,
                 trailing_slash,
                 anonymous: false,
-                anchor: Some(super::grant::Anchor {
+                anchor: Some(Anchor {
                     dir: parent.try_clone()?,
                     name,
                     target: object.take(),
                 }),
-                root: self.root.try_clone()?,
+                root_label: self.root_label.clone(),
             });
         }
     }
@@ -763,30 +652,4 @@ fn same_object(left: BorrowedFd<'_>, right: BorrowedFd<'_>) -> SysResult<bool> {
         Ok((stat.stx_mnt_id, stat.stx_ino))
     }
     Ok(identity(left)? == identity(right)?)
-}
-
-pub(super) fn fd_label_under_root(root: &Path, fd: BorrowedFd<'_>) -> SysResult<Option<PathBuf>> {
-    let label = super::grant::open_fd_path(fd)?;
-    if !label.is_absolute() {
-        return Ok(None);
-    }
-    let label = if let Some(label) = label.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
-        // An unlinked file still has the path it was opened through in procfs.
-        // Check that path instead of rejecting every deleted descriptor, but
-        // keep denying deleted entries that remain reachable through a link.
-        if fstat(fd)?.st_nlink != 0 {
-            return Err(BrokerError::syscall(libc::EACCES));
-        }
-        PathBuf::from(OsStr::from_bytes(label))
-    } else {
-        label
-    };
-    let relative = label
-        .strip_prefix(root)
-        .map_err(|_| BrokerError::syscall(libc::EXDEV))?;
-    Ok(Some(Path::new("/").join(relative)))
-}
-
-pub(super) fn label_under_root(root: &Path, fd: BorrowedFd<'_>) -> SysResult<PathBuf> {
-    fd_label_under_root(root, fd)?.ok_or_else(|| BrokerError::syscall(libc::EACCES))
 }

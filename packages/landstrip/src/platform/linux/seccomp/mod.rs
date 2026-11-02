@@ -22,6 +22,8 @@ mod grant;
 mod network;
 mod notify;
 mod process;
+mod procfs;
+mod subreaper;
 mod supervise;
 
 pub(crate) use notify::ensure_notification_supported;
@@ -43,7 +45,7 @@ use nix::sys::socket::{
     ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg, setsockopt, sockopt,
 };
 use nix::unistd::Pid;
-use process::{Subreaper, TargetProcess};
+use process::TargetProcess;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, IoSlice, IoSliceMut, Read, Write};
@@ -53,6 +55,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
+use subreaper::Subreaper;
 use supervise::{NamespaceId, Supervisor};
 
 enum NotifyStartup<'a> {

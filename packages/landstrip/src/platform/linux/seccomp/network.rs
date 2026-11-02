@@ -5,6 +5,7 @@ use super::error::{BrokerError, SysResult};
 use super::grant::{Grant, SocketGrant};
 use super::notify::NotificationResult;
 use super::process::{MissingTarget, TargetProcess};
+use super::procfs::ProcFd;
 use super::supervise::{Denial, Denials};
 use crate::policy::{AccessPolicy, UnixPathAccess, UnixSocketAccess};
 use crate::trap::NetworkOperation;
@@ -463,7 +464,7 @@ fn handle_unix_connect(
         );
     }
     let object = anchor.target.as_ref().ok_or(BrokerError::InvalidAddress)?;
-    socket.rewrite_unix_path(&Path::new("/proc/self/fd").join(object.as_raw_fd().to_string()))?;
+    socket.rewrite_unix_path(&ProcFd::new(object.as_fd()).proc_path())?;
     let grant = SocketGrant {
         sock: socket.sock,
         addr: socket.addr,

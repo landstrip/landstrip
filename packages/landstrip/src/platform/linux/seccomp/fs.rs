@@ -2,12 +2,10 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::error::{BrokerError, SysResult};
-use super::grant::{
-    FdMutation, Grant, MutationGrant, MutationTarget, OPEN_HOW_SIZE, OpenGrant, OpenHow,
-    PathMutation, open_path,
-};
+use super::grant::{FdMutation, Grant, MutationGrant, MutationTarget, OpenGrant, PathMutation};
 use super::notify::NotificationResult;
-use super::process::{MissingTarget, ResolvedPath, TargetProcess, fd_label_under_root};
+use super::process::{MissingTarget, ResolvedPath, TargetProcess};
+use super::procfs::OpenHow;
 use super::supervise::{Denial, Denials};
 use crate::paths::PathExt;
 use crate::policy::{AccessPolicy, DenialReason};
@@ -402,7 +400,7 @@ impl Open {
         let args = &request.data.args;
         let addr = usize::try_from(args[2]).map_err(|_| BrokerError::BadAddress)?;
         let size = usize::try_from(args[3]).map_err(|_| BrokerError::InvalidAddress)?;
-        if size < OPEN_HOW_SIZE {
+        if size < OpenHow::SIZE {
             return Err(BrokerError::InvalidAddress);
         }
         let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
@@ -650,7 +648,7 @@ impl AccessRequest {
         if self.flags.empty_path() && self.path.as_os_str().is_empty() {
             let filesystem = self.process.filesystem()?;
             let target = self.process.duplicate_fd(self.dirfd)?;
-            let Some(label) = fd_label_under_root(&filesystem.root_label, target.as_fd())? else {
+            let Some(label) = filesystem.label_opt(target.as_fd())? else {
                 return Ok(None);
             };
             let lexical = label.clean_lexically();
@@ -1085,7 +1083,7 @@ fn mutation_target_fd(
         return process.duplicate_fd(child_fd);
     }
 
-    open_path(&process.proc_path("cwd"), libc::O_PATH | libc::O_CLOEXEC)
+    process.open_proc("cwd", libc::O_PATH | libc::O_CLOEXEC)
 }
 
 fn handle_fd_mutation(
@@ -1105,7 +1103,7 @@ fn handle_fd_mutation(
     let target = mutation_target_fd(&process, args[0].to_i32(), spec.kind)?;
     let filesystem = process.filesystem()?;
     let mutation = spec.kind.fd_mutation(&process, args)?;
-    let Some(requested_path) = fd_label_under_root(&filesystem.root_label, target.as_fd())? else {
+    let Some(requested_path) = filesystem.label_opt(target.as_fd())? else {
         return Ok(NotificationResult::grant(MutationGrant::Fd {
             target,
             mutation,
