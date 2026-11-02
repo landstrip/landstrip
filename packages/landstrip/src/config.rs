@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::error::Error;
-use anyhow::{Context, Result};
+use crate::error::{Error, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::ffi::OsStr;
@@ -18,7 +17,7 @@ pub(crate) enum PolicyFormat {
 }
 
 impl PolicyFormat {
-    pub(crate) fn parse_document(self, document: &str) -> std::result::Result<Value, Error> {
+    pub(crate) fn parse_document(self, document: &str) -> Result<Value> {
         let mut value: Value = match self {
             Self::Json => serde_json::from_str(document).map_err(Error::parse_failed)?,
             Self::Yaml => serde_yml::from_str(document).map_err(Error::parse_failed)?,
@@ -59,16 +58,18 @@ impl PolicyFormat {
         let Some(exe) = resolve_executable(tool, cwd) else {
             return Ok(None);
         };
-        let context = format!("executable policy {}", exe.display());
+        let context = || format!("executable policy {}", exe.display());
 
-        let Some(bytes) = read_policy_bytes(&exe).with_context(|| context.clone())? else {
+        let Some(bytes) = read_policy_bytes(&exe).map_err(|error| error.with_context(context()))?
+        else {
             return Ok(None);
         };
 
         let document = String::from_utf8(bytes)
-            .map_err(Error::parse_failed)
-            .with_context(|| context.clone())?;
-        let value = self.parse_document(&document).with_context(|| context)?;
+            .map_err(|source| Error::parse_failed(source).with_context(context()))?;
+        let value = self
+            .parse_document(&document)
+            .map_err(|error| error.with_context(context()))?;
         Ok(Some(value))
     }
 }
@@ -200,21 +201,28 @@ impl Settings {
         let mut merged = Value::Object(Map::new());
 
         for path in policy_paths {
-            let (document, source_name) = if path.as_path() == Path::new("-") {
+            let is_stdin = path.as_path() == Path::new("-");
+            let source_name = || {
+                if is_stdin {
+                    "policy stdin".to_owned()
+                } else {
+                    format!("policy file {}", path.display())
+                }
+            };
+            let document = if is_stdin {
                 let mut document = String::new();
                 io::stdin()
                     .read_to_string(&mut document)
-                    .context("policy stdin")?;
-                (document, "policy stdin".to_owned())
+                    .map_err(|source| Error::policy_io(source).with_context(source_name()))?;
+                document
             } else {
                 log::debug!("config: {}", path.display());
-                let document = fs::read_to_string(path)
-                    .with_context(|| format!("policy file {}", path.display()))?;
-                (document, format!("policy file {}", path.display()))
+                fs::read_to_string(path)
+                    .map_err(|source| Error::policy_io(source).with_context(source_name()))?
             };
             let value = format
                 .parse_document(&document)
-                .with_context(|| source_name)?;
+                .map_err(|error| error.with_context(source_name()))?;
             merge_json(&mut merged, value);
         }
 
@@ -225,8 +233,7 @@ impl Settings {
         }
 
         serde_json::from_value(merged)
-            .map_err(Error::parse_failed)
-            .context("policy")
+            .map_err(|source| Error::parse_failed(source).with_context("policy"))
     }
 }
 
@@ -297,7 +304,7 @@ fn read_policy_bytes(exe: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(PathBuf::from(stream)) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(Error::policy_io(source).into()),
+        Err(source) => Err(Error::policy_io(source)),
     }
 }
 
@@ -376,7 +383,7 @@ fn classify_xattr_error() -> Result<Option<Vec<u8>>> {
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
         Some(code) if code == missing || code == libc::ENOENT => Ok(None),
-        _ => Err(Error::policy_io(error).into()),
+        _ => Err(Error::policy_io(error)),
     }
 }
 

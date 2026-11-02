@@ -2,8 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::PathExt;
-use crate::error::{Error, PathIo, PolicyViolation};
-use anyhow::Result;
+use crate::error::{Error, PathIo, PolicyViolation, Result};
 use serde::Serialize;
 use std::fmt;
 use std::fs;
@@ -176,7 +175,7 @@ impl<'a> GlobPattern<'a> {
         match fs::symlink_metadata(&base) {
             Ok(_) => self.collect_matches(&base, &mut matches, 0)?,
             Err(error) if error.is_opaque() || error.kind() == io::ErrorKind::NotADirectory => {}
-            Err(source) => return Err(Error::policy_io(source).into()),
+            Err(source) => return Err(Error::policy_io(source)),
         }
 
         Ok(matches)
@@ -186,7 +185,7 @@ impl<'a> GlobPattern<'a> {
         const LIMIT: u32 = 40;
 
         if depth >= LIMIT {
-            return Err(Error::from(PolicyViolation::TraversalDepth).into());
+            return Err(PolicyViolation::TraversalDepth.into());
         }
 
         let candidate = path.clean_lexically();
@@ -197,7 +196,7 @@ impl<'a> GlobPattern<'a> {
         let metadata = match fs::symlink_metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.is_opaque() => return Ok(()),
-            Err(source) => return Err(Error::policy_io(source).into()),
+            Err(source) => return Err(Error::policy_io(source)),
         };
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Ok(());
@@ -211,13 +210,13 @@ impl<'a> GlobPattern<'a> {
             {
                 return Ok(());
             }
-            Err(source) => return Err(Error::policy_io(source).into()),
+            Err(source) => return Err(Error::policy_io(source)),
         };
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) if error.is_transport_failed() => continue,
-                Err(source) => return Err(Error::policy_io(source).into()),
+                Err(source) => return Err(Error::policy_io(source)),
             };
             self.collect_matches(&entry.path(), matches, depth + 1)?;
         }

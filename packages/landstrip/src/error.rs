@@ -12,6 +12,7 @@ use std::path::PathBuf;
 /// reports no structured cause. An errno is recovered from it by
 /// [`Error::errno`] when the cause carries one.
 pub(crate) type Cause = Box<dyn StdError + Send + Sync>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// The OS enforcement layer an error or a denial is attributed to.
 ///
@@ -101,9 +102,11 @@ pub(crate) enum Error {
         message: String,
     },
     PolicyParseFailed {
+        context: Option<String>,
         source: Cause,
     },
     PolicyIoFailed {
+        context: Option<String>,
         source: io::Error,
     },
     Policy(PolicyViolation),
@@ -184,12 +187,30 @@ impl Error {
 
     pub(crate) fn parse_failed(source: impl StdError + Send + Sync + 'static) -> Self {
         Self::PolicyParseFailed {
+            context: None,
             source: Box::new(source),
         }
     }
 
     pub(crate) fn policy_io(source: io::Error) -> Self {
-        Self::PolicyIoFailed { source }
+        Self::PolicyIoFailed {
+            context: None,
+            source,
+        }
+    }
+
+    pub(crate) fn with_context(self, context: impl Into<String>) -> Self {
+        match self {
+            Self::PolicyParseFailed { source, .. } => Self::PolicyParseFailed {
+                context: Some(context.into()),
+                source,
+            },
+            Self::PolicyIoFailed { source, .. } => Self::PolicyIoFailed {
+                context: Some(context.into()),
+                source,
+            },
+            other => other,
+        }
     }
 
     pub(crate) fn code(&self) -> &'static str {
@@ -246,6 +267,9 @@ impl Error {
     pub(crate) fn detail(&self) -> Option<String> {
         match self {
             Self::Usage { message } => Some(message.clone()),
+            Self::PolicyParseFailed { context, .. } | Self::PolicyIoFailed { context, .. } => {
+                context.clone()
+            }
             Self::Policy(violation) => Some(violation.message().to_owned()),
             Self::LaunchFailed { tool, .. } => Some(tool.display().to_string()),
             Self::HostJobIncompatible { .. } => Some(

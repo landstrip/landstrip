@@ -8,11 +8,10 @@ use super::{
     NetworkAccess, ReadAccess, UnixSocketAccess,
 };
 use crate::config::{PathSelector, SandboxDarwin, SandboxFilesystem, SandboxNetwork, Settings};
-use crate::error::{Error, PathIo, PolicyViolation};
+use crate::error::{Error, PathIo, PolicyViolation, Result};
 use crate::paths::{
     GlobPattern, GlobPatternBuf, NormalizePatterns, NormalizeRoots, OverridesDeny, PathExt,
 };
-use anyhow::Result;
 use std::env;
 use std::fs;
 use std::io;
@@ -25,11 +24,11 @@ impl Settings {
         let windows = &self.windows;
         #[cfg(target_os = "windows")]
         if !filesystem.deny_read_always.is_empty() {
-            return Err(Error::from(PolicyViolation::DenyReadAlwaysUnsupported).into());
+            return Err(PolicyViolation::DenyReadAlwaysUnsupported.into());
         }
         #[cfg(target_os = "windows")]
         if !filesystem.deny_write_always.is_empty() {
-            return Err(Error::from(PolicyViolation::DenyWriteAlwaysUnsupported).into());
+            return Err(PolicyViolation::DenyWriteAlwaysUnsupported.into());
         }
         let resolver = PolicyResolver::new(policy_base)?;
 
@@ -228,7 +227,7 @@ fn lower_read_access(
     let fs_root = Path::new("/").normalize();
     #[cfg(target_os = "windows")]
     if read_allow.contains(&fs_root) {
-        return Err(Error::from(PolicyViolation::UnrestrictedRead).into());
+        return Err(PolicyViolation::UnrestrictedRead.into());
     }
 
     let has_dynamic_patterns = cfg!(not(target_os = "windows")) && !read_denied_patterns.is_empty();
@@ -324,7 +323,7 @@ impl SandboxDarwin {
         let mut allow_mach_lookup = Vec::with_capacity(self.allow_mach_lookup.len());
         for service in &self.allow_mach_lookup {
             if service.strip_suffix('*').unwrap_or(service).is_empty() {
-                return Err(Error::from(PolicyViolation::InvalidMachLookup).into());
+                return Err(PolicyViolation::InvalidMachLookup.into());
             }
             allow_mach_lookup.push(service.clone());
         }
@@ -337,7 +336,7 @@ impl SandboxDarwin {
                     .bytes()
                     .any(|byte| byte < 0x20 || byte == 0x7f || byte == b'"' || byte == b'\\'))
         {
-            return Err(Error::from(PolicyViolation::InvalidLogTag).into());
+            return Err(PolicyViolation::InvalidLogTag.into());
         }
 
         Ok(Self {
@@ -360,7 +359,9 @@ impl PolicyResolver {
         let base = if policy_base.is_absolute() {
             policy_base.to_path_buf()
         } else {
-            env::current_dir()?.join(policy_base)
+            env::current_dir()
+                .map_err(Error::policy_io)?
+                .join(policy_base)
         };
         Ok(Self {
             base: base.clean_lexically(),
@@ -440,7 +441,7 @@ impl PolicyResolver {
 
     fn resolve_sandbox_path(&self, path: &str) -> Result<PathBuf> {
         if path.is_empty() {
-            return Err(Error::from(PolicyViolation::EmptyPath).into());
+            return Err(PolicyViolation::EmptyPath.into());
         }
 
         let raw = Path::new(path);
@@ -450,12 +451,12 @@ impl PolicyResolver {
             self.home
                 .as_deref()
                 .map(Path::to_path_buf)
-                .ok_or_else(|| Error::from(PolicyViolation::HomeUnavailable))?
+                .ok_or(PolicyViolation::HomeUnavailable)?
         } else if let Some(rest) = path.strip_prefix("~/") {
             self.home
                 .as_deref()
                 .map(|home| home.join(rest))
-                .ok_or_else(|| Error::from(PolicyViolation::HomeUnavailable))?
+                .ok_or(PolicyViolation::HomeUnavailable)?
         } else {
             self.base.join(raw)
         };
@@ -657,7 +658,7 @@ impl PolicyResolver {
             .flatten()
         {
             if port == 0 {
-                return Err(Error::from(PolicyViolation::InvalidPort).into());
+                return Err(PolicyViolation::InvalidPort.into());
             }
             connect_tcp_ports.push(port);
         }
@@ -696,7 +697,7 @@ fn scan_allowed_root(
 
     while let Some((current, is_explicit, depth)) = stack.pop() {
         if depth >= MAX_TRAVERSAL_DEPTH {
-            return Err(Error::from(PolicyViolation::TraversalDepth).into());
+            return Err(PolicyViolation::TraversalDepth.into());
         }
 
         if current.is_under_any(denied) {
@@ -713,7 +714,7 @@ fn scan_allowed_root(
                 results.push(current);
                 continue;
             }
-            Err(source) => return Err(Error::policy_io(source).into()),
+            Err(source) => return Err(Error::policy_io(source)),
         };
         let file_type = metadata.file_type();
 
@@ -735,7 +736,7 @@ fn scan_allowed_root(
                 results.push(current);
                 continue;
             }
-            Err(source) => return Err(Error::policy_io(source).into()),
+            Err(source) => return Err(Error::policy_io(source)),
         };
         for entry in entries {
             let entry = match entry {
@@ -743,7 +744,7 @@ fn scan_allowed_root(
                 Err(error) if error.is_transport_failed() => {
                     continue;
                 }
-                Err(source) => return Err(Error::policy_io(source).into()),
+                Err(source) => return Err(Error::policy_io(source)),
             };
             let child = entry.path();
             stack.push((child, false, depth + 1));

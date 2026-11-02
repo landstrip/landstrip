@@ -9,7 +9,6 @@ use crate::platform::WindowsCommand;
 use crate::policy::AccessPolicy;
 #[cfg(unix)]
 use crate::trap_fd::TrapFd;
-use anyhow::Result;
 use clap::builder::{PathBufValueParser, TypedValueParser};
 use clap::{Args, Parser, Subcommand, error::ErrorKind};
 use std::env;
@@ -477,7 +476,7 @@ impl TryFrom<&PolicyInput> for PolicyFormat {
 }
 
 impl PolicyInput {
-    pub(super) fn resolve(&self, cwd: &Path, tool: Option<&OsStr>) -> Result<AccessPolicy> {
+    pub(super) fn resolve(&self, cwd: &Path, tool: Option<&OsStr>) -> Result<AccessPolicy, Error> {
         let format = PolicyFormat::try_from(self)?;
         log::debug!("cli: cwd: {}", cwd.display());
         let settings = Settings::load(&self.paths, format, tool, cwd)?;

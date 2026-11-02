@@ -106,6 +106,7 @@ fn check_policy(request: &PolicyRequest) -> Result<CommandOutcome> {
     let result = request
         .policy
         .resolve(&request.cwd, request.tool.as_deref())
+        .map_err(anyhow::Error::from)
         .and_then(|policy| platform::validate(&policy));
     let report = PolicyValidationReport::try_from(result)?;
     CommandOutcome::json(report.valid, report)
