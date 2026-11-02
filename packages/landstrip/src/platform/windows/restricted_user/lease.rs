@@ -13,13 +13,21 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Journal {
     account_sid: String,
     grants: GrantPlan,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalRef<'a> {
+    account_sid: &'a str,
+    grants: &'a GrantPlan,
+}
+
 pub(super) struct Lease<'a> {
+    store: &'a StateStore,
     account: &'a Account,
     _mutex: NamedMutex,
     journal_path: PathBuf,
@@ -27,7 +35,7 @@ pub(super) struct Lease<'a> {
 
 impl<'a> Lease<'a> {
     pub(super) fn acquire(
-        store: &StateStore,
+        store: &'a StateStore,
         installation: &'a Installation,
         network_mode: NetworkMode,
     ) -> Result<Self> {
@@ -56,11 +64,12 @@ impl<'a> Lease<'a> {
     }
 
     pub(super) fn write_journal(&self, grants: &GrantPlan) -> Result<()> {
-        let journal = Journal {
-            account_sid: self.account.sid.clone(),
-            grants: grants.clone(),
+        let journal = JournalRef {
+            account_sid: &self.account.sid,
+            grants,
         };
-        StateStore::write_json(&self.journal_path, &journal, "lease journal")
+        self.store
+            .write_json(&self.journal_path, &journal, "lease journal")
     }
 
     pub(super) fn clear_journal(&self) -> Result<()> {
@@ -72,7 +81,7 @@ impl<'a> Lease<'a> {
     }
 
     fn try_account(
-        store: &StateStore,
+        store: &'a StateStore,
         installation: &Installation,
         account: &'a Account,
     ) -> Result<Option<Self>> {
@@ -87,6 +96,7 @@ impl<'a> Lease<'a> {
             return Ok(None);
         };
         Ok(Some(Self {
+            store,
             account,
             _mutex: mutex,
             journal_path,
@@ -115,7 +125,7 @@ impl<'a> Lease<'a> {
         self.clear_journal()
     }
 
-    pub(super) fn recover_all(store: &StateStore, installation: &'a Installation) -> Result<()> {
+    pub(super) fn recover_all(store: &'a StateStore, installation: &'a Installation) -> Result<()> {
         let mut leases = Vec::with_capacity(installation.accounts.len());
         for account in &installation.accounts {
             let lease = Self::try_account(store, installation, account)?.ok_or_else(|| {

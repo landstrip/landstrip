@@ -50,7 +50,7 @@ pub(super) fn execute(
         .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     let request_path = store.runs_dir().join(format!("{request_id}.json"));
     let grants = access::GrantPlan::new(policy, &request_path)?;
-    worker::write_request(&request_path, &lease.account().sid, tool, args, cwd)
+    worker::write_request(&store, &request_path, &lease.account().sid, tool, args, cwd)
         .map_err(|source| Error::sandbox_setup(Mechanism::Windowsuser, source))?;
     if let Err(error) = lease.write_journal(&grants) {
         let _ = fs::remove_file(&request_path);

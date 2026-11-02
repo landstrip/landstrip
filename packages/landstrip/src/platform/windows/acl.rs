@@ -102,21 +102,27 @@ impl PathAccessEntry {
     ) {
         let ancestor_access = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
         for ancestor in path.ancestors().skip(1) {
-            entries.push(Self {
-                access_mode: GRANT_ACCESS,
-                path: ancestor.to_path_buf(),
-                access: ancestor_access,
-                inherit: false,
-                propagate: false,
-            });
+            Self::insert_or_merge_grant(entries, ancestor, ancestor_access, false);
         }
-        entries.push(Self {
-            access_mode: GRANT_ACCESS,
-            path: path.to_path_buf(),
-            access,
-            inherit: inherit_and_propagate,
-            propagate: inherit_and_propagate,
-        });
+        Self::insert_or_merge_grant(entries, path, access, inherit_and_propagate);
+    }
+
+    fn insert_or_merge_grant(
+        entries: &mut Vec<Self>,
+        path: &Path,
+        access: u32,
+        inherit_and_propagate: bool,
+    ) {
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|entry| entry.access_mode == GRANT_ACCESS && entry.path == path)
+        {
+            existing.access |= access;
+            existing.inherit |= inherit_and_propagate;
+            existing.propagate |= inherit_and_propagate;
+            return;
+        }
+        entries.push(Self::grant(path, access, inherit_and_propagate));
     }
 
     pub(super) fn grant(path: &Path, access: u32, inherit_and_propagate: bool) -> Self {

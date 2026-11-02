@@ -41,6 +41,7 @@ struct Request {
 }
 
 pub(super) fn write_request(
+    store: &StateStore,
     path: &Path,
     account_sid: &str,
     tool: &OsStr,
@@ -68,7 +69,7 @@ pub(super) fn write_request(
         file.write_all(b"\n")?;
         file.sync_all()?;
         drop(file);
-        StateStore::protect_path(path)
+        store.protect_path(path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(path);

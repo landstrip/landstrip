@@ -11,6 +11,7 @@ use crate::error::{Error as LandstripError, Mechanism, PolicyViolation};
 use crate::policy::AccessPolicy;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
 use std::env;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -176,6 +177,7 @@ impl Hex {
 
 pub(super) struct StateStore {
     root: PathBuf,
+    owner_dacl: OnceCell<OwnedSecurityDescriptor>,
 }
 
 impl StateStore {
@@ -183,6 +185,7 @@ impl StateStore {
         let base = env::var_os("ProgramData").context("Windows ProgramData is unavailable")?;
         Ok(Self {
             root: PathBuf::from(base).join(STATE_DIRECTORY),
+            owner_dacl: OnceCell::new(),
         })
     }
 
@@ -206,18 +209,25 @@ impl StateStore {
                     runtime_directory.display()
                 )
             })?;
-            Self::protect_path(&runtime_directory)?;
+            self.protect_path(&runtime_directory)?;
         }
         Ok(())
     }
 
-    pub(super) fn write_json(path: &Path, value: &impl Serialize, label: &str) -> Result<()> {
+    pub(super) fn write_json(
+        &self,
+        path: &Path,
+        value: &impl Serialize,
+        label: &str,
+    ) -> Result<()> {
         let directory = path
             .parent()
             .with_context(|| format!("{label} path has no parent"))?;
-        fs::create_dir_all(directory)
-            .with_context(|| format!("create {label} directory {}", directory.display()))?;
-        Self::protect_path(directory)?;
+        if !directory.is_dir() {
+            fs::create_dir_all(directory)
+                .with_context(|| format!("create {label} directory {}", directory.display()))?;
+            self.protect_path(directory)?;
+        }
 
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
         let bytes = serde_json::to_vec_pretty(value)?;
@@ -232,11 +242,11 @@ impl StateStore {
             file.write_all(b"\n")?;
             file.sync_all()?;
             drop(file);
-            Self::protect_path(&temporary)?;
+            self.protect_path(&temporary)?;
 
+            // MoveFileExW within the same directory preserves the file's DACL.
             AtomicFile::replace(&temporary, path)
-                .with_context(|| format!("replace restricted-user file {}", path.display()))?;
-            Self::protect_path(path)
+                .with_context(|| format!("replace restricted-user file {}", path.display()))
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -244,15 +254,9 @@ impl StateStore {
         result
     }
 
-    pub(super) fn protect_path(path: &Path) -> Result<()> {
-        let owner_sid = ProcessToken::current(TOKEN_QUERY)
-            .context("open current process token")?
-            .user_sid_string()
-            .context("query current user SID")?;
-        let sddl = format!("D:P(A;;FA;;;SY)(A;;FA;;;{owner_sid})");
-        let descriptor = OwnedSecurityDescriptor::from_sddl(&sddl)
-            .context("build restricted-user state DACL")?;
-        let dacl = descriptor
+    pub(super) fn protect_path(&self, path: &Path) -> Result<()> {
+        let dacl = self
+            .owner_security_descriptor()?
             .dacl()
             .context("get restricted-user state DACL")?;
         let path = path.to_wide_nul();
@@ -271,6 +275,23 @@ impl StateStore {
             return Err(OsStatus::from_code(status)).context("protect restricted-user state DACL");
         }
         Ok(())
+    }
+
+    fn owner_security_descriptor(&self) -> Result<&OwnedSecurityDescriptor> {
+        if let Some(descriptor) = self.owner_dacl.get() {
+            return Ok(descriptor);
+        }
+        let owner_sid = ProcessToken::current(TOKEN_QUERY)
+            .context("open current process token")?
+            .user_sid_string()
+            .context("query current user SID")?;
+        let sddl = format!("D:P(A;;FA;;;SY)(A;;FA;;;{owner_sid})");
+        let descriptor = OwnedSecurityDescriptor::from_sddl(&sddl)
+            .context("build restricted-user state DACL")?;
+        let _ = self.owner_dacl.set(descriptor);
+        self.owner_dacl
+            .get()
+            .context("owner DACL was not initialized")
     }
 
     pub(super) fn remove(&self) -> Result<()> {
@@ -388,7 +409,7 @@ impl Installation {
 
     pub(super) fn save(&self, store: &StateStore) -> Result<()> {
         let path = store.state_path();
-        StateStore::write_json(&path, self, "restricted-user state")
+        store.write_json(&path, self, "restricted-user state")
     }
 
     pub(super) fn health(&self) -> (bool, bool) {
