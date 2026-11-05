@@ -32,7 +32,6 @@ import {
   type BashOperations,
   createBashToolDefinition,
   createLocalBashOperations,
-  getAgentDir,
   getShellConfig,
   SettingsManager,
   type ToolDefinition,
@@ -45,6 +44,7 @@ import {
   type SandboxConfig as BaseSandboxConfig,
   type SandboxConfigFile,
   type SandboxFilesystemConfig,
+  type SandboxNetworkConfig,
   type SandboxShellConfig,
   type SandboxWindowsConfig,
   type ShellReadAccess,
@@ -240,37 +240,144 @@ const NETWORK_PERMISSION_OPTIONS: PromptOption[] = [
   { label: 'Keep blocked', action: 'abort' },
 ];
 
-function loadSandboxConfig(
-  cwd: string,
-  includeProject: boolean,
-): SandboxConfig & { explicitDenyRead: string[]; explicitAllowRead: string[] } {
-  const projectConfigPath = join(cwd, '.pi', 'sandbox.json');
-  const globalConfigPath = join(getAgentDir(), 'sandbox.json');
+type LoadedSandboxConfig = SandboxConfig & {
+  explicitDenyRead: string[];
+  explicitAllowRead: string[];
+};
 
-  if (!existsSync(globalConfigPath)) {
-    mkdirSync(dirname(globalConfigPath), { recursive: true });
-    writeFileSync(globalConfigPath, '{}\n', 'utf-8');
+type SandboxGrantField =
+  | Extract<keyof SandboxNetworkConfig, 'allowedDomains' | 'allowUnixSockets'>
+  | Extract<keyof SandboxFilesystemConfig, 'allowRead' | 'allowWrite'>;
+
+class SandboxConfigStore {
+  readonly globalPath: string;
+  readonly projectPath: string;
+
+  constructor(cwd: string) {
+    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+    this.globalPath = globalPath;
+    this.projectPath = projectPath;
   }
 
-  const globalOverrides = readOrEmptyConfig(globalConfigPath);
-  const projectOverrides = includeProject ? readOrEmptyConfig(projectConfigPath) : {};
-  const globalConfig = deepMerge(
-    JSON.parse(readFileSync(join(packageDir, 'sandbox.json'), 'utf-8')),
-    globalOverrides,
-  );
+  private static readOrEmpty(configPath: string): SandboxConfigFile {
+    if (!existsSync(configPath)) return {};
+    try {
+      return parseSandboxConfig(JSON.parse(readFileSync(configPath, 'utf-8')));
+    } catch (error) {
+      throw new Error(`${configPath}: ${formatError(error)}`);
+    }
+  }
 
-  return {
-    ...deepMerge(globalConfig, projectOverrides),
-    // Persisted rules are explicit, even when identical to an internal default.
-    explicitDenyRead: mergeArray(
-      globalOverrides.filesystem?.denyRead ?? [],
-      projectOverrides.filesystem?.denyRead,
-    ),
-    explicitAllowRead: mergeArray(
-      globalOverrides.filesystem?.allowRead ?? [],
-      projectOverrides.filesystem?.allowRead,
-    ),
-  };
+  private static write(configPath: string, config: SandboxConfigFile): void {
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf-8');
+  }
+
+  private static appendGrant(
+    config: SandboxConfigFile,
+    field: SandboxGrantField,
+    value: string,
+  ): boolean {
+    switch (field) {
+      case 'allowedDomains': {
+        const existing = config.network?.allowedDomains ?? [];
+        if (existing.includes(value)) return false;
+        config.network = {
+          ...config.network,
+          allowedDomains: [...existing, value],
+          deniedDomains: config.network?.deniedDomains ?? [],
+        };
+        return true;
+      }
+      case 'allowUnixSockets': {
+        const existing = config.network?.allowUnixSockets ?? [];
+        if (existing.includes(value)) return false;
+        config.network = { ...config.network, allowUnixSockets: [...existing, value] };
+        return true;
+      }
+      case 'allowRead': {
+        const existing = config.filesystem?.allowRead ?? [];
+        if (existing.includes(value)) return false;
+        config.filesystem = { ...config.filesystem, allowRead: [...existing, value] };
+        return true;
+      }
+      case 'allowWrite': {
+        const existing = config.filesystem?.allowWrite ?? [];
+        if (existing.includes(value)) return false;
+        config.filesystem = { ...config.filesystem, allowWrite: [...existing, value] };
+        return true;
+      }
+    }
+  }
+
+  changeScope(includeProject: boolean): SandboxConfigScope {
+    return includeProject ? 'project' : 'global';
+  }
+
+  load(includeProject: boolean): LoadedSandboxConfig {
+    if (!existsSync(this.globalPath)) {
+      mkdirSync(dirname(this.globalPath), { recursive: true });
+      writeFileSync(this.globalPath, '{}\n', 'utf-8');
+    }
+
+    const globalOverrides = SandboxConfigStore.readOrEmpty(this.globalPath);
+    const projectOverrides = includeProject ? SandboxConfigStore.readOrEmpty(this.projectPath) : {};
+    const globalConfig = deepMerge(
+      JSON.parse(readFileSync(join(packageDir, 'sandbox.json'), 'utf-8')) as SandboxConfig,
+      globalOverrides,
+    );
+
+    return {
+      ...deepMerge(globalConfig, projectOverrides),
+      explicitDenyRead: mergeArray(
+        globalOverrides.filesystem?.denyRead ?? [],
+        projectOverrides.filesystem?.denyRead,
+      ),
+      explicitAllowRead: mergeArray(
+        globalOverrides.filesystem?.allowRead ?? [],
+        projectOverrides.filesystem?.allowRead,
+      ),
+    };
+  }
+
+  enabledSettings(includeProject: boolean): { global: boolean; project?: boolean } {
+    const global = this.load(false).enabled;
+    if (!includeProject || !existsSync(this.projectPath)) return { global };
+    const project = SandboxConfigStore.readOrEmpty(this.projectPath).enabled;
+    return { global, project };
+  }
+
+  async setEnabled(scope: SandboxConfigScope, enabled: boolean | undefined): Promise<void> {
+    const path = scope === 'project' ? this.projectPath : this.globalPath;
+    await withFileMutationQueue(path, async () => {
+      const config = SandboxConfigStore.readOrEmpty(path);
+      if (enabled === undefined) delete config.enabled;
+      else config.enabled = enabled;
+      SandboxConfigStore.write(path, config);
+    });
+  }
+
+  async persistGrant(
+    choice: Exclude<PermissionChoice, 'abort'>,
+    includeProject: boolean,
+    field: SandboxGrantField,
+    values: readonly string[],
+  ): Promise<void> {
+    const configPath =
+      choice === 'global'
+        ? this.globalPath
+        : choice === 'project' && includeProject
+          ? this.projectPath
+          : undefined;
+    if (!configPath) return;
+    for (const value of values) {
+      await withFileMutationQueue(configPath, async () => {
+        const config = SandboxConfigStore.readOrEmpty(configPath);
+        if (!SandboxConfigStore.appendGrant(config, field, value)) return;
+        SandboxConfigStore.write(configPath, config);
+      });
+    }
+  }
 }
 
 type WindowsImplementation = 'appContainer' | 'restrictedUser';
@@ -331,71 +438,6 @@ function restrictedUserProxyPortRange(): ProxyPortRange | undefined {
     );
   }
   return { low: status.proxyPortLow!, high: status.proxyPortHigh! };
-}
-
-function readOrEmptyConfig(configPath: string): SandboxConfigFile {
-  if (!existsSync(configPath)) return {};
-  try {
-    return parseSandboxConfig(JSON.parse(readFileSync(configPath, 'utf-8')));
-  } catch (error) {
-    throw new Error(`${configPath}: ${formatError(error)}`);
-  }
-}
-
-function writeConfigFile(configPath: string, config: SandboxConfigFile): void {
-  mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, 'utf-8');
-}
-
-function getSandboxConfigWriteTarget(
-  cwd: string,
-  includeProject = true,
-): { scope: SandboxConfigScope; path: string } {
-  const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
-  return includeProject
-    ? { scope: 'project', path: projectPath }
-    : { scope: 'global', path: globalPath };
-}
-
-async function writeSandboxConfigEnabled(
-  cwd: string,
-  enabled: boolean | undefined,
-  scope: SandboxConfigScope,
-): Promise<void> {
-  const paths = getPiConfigPaths(cwd, 'sandbox.json');
-  const path = scope === 'project' ? paths.projectPath : paths.globalPath;
-  await withFileMutationQueue(path, async () => {
-    const config = readOrEmptyConfig(path);
-    if (enabled === undefined) delete config.enabled;
-    else config.enabled = enabled;
-    writeConfigFile(path, config);
-  });
-}
-
-function loadSandboxEnabledSettings(
-  cwd: string,
-  includeProject: boolean,
-): { global: boolean; project?: boolean } {
-  const { projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
-  const global = loadSandboxConfig(cwd, false).enabled;
-  if (!includeProject || !existsSync(projectPath)) return { global };
-  const project = readOrEmptyConfig(projectPath).enabled;
-  return { global, project };
-}
-
-async function addConfigValue(
-  configPath: string,
-  value: string,
-  readValues: (config: SandboxConfigFile) => string[],
-  writeValues: (config: SandboxConfigFile, values: string[]) => void,
-): Promise<void> {
-  await withFileMutationQueue(configPath, async () => {
-    const config = readOrEmptyConfig(configPath);
-    const existing = readValues(config);
-    if (existing.includes(value)) return;
-    writeValues(config, [...existing, value]);
-    writeConfigFile(configPath, config);
-  });
 }
 
 function mergeAllowances(base: string[], session: string[], execution?: string[]): string[] {
@@ -895,8 +937,8 @@ function createLandstripIntegrationWithPrompts(
     return ctx ? isProjectTrusted(ctx) : projectConfigTrusted;
   }
 
-  function loadConfig(cwd: string, ctx = activeContext): ReturnType<typeof loadSandboxConfig> {
-    return loadSandboxConfig(cwd, isProjectConfigTrusted(ctx));
+  function loadConfig(cwd: string, ctx = activeContext): LoadedSandboxConfig {
+    return new SandboxConfigStore(cwd).load(isProjectConfigTrusted(ctx));
   }
 
   let sandboxEnabled = false;
@@ -1129,19 +1171,6 @@ function createLandstripIntegrationWithPrompts(
     };
   }
 
-  function resolvePersistedConfigPath(
-    cwd: string,
-    choice: Exclude<PermissionChoice, 'abort'>,
-    ctx = activeContext,
-  ): string | undefined {
-    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
-    if (choice === 'project') {
-      return isProjectConfigTrusted(ctx) ? projectPath : undefined;
-    }
-    if (choice === 'global') return globalPath;
-    return undefined;
-  }
-
   async function applyDomainChoice(
     ctx: ExtensionContext,
     choice: Exclude<PermissionChoice, 'abort'>,
@@ -1149,21 +1178,12 @@ function createLandstripIntegrationWithPrompts(
     cwd: string,
     allowances?: ExecutionAllowances,
   ): Promise<void> {
-    const configPath = resolvePersistedConfigPath(cwd, choice, ctx);
-    if (configPath) {
-      await addConfigValue(
-        configPath,
-        domain,
-        (config) => config.network?.allowedDomains ?? [],
-        (config, allowedDomains) => {
-          config.network = {
-            ...config.network,
-            allowedDomains,
-            deniedDomains: config.network?.deniedDomains ?? [],
-          };
-        },
-      );
-    }
+    await new SandboxConfigStore(cwd).persistGrant(
+      choice,
+      isProjectConfigTrusted(ctx),
+      'allowedDomains',
+      [domain],
+    );
     const target = choice === 'once' ? allowances?.domains : sessionAllowedDomains;
     if (target && !target.includes(domain)) target.push(domain);
   }
@@ -1176,17 +1196,12 @@ function createLandstripIntegrationWithPrompts(
     cwd: string,
     allowances?: ExecutionAllowances,
   ): Promise<void> {
-    const configPath = resolvePersistedConfigPath(cwd, choice, ctx);
-    if (configPath) {
-      await addConfigValue(
-        configPath,
-        socketPath,
-        (config) => config.network?.allowUnixSockets ?? [],
-        (config, allowUnixSockets) => {
-          config.network = { ...config.network, allowUnixSockets };
-        },
-      );
-    }
+    await new SandboxConfigStore(cwd).persistGrant(
+      choice,
+      isProjectConfigTrusted(ctx),
+      'allowUnixSockets',
+      [socketPath],
+    );
     if (choice === 'once') {
       if (allowances && !allowances.targets.includes(key)) allowances.targets.push(key);
     } else {
@@ -1235,19 +1250,12 @@ function createLandstripIntegrationWithPrompts(
       cwd,
       scope,
     );
-    const configPath = resolvePersistedConfigPath(cwd, choice, ctx);
-    if (configPath) {
-      for (const entry of scopes) {
-        await addConfigValue(
-          configPath,
-          entry,
-          (cfg) => cfg.filesystem?.allowRead ?? [],
-          (cfg, allowRead) => {
-            cfg.filesystem = { ...cfg.filesystem, allowRead };
-          },
-        );
-      }
-    }
+    await new SandboxConfigStore(cwd).persistGrant(
+      choice,
+      isProjectConfigTrusted(ctx),
+      'allowRead',
+      scopes,
+    );
     const target = choice === 'once' ? allowances?.readPaths : sessionAllowedReadPaths;
     for (const entry of scopes) {
       if (target && !target.includes(entry)) target.push(entry);
@@ -1270,19 +1278,12 @@ function createLandstripIntegrationWithPrompts(
       config.filesystem.denyWrite,
       cwd,
     );
-    const configPath = resolvePersistedConfigPath(cwd, choice, ctx);
-    if (configPath) {
-      for (const entry of scopes) {
-        await addConfigValue(
-          configPath,
-          entry,
-          (cfg) => cfg.filesystem?.allowWrite ?? [],
-          (cfg, allowWrite) => {
-            cfg.filesystem = { ...cfg.filesystem, allowWrite };
-          },
-        );
-      }
-    }
+    await new SandboxConfigStore(cwd).persistGrant(
+      choice,
+      isProjectConfigTrusted(ctx),
+      'allowWrite',
+      scopes,
+    );
     const target = choice === 'once' ? allowances?.writePaths : sessionAllowedWritePaths;
     for (const entry of scopes) {
       if (target && !target.includes(entry)) target.push(entry);
@@ -2488,7 +2489,7 @@ function createLandstripIntegrationWithPrompts(
     ): Promise<AgentToolResult<BashToolDetails | undefined> | null> => {
       if (!ctx.hasUI || rejectedPaths[operation].has(blockedPath)) return null;
 
-      const { globalPath, projectPath } = getPiConfigPaths(ctx.cwd, 'sandbox.json');
+      const { globalPath, projectPath } = new SandboxConfigStore(ctx.cwd);
       const isWriteDeniedAlways = (config: SandboxConfig): boolean =>
         matchesWriteDenyPattern(
           blockedPath,
@@ -2936,7 +2937,7 @@ function createLandstripIntegrationWithPrompts(
     enabled: boolean | undefined,
     scope: SandboxConfigScope,
   ): Promise<void> {
-    await writeSandboxConfigEnabled(ctx.cwd, enabled, scope);
+    await new SandboxConfigStore(ctx.cwd).setEnabled(scope, enabled);
     const effectiveEnabled = loadConfig(ctx.cwd, ctx).enabled;
     if (!effectiveEnabled) {
       disableSandbox(ctx);
@@ -2946,8 +2947,8 @@ function createLandstripIntegrationWithPrompts(
   }
 
   function sandboxOverview(cwd: string, includeProject: boolean): SandboxOverview {
-    const config = loadSandboxConfig(cwd, includeProject);
-    const { globalPath, projectPath } = getPiConfigPaths(cwd, 'sandbox.json');
+    const store = new SandboxConfigStore(cwd);
+    const config = store.load(includeProject);
     const windowsImplementation = process.platform === 'win32' ? windowsStatus().active : undefined;
     return {
       enabled: config.enabled,
@@ -2968,8 +2969,8 @@ function createLandstripIntegrationWithPrompts(
           : windowsImplementation === 'restrictedUser'
             ? 'Restricted user'
             : `AppContainer (${config.windows.appContainerMode})`,
-      changeScope: getSandboxConfigWriteTarget(cwd, includeProject).scope,
-      paths: { global: globalPath, project: projectPath, binary: binaryPath() },
+      changeScope: store.changeScope(includeProject),
+      paths: { global: store.globalPath, project: store.projectPath, binary: binaryPath() },
       config,
       sessionDomains: [...sessionAllowedDomains],
       sessionReadPaths: [...sessionAllowedReadPaths],
@@ -2978,7 +2979,7 @@ function createLandstripIntegrationWithPrompts(
   }
 
   const sandboxCallbacks: SandboxCallbacks = {
-    load: loadSandboxEnabledSettings,
+    load: (cwd, includeProject) => new SandboxConfigStore(cwd).enabledSettings(includeProject),
     setEnabled: (ctx, enabled, scope) => applySandboxSetting(ctx, enabled, scope),
     clearProject: (ctx) => applySandboxSetting(ctx, undefined, 'project'),
     overview: sandboxOverview,
