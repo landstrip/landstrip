@@ -100,13 +100,6 @@ pub(super) enum SocketKind {
     Other,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct IpEndpoint {
-    pub(super) addr: SocketAddr,
-    pub(super) port: u16,
-    pub(super) loopback: bool,
-}
-
 /// Address family decoded from the leading field of a raw socket address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SockAddrFamily(libc::sa_family_t);
@@ -130,8 +123,8 @@ impl From<SockAddrFamily> for i32 {
 }
 
 impl TargetSocket {
-    fn ip_endpoint(&self) -> SysResult<IpEndpoint> {
-        IpEndpoint::parse(&self.addr, self.info.domain)
+    fn ip_endpoint(&self) -> SysResult<SocketAddr> {
+        SockAddrFamily::parse_ip(&self.addr, self.info.domain)
     }
 
     fn family(&self) -> SysResult<i32> {
@@ -175,12 +168,12 @@ impl TargetSocket {
     fn deny(
         self,
         operation: NetworkOperation,
-        endpoint: IpEndpoint,
+        endpoint: SocketAddr,
         pid: u32,
         call: SocketAddrCall,
         denials: &mut Denials<'_>,
     ) -> SysResult<NotificationResult> {
-        let target = endpoint.addr.to_string();
+        let target = endpoint.to_string();
         let process = TargetProcess::from_raw(pid).context();
         denials.deny(
             Denial::Network(operation, target, process),
@@ -219,7 +212,7 @@ pub(super) fn handle_bind(
                 return Err(BrokerError::PolicyDenied);
             }
             let endpoint = socket.ip_endpoint()?;
-            if !endpoint.loopback {
+            if !endpoint.ip().to_canonical().is_loopback() {
                 return socket.deny(
                     NetworkOperation::Bind,
                     endpoint,
@@ -253,12 +246,12 @@ pub(super) fn handle_connect(
                 return Ok(NotificationResult::Continue);
             }
             let endpoint = socket.ip_endpoint()?;
-            if !endpoint.loopback
+            if !endpoint.ip().to_canonical().is_loopback()
                 || (!policy.network_access.allows_local_binding()
                     && !policy
                         .network_access
                         .connect_tcp_ports()
-                        .contains(&endpoint.port))
+                        .contains(&endpoint.port()))
             {
                 return socket.deny(
                     NetworkOperation::Connect,
@@ -279,7 +272,9 @@ pub(super) fn handle_connect(
                 return Ok(NotificationResult::grant(socket.into_grant(libc::connect)));
             }
             let endpoint = socket.ip_endpoint()?;
-            if !endpoint.loopback || !policy.network_access.allows_local_binding() {
+            if !endpoint.ip().to_canonical().is_loopback()
+                || !policy.network_access.allows_local_binding()
+            {
                 return socket.deny(
                     NetworkOperation::Connect,
                     endpoint,
@@ -318,13 +313,13 @@ fn check_target_datagram_addr(
     let info = SocketInfo::try_from(sock.as_fd())?;
     match info.kind() {
         SocketKind::Tcp | SocketKind::Udp => {
-            let endpoint = IpEndpoint::parse(&addr, info.domain)?;
-            if endpoint.loopback {
+            let endpoint = SockAddrFamily::parse_ip(&addr, info.domain)?;
+            if endpoint.ip().to_canonical().is_loopback() {
                 Ok(NotificationResult::Continue)
             } else {
                 denials.record(Denial::Network(
                     NetworkOperation::Connect,
-                    endpoint.addr.to_string(),
+                    endpoint.to_string(),
                     target.context(),
                 ));
                 Err(BrokerError::PolicyDenied)
@@ -501,9 +496,9 @@ impl UnixSocketOp {
     }
 }
 
-impl IpEndpoint {
-    fn parse(addr: &[u8], domain: i32) -> SysResult<Self> {
-        match (domain, i32::from(SockAddrFamily::try_from(addr)?)) {
+impl SockAddrFamily {
+    fn parse_ip(addr: &[u8], domain: i32) -> SysResult<SocketAddr> {
+        match (domain, i32::from(Self::try_from(addr)?)) {
             (libc::AF_INET, libc::AF_INET) => {
                 if addr.len() < mem::size_of::<libc::sockaddr_in>() {
                     return Err(BrokerError::InvalidAddress);
@@ -511,11 +506,7 @@ impl IpEndpoint {
 
                 let port = u16::from_be_bytes([addr[2], addr[3]]);
                 let ip = Ipv4Addr::new(addr[4], addr[5], addr[6], addr[7]);
-                Ok(Self {
-                    addr: SocketAddr::from((ip, port)),
-                    port,
-                    loopback: ip.is_loopback(),
-                })
+                Ok(SocketAddr::from((ip, port)))
             }
             (libc::AF_INET6, libc::AF_INET6) => {
                 if addr.len() < mem::size_of::<libc::sockaddr_in6>() {
@@ -526,12 +517,7 @@ impl IpEndpoint {
                 let ip = Ipv6Addr::from(
                     <[u8; 16]>::try_from(&addr[8..24]).map_err(|_| BrokerError::InvalidAddress)?,
                 );
-                Ok(Self {
-                    addr: SocketAddr::from((ip, port)),
-                    port,
-                    loopback: ip.is_loopback()
-                        || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
-                })
+                Ok(SocketAddr::from((ip, port)))
             }
             _ => Err(BrokerError::AddressFamilyNotSupported),
         }
