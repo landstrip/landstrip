@@ -179,19 +179,9 @@ export function combineAbortSignals(...sources: Array<AbortSignal | undefined>):
   dispose: () => void;
 } {
   const signals = sources.filter((source): source is AbortSignal => source !== undefined);
-  const only = signals[0];
-  if (signals.length === 1 && only) return { signal: only, dispose: () => undefined };
-
-  const controller = new AbortController();
-  const abort = (): void => controller.abort();
-  for (const signal of signals) signal.addEventListener('abort', abort, { once: true });
-  if (signals.some((signal) => signal.aborted)) controller.abort();
-
   return {
-    signal: controller.signal,
-    dispose: () => {
-      for (const signal of signals) signal.removeEventListener('abort', abort);
-    },
+    signal: signals.length === 1 ? signals[0]! : AbortSignal.any(signals),
+    dispose: () => undefined,
   };
 }
 
