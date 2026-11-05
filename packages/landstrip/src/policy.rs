@@ -130,17 +130,11 @@ impl Carveouts {
             .any(|pattern| pattern.matches_tree(path))
     }
 
-    pub(crate) fn overrides_root(&self, deny_root: &Path, path: &Path) -> bool {
-        self.roots
-            .iter()
-            .any(|carveout| carveout.as_path().overrides_deny(deny_root) && path.is_under(carveout))
-            || self
-                .patterns
-                .iter()
-                .any(|allow| allow.as_glob().overrides_deny(deny_root) && allow.matches_tree(path))
-    }
-
-    pub(crate) fn overrides_pattern(&self, deny: &GlobPatternBuf, path: &Path) -> bool {
+    pub(crate) fn overrides<D: ?Sized>(&self, deny: &D, path: &Path) -> bool
+    where
+        PathBuf: OverridesDeny<D>,
+        GlobPatternBuf: OverridesDeny<D>,
+    {
         self.roots
             .iter()
             .any(|carveout| carveout.overrides_deny(deny) && path.is_under(carveout))
@@ -551,7 +545,7 @@ impl<'a> DenyRuleSet<'a> {
             path.is_under(root)
                 && !self
                     .carveouts
-                    .is_some_and(|carveouts| carveouts.overrides_root(root, path))
+                    .is_some_and(|carveouts| carveouts.overrides(root.as_path(), path))
         }) || self.matches_patterns(path)
     }
 
@@ -560,7 +554,7 @@ impl<'a> DenyRuleSet<'a> {
             pattern.matches_tree(path)
                 && !self
                     .carveouts
-                    .is_some_and(|carveouts| carveouts.overrides_pattern(pattern, path))
+                    .is_some_and(|carveouts| carveouts.overrides(pattern, path))
         })
     }
 
