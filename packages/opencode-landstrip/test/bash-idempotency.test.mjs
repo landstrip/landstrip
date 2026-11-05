@@ -30,7 +30,7 @@ async function withPlugin(options, run) {
       join(tempDir, 'node_modules', '@landstrip', 'landstrip-api'),
       'junction',
     );
-    for (const dependency of ['shell-quote']) {
+    for (const dependency of ['semver', 'shell-quote']) {
       await symlink(
         fileURLToPath(new URL('./', import.meta.resolve(dependency))),
         join(tempDir, 'node_modules', dependency),

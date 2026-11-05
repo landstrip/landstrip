@@ -20,6 +20,7 @@ import {
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gte, parse, valid } from 'semver';
 
 import {
   type ExtensionAPI,
@@ -253,7 +254,7 @@ interface PiPackage {
   readonly version: readonly [number, number, number];
 }
 
-const MIN_SUPPORTED_PI_VERSION = [0, 82, 0] as const;
+const MIN_SUPPORTED_PI_VERSION = '0.82.0';
 let cachedPiPackage: PiPackage | undefined;
 let piPackageResolved = false;
 
@@ -261,13 +262,8 @@ export function isSupportedPiVersion(version: readonly number[]): boolean {
   if (version.length !== 3 || !version.every((part) => Number.isInteger(part) && part >= 0)) {
     return false;
   }
-  for (let i = 0; i < 3; i++) {
-    const part = version[i]!;
-    const min = MIN_SUPPORTED_PI_VERSION[i]!;
-    if (part > min) return true;
-    if (part < min) return false;
-  }
-  return true;
+  const parsed = valid(version.join('.'));
+  return parsed !== null && gte(parsed, MIN_SUPPORTED_PI_VERSION);
 }
 
 // Resolve the Pi package used by this extension import. Reading its
@@ -318,8 +314,9 @@ function readPiPackage(pkgPath: string): PiPackage | undefined {
     ) {
       return undefined;
     }
-    const parts = value.version.split('.').map(Number);
-    if (parts.length < 3 || !parts.slice(0, 3).every((n) => Number.isInteger(n))) return undefined;
+    const version = parse(value.version);
+    // Process-backed workers historically require a release, not a prerelease.
+    if (!version || version.prerelease.length > 0) return undefined;
     const binFile =
       typeof value.bin === 'string'
         ? value.bin
@@ -329,7 +326,7 @@ function readPiPackage(pkgPath: string): PiPackage | undefined {
     if (!binFile) return undefined;
     const cliEntry = join(dirname(pkgPath), binFile);
     if (!existsSync(cliEntry)) return undefined;
-    cachedPiPackage = { cliEntry, version: parts.slice(0, 3) as [number, number, number] };
+    cachedPiPackage = { cliEntry, version: [version.major, version.minor, version.patch] };
     return cachedPiPackage;
   } catch {
     return undefined;

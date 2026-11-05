@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { type AddressInfo, createServer } from 'node:net';
 import { basename } from 'node:path';
+import { gte, parse } from 'semver';
 import { parse as parseShell, quote as quoteShell } from 'shell-quote';
 
 import {
@@ -69,8 +70,7 @@ interface SandboxPermissionDecision {
 
 type ToastVariant = 'info' | 'success' | 'warning' | 'error';
 
-const LANDSTRIP_VERSION = [0, 17, 0] as const;
-const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
+const REQUIRED_LANDSTRIP_VERSION = '0.17.0';
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
 
 function evaluateReadPermission(
@@ -175,27 +175,6 @@ function evaluateCommandDomains(
   return extractDomainsFromCommand(command).map((domain) =>
     evaluateDomainPermission(domain, config),
   );
-}
-
-function parseVersion(version: string): [number, number, number] | null {
-  const match = version.match(/\b(\d+)\.(\d+)\.(\d+)\b/);
-  if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
-}
-
-function hasMinimumVersion(version: string, minimum: readonly [number, number, number]): boolean {
-  const parsed = parseVersion(version);
-  if (!parsed) return false;
-
-  for (let i = 0; i < minimum.length; i++) {
-    const parsedPart = parsed[i];
-    const minimumPart = minimum[i];
-    if (parsedPart === undefined || minimumPart === undefined) return false;
-    if (parsedPart > minimumPart) return true;
-    if (parsedPart < minimumPart) return false;
-  }
-
-  return true;
 }
 
 function writePolicyFile(
@@ -478,7 +457,11 @@ const plugin: Plugin.Plugin = {
         return landstripCheck;
       }
 
-      if (!hasMinimumVersion(version, LANDSTRIP_VERSION)) {
+      const parsedVersion = parse(
+        version.startsWith('landstrip ') ? version.slice('landstrip '.length) : version,
+      );
+      // Include prereleases at the minimum release, matching the historical release-number gate.
+      if (!parsedVersion || !gte(parsedVersion, `${REQUIRED_LANDSTRIP_VERSION}-0`)) {
         landstripCheck = {
           ok: false,
           reason: `landstrip ${REQUIRED_LANDSTRIP_VERSION} or newer is required; found: ${version}`,

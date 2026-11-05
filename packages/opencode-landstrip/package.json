@@ -51,6 +51,7 @@
     "@landstrip/landstrip-api": "^0.20.21",
     "@opentui/core": ">=0.5.12",
     "@opentui/solid": ">=0.5.12",
+    "semver": "^7.8.6",
     "shell-quote": "^1.12.0",
     "solid-js": "1.9.12"
   },
@@ -58,6 +59,7 @@
     "@opencode/plugin": "^2.0.18",
     "@opencode/theme": "^2.0.18",
     "@types/node": "^26.1.1",
+    "@types/semver": "^7.8.0",
     "@types/shell-quote": "^1.7.5",
     "oxfmt": "^0.74.0",
     "oxlint": "^1.68.0",
