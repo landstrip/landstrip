@@ -229,57 +229,8 @@ impl ProfileBuilder {
         writeln!(self.sb, "(allow system-socket (socket-domain AF_ROUTE))")
     }
 
-    fn glob_to_sbpl_regex(pattern: &str) -> String {
-        let mut regex = String::from("^");
-        let mut rest = pattern;
-
-        while !rest.is_empty() {
-            if let Some(tail) = rest.strip_prefix("**/") {
-                regex.push_str("(.*/)?");
-                rest = tail;
-            } else if let Some(tail) = rest.strip_prefix("**") {
-                regex.push_str(".*");
-                rest = tail;
-            } else if let Some(tail) = rest.strip_prefix('*') {
-                regex.push_str("[^/]*");
-                rest = tail;
-            } else if let Some(tail) = rest.strip_prefix('?') {
-                regex.push_str("[^/]");
-                rest = tail;
-            } else if rest.starts_with('[') {
-                if let Some(offset) = rest[1..].find(']') {
-                    let end = 1 + offset;
-                    regex.push_str(&rest[..=end]);
-                    rest = &rest[end + 1..];
-                } else {
-                    regex.push_str("\\[");
-                    rest = &rest[1..];
-                }
-            } else {
-                let mut chars = rest.chars();
-                let Some(ch) = chars.next() else {
-                    break;
-                };
-                match ch {
-                    '.' | '(' | ')' | '{' | '}' | '+' | '|' | '^' | '$' | '\\' => {
-                        regex.push('\\');
-                        regex.push(ch);
-                    }
-                    _ => regex.push(ch),
-                }
-                rest = chars.as_str();
-            }
-        }
-
-        if !pattern.ends_with('/') {
-            regex.push_str("(/.*)?");
-        }
-        regex.push('$');
-        regex
-    }
-
     fn render_pattern_filter(pattern: &GlobPatternBuf, carveouts: &Carveouts) -> String {
-        let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+        let regex = pattern.sbpl_regex();
         let escaped = escape_sbpl_regex_literal(&regex);
         let glob = pattern.as_glob();
         let filter = format!("(regex #\"{escaped}\")");
@@ -289,11 +240,10 @@ impl ProfileBuilder {
             .map(PathBuf::as_path)
             .filter(|carveout| glob.matches_tree(carveout))
             .collect();
-        let matching_patterns: Vec<&str> = carveouts
+        let matching_patterns: Vec<&GlobPatternBuf> = carveouts
             .patterns
             .iter()
             .filter(|allow| allow.overrides_deny(&glob))
-            .map(GlobPatternBuf::as_str)
             .collect();
         if matching_carveouts.is_empty() && matching_patterns.is_empty() {
             return filter;
@@ -305,7 +255,7 @@ impl ProfileBuilder {
             let _ = write!(wrapped, " (require-not (subpath \"{escaped_carveout}\"))");
         }
         for allow in matching_patterns {
-            let allow_regex = Self::glob_to_sbpl_regex(allow);
+            let allow_regex = allow.sbpl_regex();
             let escaped_allow = escape_sbpl_regex_literal(&allow_regex);
             let _ = write!(wrapped, " (require-not (regex #\"{escaped_allow}\"))");
         }
@@ -331,7 +281,7 @@ impl ProfileBuilder {
                 .iter()
                 .any(|root| pattern.overrides_deny(root.as_path()))
             {
-                let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+                let regex = pattern.sbpl_regex();
                 let escaped = escape_sbpl_regex_literal(&regex);
                 writeln!(self.sb, "(allow {action} (regex #\"{escaped}\"))")?;
             }
@@ -345,7 +295,7 @@ impl ProfileBuilder {
             writeln!(self.sb, "(deny {action} (subpath \"{escaped}\"){message})")?;
         }
         for pattern in &scope.always_patterns {
-            let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+            let regex = pattern.sbpl_regex();
             let escaped = escape_sbpl_regex_literal(&regex);
             writeln!(self.sb, "(deny {action} (regex #\"{escaped}\"){message})")?;
         }
@@ -358,7 +308,7 @@ impl ProfileBuilder {
             writeln!(self.sb, "(allow file-write* (subpath \"{escaped}\"))")?;
         }
         for pattern in &policy.write_denials.carveouts.patterns {
-            let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+            let regex = pattern.sbpl_regex();
             let escaped = escape_sbpl_regex_literal(&regex);
             writeln!(self.sb, "(allow file-write* (regex #\"{escaped}\"))")?;
         }
@@ -467,7 +417,7 @@ impl ProfileBuilder {
                     writeln!(self.sb, "(allow file-read* (subpath \"{escaped}\"))")?;
                 }
                 for pattern in &policy.read_denials.carveouts.patterns {
-                    let regex = Self::glob_to_sbpl_regex(pattern.as_str());
+                    let regex = pattern.sbpl_regex();
                     let escaped = escape_sbpl_regex_literal(&regex);
                     writeln!(self.sb, "(allow file-read* (regex #\"{escaped}\"))")?;
                 }

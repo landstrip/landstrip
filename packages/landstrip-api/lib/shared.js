@@ -16,6 +16,7 @@ const { basename, dirname, isAbsolute, join, relative, resolve, sep } = require(
 const { domainToASCII } = require('node:url');
 
 const ipaddr = require('ipaddr.js');
+const { compileRe, parse } = require('picomatch');
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -373,59 +374,28 @@ class ByteGlobRegExp extends RegExp {
   }
 }
 
-// Translates an absolute glob pattern using the same UTF-8 byte semantics as
-// the Rust policy matcher: `**` crosses directories, `*` stays within one
-// segment, `?` matches one non-separator byte, and classes support byte ranges.
+// Preserve the broker's UTF-8 byte matching while delegating glob syntax to picomatch.
 function globToRegExp(globPattern) {
   const cached = globRegExpCache.get(globPattern);
   if (cached) return cached;
 
   const pattern = Buffer.from(globPattern).toString('latin1');
-  let escaped = '';
-  for (let at = 0; at < pattern.length;) {
-    if (pattern.startsWith('**/', at)) {
-      escaped += '(?:[\\s\\S]*/)?';
-      at += 3;
-    } else if (pattern.startsWith('**', at)) {
-      escaped += '[\\s\\S]*';
-      at += 2;
-    } else if (pattern[at] === '*') {
-      escaped += '[^/]*';
-      at += 1;
-    } else if (pattern[at] === '?') {
-      escaped += '[^/]';
-      at += 1;
-    } else if (pattern[at] === '[') {
-      const end = pattern.indexOf(']', at + 1);
-      if (end < 0) {
-        escaped += '\\[';
-        at += 1;
-        continue;
-      }
-
-      const content = pattern.slice(at + 1, end);
-      const hex = (code) => `\\x${code.toString(16).padStart(2, '0')}`;
-      let characterClass = '';
-      for (let offset = 0; offset < content.length;) {
-        if (offset + 2 < content.length && content[offset + 1] === '-') {
-          const start = content.charCodeAt(offset);
-          const finish = content.charCodeAt(offset + 2);
-          if (start <= finish) characterClass += `${hex(start)}-${hex(finish)}`;
-          offset += 3;
-        } else {
-          characterClass += hex(content.charCodeAt(offset));
-          offset += 1;
-        }
-      }
-      escaped += characterClass ? `(?=[^/])[${characterClass}]` : '(?!)';
-      at = end + 1;
-    } else {
-      escaped += pattern[at].replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
-      at += 1;
-    }
-  }
-
-  const result = new ByteGlobRegExp(`^${escaped}(?![\\s\\S])`);
+  if (pattern.length > 4096) throw new RangeError('Glob patterns must not exceed 4096 bytes');
+  const options = {
+    dot: true,
+    noextglob: true,
+    nonegate: true,
+    strictSlashes: true,
+    literalBrackets: false,
+    windows: false,
+    regex: false,
+    debug: true,
+    flags: process.platform === 'win32' ? 'is' : 's',
+  };
+  // The broker treats regex operators and shell quotes as literal glob characters.
+  const escaped = pattern.replaceAll('\\', '\\\\').replace(/[()|+"]/g, '\\$&');
+  const regex = compileRe(parse(escaped, options), options);
+  const result = new ByteGlobRegExp(`${regex.source}(?![\\s\\S])`, regex.flags);
   globRegExpCache.set(globPattern, result);
   return result;
 }

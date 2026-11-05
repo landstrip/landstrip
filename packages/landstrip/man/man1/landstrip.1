@@ -191,6 +191,10 @@ matches zero directories
 covers the granted root itself
 .Pc ,
 and Windows matching is case-insensitive.
+Resolved glob patterns, including canonical aliases, must not exceed 4096
+UTF-8 bytes.
+Write-deny anchoring must not produce more than 65536 selectors; policies
+exceeding either limit are rejected before execution.
 .Ss Filesystem
 Writes default to denied.
 .Va allowWrite

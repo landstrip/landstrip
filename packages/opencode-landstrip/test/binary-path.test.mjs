@@ -156,11 +156,13 @@ test('binaryPath rejects unsupported targets', (t) => {
 });
 
 async function importShared(fixture) {
-  symlinkSync(
-    dirname(require.resolve('ipaddr.js/package.json')),
-    join(fixture.root, 'node_modules', 'ipaddr.js'),
-    'junction',
-  );
+  for (const dependency of ['ipaddr.js', 'picomatch']) {
+    symlinkSync(
+      dirname(require.resolve(`${dependency}/package.json`)),
+      join(fixture.root, 'node_modules', dependency),
+      'junction',
+    );
+  }
   const modulePath = join(fixture.root, 'shared.mjs');
   writeFileSync(modulePath, transpile(readFileSync(join(packageRoot, 'shared.ts'), 'utf8')));
   return import(pathToFileURL(modulePath).href);

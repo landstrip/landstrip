@@ -175,7 +175,7 @@ function updateExtensionLock(lock) {
   lockedCli.bin = cli.bin;
   lockedCli.optionalDependencies = { ...cli.optionalDependencies };
   const lockedApi = lock.packages[`node_modules/${landstripDependency}`];
-  lockedApi.dependencies[cliDependency] = nextVersion;
+  lockedApi.dependencies = { ...api.dependencies };
   delete lockedApi.bin;
   delete lockedApi.optionalDependencies;
 }
@@ -199,7 +199,7 @@ const lockedCli = rootLock.packages['packages/landstrip-cli'];
 lockedCli.bin = cli.bin;
 lockedCli.optionalDependencies = { ...cli.optionalDependencies };
 const lockedApi = rootLock.packages['packages/landstrip-api'];
-lockedApi.dependencies[cliDependency] = nextVersion;
+lockedApi.dependencies = { ...api.dependencies };
 delete lockedApi.bin;
 delete lockedApi.optionalDependencies;
 for (const packageName of platformDependencies) updateLockedPackage(rootLock, packageName);

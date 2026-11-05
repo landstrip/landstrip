@@ -536,14 +536,15 @@ impl PolicyResolver {
 
         let mut patterns = Vec::new();
         for (selector, path, path_str) in glob_selectors {
+            let glob = GlobPattern::new(&path_str)?;
             // Recursive globs rooted under an already-granted concrete root only
             // act as dynamic carveouts on Unix; skipping their tree walk avoids
             // scanning large caches at startup.
             let covered_recursive = cfg!(not(target_os = "windows"))
                 && path_str.contains("**")
-                && GlobPattern::new(&path_str).base().is_under_any(&roots);
+                && glob.base().is_under_any(&roots);
             if !covered_recursive {
-                let matches = GlobPattern::new(&path_str).expand()?;
+                let matches = glob.expand()?;
                 if matches!(selector, PathSelector::Bare(_))
                     && matches.is_empty()
                     && fs::symlink_metadata(&path).is_ok()
@@ -560,7 +561,7 @@ impl PolicyResolver {
                 roots.extend(path.spellings());
                 continue;
             }
-            patterns.extend(GlobPatternBuf::new(path_str).spellings());
+            patterns.extend(GlobPatternBuf::new(path_str)?.spellings()?);
         }
         roots.normalize_roots();
         patterns.normalize_patterns();
@@ -590,15 +591,16 @@ impl PolicyResolver {
             if selector.is_base_relative() {
                 let relative = Path::new(selector.as_str()).clean_lexically();
                 let relative_str = relative.to_string_lossy();
-                let pattern = GlobPattern::new(&relative_str);
+                let pattern = (!selector.is_literal())
+                    .then(|| GlobPattern::new(&relative_str))
+                    .transpose()?;
                 for root in write_allow {
                     if anchor_root_name
                         && root.path.file_name().is_some_and(|name| {
                             let name = Path::new(name);
-                            if selector.is_literal() {
-                                relative == name
-                            } else {
-                                pattern.matches_path(name)
+                            match &pattern {
+                                Some(pattern) => pattern.matches_path(name),
+                                None => relative == name,
                             }
                         })
                     {
@@ -628,14 +630,14 @@ impl PolicyResolver {
             let resolved = self.resolve_sandbox_path(selector.as_str())?;
             let resolved_str = resolved.to_string_lossy();
             if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
-                let glob = GlobPattern::new(&resolved_str);
+                let glob = GlobPattern::new(&resolved_str)?;
                 check_paths.push(glob.base());
                 if expand_globs {
                     for candidate in glob.expand()? {
                         expanded.extend(candidate.spellings());
                     }
                 }
-                patterns.extend(GlobPatternBuf::new(resolved_str.into_owned()).spellings());
+                patterns.extend(GlobPatternBuf::new(resolved_str.into_owned())?.spellings()?);
             } else {
                 check_paths.push(resolved.clone());
                 concrete.extend(resolved.spellings());

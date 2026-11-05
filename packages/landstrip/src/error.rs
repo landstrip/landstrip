@@ -56,6 +56,7 @@ pub(crate) enum PolicyViolation {
     InvalidLogTag,
     HomeUnavailable,
     TraversalDepth,
+    GlobTooLong,
     SelectorLimit,
 }
 
@@ -90,6 +91,7 @@ impl PolicyViolation {
                 "the home directory is unavailable for a tilde-prefixed policy path"
             }
             Self::TraversalDepth => "policy path traversal exceeded its maximum depth",
+            Self::GlobTooLong => "glob patterns must not exceed 4096 bytes",
             Self::SelectorLimit => "write-deny anchoring must not exceed 65536 selectors",
         }
     }

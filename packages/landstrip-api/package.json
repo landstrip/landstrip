@@ -34,7 +34,8 @@
   ],
   "dependencies": {
     "@landstrip/landstrip": "0.20.21",
-    "ipaddr.js": "^2.5.0"
+    "ipaddr.js": "^2.5.0",
+    "picomatch": "^4.0.7"
   },
   "publishConfig": {
     "access": "public"
