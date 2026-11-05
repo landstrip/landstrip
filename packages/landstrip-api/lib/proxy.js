@@ -363,8 +363,18 @@ function createProxyCredentials(tokenArg) {
 }
 
 function createProxyUrl(port, token, host = '127.0.0.1') {
-  const credentials = typeof token === 'string' && token.length > 0 ? `landstrip:${token}@` : '';
-  return `http://${credentials}${host}:${port}`;
+  const hostname = canonicalizeHost(host);
+  if (!hostname) throw new TypeError('Invalid proxy hostname');
+  if (parseProxyPort(String(port), 0) === null) throw new RangeError('Invalid proxy port');
+  const url = new URL('http://127.0.0.1');
+  url.hostname = isIP(hostname) === 6 ? `[${hostname}]` : hostname;
+  if (canonicalizeHost(url.hostname) !== hostname) throw new TypeError('Invalid proxy hostname');
+  url.port = String(port);
+  if (typeof token === 'string' && token.length > 0) {
+    url.username = 'landstrip';
+    url.password = encodeURIComponent(token);
+  }
+  return url.href.slice(0, -1);
 }
 
 function createProxyEnvironment(port, options) {
