@@ -29,7 +29,6 @@ pub fn execute() {
         }
         Err(error) => exit_with_error(&error.into(), None),
     };
-    init_logging(invocation.debug);
 
     #[cfg(unix)]
     let trap_fd = match &invocation.command {
@@ -38,6 +37,10 @@ pub fn execute() {
     };
     #[cfg(not(unix))]
     let trap_fd = None;
+
+    if let Err(error) = init_logging(invocation.debug) {
+        exit_with_error(&error, trap_fd);
+    }
 
     let outcome = match dispatch(&invocation) {
         Ok(outcome) => outcome,
@@ -55,11 +58,12 @@ pub fn execute() {
     }
 }
 
-fn init_logging(debug: bool) {
+fn init_logging(debug: bool) -> Result<()> {
     let default_filter = if debug { "debug" } else { "warn" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
         .format_timestamp(None)
-        .init();
+        .try_init()?;
+    Ok(())
 }
 
 fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
