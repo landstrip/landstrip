@@ -9,10 +9,11 @@ use super::procfs::ProcFd;
 use super::supervise::{Denial, Denials};
 use crate::policy::{AccessPolicy, UnixPathAccess, UnixSocketAccess};
 use crate::trap::NetworkOperation;
+use socket2::SockRef;
 use std::ffi::OsStr;
 use std::mem;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 #[derive(Debug)]
@@ -33,36 +34,11 @@ impl TryFrom<BorrowedFd<'_>> for SocketInfo {
     type Error = BrokerError;
 
     fn try_from(fd: BorrowedFd<'_>) -> SysResult<Self> {
-        let fd = fd.as_raw_fd();
-        let get_opt = |name: i32| -> std::io::Result<i32> {
-            let mut value: i32 = 0;
-            let mut len =
-                libc::socklen_t::try_from(std::mem::size_of_val(&value)).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "socket option size exceeds socklen_t",
-                    )
-                })?;
-            let rc = unsafe {
-                libc::getsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    name,
-                    (&raw mut value).cast::<libc::c_void>(),
-                    &raw mut len,
-                )
-            };
-            if rc < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(value)
-            }
-        };
-
+        let socket = SockRef::from(&fd);
         Ok(Self {
-            domain: get_opt(libc::SO_DOMAIN)?,
-            ty: get_opt(libc::SO_TYPE)?,
-            proto: get_opt(libc::SO_PROTOCOL)?,
+            domain: socket.domain()?.into(),
+            ty: socket.r#type()?.into(),
+            proto: socket.protocol()?.map_or(0, i32::from),
         })
     }
 }
