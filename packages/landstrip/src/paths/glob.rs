@@ -141,37 +141,68 @@ impl<'a> GlobPattern<'a> {
             return Err(PolicyViolation::TraversalDepth.into());
         }
 
-        let candidate = path.clean_lexically();
-        if self.matches_path(&candidate) {
-            matches.push(candidate);
-        }
-
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.is_opaque() => return Ok(()),
-            Err(source) => return Err(Error::policy_io(source)),
-        };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Ok(());
-        }
-
-        let entries = match fs::read_dir(path) {
-            Ok(entries) => entries,
-            Err(error)
-                if error.kind() == io::ErrorKind::PermissionDenied
-                    || error.is_transport_failed() =>
-            {
-                return Ok(());
-            }
-            Err(source) => return Err(Error::policy_io(source)),
-        };
-        for entry in entries {
-            let entry = match entry {
+        let remaining_depth = (LIMIT - depth) as usize;
+        let mut walk = walkdir::WalkDir::new(path)
+            .follow_links(false)
+            .follow_root_links(false)
+            .into_iter();
+        let mut directory = None;
+        while let Some(result) = walk.next() {
+            // Walkdir yields directories before reporting failures to open them.
+            let previous_directory = directory.take();
+            let entry = match result {
                 Ok(entry) => entry,
-                Err(error) if error.is_transport_failed() => continue,
+                Err(error) => {
+                    let opening_directory =
+                        error.path().is_some() && error.path() == previous_directory.as_deref();
+                    let metadata_failed = error.path().is_some() && !opening_directory;
+                    if metadata_failed {
+                        if error.depth() >= remaining_depth {
+                            return Err(PolicyViolation::TraversalDepth.into());
+                        }
+                        if let Some(path) = error.path() {
+                            let candidate = path.clean_lexically();
+                            if self.matches_path(&candidate) {
+                                matches.push(candidate);
+                            }
+                        }
+                    }
+                    if let Some(source) = error.io_error()
+                        && (source.is_transport_failed()
+                            || (opening_directory
+                                && source.kind() == io::ErrorKind::PermissionDenied)
+                            || (metadata_failed && source.is_opaque()))
+                    {
+                        continue;
+                    }
+                    return Err(Error::policy_io(error.into()));
+                }
+            };
+            if entry.depth() >= remaining_depth {
+                return Err(PolicyViolation::TraversalDepth.into());
+            }
+            let candidate = entry.path().clean_lexically();
+            if self.matches_path(&candidate) {
+                matches.push(candidate);
+            }
+
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.is_opaque() => {
+                    if entry.file_type().is_dir() {
+                        walk.skip_current_dir();
+                    }
+                    continue;
+                }
                 Err(source) => return Err(Error::policy_io(source)),
             };
-            self.collect_matches(&entry.path(), matches, depth + 1)?;
+            if entry.file_type().is_dir() {
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    walk.skip_current_dir();
+                } else {
+                    directory = Some(entry.into_path());
+                }
+            }
         }
 
         Ok(())
