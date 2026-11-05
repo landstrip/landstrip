@@ -12,6 +12,7 @@ import type { SandboxConfig, SandboxConfigOverrides } from '@landstrip/landstrip
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
+import { connect } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { dirname, isAbsolute, join } from 'node:path';
 
@@ -227,67 +228,79 @@ export function shouldRenderSandboxPermission(
   return requestSessionID === routeSessionID && !hostPromptActive;
 }
 
-// The TUI plugin runs the query-response socket server and publishes its port
-// to a per-directory discovery file; the server plugin reads it to inject the
-// fd-3 redirect. Namespacing by a hash of the realpath keeps concurrent
-// opencode instances in different projects from colliding.
-function discoveryDir(): string {
-  const base = process.env.XDG_RUNTIME_DIR || tmpdir();
-  return join(base, 'opencode-landstrip');
-}
+// The TUI publishes its query-response port for the server plugin to discover.
+// Hashing the directory realpath keeps different projects from colliding.
+export class TrapPortDiscovery {
+  constructor(private readonly baseDirectory: string) {}
 
-function directoryHash(baseDirectory: string): string {
-  let key = baseDirectory;
-  try {
-    key = realpathSync.native(baseDirectory);
-  } catch {
-    // Directory not resolvable — hash the raw path instead.
-  }
-  return createHash('sha256').update(key).digest('hex').slice(0, 16);
-}
-
-export function discoveryFilePath(baseDirectory: string): string {
-  return join(discoveryDir(), `port-${directoryHash(baseDirectory)}.json`);
-}
-
-export function writeDiscoveryPort(baseDirectory: string, port: number): void {
-  const dir = discoveryDir();
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(
-    discoveryFilePath(baseDirectory),
-    JSON.stringify({ port, pid: process.pid, ts: Date.now() }) + '\n',
-  );
-}
-
-export function removeDiscoveryFile(baseDirectory: string): void {
-  rmSync(discoveryFilePath(baseDirectory), { force: true });
-}
-
-// Returns the live query-response port, or null when no fresh server is
-// listening. A recorded writer pid that no longer exists marks the file stale.
-export function readDiscoveryPort(baseDirectory: string): number | null {
-  const path = discoveryFilePath(baseDirectory);
-  if (!existsSync(path)) return null;
-
-  try {
-    const data: unknown = JSON.parse(readFileSync(path, 'utf-8'));
-    if (!isRecord(data)) return null;
-
-    const port = typeof data.port === 'number' ? data.port : NaN;
-    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
-
-    if (typeof data.pid === 'number') {
-      try {
-        process.kill(data.pid, 0);
-      } catch (error) {
-        // ESRCH: the writer is gone, so the file is stale. EPERM: alive but
-        // owned by another user — still a live listener, so accept it.
-        if ((error as NodeJS.ErrnoException).code === 'ESRCH') return null;
-      }
+  get filePath(): string {
+    const base = process.env.XDG_RUNTIME_DIR || tmpdir();
+    let key = this.baseDirectory;
+    try {
+      key = realpathSync.native(this.baseDirectory);
+    } catch {
+      // Directory not resolvable — hash the raw path instead.
     }
+    const hash = createHash('sha256').update(key).digest('hex').slice(0, 16);
+    return join(base, 'opencode-landstrip', `port-${hash}.json`);
+  }
 
-    return port;
-  } catch {
-    return null;
+  publish(port: number): void {
+    const path = this.filePath;
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    writeFileSync(path, JSON.stringify({ port, pid: process.pid, ts: Date.now() }) + '\n');
+  }
+
+  remove(): void {
+    rmSync(this.filePath, { force: true });
+  }
+
+  // A recorded writer pid that no longer exists marks the file stale.
+  readPort(): number | null {
+    const path = this.filePath;
+    if (!existsSync(path)) return null;
+
+    try {
+      const data: unknown = JSON.parse(readFileSync(path, 'utf-8'));
+      if (!isRecord(data)) return null;
+
+      const port = typeof data.port === 'number' ? data.port : NaN;
+      if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+
+      if (typeof data.pid === 'number') {
+        try {
+          process.kill(data.pid, 0);
+        } catch (error) {
+          // ESRCH: the writer is gone. EPERM: alive but owned by another user.
+          if ((error as NodeJS.ErrnoException).code === 'ESRCH') return null;
+        }
+      }
+
+      return port;
+    } catch {
+      return null;
+    }
+  }
+
+  async connectablePort(): Promise<number | null> {
+    const port = this.readPort();
+    if (port === null) return null;
+
+    return new Promise((resolve) => {
+      const socket = connect({ host: '127.0.0.1', port });
+      let settled = false;
+      let timer: NodeJS.Timeout;
+      const finish = (ok: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(ok ? port : null);
+      };
+      timer = setTimeout(() => finish(false), 250);
+
+      socket.once('connect', () => finish(true));
+      socket.once('error', () => finish(false));
+    });
   }
 }

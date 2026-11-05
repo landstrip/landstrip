@@ -25,15 +25,14 @@ import {
 
 import {
   SandboxConfigStore,
+  TrapPortDiscovery,
   decodeTrapSessionHello,
   normalizeOptions,
   nextSandboxPermissionIndex,
-  removeDiscoveryFile,
   sessionAllowancesFor,
   rootSessionIDFor,
   shouldRenderSandboxPermission,
   type SessionAllowances,
-  writeDiscoveryPort,
 } from './shared.js';
 
 type QueryChoice = 'once' | 'session' | 'project' | 'global' | 'deny';
@@ -136,6 +135,7 @@ const tui: TuiPlugin.Definition = {
     const optionOverrides = normalizeOptions(context.options);
     const enabledManagedByOptions = optionOverrides.enabled !== undefined;
     const configStore = new SandboxConfigStore(directory, optionOverrides);
+    const discovery = new TrapPortDiscovery(directory);
 
     function LandstripPermissionPrompt(rawProps: Record<string, unknown>) {
       const props = rawProps as unknown as PermissionPromptProps<string>;
@@ -565,7 +565,6 @@ const tui: TuiPlugin.Definition = {
     let socketServer: ReturnType<typeof createServer> | undefined;
 
     if (process.platform === 'linux') {
-      const baseDirectory = directory;
       let socketSeq = 0;
 
       socketServer = createServer((socket) => {
@@ -704,7 +703,7 @@ const tui: TuiPlugin.Definition = {
 
       socketServer.on('error', () => {
         try {
-          removeDiscoveryFile(baseDirectory);
+          discovery.remove();
         } catch {
           // best effort
         }
@@ -714,7 +713,7 @@ const tui: TuiPlugin.Definition = {
         const address = socketServer?.address() as AddressInfo | null;
         if (address && typeof address === 'object') {
           try {
-            writeDiscoveryPort(baseDirectory, address.port);
+            discovery.publish(address.port);
           } catch {
             // best effort — falls back to the server's reset model
           }
@@ -974,7 +973,7 @@ const tui: TuiPlugin.Definition = {
       if (socketServer) {
         socketServer.close();
         try {
-          removeDiscoveryFile(directory);
+          discovery.remove();
         } catch {
           // best effort
         }

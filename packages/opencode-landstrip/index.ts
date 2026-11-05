@@ -6,7 +6,7 @@ import type { Plugin } from '@opencode/plugin';
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { rmSync } from 'node:fs';
-import { type AddressInfo, connect as connectNet, createServer } from 'node:net';
+import { type AddressInfo, createServer } from 'node:net';
 import { basename } from 'node:path';
 
 import {
@@ -37,10 +37,10 @@ import {
 } from '@landstrip/landstrip-api/shared';
 
 import {
+  TrapPortDiscovery,
   SandboxConfigStore,
   landstripBinaryPath,
   normalizeOptions,
-  readDiscoveryPort,
   trapSessionHelloLine,
 } from './shared.js';
 
@@ -71,7 +71,6 @@ type ToastVariant = 'info' | 'success' | 'warning' | 'error';
 const LANDSTRIP_VERSION = [0, 17, 0] as const;
 const REQUIRED_LANDSTRIP_VERSION = LANDSTRIP_VERSION.join('.');
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
-const DISCOVERY_CONNECT_TIMEOUT_MS = 250;
 
 function evaluateReadPermission(
   path: string,
@@ -304,25 +303,6 @@ function startTrapServer(
   });
 }
 
-function trapPortAcceptsConnections(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = connectNet({ host: '127.0.0.1', port });
-    let settled = false;
-    let timer: NodeJS.Timeout;
-    const finish = (ok: boolean): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolve(ok);
-    };
-    timer = setTimeout(() => finish(false), DISCOVERY_CONNECT_TIMEOUT_MS);
-
-    socket.once('connect', () => finish(true));
-    socket.once('error', () => finish(false));
-  });
-}
-
 function buildWrappedCommand(
   policyPath: string,
   shell: string,
@@ -483,6 +463,7 @@ const plugin: Plugin.Plugin = {
   async setup(context: Plugin.Context) {
     const directory = context.location?.directory ?? process.cwd();
     const configStore = new SandboxConfigStore(directory, normalizeOptions(context.options));
+    const discovery = new TrapPortDiscovery(directory);
     const pendingCallIDByCommand = new Map<string, string>();
     const pendingSessionIDByCommand = new Map<string, string>();
     const activeBash = new Map<string, BashSandboxState>();
@@ -673,11 +654,9 @@ const plugin: Plugin.Plugin = {
       // The TUI owns interactive query handling. Fall back to an in-process
       // broker when no TUI endpoint or session identity is available.
       const interactiveSessionID = normalizedSessionID ?? '';
-      const discoveredPort =
-        process.platform === 'linux' && interactiveSessionID ? readDiscoveryPort(directory) : null;
       const tuiTrapPort =
-        discoveredPort !== null && (await trapPortAcceptsConnections(discoveredPort))
-          ? discoveredPort
+        process.platform === 'linux' && interactiveSessionID
+          ? await discovery.connectablePort()
           : null;
       const trapServer =
         tuiTrapPort === null
