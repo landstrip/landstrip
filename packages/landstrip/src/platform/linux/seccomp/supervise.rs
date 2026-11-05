@@ -109,7 +109,7 @@ impl<'a> Denials<'a> {
     ) -> SysResult<NotificationResult> {
         if self.can_query(allow_query) {
             let query_id = self.next_query_id;
-            self.next_query_id += 1;
+            self.next_query_id = query_id.checked_add(1).ok_or(Errno::EOVERFLOW)?;
             return Ok(NotificationResult::query(
                 query_id,
                 denial.into_trap(Some(query_id)),
