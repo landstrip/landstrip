@@ -405,8 +405,11 @@ impl PolicyResolver {
 
         let deny_selectors =
             Self::anchor_write_deny_selectors(&filesystem.deny_write, &anchor_roots, false);
+        // Unix mediates denyWrite globs dynamically (seccomp on Linux, Seatbelt
+        // regex on macOS); expanding them here scans the entire project tree before
+        // even starting a simple command.
         let mut resolved_deny =
-            self.resolve_deny_paths(&deny_selectors, !cfg!(target_os = "linux"))?;
+            self.resolve_deny_paths(&deny_selectors, cfg!(target_os = "windows"))?;
         let carveouts =
             resolved_deny.apply_write_carveouts(&resolved_always, &allow, &resolved_allow.patterns);
 
