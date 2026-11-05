@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 pub(crate) mod glob;
 
@@ -67,27 +67,12 @@ impl PathExt for Path {
     }
 
     fn clean_lexically(&self) -> PathBuf {
-        let mut normalized = PathBuf::new();
-
-        for component in self.components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => match normalized.components().next_back() {
-                    Some(Component::Normal(_) | Component::CurDir) => {
-                        normalized.pop();
-                    }
-                    Some(Component::RootDir | Component::Prefix(_)) => {}
-                    Some(Component::ParentDir) | None => {
-                        if !self.has_root() {
-                            normalized.push(Component::ParentDir.as_os_str());
-                        }
-                    }
-                },
-                _ => normalized.push(component.as_os_str()),
-            }
+        let cleaned = path_clean::clean(self);
+        if cleaned == Path::new(".") {
+            PathBuf::new()
+        } else {
+            cleaned
         }
-
-        normalized
     }
 
     fn spellings(&self) -> impl Iterator<Item = PathBuf> {
