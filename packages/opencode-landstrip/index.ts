@@ -37,8 +37,8 @@ import {
 } from '@landstrip/landstrip-api/shared';
 
 import {
-  TrapPortDiscovery,
   SandboxConfigStore,
+  TrapPortDiscovery,
   landstripBinaryPath,
   normalizeOptions,
   trapSessionHelloLine,
@@ -464,8 +464,7 @@ const plugin: Plugin.Plugin = {
     const directory = context.location?.directory ?? process.cwd();
     const configStore = new SandboxConfigStore(directory, normalizeOptions(context.options));
     const discovery = new TrapPortDiscovery(directory);
-    const pendingCallIDByCommand = new Map<string, string>();
-    const pendingSessionIDByCommand = new Map<string, string>();
+    const pendingByCommand = new Map<string, { callID: string; sessionID: string | undefined }>();
     const activeBash = new Map<string, BashSandboxState>();
     const notified = new Set<string>();
     let enabledNotified = false;
@@ -752,8 +751,7 @@ const plugin: Plugin.Plugin = {
         }
         if (typeof args.command === 'string') {
           await prepareBash(event.id, event.sessionID, args, config);
-          pendingCallIDByCommand.set(args.command, event.id);
-          pendingSessionIDByCommand.set(args.command, event.sessionID);
+          pendingByCommand.set(args.command, { callID: event.id, sessionID: event.sessionID });
         }
         return;
       }
@@ -780,16 +778,10 @@ const plugin: Plugin.Plugin = {
       const config = await activeConfig();
       if (!config) return;
 
-      let callID = pendingCallIDByCommand.get(invocation.command);
-      let sessionID = pendingSessionIDByCommand.get(invocation.command);
-      if (callID) {
-        pendingCallIDByCommand.delete(invocation.command);
-      } else {
-        callID = `shell-${randomBytes(6).toString('hex')}`;
-      }
-      if (sessionID) {
-        pendingSessionIDByCommand.delete(invocation.command);
-      }
+      const pending = pendingByCommand.get(invocation.command);
+      pendingByCommand.delete(invocation.command);
+      const callID = pending?.callID || `shell-${randomBytes(6).toString('hex')}`;
+      const sessionID = pending?.sessionID;
 
       await prepareBash(
         callID,
