@@ -309,15 +309,15 @@ pub(super) fn run_broker(
             let result = (|| match parent.receive(&mut subreaper)? {
                 NotifyStartup::Ready(notify, namespace) => {
                     signals.process_pending()?;
-                    Supervisor {
+                    Supervisor::new(
                         policy,
                         child,
-                        notify_fd: notify,
-                        notify_filesystem: needs_filesystem,
+                        notify,
+                        needs_filesystem,
                         trap_fd,
-                        mount_namespace: namespace,
-                        signals: Some(&mut signals),
-                    }
+                        namespace,
+                        &mut signals,
+                    )
                     .run()
                 }
                 NotifyStartup::Trap(trap) => {

@@ -82,6 +82,10 @@ impl<'a> Denials<'a> {
         self.query_enabled && allow_query
     }
 
+    pub(super) fn control_fd(&self) -> Option<BorrowedFd<'a>> {
+        self.trap_fd.filter(|_| self.query_enabled).map(AsFd::as_fd)
+    }
+
     pub(super) fn disable_queries(&mut self) {
         self.trap_fd = None;
         self.query_enabled = false;
@@ -139,47 +143,6 @@ pub(super) enum HandleResult {
     Respond(libc::seccomp_notif_resp),
     Apply(Grant),
     Pending(QueryDecision),
-}
-
-pub(super) struct NotificationContext<'a> {
-    pub(super) policy: &'a AccessPolicy,
-    pub(super) notify_filesystem: bool,
-    pub(super) mount_namespace: NamespaceId,
-}
-
-impl NotificationContext<'_> {
-    fn handle(&self, request: &libc::seccomp_notif, denials: &mut Denials<'_>) -> HandleResult {
-        let syscall = i64::from(request.data.nr);
-        let result = match SyscallClass::classify(syscall) {
-            Some(SyscallClass::Bind) => handle_bind(self.policy, request, denials),
-            Some(SyscallClass::Connect) => handle_connect(self.policy, request, denials),
-            Some(SyscallClass::Sendto) => handle_sendto(request, denials),
-            Some(SyscallClass::Sendmsg) => handle_sendmsg(request, denials),
-            Some(SyscallClass::Sendmmsg) => handle_sendmmsg(request, denials),
-            Some(SyscallClass::Open) if self.notify_filesystem => {
-                handle_openat(self.policy, request, denials)
-            }
-            Some(SyscallClass::Access) => handle_access(self.policy, request, denials),
-            Some(SyscallClass::Handle) if self.notify_filesystem => Err(BrokerError::PolicyDenied),
-            Some(SyscallClass::Mutation { landlock_backed })
-                if self.notify_filesystem || !landlock_backed =>
-            {
-                handle_mutation(self.policy, request, denials)
-            }
-            Some(SyscallClass::Open | SyscallClass::Handle | SyscallClass::Mutation { .. })
-            | None => Ok(NotificationResult::Continue),
-        };
-        match result {
-            Ok(NotificationResult::Continue) => {
-                HandleResult::Respond(NotificationResponse::continue_syscall(request.id))
-            }
-            Ok(NotificationResult::Grant(grant)) => HandleResult::Apply(grant),
-            Ok(NotificationResult::Query(decision)) => HandleResult::Pending(decision),
-            Err(error) => {
-                HandleResult::Respond(NotificationResponse::error(request.id, error.errno()))
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -319,82 +282,75 @@ struct ControlResponse {
 }
 
 pub(super) struct Supervisor<'a> {
-    pub(super) policy: &'a AccessPolicy,
-    pub(super) child: Pid,
-    pub(super) notify_fd: BorrowedFd<'a>,
-    pub(super) notify_filesystem: bool,
-    pub(super) trap_fd: Option<&'a TrapFd>,
-    pub(super) mount_namespace: NamespaceId,
-    pub(super) signals: Option<&'a mut ForwardSignals>,
+    policy: &'a AccessPolicy,
+    child: Pid,
+    notify_fd: BorrowedFd<'a>,
+    notify: NotificationChannel<'a>,
+    notify_filesystem: bool,
+    mount_namespace: NamespaceId,
+    signals: &'a mut ForwardSignals,
+    denials: Denials<'a>,
+    pending_queries: HashMap<u64, PendingQuery>,
+    control_buffer: Vec<u8>,
 }
 
-impl Supervisor<'_> {
-    #[allow(
-        clippy::too_many_lines,
-        reason = "query delivery failure handling must update supervisor state atomically"
-    )]
+impl<'a> Supervisor<'a> {
+    pub(super) fn new(
+        policy: &'a AccessPolicy,
+        child: Pid,
+        notify_fd: BorrowedFd<'a>,
+        notify_filesystem: bool,
+        trap_fd: Option<&'a TrapFd>,
+        mount_namespace: NamespaceId,
+        signals: &'a mut ForwardSignals,
+    ) -> Self {
+        Self {
+            policy,
+            child,
+            notify_fd,
+            notify: NotificationChannel::new(notify_fd),
+            notify_filesystem,
+            mount_namespace,
+            signals,
+            denials: Denials::new(trap_fd),
+            pending_queries: HashMap::new(),
+            control_buffer: Vec::new(),
+        }
+    }
+
     pub(super) fn run(mut self) -> Result<i32> {
-        let notify = NotificationChannel::new(self.notify_fd);
-        let mut denials = Denials::new(self.trap_fd);
-        let mut trap_fd = self
-            .trap_fd
-            .filter(|trap_fd| trap_fd.is_stream_socket())
-            .map(AsFd::as_fd);
-        let ctx = NotificationContext {
-            policy: self.policy,
-            notify_filesystem: self.notify_filesystem,
-            mount_namespace: self.mount_namespace,
-        };
-        let mut pending_queries: HashMap<u64, PendingQuery> = HashMap::new();
-        let mut control_buffer: Vec<u8> = Vec::new();
         loop {
-            loop {
-                match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::StillAlive) => break,
-                    Ok(status) => return Ok(denials.emit(status)),
-                    Err(Errno::EINTR) => {}
-                    Err(error) => return Err(LandstripError::supervise_errno(error).into()),
-                }
+            if let Some(status) = self.wait_child(Some(WaitPidFlag::WNOHANG))? {
+                return Ok(self.denials.emit(status));
             }
 
-            let signal_fd = self.signals.as_ref().map(|s| s.as_fd());
-            let revents = poll_broker_fds(self.notify_fd, trap_fd, signal_fd)?;
+            let control_fd = self.denials.control_fd();
+            let revents = self.poll_fds(control_fd)?;
             if revents.iter().all(PollFlags::is_empty) {
                 continue;
             }
 
-            if let Some(ref mut signals) = self.signals
-                && revents[2].intersects(PollFlags::POLLIN)
-            {
-                signals.process_pending()?;
+            if revents[1].intersects(PollFlags::POLLIN) {
+                self.signals.process_pending()?;
             }
 
             if revents[0].intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
             {
-                loop {
-                    match waitpid(self.child, None) {
-                        Ok(status) => return Ok(denials.emit(status)),
-                        Err(Errno::EINTR) => {}
-                        Err(error) => return Err(LandstripError::supervise_errno(error).into()),
-                    }
+                if let Some(status) = self.wait_child(None)? {
+                    return Ok(self.denials.emit(status));
                 }
+                continue;
             }
 
-            if let Some(cfd) = trap_fd {
-                let dead = revents[1]
-                    .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
-                    || (revents[1].intersects(PollFlags::POLLIN)
-                        && process_control_responses(
-                            self.policy,
-                            cfd,
-                            &mut control_buffer,
-                            &mut pending_queries,
-                            notify,
-                        ));
+            if let Some(cfd) = control_fd {
+                let dead = if revents[2].intersects(PollFlags::POLLIN) {
+                    self.read_control_responses(cfd)
+                } else {
+                    revents[2]
+                        .intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+                };
                 if dead {
-                    deny_all_pending(&mut pending_queries, notify);
-                    denials.disable_queries();
-                    trap_fd = None;
+                    self.disconnect_control();
                 }
             }
 
@@ -402,39 +358,28 @@ impl Supervisor<'_> {
                 continue;
             }
 
-            let Some((request, handle_result)) =
-                receive_handled_notification(notify, &ctx, &mut denials)?
-            else {
+            let Some((request, handle_result)) = self.receive_notification()? else {
                 continue;
             };
             match handle_result {
                 HandleResult::Respond(response) => {
-                    if let Err(source) = notify.respond(response) {
-                        loop {
-                            match waitpid(self.child, Some(WaitPidFlag::WNOHANG)) {
-                                Ok(WaitStatus::StillAlive) => break,
-                                Ok(status) => return Ok(denials.emit(status)),
-                                Err(Errno::EINTR) => {}
-                                Err(error) => {
-                                    return Err(LandstripError::supervise_errno(error).into());
-                                }
-                            }
+                    if let Err(source) = self.notify.respond(response) {
+                        if let Some(status) = self.wait_child(Some(WaitPidFlag::WNOHANG))? {
+                            return Ok(self.denials.emit(status));
                         }
                         return Err(source);
                     }
                 }
                 HandleResult::Pending(decision) => {
-                    if let Err(error) = denials.write(&decision.trap) {
+                    if let Err(error) = self.denials.write(&decision.trap) {
                         log::debug!("trap query write failed: {error}");
-                        deny_all_pending(&mut pending_queries, notify);
-                        denials.disable_queries();
-                        trap_fd = None;
-                        notify.respond(NotificationResponse::error(
+                        self.disconnect_control();
+                        self.notify.respond(NotificationResponse::error(
                             request.id,
                             LandstripError::DENIAL_ERRNO,
                         ))?;
                     } else {
-                        pending_queries.insert(
+                        self.pending_queries.insert(
                             decision.query_id,
                             PendingQuery {
                                 request,
@@ -444,156 +389,187 @@ impl Supervisor<'_> {
                     }
                 }
                 HandleResult::Apply(grant) => {
-                    grant.apply(self.policy, notify, request.id);
+                    grant.apply(self.policy, self.notify, request.id);
                 }
             }
         }
     }
-}
 
-fn receive_handled_notification(
-    notify: NotificationChannel<'_>,
-    ctx: &NotificationContext,
-    denials: &mut Denials<'_>,
-) -> Result<Option<(libc::seccomp_notif, HandleResult)>> {
-    let request = notify.receive()?;
-    if !notify.is_id_valid(request.id)? {
-        return Ok(None);
-    }
-    let handle_result = match ctx.mount_namespace.verify(request.pid) {
-        Ok(()) => ctx.handle(&request, denials),
-        Err(error) => HandleResult::Respond(NotificationResponse::error(request.id, error.errno())),
-    };
-    if !notify.is_id_valid(request.id)? {
-        return Ok(None);
-    }
-    Ok(Some((request, handle_result)))
-}
-
-fn poll_broker_fds(
-    notify: BorrowedFd<'_>,
-    control: Option<BorrowedFd<'_>>,
-    signals: Option<BorrowedFd<'_>>,
-) -> Result<[PollFlags; 3]> {
-    let mut len = 1;
-    let mut poll_fds = [
-        PollFd::new(notify, PollFlags::POLLIN),
-        PollFd::new(control.unwrap_or(notify), PollFlags::POLLIN),
-        PollFd::new(signals.unwrap_or(notify), PollFlags::POLLIN),
-    ];
-    if control.is_some() {
-        len = 2;
-    }
-    if signals.is_some() {
-        len = 3;
-    }
-    loop {
-        match poll(&mut poll_fds[..len], POLL_MS) {
-            Ok(0) => return Ok([PollFlags::empty(); 3]),
-            Ok(_) => {
-                return Ok([
-                    poll_fds[0].revents().unwrap_or_else(PollFlags::empty),
-                    poll_fds[1].revents().unwrap_or_else(PollFlags::empty),
-                    poll_fds[2].revents().unwrap_or_else(PollFlags::empty),
-                ]);
+    fn wait_child(&self, options: Option<WaitPidFlag>) -> Result<Option<WaitStatus>> {
+        loop {
+            match waitpid(self.child, options) {
+                Ok(WaitStatus::StillAlive) => return Ok(None),
+                Ok(status) => return Ok(Some(status)),
+                Err(Errno::EINTR) => {}
+                Err(error) => return Err(LandstripError::supervise_errno(error).into()),
             }
-            Err(Errno::EINTR) => {}
-            Err(error) => return Err(LandstripError::supervise_errno(error).into()),
         }
     }
-}
 
-fn process_control_responses(
-    policy: &AccessPolicy,
-    control_fd: BorrowedFd<'_>,
-    buffer: &mut Vec<u8>,
-    pending_queries: &mut HashMap<u64, PendingQuery>,
-    notify: NotificationChannel<'_>,
-) -> bool {
-    let mut chunk = [0u8; 4096];
-    let n = loop {
-        let n = unsafe {
-            libc::read(
-                control_fd.as_raw_fd(),
-                chunk.as_mut_ptr().cast(),
-                chunk.len(),
-            )
+    fn handle_request(&mut self, request: &libc::seccomp_notif) -> HandleResult {
+        let syscall = i64::from(request.data.nr);
+        let result = match SyscallClass::classify(syscall) {
+            Some(SyscallClass::Bind) => handle_bind(self.policy, request, &mut self.denials),
+            Some(SyscallClass::Connect) => handle_connect(self.policy, request, &mut self.denials),
+            Some(SyscallClass::Sendto) => handle_sendto(request, &mut self.denials),
+            Some(SyscallClass::Sendmsg) => handle_sendmsg(request, &mut self.denials),
+            Some(SyscallClass::Sendmmsg) => handle_sendmmsg(request, &mut self.denials),
+            Some(SyscallClass::Open) if self.notify_filesystem => {
+                handle_openat(self.policy, request, &mut self.denials)
+            }
+            Some(SyscallClass::Access) => handle_access(self.policy, request, &mut self.denials),
+            Some(SyscallClass::Handle) if self.notify_filesystem => Err(BrokerError::PolicyDenied),
+            Some(SyscallClass::Mutation { landlock_backed })
+                if self.notify_filesystem || !landlock_backed =>
+            {
+                handle_mutation(self.policy, request, &mut self.denials)
+            }
+            Some(SyscallClass::Open | SyscallClass::Handle | SyscallClass::Mutation { .. })
+            | None => Ok(NotificationResult::Continue),
         };
-        if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
+        match result {
+            Ok(NotificationResult::Continue) => {
+                HandleResult::Respond(NotificationResponse::continue_syscall(request.id))
+            }
+            Ok(NotificationResult::Grant(grant)) => HandleResult::Apply(grant),
+            Ok(NotificationResult::Query(decision)) => HandleResult::Pending(decision),
+            Err(error) => {
+                HandleResult::Respond(NotificationResponse::error(request.id, error.errno()))
+            }
         }
-        break n;
-    };
-    if n == 0 {
-        return true;
-    }
-    if n < 0 {
-        return io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock;
-    }
-    let Ok(n) = usize::try_from(n) else {
-        return true;
-    };
-    buffer.extend_from_slice(&chunk[..n]);
-
-    if buffer.len() > CONTROL_BUFFER_MAX {
-        log::warn!(
-            "linux: control buffer exceeded {CONTROL_BUFFER_MAX} bytes with no newline; dropping"
-        );
-        buffer.clear();
-        return true;
     }
 
-    let Some(last_newline) = buffer.iter().rposition(|b| *b == b'\n') else {
-        return false;
-    };
-    let complete: Vec<u8> = buffer.drain(..=last_newline).collect();
-
-    for line in complete.split(|b| *b == b'\n') {
-        if line.is_empty() {
-            continue;
+    fn receive_notification(&mut self) -> Result<Option<(libc::seccomp_notif, HandleResult)>> {
+        let request = self.notify.receive()?;
+        if !self.notify.is_id_valid(request.id)? {
+            return Ok(None);
         }
-        let Ok(response): std::result::Result<ControlResponse, _> = serde_json::from_slice(line)
-        else {
-            return true;
+        let handle_result = match self.mount_namespace.verify(request.pid) {
+            Ok(()) => self.handle_request(&request),
+            Err(error) => {
+                HandleResult::Respond(NotificationResponse::error(request.id, error.errno()))
+            }
         };
-        let Ok(query_id) = response.query_id.parse::<u64>() else {
-            return true;
-        };
-        if let Some(pending) = pending_queries.remove(&query_id) {
-            let id = pending.request.id;
-            if !notify.is_id_valid(id).unwrap_or(false) {
+        if !self.notify.is_id_valid(request.id)? {
+            return Ok(None);
+        }
+        Ok(Some((request, handle_result)))
+    }
+
+    fn poll_fds(&self, control: Option<BorrowedFd<'_>>) -> Result<[PollFlags; 3]> {
+        let len = if control.is_some() { 3 } else { 2 };
+        let mut poll_fds = [
+            PollFd::new(self.notify_fd, PollFlags::POLLIN),
+            PollFd::new(self.signals.as_fd(), PollFlags::POLLIN),
+            PollFd::new(control.unwrap_or(self.notify_fd), PollFlags::POLLIN),
+        ];
+        loop {
+            match poll(&mut poll_fds[..len], POLL_MS) {
+                Ok(0) => return Ok([PollFlags::empty(); 3]),
+                Ok(_) => {
+                    return Ok([
+                        poll_fds[0].revents().unwrap_or_else(PollFlags::empty),
+                        poll_fds[1].revents().unwrap_or_else(PollFlags::empty),
+                        if control.is_some() {
+                            poll_fds[2].revents().unwrap_or_else(PollFlags::empty)
+                        } else {
+                            PollFlags::empty()
+                        },
+                    ]);
+                }
+                Err(Errno::EINTR) => {}
+                Err(error) => return Err(LandstripError::supervise_errno(error).into()),
+            }
+        }
+    }
+
+    fn read_control_responses(&mut self, control_fd: BorrowedFd<'_>) -> bool {
+        let mut chunk = [0u8; 4096];
+        let n = loop {
+            let n = unsafe {
+                libc::read(
+                    control_fd.as_raw_fd(),
+                    chunk.as_mut_ptr().cast(),
+                    chunk.len(),
+                )
+            };
+            if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            match response.action {
-                ControlAction::Allow => match pending.grant {
-                    Some(grant) => grant.apply(policy, notify, id),
-                    None => {
-                        let _ = notify.respond(NotificationResponse::continue_syscall(id));
+            break n;
+        };
+        if n == 0 {
+            return true;
+        }
+        if n < 0 {
+            return io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock;
+        }
+        let Ok(n) = usize::try_from(n) else {
+            return true;
+        };
+        self.control_buffer.extend_from_slice(&chunk[..n]);
+
+        if self.control_buffer.len() > CONTROL_BUFFER_MAX {
+            log::warn!(
+                "linux: control buffer exceeded {CONTROL_BUFFER_MAX} bytes with no newline; dropping"
+            );
+            self.control_buffer.clear();
+            return true;
+        }
+
+        let Some(last_newline) = self.control_buffer.iter().rposition(|b| *b == b'\n') else {
+            return false;
+        };
+        let complete: Vec<u8> = self.control_buffer.drain(..=last_newline).collect();
+
+        for line in complete.split(|b| *b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(response): std::result::Result<ControlResponse, _> =
+                serde_json::from_slice(line)
+            else {
+                return true;
+            };
+            let Ok(query_id) = response.query_id.parse::<u64>() else {
+                return true;
+            };
+            if let Some(pending) = self.pending_queries.remove(&query_id) {
+                let id = pending.request.id;
+                if !self.notify.is_id_valid(id).unwrap_or(false) {
+                    continue;
+                }
+                match response.action {
+                    ControlAction::Allow => match pending.grant {
+                        Some(grant) => grant.apply(self.policy, self.notify, id),
+                        None => {
+                            let _ = self
+                                .notify
+                                .respond(NotificationResponse::continue_syscall(id));
+                        }
+                    },
+                    ControlAction::Deny => {
+                        let _ = self.notify.respond(NotificationResponse::error(
+                            id,
+                            LandstripError::DENIAL_ERRNO,
+                        ));
                     }
-                },
-                ControlAction::Deny => {
-                    let _ = notify.respond(NotificationResponse::error(
-                        id,
-                        LandstripError::DENIAL_ERRNO,
-                    ));
                 }
             }
         }
+        false
     }
-    false
-}
 
-fn deny_all_pending(
-    pending_queries: &mut HashMap<u64, PendingQuery>,
-    notify: NotificationChannel<'_>,
-) {
-    for (_id, pending) in pending_queries.drain() {
-        let id = pending.request.id;
-        if notify.is_id_valid(id).unwrap_or(false) {
-            let _ = notify.respond(NotificationResponse::error(
-                id,
-                LandstripError::DENIAL_ERRNO,
-            ));
+    fn disconnect_control(&mut self) {
+        for (_id, pending) in self.pending_queries.drain() {
+            let id = pending.request.id;
+            if self.notify.is_id_valid(id).unwrap_or(false) {
+                let _ = self.notify.respond(NotificationResponse::error(
+                    id,
+                    LandstripError::DENIAL_ERRNO,
+                ));
+            }
         }
+        self.denials.disable_queries();
     }
 }
