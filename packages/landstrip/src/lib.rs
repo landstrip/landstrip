@@ -6,6 +6,7 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
 #![deny(clippy::panic)]
+#![deny(clippy::todo, clippy::unimplemented, clippy::unreachable)]
 
 //! Sandbox library: policy loading and lowering, platform enforcement, and
 //! structured outcomes and traps.
