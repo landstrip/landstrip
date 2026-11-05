@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
+import { parse as parseShell } from 'shell-quote';
 
 import { packageRoot, transpile } from './helper.mjs';
 
@@ -29,6 +30,13 @@ async function withPlugin(options, run) {
       join(tempDir, 'node_modules', '@landstrip', 'landstrip-api'),
       'junction',
     );
+    for (const dependency of ['shell-quote']) {
+      await symlink(
+        fileURLToPath(new URL('./', import.meta.resolve(dependency))),
+        join(tempDir, 'node_modules', dependency),
+        'junction',
+      );
+    }
     await writeFile(
       join(tempDir, 'shared.js'),
       transpile(await readFile(join(packageRoot, 'shared.ts'), 'utf8')),
@@ -442,7 +450,7 @@ test(
           await handlers.tool['execute.before'](event);
           const wrapped = event.input.command;
           assert.notEqual(wrapped, command, messages.join('\n'));
-          assert.match(wrapped, /'--trap' '3'/);
+          assert.deepEqual(parseShell(wrapped).slice(5, 8), ['run', '--trap', '3']);
           const invocation = {
             command: wrapped,
             cwd: tempDir,
@@ -499,7 +507,7 @@ test('headless sandbox denies protected file access without hanging', linuxOnly,
 
       try {
         await handlers.tool['execute.before'](event);
-        assert.match(event.input.command, /'--trap' '3'/);
+        assert.deepEqual(parseShell(event.input.command).slice(5, 8), ['run', '--trap', '3']);
         await assert.rejects(
           execFileAsync('/bin/bash', ['-c', event.input.command], {
             cwd: tempDir,

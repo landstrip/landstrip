@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { fileURLToPath } from 'node:url';
+import { quote as quoteShell } from 'shell-quote';
 
 import type {
   AgentToolResult,
@@ -802,14 +803,13 @@ export function writeEnvFile(
     // non-zero and the `&&`-chained command never runs. Skip what the shell
     // itself cannot set.
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
-    // Escape single quotes: ' -> '\''
-    const escaped = value.replace(/'/g, "'\\''");
-    lines.push(`export ${key}='${escaped}'`);
+    lines.push(`export ${key}=${quoteShell([value])}`);
   }
   if (proxyPort !== null) {
     const proxyVars = createProxyEnvironment(proxyPort, { token: proxyToken });
     for (const [name, value] of Object.entries(proxyVars)) {
-      lines.push(`export ${name}='${value}'`);
+      if (value === undefined) continue;
+      lines.push(`export ${name}=${quoteShell([value])}`);
     }
   }
   const dir = mkdtempSync(join(tmpdir(), 'pi-landstrip-env-'));
@@ -831,7 +831,7 @@ export function createPosixShellProvider(): LandstripShellProvider {
 
       return {
         executable: shell,
-        args: [...args, `source '${envFile.path}' && ${options.command}`],
+        args: [...args, `source ${quoteShell([envFile.path])} && ${options.command}`],
         launcherEnv: { PATH: process.env.PATH, HOME: process.env.HOME },
         readPaths: [envFile.path],
         dispose() {

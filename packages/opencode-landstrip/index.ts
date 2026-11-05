@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { type AddressInfo, createServer } from 'node:net';
 import { basename } from 'node:path';
+import { parse as parseShell, quote as quoteShell } from 'shell-quote';
 
 import {
   createProxyCredentials,
@@ -223,11 +224,6 @@ function proxyEnv(
   return createProxyEnvironment(port, { token: proxyToken }) as Record<string, string>;
 }
 
-function shellQuote(value: string): string {
-  if (value.length === 0) return "''";
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
 function shellArgs(shell: string, command: string): string[] {
   const name = basename(shell).toLowerCase();
   if (name.includes('fish')) return [shell, '-c', command];
@@ -311,14 +307,14 @@ function buildWrappedCommand(
   sessionID?: string,
 ): string {
   const baseArgs = ['run', '-p', policyPath, '--', ...shellArgs(shell, command)];
-  const plain = [landstripBinaryPath(), ...baseArgs].map(shellQuote).join(' ');
+  const plain = quoteShell([landstripBinaryPath(), ...baseArgs]);
   if (trapPort === null) return plain;
 
   // Open fd 3 before landstrip starts the command. The wrapper must never use
   // the command's exit status to select a fallback: by then the command may
   // already have changed the workspace. A failed socket setup therefore stops
   // without invoking landstrip, while every started command runs exactly once.
-  const trapped = [
+  const trapped = quoteShell([
     landstripBinaryPath(),
     'run',
     '--trap',
@@ -327,59 +323,33 @@ function buildWrappedCommand(
     policyPath,
     '--',
     ...shellArgs(shell, command),
-  ]
-    .map(shellQuote)
-    .join(' ');
+  ]);
   const identifySession = sessionID
-    ? ` && printf '%s' ${shellQuote(trapSessionHelloLine(sessionID))} >&3`
+    ? ` && printf '%s' ${quoteShell([trapSessionHelloLine(sessionID)])} >&3`
     : '';
   const openTrap = `exec 3<>/dev/tcp/127.0.0.1/${trapPort}${identifySession} && exec "$@"`;
-  return `bash -c ${shellQuote(openTrap)} bash ${trapped}`;
+  return quoteShell(['bash', '-c', openTrap, 'bash']) + ` ${trapped}`;
 }
 
 function isGeneratedWrappedCommand(command: string): boolean {
   return (
     // `.includes` rather than `.startsWith`: the query-response form prefixes
     // the landstrip invocation with a small bash fd-setup wrapper.
-    command.includes(`${shellQuote(landstripBinaryPath())} `) &&
-    command.includes(` ${shellQuote('-p')} `) &&
+    command.includes(`${quoteShell([landstripBinaryPath()])} `) &&
+    command.includes(` ${quoteShell(['-p'])} `) &&
     command.includes('opencode-landstrip-')
   );
 }
 
 function splitShellQuotedArgs(command: string): string[] {
-  const args: string[] = [];
-  let i = 0;
-  while (i < command.length) {
-    while (i < command.length && command[i] === ' ') i++;
-    if (i >= command.length) break;
-    if (command[i] === "'") {
-      i++;
-      let arg = '';
-      while (i < command.length) {
-        if (command[i] === "'") {
-          if (command[i + 1] === '\\' && command[i + 2] === "'" && command[i + 3] === "'") {
-            arg += "'";
-            i += 4;
-            continue;
-          }
-          i++;
-          break;
-        }
-        arg += command[i];
-        i++;
-      }
-      args.push(arg);
-    } else {
-      let arg = '';
-      while (i < command.length && command[i] !== ' ') {
-        arg += command[i];
-        i++;
-      }
-      args.push(arg);
+  // Preserve variable references literally; never read the host environment.
+  const args = parseShell(command, (name) => `$${name}`);
+  return args.map((arg) => {
+    if (typeof arg !== 'string') {
+      throw new Error('Unexpected shell operator in generated landstrip command');
     }
-  }
-  return args;
+    return arg;
+  });
 }
 
 function extractOriginalCommand(wrappedCommand: string): string | null {
