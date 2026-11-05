@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::cell::OnceCell;
 use std::env;
 use std::ffi::OsStr;
-use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
@@ -93,14 +92,13 @@ impl SecretWide {
 
         let size = output.cbData as usize;
         let output = unsafe { OwnedLocal::from_raw(output.pbData) };
-        let protected = unsafe { Hex::encode(std::slice::from_raw_parts(output.as_ptr(), size)) };
+        let protected = unsafe { hex::encode(std::slice::from_raw_parts(output.as_ptr(), size)) };
         Ok(protected)
     }
 
     pub(super) fn decrypt(protected: &str) -> Result<Self> {
-        let mut protected = Hex::decode(protected)
-            .map_err(anyhow::Error::msg)
-            .context("protected password is not valid hexadecimal")?;
+        let mut protected =
+            hex::decode(protected).context("protected password is not valid hexadecimal")?;
         let protected_len =
             u32::try_from(protected.len()).context("protected password is too long")?;
         let input = CRYPT_INTEGER_BLOB {
@@ -146,32 +144,6 @@ impl SecretWide {
 impl Drop for SecretWide {
     fn drop(&mut self) {
         self.0.zeroize();
-    }
-}
-
-pub(super) struct Hex;
-
-impl Hex {
-    pub(super) fn encode(bytes: &[u8]) -> String {
-        let mut output = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            let _ = write!(&mut output, "{byte:02x}");
-        }
-        output
-    }
-
-    fn decode(value: &str) -> std::result::Result<Vec<u8>, &'static str> {
-        if !value.len().is_multiple_of(2) {
-            return Err("hex string must contain an even number of digits");
-        }
-        value
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| {
-                let text = std::str::from_utf8(pair).map_err(|_| "invalid UTF-8 in hex string")?;
-                u8::from_str_radix(text, 16).map_err(|_| "invalid hexadecimal digit")
-            })
-            .collect()
     }
 }
 

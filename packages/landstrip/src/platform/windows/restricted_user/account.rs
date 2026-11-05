@@ -4,7 +4,7 @@
 //! Local sandbox account provisioning.
 
 use super::super::win32::{LocalSid, OsStatus, ToWideNul};
-use super::state::{Account, Hex, NetworkMode, SecretWide};
+use super::state::{Account, NetworkMode, SecretWide};
 use anyhow::{Context, Result, bail};
 use std::io;
 use std::ptr;
@@ -110,7 +110,7 @@ pub(super) fn lookup_sid(name: &str) -> Result<String> {
 pub(super) fn random_identifier(bytes: usize) -> Result<String> {
     let mut random = vec![0_u8; bytes];
     fill_random(&mut random)?;
-    Ok(Hex::encode(&random))
+    Ok(hex::encode(&random))
 }
 
 fn create(name: &str, password: &str) -> Result<()> {

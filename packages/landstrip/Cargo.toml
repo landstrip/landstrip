@@ -44,6 +44,7 @@ socket2 = { version = "0.6", features = ["all"] }
 nix = { version = "0.31", features = ["fs", "ioctl", "mount", "poll", "process", "sched", "signal", "socket", "uio", "user"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+hex = "0.4"
 zeroize = "1.8"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
