@@ -55,7 +55,7 @@ impl PolicyFormat {
     }
 
     fn read_executable_policy(self, tool: &OsStr, cwd: &Path) -> Result<Option<Value>> {
-        let Some(exe) = resolve_executable(tool, cwd) else {
+        let Some(exe) = resolve_executable(tool, cwd)? else {
             return Ok(None);
         };
         let context = || format!("executable policy {}", exe.display());
@@ -237,22 +237,18 @@ impl Settings {
     }
 }
 
-fn resolve_executable(tool: &OsStr, cwd: &Path) -> Option<PathBuf> {
-    let base = if cfg!(unix) { cwd } else { Path::new("") };
-    let tool_path = Path::new(tool);
-    let has_location = tool_path
-        .parent()
-        .is_some_and(|parent| !parent.as_os_str().is_empty());
-
-    let candidate = if has_location {
-        locate_executable(&base.join(tool_path))?
+fn resolve_executable(tool: &OsStr, cwd: &Path) -> Result<Option<PathBuf>> {
+    let cwd = if cfg!(unix) {
+        cwd.to_path_buf()
     } else {
-        let path_var = std::env::var_os("PATH")?;
-        std::env::split_paths(&path_var)
-            .find_map(|dir| locate_executable(&base.join(dir).join(tool_path)))?
+        std::env::current_dir().map_err(Error::policy_io)?
     };
-
-    candidate.canonicalize().ok()
+    let candidate = match which::which_in(tool, std::env::var_os("PATH"), cwd) {
+        Ok(candidate) => candidate,
+        Err(which::Error::CannotFindBinaryPath) => return Ok(None),
+        Err(source) => return Err(Error::policy_io(io::Error::other(source))),
+    };
+    candidate.canonicalize().map(Some).map_err(Error::policy_io)
 }
 
 /// The extended attribute carrying a supplementary policy, in the
@@ -266,35 +262,6 @@ const EXECUTABLE_POLICY_XATTR: &std::ffi::CStr = c"user.landstrip.policy";
 /// The alternate data stream carrying the same policy on Windows.
 #[cfg(target_os = "windows")]
 const EXECUTABLE_POLICY_STREAM: &str = "landstrip.policy";
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn locate_executable(path: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::metadata(path)
-        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .then(|| path.to_path_buf())
-}
-
-#[cfg(target_os = "windows")]
-fn locate_executable(base: &Path) -> Option<PathBuf> {
-    if base.extension().is_some() {
-        return base.is_file().then(|| base.to_path_buf());
-    }
-
-    let pathext = std::env::var_os("PATHEXT")
-        .unwrap_or_else(|| std::ffi::OsString::from(".COM;.EXE;.BAT;.CMD"));
-    std::env::split_paths(&pathext).find_map(|ext| {
-        let mut candidate = base.as_os_str().to_os_string();
-        candidate.push(ext);
-        let candidate = PathBuf::from(candidate);
-        candidate.is_file().then_some(candidate)
-    })
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn locate_executable(_path: &Path) -> Option<PathBuf> {
-    None
-}
 
 #[cfg(target_os = "windows")]
 fn read_policy_bytes(exe: &Path) -> Result<Option<Vec<u8>>> {
