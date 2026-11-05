@@ -5,7 +5,10 @@
 
 use super::super::win32::{LocalSid, OsStatus, ToWideNul};
 use super::state::{Account, NetworkMode, SecretWide};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use chacha20::ChaCha20Rng;
+use rand::SeedableRng;
+use rand::distr::{Distribution, Uniform};
 use std::io;
 use std::ptr;
 use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
@@ -13,11 +16,8 @@ use windows_sys::Win32::NetworkManagement::NetManagement::{
     NERR_Success, NetUserAdd, NetUserDel, UF_DONT_EXPIRE_PASSWD, UF_NORMAL_ACCOUNT,
     UF_PASSWD_CANT_CHANGE, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
 };
-use windows_sys::Win32::Security::Cryptography::{
-    BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
-};
 use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const ACCOUNT_COMMENT: &str = "Landstrip restricted-user sandbox account";
 const PASSWORD_BYTES: usize = 32;
@@ -146,33 +146,23 @@ fn create(name: &str, password: &str) -> Result<()> {
 
 fn random_password() -> Result<String> {
     const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*-_+";
-    let mut random = vec![0_u8; PASSWORD_BYTES];
-    fill_random(&mut random)?;
+    let mut seed = Zeroizing::new(<ChaCha20Rng as SeedableRng>::Seed::default());
+    fill_random(seed.as_mut())?;
+    let mut rng = ChaCha20Rng::from_seed(*seed);
+    seed.zeroize();
+    let alphabet = Uniform::new(0, ALPHABET.len()).context("invalid password alphabet")?;
 
     let mut password = String::with_capacity(PASSWORD_BYTES + 4);
     password.push('a');
     password.push('A');
     password.push('7');
     password.push('!');
-    for byte in &random {
-        password.push(char::from(ALPHABET[*byte as usize % ALPHABET.len()]));
+    for _ in 0..PASSWORD_BYTES {
+        password.push(char::from(ALPHABET[alphabet.sample(&mut rng)]));
     }
-    random.zeroize();
     Ok(password)
 }
 
 fn fill_random(buffer: &mut [u8]) -> Result<()> {
-    let length = u32::try_from(buffer.len()).context("random buffer is too long")?;
-    let status = unsafe {
-        BCryptGenRandom(
-            ptr::null_mut(),
-            buffer.as_mut_ptr(),
-            length,
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        )
-    };
-    if status < 0 {
-        bail!("BCryptGenRandom failed with NTSTATUS 0x{status:08x}");
-    }
-    Ok(())
+    getrandom::fill(buffer).context("generate sandbox account randomness")
 }
