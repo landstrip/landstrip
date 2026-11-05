@@ -425,14 +425,10 @@ struct OpenDenial {
     grant: Option<OpenGrant>,
     reason: DenialReason,
     pid: u32,
-    report: bool,
 }
 
 impl OpenDenial {
     fn deny(self, denials: &mut Denials<'_>, allow_query: bool) -> SysResult<NotificationResult> {
-        if !self.report {
-            return Err(BrokerError::PolicyDenied);
-        }
         // SECCOMP_IOCTL_NOTIF_ADDFD cannot inject O_PATH descriptors.
         let grant = if self.flags & libc::O_PATH != 0 {
             None
@@ -770,7 +766,6 @@ pub(super) fn handle_openat(
     let anonymous = target.anonymous;
     let open_grant = OpenGrant::new(target, flags, mode, resolve);
     let wants_write = flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0;
-    let reports_write = flags & (libc::O_CREAT | libc::O_TRUNC | libc::O_APPEND) != 0;
     let wants_read = flags & libc::O_WRONLY == 0;
     let hard_read_denied = wants_read && policy.read_denials.is_denied_always(&resolved, &lexical);
     let hard_write_denied =
@@ -798,7 +793,6 @@ pub(super) fn handle_openat(
             grant: open_grant,
             reason,
             pid: request.pid,
-            report: reports_write,
         }
         .deny(denials, allow_query);
     }
@@ -812,7 +806,6 @@ pub(super) fn handle_openat(
             grant: open_grant,
             reason,
             pid: request.pid,
-            report: true,
         }
         .deny(denials, allow_query);
     }
