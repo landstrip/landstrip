@@ -432,9 +432,14 @@ impl UnixSocketOp {
         })?;
         let access =
             policy.unix_path_access(&target.label, anchor.target.as_ref().map(AsFd::as_fd));
-        if matches!(access, UnixPathAccess::Supervisor)
-            || (matches!(self, Self::Bind) && policy.write_reason(&target.label, true).is_some())
-        {
+        if matches!(access, UnixPathAccess::Supervisor) {
+            log::debug!(
+                "service manager socket {operation:?} denied: {}",
+                target.label.display()
+            );
+            return Err(BrokerError::PolicyDenied);
+        }
+        if matches!(self, Self::Bind) && policy.write_reason(&target.label, true).is_some() {
             return denials.deny(
                 Denial::Network(
                     operation,
