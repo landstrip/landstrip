@@ -273,8 +273,19 @@ impl Error {
         }
     }
 
-    pub(crate) fn errno_name(&self) -> Option<&'static str> {
-        self.errno().and_then(Self::errno_symbol)
+    pub(crate) fn errno_name(&self) -> Option<String> {
+        self.errno().and_then(|errno| {
+            #[cfg(unix)]
+            {
+                let errno = nix::errno::Errno::from_raw(errno);
+                (errno != nix::errno::Errno::UnknownErrno).then(|| format!("{errno:?}"))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = errno;
+                None
+            }
+        })
     }
 
     pub(crate) fn message(&self) -> String {
@@ -300,27 +311,6 @@ impl Error {
         error
             .chain()
             .find_map(<dyn StdError + 'static>::downcast_ref::<Self>)
-    }
-
-    const fn errno_symbol(errno: i32) -> Option<&'static str> {
-        match errno {
-            libc::E2BIG => Some("E2BIG"),
-            libc::EACCES => Some("EACCES"),
-            libc::EAGAIN => Some("EAGAIN"),
-            libc::EBADF => Some("EBADF"),
-            libc::EFAULT => Some("EFAULT"),
-            libc::EINVAL => Some("EINVAL"),
-            libc::EIO => Some("EIO"),
-            libc::EISDIR => Some("EISDIR"),
-            libc::ELOOP => Some("ELOOP"),
-            libc::ENAMETOOLONG => Some("ENAMETOOLONG"),
-            libc::ENOENT => Some("ENOENT"),
-            libc::ENOEXEC => Some("ENOEXEC"),
-            libc::ENOMEM => Some("ENOMEM"),
-            libc::ENOTDIR => Some("ENOTDIR"),
-            libc::EPERM => Some("EPERM"),
-            _ => None,
-        }
     }
 }
 

@@ -166,7 +166,7 @@ pub(crate) struct LaunchTrap {
     pub(crate) code: &'static str,
     pub(crate) program: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) errno: Option<&'static str>,
+    pub(crate) errno: Option<String>,
     pub(crate) message: String,
 }
 
