@@ -423,17 +423,14 @@ impl PolicyResolver {
         let mut denied_roots = resolved_deny.concrete;
         #[cfg(target_os = "windows")]
         denied_roots.retain_windows_deny_roots();
-        let mut always_roots = resolved_always.concrete;
-        always_roots.normalize_roots();
-
         Ok(ResolvedWritePolicy {
             roots: allow,
             denials: DenialScope {
                 roots: denied_roots,
                 patterns: resolved_deny.patterns,
                 carveouts,
-                always_roots: always_roots.into_boxed_slice(),
-                always_patterns: resolved_always.patterns.into_boxed_slice(),
+                always_roots: resolved_always.concrete,
+                always_patterns: resolved_always.patterns,
             },
             denied_links,
         })
@@ -475,8 +472,8 @@ impl PolicyResolver {
                 roots: denied_roots,
                 patterns: resolved_deny.patterns,
                 carveouts,
-                always_roots: resolved_always.concrete.into_boxed_slice(),
-                always_patterns: resolved_always.patterns.into_boxed_slice(),
+                always_roots: resolved_always.concrete,
+                always_patterns: resolved_always.patterns,
             },
             symlinks: lowered.symlinks,
         })

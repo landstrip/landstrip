@@ -80,9 +80,9 @@ pub(crate) struct DenialScope {
     pub(crate) patterns: Vec<GlobPatternBuf>,
     pub(crate) carveouts: Carveouts,
     #[cfg_attr(target_os = "windows", allow(dead_code))]
-    pub(crate) always_roots: Box<[PathBuf]>,
+    pub(crate) always_roots: Vec<PathBuf>,
     #[cfg_attr(target_os = "windows", allow(dead_code))]
-    pub(crate) always_patterns: Box<[GlobPatternBuf]>,
+    pub(crate) always_patterns: Vec<GlobPatternBuf>,
 }
 
 #[cfg(target_os = "linux")]
