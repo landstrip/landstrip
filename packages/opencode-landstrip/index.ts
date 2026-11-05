@@ -37,9 +37,8 @@ import {
 } from '@landstrip/landstrip-api/shared';
 
 import {
-  getConfigPaths,
+  SandboxConfigStore,
   landstripBinaryPath,
-  loadConfig,
   normalizeOptions,
   readDiscoveryPort,
   trapSessionHelloLine,
@@ -479,26 +478,17 @@ function evaluateToolPermissions(
   return [];
 }
 
-function errorWithConfigPaths(baseDirectory: string, message: string): Error {
-  const { globalPath, projectPath } = getConfigPaths(baseDirectory);
-  return new Error(`${message}\n\nUpdate sandbox config in:\n  ${projectPath}\n  ${globalPath}`);
-}
-
 const plugin: Plugin.Plugin = {
   id: 'opencode-landstrip',
   async setup(context: Plugin.Context) {
     const directory = context.location?.directory ?? process.cwd();
-    const optionOverrides = normalizeOptions(context.options);
+    const configStore = new SandboxConfigStore(directory, normalizeOptions(context.options));
     const pendingCallIDByCommand = new Map<string, string>();
     const pendingSessionIDByCommand = new Map<string, string>();
     const activeBash = new Map<string, BashSandboxState>();
     const notified = new Set<string>();
     let enabledNotified = false;
     let landstripCheck: { ok: true; version: string } | { ok: false; reason: string } | undefined;
-    function reportBlocked(decision: SandboxPermissionDecision): never {
-      throw errorWithConfigPaths(directory, decision.message);
-    }
-
     async function notifyOnce(key: string, message: string, variant: ToastVariant): Promise<void> {
       if (notified.has(key)) return;
       notified.add(key);
@@ -551,7 +541,7 @@ const plugin: Plugin.Plugin = {
     }
 
     async function activeConfig(): Promise<SandboxConfig | null> {
-      const config = loadConfig(directory, optionOverrides);
+      const config = configStore.load();
       if (!config.enabled) {
         await notifyOnce(
           `not-configured:${directory}`,
@@ -656,7 +646,7 @@ const plugin: Plugin.Plugin = {
       const allowNetwork = config.network.allowNetwork;
       if (!allowNetwork) {
         for (const decision of evaluateCommandDomains(args.command as string, config)) {
-          if (decision.status !== 'allow') throw errorWithConfigPaths(directory, decision.message);
+          if (decision.status !== 'allow') throw configStore.errorWithPaths(decision.message);
         }
       }
 
@@ -803,7 +793,7 @@ const plugin: Plugin.Plugin = {
           // These host tools assert their own permission during execution.
           continue;
         }
-        reportBlocked(decision);
+        throw configStore.errorWithPaths(decision.message);
       }
     });
 

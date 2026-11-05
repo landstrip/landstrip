@@ -24,19 +24,15 @@ import {
 } from '@landstrip/landstrip-api/shared';
 
 import {
+  SandboxConfigStore,
   decodeTrapSessionHello,
-  getConfigPaths,
-  loadConfig,
   normalizeOptions,
   nextSandboxPermissionIndex,
   removeDiscoveryFile,
   sessionAllowancesFor,
-  sandboxConfigTarget,
   rootSessionIDFor,
-  setSandboxConfigEnabled,
   shouldRenderSandboxPermission,
   type SessionAllowances,
-  writeConfigFile,
   writeDiscoveryPort,
 } from './shared.js';
 
@@ -139,6 +135,7 @@ const tui: TuiPlugin.Definition = {
     const directory = context.location?.directory ?? process.cwd();
     const optionOverrides = normalizeOptions(context.options);
     const enabledManagedByOptions = optionOverrides.enabled !== undefined;
+    const configStore = new SandboxConfigStore(directory, optionOverrides);
 
     function LandstripPermissionPrompt(rawProps: Record<string, unknown>) {
       const props = rawProps as unknown as PermissionPromptProps<string>;
@@ -473,7 +470,8 @@ const tui: TuiPlugin.Definition = {
       const action = choice === 'deny' ? 'deny' : 'allow';
       const verb = entry.operation === 'read' ? 'Read' : 'Write';
       const directory = entry.directory;
-      const config = loadConfig(directory, optionOverrides);
+      const store = configStore.forDirectory(directory);
+      const config = store.load();
       const allowances = sessionAllowancesFor(sessionAllowances, entry.sessionID);
       const sessionPaths =
         entry.operation === 'read' ? allowances.readPaths : allowances.writePaths;
@@ -495,8 +493,7 @@ const tui: TuiPlugin.Definition = {
       try {
         if (action === 'allow') {
           if (choice === 'project' || choice === 'global') {
-            const { globalPath, projectPath } = getConfigPaths(directory);
-            writeConfigFile(choice === 'project' ? projectPath : globalPath, {
+            store.persistGrant(choice, {
               filesystem:
                 entry.operation === 'read' ? { allowRead: scopes } : { allowWrite: scopes },
             });
@@ -533,8 +530,7 @@ const tui: TuiPlugin.Definition = {
       try {
         if (action === 'allow') {
           if (path.isAbsolute(entry.target) && (choice === 'project' || choice === 'global')) {
-            const { globalPath, projectPath } = getConfigPaths(entry.directory);
-            writeConfigFile(choice === 'project' ? projectPath : globalPath, {
+            configStore.forDirectory(entry.directory).persistGrant(choice, {
               network: { allowUnixSockets: [entry.target] },
             });
           }
@@ -618,7 +614,7 @@ const tui: TuiPlugin.Definition = {
               if (seen.has(trap.query_id)) continue;
               seen.add(trap.query_id);
 
-              const config = loadConfig(sessionDirectory, optionOverrides);
+              const config = configStore.forDirectory(sessionDirectory).load();
               if (!config.enabled) {
                 respondQuery(socket, trap.query_id, 'allow');
                 continue;
@@ -762,14 +758,14 @@ const tui: TuiPlugin.Definition = {
         return;
       }
 
-      const config = loadConfig(directory, optionOverrides);
+      const config = configStore.load();
       if (config.enabled && !confirmingDisable()) {
         setConfirmingDisable(true);
         return;
       }
       setConfirmingDisable(false);
       const enabled = !config.enabled;
-      const scope = setSandboxConfigEnabled(directory, enabled, optionOverrides);
+      const scope = configStore.setEnabled(enabled);
       refreshSandboxStatus?.();
       context.ui.toast.show({
         title: 'Landstrip',
@@ -811,8 +807,8 @@ const tui: TuiPlugin.Definition = {
         get children() {
           if (!landstripOpen()) return null;
           sandboxRevision();
-          const config = loadConfig(directory, optionOverrides);
-          const target = sandboxConfigTarget(directory);
+          const config = configStore.load();
+          const target = configStore.target();
           const values = (items: readonly string[]) => items.join(', ') || 'none';
           const status = enabledManagedByOptions
             ? config.enabled
@@ -910,7 +906,7 @@ const tui: TuiPlugin.Definition = {
     // Persistent status badge in the prompt area.
     const statusBadge = () => {
       sandboxRevision();
-      const config = loadConfig(directory, optionOverrides);
+      const config = configStore.load();
       const theme = resolveThemeColors(context.theme);
 
       if (!config.enabled) return jsx('text', { fg: theme.textMuted, children: 'sandbox off' });

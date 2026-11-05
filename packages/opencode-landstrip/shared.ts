@@ -23,74 +23,113 @@ export function normalizeOptions(options: unknown): SandboxConfigOverrides {
   if (!isRecord(options.config)) throw new Error('config must be an object');
   return parseSandboxConfig(options.config);
 }
-export function getConfigPaths(baseDirectory: string): { globalPath: string; projectPath: string } {
-  const configHome = process.env.XDG_CONFIG_HOME;
-  const configDirectory =
-    configHome && isAbsolute(configHome) ? configHome : join(homedir(), '.config');
-  return {
-    globalPath: join(configDirectory, 'opencode', 'sandbox.json'),
-    projectPath: join(baseDirectory, '.opencode', 'sandbox.json'),
-  };
-}
 
-export function readConfigFile(configPath: string): SandboxConfigOverrides {
-  if (!existsSync(configPath)) return {};
+export class SandboxConfigStore {
+  constructor(
+    readonly baseDirectory: string,
+    private readonly optionOverrides: SandboxConfigOverrides = {},
+  ) {}
 
-  try {
-    return parseSandboxConfig(JSON.parse(readFileSync(configPath, 'utf-8')));
-  } catch (error) {
-    throw new Error(
-      `Could not load ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
-      { cause: error },
+  get globalPath(): string {
+    const configHome = process.env.XDG_CONFIG_HOME;
+    const configDirectory =
+      configHome && isAbsolute(configHome) ? configHome : join(homedir(), '.config');
+    return join(configDirectory, 'opencode', 'sandbox.json');
+  }
+
+  get projectPath(): string {
+    return join(this.baseDirectory, '.opencode', 'sandbox.json');
+  }
+
+  forDirectory(directory: string): SandboxConfigStore {
+    return directory === this.baseDirectory
+      ? this
+      : new SandboxConfigStore(directory, this.optionOverrides);
+  }
+
+  private static read(configPath: string): SandboxConfigOverrides {
+    if (!existsSync(configPath)) return {};
+
+    try {
+      return parseSandboxConfig(JSON.parse(readFileSync(configPath, 'utf-8')));
+    } catch (error) {
+      throw new Error(
+        `Could not load ${configPath}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  }
+
+  load(): SandboxConfig {
+    const { globalPath, projectPath } = this;
+    const templatePath = join(packageDir, 'sandbox.json');
+
+    if (!existsSync(globalPath)) {
+      mkdirSync(dirname(globalPath), { recursive: true });
+      writeFileSync(globalPath, readFileSync(templatePath, 'utf-8'), 'utf-8');
+    }
+
+    const templateConfig: SandboxConfig = JSON.parse(readFileSync(templatePath, 'utf-8'));
+    templateConfig.filesystem.denyWrite.push(globalPath);
+    const globalOverrides = SandboxConfigStore.read(globalPath);
+    const baseConfig = deepMergeSandboxConfig(templateConfig, globalOverrides);
+
+    return deepMergeSandboxConfig(
+      deepMergeSandboxConfig(baseConfig, SandboxConfigStore.read(projectPath)),
+      this.optionOverrides,
     );
   }
-}
 
-export function loadConfig(
-  baseDirectory: string,
-  optionOverrides: SandboxConfigOverrides,
-): SandboxConfig {
-  const { globalPath, projectPath } = getConfigPaths(baseDirectory);
-  const templatePath = join(packageDir, 'sandbox.json');
+  private static write(configPath: string, update: SandboxConfigOverrides): void {
+    const next: Record<string, unknown> = { ...SandboxConfigStore.read(configPath) };
+    for (const [key, value] of Object.entries(parseSandboxConfig(update))) {
+      if (!isRecord(value)) {
+        next[key] = value;
+        continue;
+      }
 
-  if (!existsSync(globalPath)) {
-    mkdirSync(dirname(globalPath), { recursive: true });
-    writeFileSync(globalPath, readFileSync(templatePath, 'utf-8'), 'utf-8');
-  }
-
-  const templateConfig: SandboxConfig = JSON.parse(readFileSync(templatePath, 'utf-8'));
-  templateConfig.filesystem.denyWrite.push(globalPath);
-  const globalOverrides = readConfigFile(globalPath);
-  const baseConfig = deepMergeSandboxConfig(templateConfig, globalOverrides);
-
-  return deepMergeSandboxConfig(
-    deepMergeSandboxConfig(baseConfig, readConfigFile(projectPath)),
-    optionOverrides,
-  );
-}
-
-export function writeConfigFile(configPath: string, update: SandboxConfigOverrides): void {
-  const next: Record<string, unknown> = { ...readConfigFile(configPath) };
-  for (const [key, value] of Object.entries(parseSandboxConfig(update))) {
-    if (!isRecord(value)) {
-      next[key] = value;
-      continue;
+      const previous = next[key];
+      const section: Record<string, unknown> = isRecord(previous) ? { ...previous } : {};
+      for (const [field, fieldValue] of Object.entries(value)) {
+        if (fieldValue === undefined) continue;
+        const existing = section[field];
+        section[field] = Array.isArray(fieldValue)
+          ? mergeArray(Array.isArray(existing) ? existing : [], fieldValue)
+          : fieldValue;
+      }
+      next[key] = section;
     }
 
-    const previous = next[key];
-    const section: Record<string, unknown> = isRecord(previous) ? { ...previous } : {};
-    for (const [field, fieldValue] of Object.entries(value)) {
-      if (fieldValue === undefined) continue;
-      const existing = section[field];
-      section[field] = Array.isArray(fieldValue)
-        ? mergeArray(Array.isArray(existing) ? existing : [], fieldValue)
-        : fieldValue;
-    }
-    next[key] = section;
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(configPath, JSON.stringify(next, null, 2) + '\n');
   }
 
-  mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, JSON.stringify(next, null, 2) + '\n');
+  // Toggle where enabled already lives, falling back to the global config.
+  target(): { scope: 'project' | 'global'; path: string } {
+    const { globalPath, projectPath } = this;
+    return SandboxConfigStore.read(projectPath).enabled !== undefined
+      ? { scope: 'project', path: projectPath }
+      : { scope: 'global', path: globalPath };
+  }
+
+  setEnabled(enabled: boolean): 'project' | 'global' {
+    if (this.optionOverrides.enabled !== undefined) {
+      throw new Error('Sandbox state is managed by plugin options');
+    }
+
+    const target = this.target();
+    SandboxConfigStore.write(target.path, { enabled });
+    return target.scope;
+  }
+
+  persistGrant(scope: 'project' | 'global', update: SandboxConfigOverrides): void {
+    SandboxConfigStore.write(scope === 'project' ? this.projectPath : this.globalPath, update);
+  }
+
+  errorWithPaths(message: string): Error {
+    const { globalPath, projectPath } = this;
+    return new Error(`${message}\n\nUpdate sandbox config in:\n  ${projectPath}\n  ${globalPath}`);
+  }
 }
 
 let _landstripBinaryPath: string | undefined;
@@ -209,34 +248,6 @@ function directoryHash(baseDirectory: string): string {
 
 export function discoveryFilePath(baseDirectory: string): string {
   return join(discoveryDir(), `port-${directoryHash(baseDirectory)}.json`);
-}
-
-// /landstrip toggles the persisted `enabled` flag. Write it where the setting
-// already lives — the project config if it sets `enabled`, otherwise the global
-// config — and return the scope written so the UI can report it.
-export function sandboxConfigTarget(baseDirectory: string): {
-  scope: 'project' | 'global';
-  path: string;
-} {
-  const { globalPath, projectPath } = getConfigPaths(baseDirectory);
-  const useProject = readConfigFile(projectPath).enabled !== undefined;
-  return useProject
-    ? { scope: 'project', path: projectPath }
-    : { scope: 'global', path: globalPath };
-}
-
-export function setSandboxConfigEnabled(
-  baseDirectory: string,
-  enabled: boolean,
-  optionOverrides: SandboxConfigOverrides = {},
-): 'project' | 'global' {
-  if (optionOverrides.enabled !== undefined) {
-    throw new Error('Sandbox state is managed by plugin options');
-  }
-
-  const target = sandboxConfigTarget(baseDirectory);
-  writeConfigFile(target.path, { enabled });
-  return target.scope;
 }
 
 export function writeDiscoveryPort(baseDirectory: string, port: number): void {
