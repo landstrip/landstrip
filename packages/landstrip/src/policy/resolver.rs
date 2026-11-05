@@ -397,14 +397,14 @@ impl PolicyResolver {
             anchor_paths.into_iter().map(WriteAnchorRoot::new).collect();
 
         let always_selectors =
-            Self::anchor_write_deny_selectors(&filesystem.deny_write_always, &anchor_roots, true);
+            Self::anchor_write_deny_selectors(&filesystem.deny_write_always, &anchor_roots, true)?;
         let mut resolved_always = self.resolve_deny_paths(&always_selectors, true)?;
         resolved_always.merge_expanded();
         allow.retain(|path| !resolved_always.matches(path));
         anchor_roots.retain(|root| !resolved_always.matches(&root.path));
 
         let deny_selectors =
-            Self::anchor_write_deny_selectors(&filesystem.deny_write, &anchor_roots, false);
+            Self::anchor_write_deny_selectors(&filesystem.deny_write, &anchor_roots, false)?;
         // Unix mediates denyWrite globs dynamically (seccomp on Linux, Seatbelt
         // regex on macOS); expanding them here scans the entire project tree before
         // even starting a simple command.
@@ -572,10 +572,21 @@ impl PolicyResolver {
         paths: &[PathSelector],
         write_allow: &[WriteAnchorRoot],
         anchor_root_name: bool,
-    ) -> Vec<PathSelector> {
-        let mut anchored = Vec::with_capacity(paths.len() * (1 + write_allow.len()));
+    ) -> Result<Vec<PathSelector>> {
+        let mut anchored = Vec::new();
+        let mut push = |selector| -> Result<()> {
+            const LIMIT: usize = 65_536;
+            if anchored.len() >= LIMIT {
+                return Err(PolicyViolation::SelectorLimit.into());
+            }
+            anchored
+                .try_reserve(1)
+                .map_err(|error| Error::policy_io(io::Error::other(error)))?;
+            anchored.push(selector);
+            Ok(())
+        };
         for selector in paths {
-            anchored.push(selector.clone());
+            push(selector.clone())?;
             if selector.is_base_relative() {
                 let relative = Path::new(selector.as_str()).clean_lexically();
                 let relative_str = relative.to_string_lossy();
@@ -591,16 +602,16 @@ impl PolicyResolver {
                             }
                         })
                     {
-                        anchored.push(PathSelector::literal_path(&root.path));
+                        push(PathSelector::literal_path(&root.path))?;
                     }
                     if !root.is_dir() {
                         continue;
                     }
-                    anchored.push(selector.join_under(&root.path));
+                    push(selector.join_under(&root.path))?;
                 }
             }
         }
-        anchored
+        Ok(anchored)
     }
 
     fn resolve_deny_paths(
