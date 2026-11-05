@@ -5,7 +5,6 @@ use super::error::{BrokerError, SysResult};
 use super::notify::{NotificationChannel, NotificationResponse};
 use super::process::ResolvedPath;
 use super::procfs::{Anchor, OpenHow, ProcFd};
-use crate::error::Error as LandstripError;
 use crate::policy::AccessPolicy;
 use nix::errno::Errno;
 use nix::sys::stat::fstat;
@@ -272,10 +271,7 @@ impl OpenGrant {
         };
 
         if notify.add_fd(&addfd).is_err() {
-            let _ = notify.respond(NotificationResponse::error(
-                id,
-                LandstripError::DENIAL_ERRNO,
-            ));
+            let _ = notify.respond(NotificationResponse::error(id, libc::EACCES));
         }
     }
 }

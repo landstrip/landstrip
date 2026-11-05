@@ -374,10 +374,8 @@ impl<'a> Supervisor<'a> {
                     if let Err(error) = self.denials.write(&decision.trap) {
                         log::debug!("trap query write failed: {error}");
                         self.disconnect_control();
-                        self.notify.respond(NotificationResponse::error(
-                            request.id,
-                            LandstripError::DENIAL_ERRNO,
-                        ))?;
+                        self.notify
+                            .respond(NotificationResponse::error(request.id, libc::EACCES))?;
                     } else {
                         self.pending_queries.insert(
                             decision.query_id,
@@ -549,10 +547,9 @@ impl<'a> Supervisor<'a> {
                         }
                     },
                     ControlAction::Deny => {
-                        let _ = self.notify.respond(NotificationResponse::error(
-                            id,
-                            LandstripError::DENIAL_ERRNO,
-                        ));
+                        let _ = self
+                            .notify
+                            .respond(NotificationResponse::error(id, libc::EACCES));
                     }
                 }
             }
@@ -564,10 +561,9 @@ impl<'a> Supervisor<'a> {
         for (_id, pending) in self.pending_queries.drain() {
             let id = pending.request.id;
             if self.notify.is_id_valid(id).unwrap_or(false) {
-                let _ = self.notify.respond(NotificationResponse::error(
-                    id,
-                    LandstripError::DENIAL_ERRNO,
-                ));
+                let _ = self
+                    .notify
+                    .respond(NotificationResponse::error(id, libc::EACCES));
             }
         }
         self.denials.disable_queries();

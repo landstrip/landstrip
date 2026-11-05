@@ -142,13 +142,6 @@ impl From<PolicyViolation> for Error {
 }
 
 impl Error {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) const DENIAL_ERRNO: i32 = libc::EACCES;
-
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) const DENIAL_ERRNO_NAME: &'static str = Self::errno_symbol(Self::DENIAL_ERRNO)
-        .expect("DENIAL_ERRNO must map to a POSIX errno name");
-
     pub(crate) fn sandbox_setup(mechanism: Mechanism, source: impl Into<Cause>) -> Self {
         Self::SandboxSetupFailed {
             mechanism,

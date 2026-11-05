@@ -136,7 +136,7 @@ impl FilesystemDenial {
             path: path.into_owned(),
             requested_path: self.requested_path.to_string_lossy().into_owned(),
             syscall: self.syscall,
-            errno: Error::DENIAL_ERRNO_NAME,
+            errno: "EACCES",
             flags: self.flags,
             reason: self.reason,
             suggested_grant,
@@ -221,7 +221,7 @@ impl Trap {
             operation,
             target,
             syscall,
-            errno: Error::DENIAL_ERRNO_NAME,
+            errno: "EACCES",
             mechanism: Mechanism::Seccomp,
             process,
         }))

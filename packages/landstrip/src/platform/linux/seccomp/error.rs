@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::error::Error as LandstripError;
 use nix::errno::Errno;
 use std::io;
 
@@ -23,7 +22,7 @@ impl BrokerError {
 
     pub(crate) fn errno(self) -> i32 {
         match self {
-            Self::PolicyDenied => LandstripError::DENIAL_ERRNO,
+            Self::PolicyDenied => libc::EACCES,
             Self::AddressFamilyNotSupported => libc::EAFNOSUPPORT,
             Self::InvalidAddress => libc::EINVAL,
             Self::BadFileDescriptor => libc::EBADF,
