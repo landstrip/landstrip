@@ -35,6 +35,7 @@ which = "8.0"
 
 [target.'cfg(unix)'.dependencies]
 nix = "0.31"
+xattr = "1.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

@@ -257,7 +257,7 @@ fn resolve_executable(tool: &OsStr, cwd: &Path) -> Result<Option<PathBuf>> {
 /// supplements. A sysadmin who wants it root-only protects the executable
 /// itself, the same way they would protect a `sandbox.json`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const EXECUTABLE_POLICY_XATTR: &std::ffi::CStr = c"user.landstrip.policy";
+const EXECUTABLE_POLICY_XATTR: &str = "user.landstrip.policy";
 
 /// The alternate data stream carrying the same policy on Windows.
 #[cfg(target_os = "windows")]
@@ -282,96 +282,14 @@ fn read_policy_bytes(_exe: &Path) -> Result<Option<Vec<u8>>> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_policy_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|source| Error::policy_io(io::Error::new(io::ErrorKind::InvalidInput, source)))?;
-
-    // SAFETY: c_path and EXECUTABLE_POLICY_XATTR are live NUL-terminated C strings;
-    // a null value pointer with size 0 only queries the attribute's length.
-    let needed = unsafe {
-        platform_getxattr(
-            c_path.as_ptr(),
-            EXECUTABLE_POLICY_XATTR.as_ptr(),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if needed < 0 {
-        return classify_xattr_error();
+    // Follow the executable's target, not the symlink's own attributes.
+    // Only a missing attribute or file is optional; other failures must not
+    // silently skip a policy that might have tightened access.
+    match xattr::get_deref(path, EXECUTABLE_POLICY_XATTR) {
+        Ok(bytes) => Ok(bytes),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::policy_io(source)),
     }
-    if needed == 0 {
-        return Ok(Some(Vec::new()));
-    }
-
-    let needed = usize::try_from(needed).map_err(|_| {
-        Error::policy_io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "xattr size does not fit usize",
-        ))
-    })?;
-    let mut buffer = vec![0u8; needed];
-    // SAFETY: buffer is valid for writes of its own length, which is passed
-    // as the size bound alongside it.
-    let got = unsafe {
-        platform_getxattr(
-            c_path.as_ptr(),
-            EXECUTABLE_POLICY_XATTR.as_ptr(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-        )
-    };
-    if got < 0 {
-        return classify_xattr_error();
-    }
-
-    let got = usize::try_from(got).map_err(|_| {
-        Error::policy_io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "xattr size does not fit usize",
-        ))
-    })?;
-    buffer.truncate(got);
-    Ok(Some(buffer))
-}
-
-/// `ENODATA` (Linux) or `ENOATTR` (macOS) means the attribute is absent:
-/// nothing to merge. Anything else — `ENOTSUP`, `EACCES`, `ERANGE`, a vanished
-/// file — fails the invocation instead of silently skipping a policy that
-/// might have tightened access.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn classify_xattr_error() -> Result<Option<Vec<u8>>> {
-    #[cfg(target_os = "linux")]
-    let missing = libc::ENODATA;
-    #[cfg(target_os = "macos")]
-    let missing = libc::ENOATTR;
-
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(code) if code == missing || code == libc::ENOENT => Ok(None),
-        _ => Err(Error::policy_io(error)),
-    }
-}
-
-#[cfg(target_os = "linux")]
-unsafe fn platform_getxattr(
-    path: *const libc::c_char,
-    name: *const libc::c_char,
-    value: *mut libc::c_void,
-    size: libc::size_t,
-) -> libc::ssize_t {
-    unsafe { libc::getxattr(path, name, value, size) }
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn platform_getxattr(
-    path: *const libc::c_char,
-    name: *const libc::c_char,
-    value: *mut libc::c_void,
-    size: libc::size_t,
-) -> libc::ssize_t {
-    unsafe { libc::getxattr(path, name, value, size, 0, 0) }
 }
 
 fn deserialize_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<PathSelector>, D::Error>
