@@ -380,6 +380,127 @@ class SandboxConfigStore {
   }
 }
 
+type GrantChoice = Exclude<PermissionChoice, 'abort'>;
+
+class SessionGrants {
+  private readonly domains: string[] = [];
+  private readonly readPaths: string[] = [];
+  private readonly writePaths: string[] = [];
+  private readonly unixSockets: string[] = [];
+  private readonly targets: string[] = [];
+
+  private static addUnique(target: string[] | undefined, value: string): void {
+    if (target && !target.includes(value)) target.push(value);
+  }
+
+  reset(): void {
+    this.domains.length = 0;
+    this.readPaths.length = 0;
+    this.writePaths.length = 0;
+    this.unixSockets.length = 0;
+    this.targets.length = 0;
+  }
+
+  overview(): Pick<SandboxOverview, 'sessionDomains' | 'sessionReadPaths' | 'sessionWritePaths'> {
+    return {
+      sessionDomains: [...this.domains],
+      sessionReadPaths: [...this.readPaths],
+      sessionWritePaths: [...this.writePaths],
+    };
+  }
+
+  domainOverrides(allowances?: ExecutionAllowances): string[] {
+    return [...new Set([...this.domains, ...(allowances?.domains ?? [])])];
+  }
+
+  effectiveUnixSockets(base: readonly string[]): string[] {
+    return [...new Set([...base, ...this.unixSockets])];
+  }
+
+  effectiveAllowRead(
+    config: SandboxConfig,
+    cwd: string,
+    allowances?: ExecutionAllowances,
+  ): string[] {
+    const paths = [
+      ...new Set([
+        ...config.filesystem.allowRead,
+        ...this.readPaths,
+        ...(allowances?.readPaths ?? []),
+      ]),
+    ];
+    if (process.platform !== 'win32') return paths;
+
+    return paths.filter(
+      (path) => !path.startsWith('/') && (path.includes('*') || existsSync(expandPath(path, cwd))),
+    );
+  }
+
+  effectiveAllowWrite(config: SandboxConfig, allowances?: ExecutionAllowances): string[] {
+    const paths = [
+      ...new Set([
+        ...config.filesystem.allowWrite,
+        ...this.writePaths,
+        ...(allowances?.writePaths ?? []),
+      ]),
+    ];
+    return process.platform === 'win32' ? paths.filter((path) => !path.startsWith('/')) : paths;
+  }
+
+  explicitAllowRead(base: string[], approvedPaths: readonly string[]): string[] {
+    return mergeArray(base, [...this.readPaths, ...approvedPaths]);
+  }
+
+  hasTarget(key: string, allowances: ExecutionAllowances): boolean {
+    return this.targets.includes(key) || allowances.targets.includes(key);
+  }
+
+  grantDomain(choice: GrantChoice, domain: string, allowances?: ExecutionAllowances): void {
+    SessionGrants.addUnique(choice === 'once' ? allowances?.domains : this.domains, domain);
+  }
+
+  grantTarget(choice: GrantChoice, key: string, allowances: ExecutionAllowances): void {
+    SessionGrants.addUnique(choice === 'once' ? allowances.targets : this.targets, key);
+  }
+
+  grantUnixSocket(
+    choice: GrantChoice,
+    socketPath: string,
+    key: string,
+    allowances?: ExecutionAllowances,
+  ): void {
+    if (choice === 'once') {
+      SessionGrants.addUnique(allowances?.targets, key);
+      return;
+    }
+    SessionGrants.addUnique(this.unixSockets, socketPath);
+    SessionGrants.addUnique(this.targets, key);
+  }
+
+  grantRead(
+    choice: GrantChoice,
+    scopes: readonly string[],
+    allowances?: ExecutionAllowances,
+  ): void {
+    const target = choice === 'once' ? allowances?.readPaths : this.readPaths;
+    for (const entry of scopes) {
+      SessionGrants.addUnique(target, entry);
+      SessionGrants.addUnique(allowances?.explicitDenyRead?.approvedPaths, entry);
+    }
+  }
+
+  grantWrite(
+    choice: GrantChoice,
+    scopes: readonly string[],
+    allowances?: ExecutionAllowances,
+  ): void {
+    const target = choice === 'once' ? allowances?.writePaths : this.writePaths;
+    for (const entry of scopes) {
+      SessionGrants.addUnique(target, entry);
+    }
+  }
+}
+
 type WindowsImplementation = 'appContainer' | 'restrictedUser';
 
 interface WindowsStatus {
@@ -438,10 +559,6 @@ function restrictedUserProxyPortRange(): ProxyPortRange | undefined {
     );
   }
   return { low: status.proxyPortLow!, high: status.proxyPortHigh! };
-}
-
-function mergeAllowances(base: string[], session: string[], execution?: string[]): string[] {
-  return [...base, ...session, ...(execution ?? [])];
 }
 
 export function matchesPattern(
@@ -652,29 +769,19 @@ async function showPermissionPrompt(
   return option.action;
 }
 
-function promptReadBlock(
+function promptFilesystemBlock(
   ctx: ExtensionContext,
+  operation: 'read' | 'write',
   filePath: string,
   reason?: string,
   signal?: AbortSignal,
   label?: string,
 ): Promise<PermissionChoice> {
+  const [verb, denyField, allowField] =
+    operation === 'read' ? ['Read', 'denyRead', 'allowRead'] : ['Write', 'denyWrite', 'allowWrite'];
   const title = reason
-    ? `Read blocked: "${filePath}" is in denyRead (${reason})`
-    : `Read blocked: "${filePath}" is not in allowRead`;
-  return showPermissionPrompt(ctx, title, permissionOptionsFor(ctx), signal, label);
-}
-
-function promptWriteBlock(
-  ctx: ExtensionContext,
-  filePath: string,
-  reason?: string,
-  signal?: AbortSignal,
-  label?: string,
-): Promise<PermissionChoice> {
-  const title = reason
-    ? `Write blocked: "${filePath}" is in denyWrite (${reason})`
-    : `Write blocked: "${filePath}" is not in allowWrite`;
+    ? `${verb} blocked: "${filePath}" is in ${denyField} (${reason})`
+    : `${verb} blocked: "${filePath}" is not in ${allowField}`;
   return showPermissionPrompt(ctx, title, permissionOptionsFor(ctx), signal, label);
 }
 
@@ -952,11 +1059,7 @@ function createLandstripIntegrationWithPrompts(
   let externalPermissionAskProvider: LandstripPermissionAskProvider | undefined;
   const eventHandlers = new Set<(event: LandstripEvent) => void>();
   const workerExtensions = new Map<string, { entry: string; registrations: number }>();
-  const sessionAllowedDomains: string[] = [];
-  const sessionAllowedReadPaths: string[] = [];
-  const sessionAllowedWritePaths: string[] = [];
-  const sessionAllowedUnixSockets: string[] = [];
-  const sessionAllowedTargets: string[] = [];
+  const sessionGrants = new SessionGrants();
   function getContext(ctx = activeContext): LandstripContextV3 {
     return {
       version: LANDSTRIP_RUNTIME_VERSION,
@@ -1095,35 +1198,6 @@ function createLandstripIntegrationWithPrompts(
     return [...workerExtensions].map(([id, extension]) => ({ id, entry: extension.entry }));
   }
 
-  function getEffectiveAllowRead(
-    config: SandboxConfig,
-    cwd: string,
-    allowances?: ExecutionAllowances,
-  ): string[] {
-    const paths = mergeAllowances(
-      config.filesystem.allowRead,
-      sessionAllowedReadPaths,
-      allowances?.readPaths,
-    );
-    if (process.platform !== 'win32') return paths;
-
-    return paths.filter(
-      (path) => !path.startsWith('/') && (path.includes('*') || existsSync(expandPath(path, cwd))),
-    );
-  }
-
-  function getEffectiveAllowWrite(
-    config: SandboxConfig,
-    allowances?: ExecutionAllowances,
-  ): string[] {
-    const paths = mergeAllowances(
-      config.filesystem.allowWrite,
-      sessionAllowedWritePaths,
-      allowances?.writePaths,
-    );
-    return process.platform === 'win32' ? paths.filter((path) => !path.startsWith('/')) : paths;
-  }
-
   function getEffectiveDenyRead(config: SandboxConfig, cwd: string): string[] {
     if (process.platform !== 'win32') return config.filesystem.denyRead;
 
@@ -1184,8 +1258,7 @@ function createLandstripIntegrationWithPrompts(
       'allowedDomains',
       [domain],
     );
-    const target = choice === 'once' ? allowances?.domains : sessionAllowedDomains;
-    if (target && !target.includes(domain)) target.push(domain);
+    sessionGrants.grantDomain(choice, domain, allowances);
   }
 
   async function applyUnixSocketChoice(
@@ -1202,14 +1275,7 @@ function createLandstripIntegrationWithPrompts(
       'allowUnixSockets',
       [socketPath],
     );
-    if (choice === 'once') {
-      if (allowances && !allowances.targets.includes(key)) allowances.targets.push(key);
-    } else {
-      if (!sessionAllowedUnixSockets.includes(socketPath)) {
-        sessionAllowedUnixSockets.push(socketPath);
-      }
-      if (!sessionAllowedTargets.includes(key)) sessionAllowedTargets.push(key);
-    }
+    sessionGrants.grantUnixSocket(choice, socketPath, key, allowances);
   }
 
   // Breadth-first: approve the broadest reasonable ancestor of the blocked file
@@ -1245,7 +1311,7 @@ function createLandstripIntegrationWithPrompts(
       : config.filesystem.denyRead;
     const scopes = readGrantScopesFor(
       filePath,
-      getEffectiveAllowRead(config, cwd, allowances),
+      sessionGrants.effectiveAllowRead(config, cwd, allowances),
       effectiveDenyRead,
       cwd,
       scope,
@@ -1256,11 +1322,7 @@ function createLandstripIntegrationWithPrompts(
       'allowRead',
       scopes,
     );
-    const target = choice === 'once' ? allowances?.readPaths : sessionAllowedReadPaths;
-    for (const entry of scopes) {
-      if (target && !target.includes(entry)) target.push(entry);
-      allowances?.explicitDenyRead?.approvedPaths.push(entry);
-    }
+    sessionGrants.grantRead(choice, scopes, allowances);
     noteScope(ctx, 'Read', choice, filePath, scopes);
   }
 
@@ -1274,7 +1336,7 @@ function createLandstripIntegrationWithPrompts(
     const config = loadConfig(cwd, ctx);
     const scopes = writeGrantScopesFor(
       filePath,
-      getEffectiveAllowWrite(config, allowances),
+      sessionGrants.effectiveAllowWrite(config, allowances),
       config.filesystem.denyWrite,
       cwd,
     );
@@ -1284,10 +1346,7 @@ function createLandstripIntegrationWithPrompts(
       'allowWrite',
       scopes,
     );
-    const target = choice === 'once' ? allowances?.writePaths : sessionAllowedWritePaths;
-    for (const entry of scopes) {
-      if (target && !target.includes(entry)) target.push(entry);
-    }
+    sessionGrants.grantWrite(choice, scopes, allowances);
     noteScope(ctx, 'Write', choice, filePath, scopes);
   }
 
@@ -1314,13 +1373,13 @@ function createLandstripIntegrationWithPrompts(
           ? enforceReads &&
             !readAllowed(
               access.path,
-              getEffectiveAllowRead(config, ctx.cwd),
+              sessionGrants.effectiveAllowRead(config, ctx.cwd),
               getEffectiveDenyRead(config, ctx.cwd),
               ctx.cwd,
             )
           : shouldPromptForWrite(
               access.path,
-              getEffectiveAllowWrite(config),
+              sessionGrants.effectiveAllowWrite(config),
               config.filesystem.denyWrite,
               ctx.cwd,
             ),
@@ -1338,7 +1397,7 @@ function createLandstripIntegrationWithPrompts(
                 access.path,
                 config.filesystem.denyWriteAlways,
                 ctx.cwd,
-                getEffectiveAllowWrite(config),
+                sessionGrants.effectiveAllowWrite(config),
               );
         if (denied) {
           return {
@@ -1352,12 +1411,15 @@ function createLandstripIntegrationWithPrompts(
       return blockedAccesses(config).length === 0 ? { allowed: true, prompted: false } : undefined;
     };
 
-    const existing = current();
-    if (existing) return existing;
     if (!ctx.hasUI) {
-      return { allowed: false, prompted: false, reason: 'Filesystem access requires approval' };
+      return (
+        current() ?? {
+          allowed: false,
+          prompted: false,
+          reason: 'Filesystem access requires approval',
+        }
+      );
     }
-
     return permissionPrompts.resolve(
       current,
       async (promptSignal) => {
@@ -1396,7 +1458,7 @@ function createLandstripIntegrationWithPrompts(
     const current = (): boolean | undefined => {
       const config = loadConfig(cwd, ctx);
       const decision = evaluateDomainAccess(domain, config.network, {
-        allowedDomainsOverrides: [...sessionAllowedDomains, ...(allowances?.domains ?? [])],
+        allowedDomainsOverrides: sessionGrants.domainOverrides(allowances),
       });
       if (decision === 'deny') return false;
       if (decision === 'allow') return true;
@@ -1437,21 +1499,18 @@ function createLandstripIntegrationWithPrompts(
         ...(allowances?.explicitDenyRead?.patterns ?? []),
         ...[...(allowances?.explicitDenyRead?.globRoots.values() ?? [])].flat(),
       ]),
-      getEffectiveAllowRead(config, cwd, allowances),
+      sessionGrants.effectiveAllowRead(config, cwd, allowances),
     );
 
     return assembleLandstripPolicy({
       network: {
         ...config.network,
-        allowUnixSockets: mergeAllowances(
-          config.network.allowUnixSockets,
-          sessionAllowedUnixSockets,
-        ),
+        allowUnixSockets: sessionGrants.effectiveUnixSockets(config.network.allowUnixSockets),
       },
       filesystem: {
         ...readPolicy,
         denyReadAlways: mergeArray(config.filesystem.denyReadAlways, allowances?.protectedPaths),
-        allowWrite: getEffectiveAllowWrite(config, allowances),
+        allowWrite: sessionGrants.effectiveAllowWrite(config, allowances),
         denyWrite: mergeArray(config.filesystem.denyWrite, allowances?.protectedPaths),
         denyWriteAlways: mergeArray(config.filesystem.denyWriteAlways, allowances?.protectedPaths),
       },
@@ -1517,11 +1576,12 @@ function createLandstripIntegrationWithPrompts(
 
   interface TrapQueryResult {
     action: LandstripControlResponse['action'];
+    granted?: boolean;
     reason?: 'unprompted' | 'rejected' | 'hard-deny';
   }
 
   async function resolveTrapQuery(
-    trap: LandstripQueryTrap | { kind: 'filesystem'; operation: 'read'; path: string },
+    trap: LandstripQueryTrap | { kind: 'filesystem'; operation: 'read' | 'write'; path: string },
     ctx: ExtensionContext,
     cwd: string,
     allowances: ExecutionAllowances,
@@ -1537,7 +1597,7 @@ function createLandstripIntegrationWithPrompts(
       const isUnixSocket = isAbsolute(trap.target);
       const socketPath = isUnixSocket ? normalizeBlockedPath(trap.target, cwd) : trap.target;
       const current = (): TrapQueryResult | undefined => {
-        if (sessionAllowedTargets.includes(key) || allowances.targets.includes(key)) {
+        if (sessionGrants.hasTarget(key, allowances)) {
           return { action: 'allow' };
         }
         if (isUnixSocket) {
@@ -1546,7 +1606,7 @@ function createLandstripIntegrationWithPrompts(
             config.network.allowAllUnixSockets ||
             matchesPattern(
               socketPath,
-              mergeAllowances(config.network.allowUnixSockets, sessionAllowedUnixSockets),
+              sessionGrants.effectiveUnixSockets(config.network.allowUnixSockets),
               cwd,
             )
           ) {
@@ -1555,9 +1615,9 @@ function createLandstripIntegrationWithPrompts(
         }
         return undefined;
       };
-      const existing = current();
-      if (existing) return existing;
-      if (!ctx.hasUI || !promptOnBlock) return { action: 'deny', reason: 'unprompted' };
+      if (!ctx.hasUI || !promptOnBlock) {
+        return current() ?? { action: 'deny', reason: 'unprompted' };
+      }
 
       return permissionPrompts.resolve(
         current,
@@ -1576,8 +1636,7 @@ function createLandstripIntegrationWithPrompts(
           if (isUnixSocket) {
             await applyUnixSocketChoice(ctx, choice, socketPath, key, cwd, allowances);
           } else {
-            const targets = choice === 'once' ? allowances.targets : sessionAllowedTargets;
-            if (!targets.includes(key)) targets.push(key);
+            sessionGrants.grantTarget(choice, key, allowances);
           }
           return { action: 'allow' };
         },
@@ -1586,7 +1645,10 @@ function createLandstripIntegrationWithPrompts(
     }
 
     const path = normalizeBlockedPath(trap.path, cwd);
+    let initialCheck = true;
     const current = (): TrapQueryResult | undefined => {
+      const granted = !initialCheck;
+      initialCheck = false;
       if (matchesPattern(path, allowances.protectedPaths ?? [], cwd)) {
         return { action: 'deny', reason: 'hard-deny' };
       }
@@ -1609,10 +1671,10 @@ function createLandstripIntegrationWithPrompts(
       ) {
         return isPathReadAllowed(
           path,
-          mergeArray(config.explicitAllowRead, [
-            ...sessionAllowedReadPaths,
-            ...allowances.explicitDenyRead.approvedPaths,
-          ]),
+          sessionGrants.explicitAllowRead(
+            config.explicitAllowRead,
+            allowances.explicitDenyRead.approvedPaths,
+          ),
           mergeArray(config.explicitDenyRead, [
             ...allowances.explicitDenyRead.patterns,
             ...[...allowances.explicitDenyRead.globRoots.values()].flat(),
@@ -1620,7 +1682,7 @@ function createLandstripIntegrationWithPrompts(
           cwd,
           { requireAllowMatch: true },
         )
-          ? { action: 'allow' }
+          ? { action: 'allow', granted }
           : undefined;
       }
       if (
@@ -1629,7 +1691,7 @@ function createLandstripIntegrationWithPrompts(
           path,
           config.filesystem.denyWriteAlways,
           cwd,
-          getEffectiveAllowWrite(config, allowances),
+          sessionGrants.effectiveAllowWrite(config, allowances),
         )
       ) {
         return { action: 'deny', reason: 'hard-deny' };
@@ -1638,51 +1700,47 @@ function createLandstripIntegrationWithPrompts(
         trap.operation === 'read'
           ? readAllowed(
               path,
-              getEffectiveAllowRead(config, cwd, allowances),
+              sessionGrants.effectiveAllowRead(config, cwd, allowances),
               getEffectiveDenyRead(config, cwd),
               cwd,
             )
           : !shouldPromptForWrite(
               path,
-              getEffectiveAllowWrite(config, allowances),
+              sessionGrants.effectiveAllowWrite(config, allowances),
               config.filesystem.denyWrite,
               cwd,
             );
-      return allowed ? { action: 'allow' } : undefined;
+      return allowed ? { action: 'allow', granted } : undefined;
     };
-    const existing = current();
-    if (existing) return existing;
-    if (!ctx.hasUI || !promptOnBlock) return { action: 'deny', reason: 'unprompted' };
+    if (!ctx.hasUI || !promptOnBlock) {
+      return current() ?? { action: 'deny', reason: 'unprompted' };
+    }
 
     return permissionPrompts.resolve(
       current,
       async (promptSignal) => {
         const config = loadConfig(cwd, ctx);
-        const choice =
+        const reason =
           trap.operation === 'read'
-            ? await promptReadBlock(
-                ctx,
-                path,
-                matchesPattern(path, config.filesystem.denyRead, cwd)
-                  ? 'granting allowRead will override it'
-                  : undefined,
-                promptSignal,
-                allowances.permissionPromptLabel,
-              )
-            : await promptWriteBlock(
-                ctx,
-                path,
-                matchesWriteDenyPattern(
+            ? matchesPattern(path, config.filesystem.denyRead, cwd)
+              ? 'granting allowRead will override it'
+              : undefined
+            : matchesWriteDenyPattern(
                   path,
                   config.filesystem.denyWrite,
                   cwd,
-                  getEffectiveAllowWrite(config, allowances),
+                  sessionGrants.effectiveAllowWrite(config, allowances),
                 )
-                  ? 'granting allowWrite will override it'
-                  : undefined,
-                promptSignal,
-                allowances.permissionPromptLabel,
-              );
+              ? 'granting allowWrite will override it'
+              : undefined;
+        const choice = await promptFilesystemBlock(
+          ctx,
+          trap.operation,
+          path,
+          reason,
+          promptSignal,
+          allowances.permissionPromptLabel,
+        );
         if (choice === 'abort' || promptSignal.aborted)
           return { action: 'deny', reason: 'rejected' };
         if (trap.operation === 'read') {
@@ -1690,7 +1748,7 @@ function createLandstripIntegrationWithPrompts(
         } else {
           await applyWriteChoice(ctx, choice, path, cwd, allowances);
         }
-        return { action: 'allow' };
+        return { action: 'allow', granted: true };
       },
       signal,
     );
@@ -2479,7 +2537,7 @@ function createLandstripIntegrationWithPrompts(
       return extractRetryableNativeReadDeniedPath(
         nativeOutput,
         ctx.cwd,
-        getEffectiveAllowRead(config, ctx.cwd, allowances),
+        sessionGrants.effectiveAllowRead(config, ctx.cwd, allowances),
         getEffectiveDenyRead(config, ctx.cwd),
       );
     };
@@ -2487,81 +2545,30 @@ function createLandstripIntegrationWithPrompts(
       operation: 'read' | 'write',
       blockedPath: string,
     ): Promise<AgentToolResult<BashToolDetails | undefined> | null> => {
-      if (!ctx.hasUI || rejectedPaths[operation].has(blockedPath)) return null;
+      if (!ctx.hasUI || signal?.aborted || rejectedPaths[operation].has(blockedPath)) return null;
 
-      const { globalPath, projectPath } = new SandboxConfigStore(ctx.cwd);
-      const isWriteDeniedAlways = (config: SandboxConfig): boolean =>
-        matchesWriteDenyPattern(
-          blockedPath,
-          config.filesystem.denyWriteAlways,
+      let access: TrapQueryResult;
+      try {
+        access = await resolveTrapQuery(
+          { kind: 'filesystem', operation, path: blockedPath },
+          ctx,
           ctx.cwd,
-          getEffectiveAllowWrite(config, allowances),
+          allowances,
+          true,
+          signal,
         );
-      const current = (): boolean | undefined => {
-        const config = loadConfig(ctx.cwd, ctx);
+      } catch (error) {
         if (
-          operation === 'read'
-            ? matchesPattern(blockedPath, config.filesystem.denyReadAlways, ctx.cwd)
-            : isWriteDeniedAlways(config)
+          signal?.aborted ||
+          (error instanceof Error && error.message === 'Permission request cancelled')
         ) {
-          return false;
+          return null;
         }
-        const needsPrompt =
-          operation === 'read'
-            ? !readAllowed(
-                blockedPath,
-                getEffectiveAllowRead(config, ctx.cwd, allowances),
-                getEffectiveDenyRead(config, ctx.cwd),
-                ctx.cwd,
-              )
-            : shouldPromptForWrite(
-                blockedPath,
-                getEffectiveAllowWrite(config, allowances),
-                config.filesystem.denyWrite,
-                ctx.cwd,
-              );
-        return needsPrompt ? undefined : true;
-      };
-      const access = await permissionPrompts.resolve(
-        current,
-        async (promptSignal) => {
-          const config = loadConfig(ctx.cwd, ctx);
-          const choice =
-            operation === 'read'
-              ? await promptReadBlock(
-                  ctx,
-                  blockedPath,
-                  matchesPattern(blockedPath, config.filesystem.denyRead, ctx.cwd)
-                    ? 'granting allowRead will override it'
-                    : undefined,
-                  promptSignal,
-                )
-              : await promptWriteBlock(
-                  ctx,
-                  blockedPath,
-                  matchesWriteDenyPattern(
-                    blockedPath,
-                    config.filesystem.denyWrite,
-                    ctx.cwd,
-                    getEffectiveAllowWrite(config, allowances),
-                  )
-                    ? 'granting allowWrite will override it'
-                    : undefined,
-                  promptSignal,
-                );
-          if (choice === 'abort' || promptSignal.aborted) return false;
-          if (operation === 'read') {
-            await applyReadChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
-          } else {
-            await applyWriteChoice(ctx, choice, blockedPath, ctx.cwd, allowances);
-          }
-          return true;
-        },
-        signal,
-      );
-      if (!access) {
-        const config = loadConfig(ctx.cwd, ctx);
-        if (operation === 'write' && isWriteDeniedAlways(config)) {
+        throw error;
+      }
+      if (access.action !== 'allow') {
+        if (operation === 'write' && access.reason === 'hard-deny') {
+          const { globalPath, projectPath } = new SandboxConfigStore(ctx.cwd);
           notify(
             ctx,
             `"${blockedPath}" is blocked by denyWriteAlways. Check:\n  ${projectPath}\n  ${globalPath}`,
@@ -2570,15 +2577,25 @@ function createLandstripIntegrationWithPrompts(
         }
         return null;
       }
-
-      const config = loadConfig(ctx.cwd, ctx);
-      if (operation === 'write' && isWriteDeniedAlways(config)) {
-        notify(
-          ctx,
-          `"${blockedPath}" was added to allowWrite, but denyWriteAlways still blocks it. Check:\n  ${projectPath}\n  ${globalPath}`,
-          'warning',
-        );
-        return null;
+      if (!access.granted) return null;
+      if (operation === 'write') {
+        const config = loadConfig(ctx.cwd, ctx);
+        if (
+          matchesWriteDenyPattern(
+            blockedPath,
+            config.filesystem.denyWriteAlways,
+            ctx.cwd,
+            sessionGrants.effectiveAllowWrite(config, allowances),
+          )
+        ) {
+          const { globalPath, projectPath } = new SandboxConfigStore(ctx.cwd);
+          notify(
+            ctx,
+            `"${blockedPath}" was added to allowWrite, but denyWriteAlways still blocks it. Check:\n  ${projectPath}\n  ${globalPath}`,
+            'warning',
+          );
+          return null;
+        }
       }
       onUpdate?.({
         content: [
@@ -2899,11 +2916,7 @@ function createLandstripIntegrationWithPrompts(
     pi.on('session_start', async (_event, ctx) => {
       activeContext = ctx;
       permissionPrompts.reset();
-      sessionAllowedDomains.length = 0;
-      sessionAllowedReadPaths.length = 0;
-      sessionAllowedWritePaths.length = 0;
-      sessionAllowedUnixSockets.length = 0;
-      sessionAllowedTargets.length = 0;
+      sessionGrants.reset();
       unsandboxedWorkerWarningShown = false;
       projectConfigTrusted = isProjectTrusted(ctx);
       if (getNoSandboxFlag()) {
@@ -2972,9 +2985,7 @@ function createLandstripIntegrationWithPrompts(
       changeScope: store.changeScope(includeProject),
       paths: { global: store.globalPath, project: store.projectPath, binary: binaryPath() },
       config,
-      sessionDomains: [...sessionAllowedDomains],
-      sessionReadPaths: [...sessionAllowedReadPaths],
-      sessionWritePaths: [...sessionAllowedWritePaths],
+      ...sessionGrants.overview(),
     };
   }
 

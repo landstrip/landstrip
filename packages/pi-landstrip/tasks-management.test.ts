@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -1002,6 +1010,60 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
       expect(allowSelect).toHaveBeenCalledTimes(1);
       expect(allowed.isError, textOf(allowed)).not.toBe(true);
       expect(textOf(allowed)).toContain('cert');
+
+      if (process.platform !== 'win32') {
+        const readonlyPath = join(projectDir, 'readonly.txt');
+        const runCountPath = join(projectDir, 'dac-runs.txt');
+        writeFileSync(readonlyPath, 'locked\n');
+        chmodSync(readonlyPath, 0o444);
+        try {
+          const dacSelect = vi.fn();
+          const updates: string[] = [];
+          const dacResult = await bashTool.execute(
+            'call-dac-readonly',
+            {
+              command: 'echo run >> dac-runs.txt; echo nope > readonly.txt',
+            } satisfies LandstripBashInput,
+            new AbortController().signal,
+            (partial: { content: Array<{ text?: string }> }) => {
+              updates.push(textOf(partial));
+            },
+            {
+              ...ctx,
+              hasUI: true,
+              ui: { ...ctx.ui, select: dacSelect },
+            },
+          );
+          expect(dacResult.isError).toBe(true);
+          expect(dacSelect).not.toHaveBeenCalled();
+          expect(updates.join('\n')).not.toContain('access granted for');
+          expect(readFileSync(runCountPath, 'utf8').trim().split('\n')).toEqual(['run']);
+        } finally {
+          chmodSync(readonlyPath, 0o644);
+        }
+      }
+
+      const abortController = new AbortController();
+      const abortOnPromptSelect = vi.fn(async () => {
+        abortController.abort();
+        return undefined;
+      });
+      const abortedRetryResult = await bashTool.execute(
+        'call-abort-retry',
+        {
+          command: `printf "touch: cannot create '%s': Permission denied\\n" ${JSON.stringify(join(root, 'outside-abort.txt'))} >&2; exit 1`,
+        } satisfies LandstripBashInput,
+        abortController.signal,
+        () => {},
+        {
+          ...ctx,
+          hasUI: true,
+          ui: { ...ctx.ui, select: abortOnPromptSelect },
+        },
+      );
+      expect(abortOnPromptSelect).toHaveBeenCalledTimes(1);
+      expect(abortedRetryResult.isError).toBe(true);
+      expect(textOf(abortedRetryResult)).not.toContain('Permission request cancelled');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
