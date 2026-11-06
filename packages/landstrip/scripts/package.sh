@@ -187,11 +187,7 @@ smoke_host_binary() {
     if [[ "$platform" == darwin-* ]] && command -v codesign >/dev/null 2>&1; then
       codesign --force -s - "$bin" >/dev/null 2>&1 || true
     fi
-    if [[ "$platform" == linux-* ]]; then
-      APPIMAGE_EXTRACT_AND_RUN=1 "$bin" --version >/dev/null
-    else
-      "$bin" --version >/dev/null
-    fi
+    "$bin" --version >/dev/null
   fi
 }
 
