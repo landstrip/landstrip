@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "landstrip"
-version = "0.20.23"
+version = "0.20.24"
 dependencies = [
  "anyhow",
  "chacha20",
