@@ -903,7 +903,8 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
             allowRead: [root],
             denyRead: [],
             denyReadAlways: [],
-            allowWrite: [projectDir],
+            // Bash may open its controlling terminal during startup on Linux.
+            allowWrite: [projectDir, ...(process.platform === 'linux' ? ['/dev/tty'] : [])],
             denyWrite: ['**/*.pem'],
             denyWriteAlways: [join(projectDir, 'immutable.txt')],
           },
