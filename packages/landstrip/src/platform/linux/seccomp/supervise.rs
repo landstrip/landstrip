@@ -438,7 +438,9 @@ impl<'a> Supervisor<'a> {
     }
 
     fn receive_notification(&mut self) -> Result<Option<(libc::seccomp_notif, HandleResult)>> {
-        let request = self.notify.receive()?;
+        let Some(request) = self.notify.receive()? else {
+            return Ok(None);
+        };
         if !self.notify.is_id_valid(request.id)? {
             return Ok(None);
         }

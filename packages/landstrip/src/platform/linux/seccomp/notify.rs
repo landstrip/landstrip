@@ -99,14 +99,17 @@ impl<'a> NotificationChannel<'a> {
         Self(fd)
     }
 
-    pub(super) fn receive(&self) -> Result<libc::seccomp_notif> {
+    pub(super) fn receive(&self) -> Result<Option<libc::seccomp_notif>> {
         loop {
             // SAFETY: zero is a valid initial byte pattern for this plain kernel UAPI struct.
             let mut request = unsafe { mem::zeroed::<libc::seccomp_notif>() };
             // SAFETY: request points to writable storage for SECCOMP_IOCTL_NOTIF_RECV.
             match unsafe { seccomp_notif_recv(self.0.as_raw_fd(), ptr::addr_of_mut!(request)) } {
-                Ok(_) => return Ok(request),
+                Ok(_) => return Ok(Some(request)),
                 Err(Errno::EINTR) => {}
+                // A signal can cancel the target syscall before we receive it.
+                // Return to polling so child exit and forwarded signals are still handled.
+                Err(Errno::ENOENT) => return Ok(None),
                 Err(error) => return Err(LandstripError::supervise_errno(error).into()),
             }
         }
@@ -128,7 +131,8 @@ impl<'a> NotificationChannel<'a> {
         loop {
             // SAFETY: response points to initialized storage for SECCOMP_IOCTL_NOTIF_SEND.
             match unsafe { seccomp_notif_send(self.0.as_raw_fd(), ptr::addr_of_mut!(response)) } {
-                Ok(_) => return Ok(()),
+                // The target can cancel after the supervisor's final ID_VALID check.
+                Ok(_) | Err(Errno::ENOENT) => return Ok(()),
                 Err(Errno::EINTR) => {}
                 Err(error) => return Err(LandstripError::supervise_errno(error).into()),
             }
