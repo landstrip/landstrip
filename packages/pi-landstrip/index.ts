@@ -193,6 +193,7 @@ interface ExecutionAllowances {
   readonly readPaths: string[];
   readonly writePaths: string[];
   readonly targets: string[];
+  rejectedTargets?: Set<string>;
 }
 
 const SUPPORTED_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32']);
@@ -371,12 +372,21 @@ class SandboxConfigStore {
           ? this.projectPath
           : undefined;
     if (!configPath) return;
-    for (const value of values) {
-      await withFileMutationQueue(configPath, async () => {
-        const config = SandboxConfigStore.readOrEmpty(configPath);
-        if (!SandboxConfigStore.appendGrant(config, field, value)) return;
-        SandboxConfigStore.write(configPath, config);
-      });
+    try {
+      for (const value of values) {
+        await withFileMutationQueue(configPath, async () => {
+          const config = SandboxConfigStore.readOrEmpty(configPath);
+          if (!SandboxConfigStore.appendGrant(config, field, value)) return;
+          SandboxConfigStore.write(configPath, config);
+        });
+      }
+    } catch (error) {
+      throw new Error(
+        `Failed to save sandbox permission to "${configPath}": ${formatError(error)}`,
+        {
+          cause: error,
+        },
+      );
     }
   }
 }
@@ -1593,10 +1603,13 @@ function createLandstripIntegrationWithPrompts(
     // for the current command or session. Filesystem Unix domain sockets carry
     // their socket path and can also be persisted to network.allowUnixSockets.
     if (trap.kind !== 'filesystem') {
-      const key = `${trap.operation}\u0000${trap.target}`;
       const isUnixSocket = isAbsolute(trap.target);
       const socketPath = isUnixSocket ? normalizeBlockedPath(trap.target, cwd) : trap.target;
+      const key = `${trap.operation}\u0000${socketPath}`;
       const current = (): TrapQueryResult | undefined => {
+        if (allowances.rejectedTargets?.has(key)) {
+          return { action: 'deny', reason: 'rejected' };
+        }
         if (sessionGrants.hasTarget(key, allowances)) {
           return { action: 'allow' };
         }
@@ -1631,10 +1644,17 @@ function createLandstripIntegrationWithPrompts(
             promptSignal,
             allowances.permissionPromptLabel,
           );
-          if (choice === 'abort' || promptSignal.aborted)
+          if (choice === 'abort' || promptSignal.aborted) {
+            if (!promptSignal.aborted) (allowances.rejectedTargets ??= new Set()).add(key);
             return { action: 'deny', reason: 'rejected' };
+          }
           if (isUnixSocket) {
-            await applyUnixSocketChoice(ctx, choice, socketPath, key, cwd, allowances);
+            try {
+              await applyUnixSocketChoice(ctx, choice, socketPath, key, cwd, allowances);
+            } catch (error) {
+              (allowances.rejectedTargets ??= new Set()).add(key);
+              throw error;
+            }
           } else {
             sessionGrants.grantTarget(choice, key, allowances);
           }
@@ -1784,7 +1804,15 @@ function createLandstripIntegrationWithPrompts(
           const result = await resolveTrapQuery(trap, ctx, cwd, allowances, true, signal);
           respond(trap.query_id, result.action);
         })
-        .catch(() => respond(trap.query_id, 'deny'));
+        .catch((error) => {
+          respond(trap.query_id, 'deny');
+          if (!signal?.aborted && formatError(error) !== 'Permission request cancelled') {
+            const target = isFilesystemTrap(trap) ? trap.path : trap.target;
+            reportTrapError(
+              `Sandbox permission request failed (${trap.operation} "${target}"): ${formatError(error)}`,
+            );
+          }
+        });
     };
 
     socket.on('error', (error) => {
@@ -2187,6 +2215,7 @@ function createLandstripIntegrationWithPrompts(
     callbacks: LandstripBashCallbacks = {},
     allowances: ExecutionAllowances = { domains: [], readPaths: [], writePaths: [], targets: [] },
   ): BashOperations {
+    allowances.rejectedTargets ??= new Set();
     return {
       async exec(command, cwd, { onData, signal, timeout, env }) {
         if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
@@ -2433,7 +2462,20 @@ function createLandstripIntegrationWithPrompts(
                       }
                       respondQuery(trap.query_id, result.action);
                     })
-                    .catch(() => respondQuery(trap.query_id, 'deny'));
+                    .catch((error) => {
+                      respondQuery(trap.query_id, 'deny');
+                      if (
+                        !signal?.aborted &&
+                        formatError(error) !== 'Permission request cancelled'
+                      ) {
+                        const target = isFilesystemTrap(trap) ? trap.path : trap.target;
+                        const message = `Sandbox permission request failed (${trap.operation} "${target}"): ${formatError(error)}`;
+                        appendErrorLine(
+                          JSON.stringify({ kind: 'internal', code: 'INTERNAL_ERROR', message }),
+                        );
+                        onData(Buffer.from(`pi-landstrip: ${message}\n`, 'utf8'));
+                      }
+                    });
                 } else {
                   appendErrorLine(line);
                 }
