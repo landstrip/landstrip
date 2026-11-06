@@ -51,12 +51,9 @@ describe('createLandstripLauncherEnvironment', () => {
     });
   });
 
-  it('uses FUSE-free AppImage launching on Linux and leaves macOS unchanged', () => {
+  it('leaves the environment unchanged elsewhere', () => {
     const provider = { PATH: '/usr/bin', HOME: '/home/me' };
-    expect(createLandstripLauncherEnvironment(provider, host, 'linux')).toEqual({
-      ...provider,
-      APPIMAGE_EXTRACT_AND_RUN: '1',
-    });
+    expect(createLandstripLauncherEnvironment(provider, host, 'linux')).toBe(provider);
     expect(createLandstripLauncherEnvironment(provider, host, 'darwin')).toBe(provider);
   });
 });
