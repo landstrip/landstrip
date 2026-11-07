@@ -223,9 +223,10 @@ function startTrapServer(
 ): Promise<{ server: ReturnType<typeof createServer>; port: number; trapLines: string[] }> {
   const trapLines: string[] = [];
   const server = createServer((trapSocket) => {
+    trapSocket.setEncoding('utf8');
     let buffer = '';
-    trapSocket.on('data', (data: Buffer) => {
-      buffer += data.toString('utf8');
+    trapSocket.on('data', (data: string) => {
+      buffer += data;
       let nl = buffer.indexOf('\n');
       while (nl !== -1) {
         const line = buffer.slice(0, nl);
