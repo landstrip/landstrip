@@ -2396,19 +2396,28 @@ function createLandstripIntegrationWithPrompts(
               child.kill('SIGKILL');
             }
 
+            const execAbort = new AbortController();
+            const querySignal = signal
+              ? AbortSignal.any([signal, execAbort.signal])
+              : execAbort.signal;
+
             function onAbort(): void {
+              execAbort.abort();
               killChild();
             }
 
             if (timeout !== undefined && timeout > 0) {
               timeoutHandle = setTimeout(() => {
                 timedOut = true;
+                execAbort.abort();
                 killChild();
               }, timeout * 1000);
             }
 
             signal?.addEventListener('abort', onAbort, { once: true });
             if (signal?.aborted) onAbort();
+            const stderrDecoder = new StringDecoder('utf8');
+            let stderrFlushed = false;
             let stderrAcc = '';
             let errorFdAcc = '';
 
@@ -2418,17 +2427,107 @@ function createLandstripIntegrationWithPrompts(
             let postExitTimer: NodeJS.Timeout | undefined;
             let stdoutEnded = child.stdout === null;
             let stderrEnded = child.stderr === null;
+            let trapEnded = trapSocket === undefined;
+            const trapDecoder = new StringDecoder('utf8');
+            let trapFlushed = false;
+            let trapBuffer = '';
+            let queryChain: Promise<void> = Promise.resolve();
+
+            const flushStderr = (): void => {
+              if (stderrFlushed) return;
+              stderrFlushed = true;
+              stderrAcc += stderrDecoder.end();
+            };
+
+            const respondQuery = (
+              queryId: string,
+              action: LandstripControlResponse['action'],
+            ): void => {
+              if (!trapSocket || trapSocket.destroyed) return;
+              trapSocket.write(controlResponseLine(queryId, action));
+            };
+
+            const appendErrorLine = (line: string): void => {
+              const infoLine = line + '\n';
+              errorFdAcc += infoLine;
+              callbacks.onErrorFd?.(Buffer.from(infoLine, 'utf8'));
+            };
+
+            const processTrapLine = (line: string): void => {
+              if (line.length === 0) return;
+              const trap = parseTrapLine(line);
+              if (trap && isQueryTrap(trap)) {
+                queryChain = queryChain
+                  .then(async () => {
+                    const result = await resolveTrapQuery(
+                      trap,
+                      ctx,
+                      cwd,
+                      processAllowances,
+                      callbacks.promptOnBlock === true,
+                      querySignal,
+                    );
+                    if (result.action === 'deny') {
+                      if (result.reason === 'rejected' && isFilesystemTrap(trap)) {
+                        callbacks.onRejectedPath?.(
+                          trap.operation,
+                          normalizeBlockedPath(trap.path, cwd),
+                        );
+                      }
+                      appendErrorLine(line);
+                    }
+                    respondQuery(trap.query_id, result.action);
+                  })
+                  .catch((error) => {
+                    respondQuery(trap.query_id, 'deny');
+                    if (
+                      !querySignal.aborted &&
+                      formatError(error) !== 'Permission request cancelled'
+                    ) {
+                      const target = isFilesystemTrap(trap) ? trap.path : trap.target;
+                      const message = `Sandbox permission request failed (${trap.operation} "${target}"): ${formatError(error)}`;
+                      appendErrorLine(
+                        JSON.stringify({ kind: 'internal', code: 'INTERNAL_ERROR', message }),
+                      );
+                      onData(Buffer.from(`pi-landstrip: ${message}\n`, 'utf8'));
+                    }
+                  });
+              } else {
+                appendErrorLine(line);
+              }
+            };
+
+            const drainTrapLines = (): void => {
+              let nl = trapBuffer.indexOf('\n');
+              while (nl !== -1) {
+                const line = trapBuffer.slice(0, nl);
+                trapBuffer = trapBuffer.slice(nl + 1);
+                nl = trapBuffer.indexOf('\n');
+                processTrapLine(line);
+              }
+            };
+
+            const flushTrap = (): void => {
+              if (trapFlushed) return;
+              trapFlushed = true;
+              trapBuffer += trapDecoder.end();
+              drainTrapLines();
+              const rest = trapBuffer.trim();
+              trapBuffer = '';
+              if (rest.length > 0) processTrapLine(rest);
+            };
 
             const finalizeExec = (code: number | null): void => {
               if (execSettled) return;
               execSettled = true;
+              execAbort.abort();
               if (postExitTimer) clearTimeout(postExitTimer);
-              // Stop tracking the inherited pipes: a backgrounded grandchild can
-              // hold them open after the command itself exits, so 'close' would
-              // otherwise never arrive.
+              flushStderr();
+              flushTrap();
               child.stdout?.destroy();
               child.stderr?.destroy();
               void (async () => {
+                await queryChain;
                 await cleanup();
                 if (signal?.aborted) {
                   reject(new Error('aborted'));
@@ -2464,105 +2563,56 @@ function createLandstripIntegrationWithPrompts(
             };
 
             const maybeFinalizeAfterExit = (): void => {
-              if (childExited && !execSettled && stdoutEnded && stderrEnded) {
+              if (childExited && !execSettled && stdoutEnded && stderrEnded && trapEnded) {
                 finalizeExec(childExitCode);
               }
             };
 
+            const onStdoutEnd = (): void => {
+              stdoutEnded = true;
+              maybeFinalizeAfterExit();
+            };
+
+            const onStderrEnd = (): void => {
+              stderrEnded = true;
+              flushStderr();
+              maybeFinalizeAfterExit();
+            };
+
+            const onTrapEnd = (): void => {
+              if (trapEnded) return;
+              trapEnded = true;
+              flushTrap();
+              maybeFinalizeAfterExit();
+            };
+
             child.stdout?.on('data', onData);
             child.stderr?.on('data', (data: Buffer) => {
-              stderrAcc += data.toString('utf8');
+              stderrAcc += stderrDecoder.write(data);
               callbacks.onStderr?.(data);
               onData(data);
             });
-            child.stdout?.once('end', () => {
-              stdoutEnded = true;
-              maybeFinalizeAfterExit();
-            });
-            child.stderr?.once('end', () => {
-              stderrEnded = true;
-              maybeFinalizeAfterExit();
-            });
-            const trapDecoder = new StringDecoder('utf8');
-            let trapBuffer = '';
-            let queryChain: Promise<void> = Promise.resolve();
-
-            const respondQuery = (
-              queryId: string,
-              action: LandstripControlResponse['action'],
-            ): void => {
-              if (!trapSocket || trapSocket.destroyed) return;
-              trapSocket.write(controlResponseLine(queryId, action));
-            };
-
-            // Surface a denial through the error-fd accumulator so the post-close
-            // notify and the runBashWithOptionalRetry prompt/retry paths still work.
-            const appendErrorLine = (line: string): void => {
-              const infoLine = line + '\n';
-              errorFdAcc += infoLine;
-              callbacks.onErrorFd?.(Buffer.from(infoLine, 'utf8'));
-            };
+            child.stdout?.once('end', onStdoutEnd);
+            child.stdout?.once('close', onStdoutEnd);
+            child.stderr?.once('end', onStderrEnd);
+            child.stderr?.once('close', onStderrEnd);
 
             trapSocket?.on('data', (data: Buffer) => {
               trapBuffer += trapDecoder.write(data);
-              let nl = trapBuffer.indexOf('\n');
-              while (nl !== -1) {
-                const line = trapBuffer.slice(0, nl);
-                trapBuffer = trapBuffer.slice(nl + 1);
-                nl = trapBuffer.indexOf('\n');
-                if (line.length === 0) continue;
-                const trap = parseTrapLine(line);
-                // An unanswered query holds the child's syscall, so every query
-                // gets an answer; anything else is informational and kept for
-                // post-close handling.
-                if (trap && isQueryTrap(trap)) {
-                  queryChain = queryChain
-                    .then(async () => {
-                      const result = await resolveTrapQuery(
-                        trap,
-                        ctx,
-                        cwd,
-                        processAllowances,
-                        callbacks.promptOnBlock === true,
-                        signal,
-                      );
-                      if (result.action === 'deny') {
-                        if (result.reason === 'rejected' && isFilesystemTrap(trap)) {
-                          callbacks.onRejectedPath?.(
-                            trap.operation,
-                            normalizeBlockedPath(trap.path, cwd),
-                          );
-                        }
-                        appendErrorLine(line);
-                      }
-                      respondQuery(trap.query_id, result.action);
-                    })
-                    .catch((error) => {
-                      respondQuery(trap.query_id, 'deny');
-                      if (
-                        !signal?.aborted &&
-                        formatError(error) !== 'Permission request cancelled'
-                      ) {
-                        const target = isFilesystemTrap(trap) ? trap.path : trap.target;
-                        const message = `Sandbox permission request failed (${trap.operation} "${target}"): ${formatError(error)}`;
-                        appendErrorLine(
-                          JSON.stringify({ kind: 'internal', code: 'INTERNAL_ERROR', message }),
-                        );
-                        onData(Buffer.from(`pi-landstrip: ${message}\n`, 'utf8'));
-                      }
-                    });
-                } else {
-                  appendErrorLine(line);
-                }
-              }
+              drainTrapLines();
             });
+            trapSocket?.once('end', onTrapEnd);
+            trapSocket?.once('close', onTrapEnd);
+            trapSocket?.on('error', onTrapEnd);
 
             child.on('error', (error) => {
               if (execSettled) return;
               execSettled = true;
+              execAbort.abort();
               if (postExitTimer) clearTimeout(postExitTimer);
               void (async () => {
                 try {
+                  await queryChain;
                   await cleanup();
                   reject(error);
                 } catch (cleanupError) {
@@ -2571,19 +2621,27 @@ function createLandstripIntegrationWithPrompts(
               })();
             });
 
-            // Settle on 'exit' — the command itself has ended — rather than
-            // waiting for 'close', which only fires once every inherited stdio
-            // pipe is closed. A backgrounded process holding one open would
-            // otherwise block us indefinitely.
             child.once('exit', (code) => {
               childExited = true;
               childExitCode = code;
+              execAbort.abort();
               maybeFinalizeAfterExit();
               if (!execSettled) {
                 postExitTimer = setTimeout(() => finalizeExec(code), EXIT_STDIO_GRACE_MS);
               }
             });
-            child.once('close', (code) => finalizeExec(code));
+            child.once('close', (code) => {
+              childExited = true;
+              childExitCode ??= code;
+              stdoutEnded = true;
+              stderrEnded = true;
+              flushStderr();
+              execAbort.abort();
+              maybeFinalizeAfterExit();
+              if (!execSettled && !postExitTimer) {
+                postExitTimer = setTimeout(() => finalizeExec(childExitCode), EXIT_STDIO_GRACE_MS);
+              }
+            });
           })().catch((error: unknown) => {
             // A failure before the child is wired (for example, creating the trap
             // channel) never reaches cleanup(), so free temporary resources here.
@@ -2608,6 +2666,7 @@ function createLandstripIntegrationWithPrompts(
   ): Promise<AgentToolResult<BashToolDetails | undefined>> {
     let landstripErrorOutput = '';
     let stderrOutput = '';
+    let stderrOutputDecoder = new StringDecoder('utf8');
     const rejectedPaths = {
       read: new Set<string>(),
       write: new Set<string>(),
@@ -2626,7 +2685,7 @@ function createLandstripIntegrationWithPrompts(
             landstripErrorOutput += data.toString('utf8');
           },
           onStderr: (data) => {
-            stderrOutput += data.toString('utf8');
+            stderrOutput += stderrOutputDecoder.write(data);
           },
           onRejectedPath: (operation, path) => {
             rejectedPaths[operation].add(path);
@@ -2638,7 +2697,13 @@ function createLandstripIntegrationWithPrompts(
       shellPath: SettingsManager.create(ctx.cwd).getShellPath(),
     });
 
-    const run = () => sandboxedBash.execute(id, params, signal, onUpdate, ctx);
+    const run = async () => {
+      try {
+        return await sandboxedBash.execute(id, params, signal, onUpdate, ctx);
+      } finally {
+        stderrOutput += stderrOutputDecoder.end();
+      }
+    };
     const formatTrapErrors = (): string | null => {
       const landstripErrors = parseLandstripTraps(landstripErrorOutput);
       if (landstripErrors.length === 0) return null;
@@ -2725,6 +2790,7 @@ function createLandstripIntegrationWithPrompts(
       });
       landstripErrorOutput = '';
       stderrOutput = '';
+      stderrOutputDecoder = new StringDecoder('utf8');
       return run();
     };
 
