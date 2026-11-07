@@ -2,7 +2,7 @@
 // Copyright (C) Jarkko Sakkinen 2026
 
 import { spawn, type SpawnOptions } from 'node:child_process';
-import { Duplex, type Readable } from 'node:stream';
+import { Duplex } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 
 import { formatError, isRecord } from './util.ts';
@@ -72,10 +72,28 @@ interface SettledWaiter {
   readonly timer: NodeJS.Timeout;
 }
 
+interface ChildSession {
+  readonly child: RpcChildProcess;
+  readonly exitedPromise: Promise<void>;
+  readonly settledPromise: Promise<void>;
+  spawned: boolean;
+  exited: boolean;
+  settled: boolean;
+  stopped: boolean;
+  exitCode: number | null;
+  exitSignal: NodeJS.Signals | null;
+  stdoutEnded: boolean;
+  stderrEnded: boolean;
+  drainTimer?: NodeJS.Timeout;
+  disposeAuthPipe?: () => void;
+  abortStartup: () => void;
+}
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_SETTLE_TIMEOUT_MS = 60_000;
 const DEFAULT_STOP_TIMEOUT_MS = 1_000;
 const DEFAULT_KILL_TIMEOUT_MS = 1_000;
+const DEFAULT_DRAIN_TIMEOUT_MS = 100;
 const DEFAULT_STDERR_LIMIT_BYTES = 64 * 1024;
 const DEFAULT_STDOUT_FRAME_LIMIT_BYTES = 64 * 1024 * 1024;
 
@@ -87,14 +105,9 @@ function defaultSpawn(
   return spawn(command, [...args], options) as RpcChildProcess;
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
 export class RpcProcess {
   private readonly options: RpcProcessOptions;
-  private child: RpcChildProcess | null = null;
-  private exitPromise: Promise<void> | null = null;
+  private session: ChildSession | null = null;
   private nextRequestId = 0;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly eventListeners = new Set<(event: RpcRecord) => void>();
@@ -104,7 +117,6 @@ export class RpcProcess {
   private fatalError: Error | null = null;
   private stopping: Promise<void> | null = null;
   private promptQueue: Promise<void> = Promise.resolve();
-  private disposeAuthPipe?: () => void;
 
   public constructor(options: RpcProcessOptions) {
     if (!options.command) throw new Error('RPC command must not be empty');
@@ -118,7 +130,7 @@ export class RpcProcess {
   }
 
   public async start(): Promise<void> {
-    if (this.child) throw new Error('RPC process is already started');
+    if (this.session) throw new Error('RPC process is already started');
     if (this.stopping) throw new Error('RPC process is stopping');
     if (this.options.onAuthPipe && process.platform === 'win32') {
       throw new Error('Authenticated subagent workers require inherited Unix file descriptors');
@@ -138,42 +150,35 @@ export class RpcProcess {
       throw this.asError(error, 'Failed to spawn RPC process');
     }
 
-    this.child = child;
     this.fatalError = null;
     this.stderr = Buffer.alloc(0);
-    this.attachStdout(child, child.stdout);
-    child.stderr.on('data', (chunk: Buffer | string) => {
-      if (this.child === child) this.captureStderr(chunk);
-    });
-    child.stdin.on('error', (error) => this.handleChildError(child, error, 'RPC stdin error'));
-    child.on('error', (error) => this.handleChildError(child, error, 'RPC process error'));
-    this.exitPromise = new Promise((resolve) => {
-      child.once('exit', (code, signal) => {
-        this.disposeAuthPipe?.();
-        this.disposeAuthPipe = undefined;
-        if (this.child === child) {
-          this.child = null;
-          this.failAll(new Error(this.exitMessage(code, signal)));
-        }
-        resolve();
-      });
-    });
+    const session = this.createSession(child);
+    this.session = session;
 
     await new Promise<void>((resolve, reject) => {
       const onSpawn = () => {
+        session.spawned = true;
         cleanup();
         resolve();
       };
       const onError = (error: Error) => {
         cleanup();
-        if (this.child === child) this.child = null;
+        session.abortStartup();
         const spawnError = this.asError(error, 'Failed to spawn RPC process');
         this.failAll(spawnError);
         reject(spawnError);
       };
       const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
         cleanup();
-        reject(new Error(this.exitMessage(code, signal)));
+        void (async () => {
+          await session.settledPromise;
+          if (this.stopping) await this.stopping.catch(() => undefined);
+          reject(
+            session.stopped
+              ? new Error('RPC process stopped during startup')
+              : new Error(this.exitMessage(code, signal)),
+          );
+        })();
       };
       const cleanup = () => {
         child.off('spawn', onSpawn);
@@ -184,16 +189,34 @@ export class RpcProcess {
       child.once('error', onError);
       child.once('exit', onExit);
     });
-    if (this.child !== child || this.stopping)
+    if (session.stopped || this.stopping) {
+      if (this.stopping) await this.stopping;
+      else if (this.session === session) await this.stop();
+      if (this.fatalError) throw this.fatalError;
+      await session.settledPromise;
       throw new Error('RPC process stopped during startup');
+    }
+    if (this.session !== session || session.exited) {
+      await session.settledPromise;
+      if (this.stopping) await this.stopping;
+      if (session.stopped) {
+        if (this.fatalError) throw this.fatalError;
+        throw new Error('RPC process stopped during startup');
+      }
+      throw new Error(this.exitMessage(session.exitCode, session.exitSignal));
+    }
+    if (this.fatalError) {
+      const error = this.fatalError;
+      await this.stop().catch(() => undefined);
+      throw error;
+    }
     if (this.options.onAuthPipe) {
       try {
-        const stdio = 'stdio' in child ? child.stdio : undefined;
-        const pipe = Array.isArray(stdio) ? stdio[WORKER_AUTH_FD] : undefined;
+        const pipe = this.authPipe(child);
         if (!(pipe instanceof Duplex)) {
           throw new Error('Worker launcher does not support private authentication pipes');
         }
-        this.disposeAuthPipe = this.options.onAuthPipe(pipe);
+        session.disposeAuthPipe = this.options.onAuthPipe(pipe);
       } catch (error) {
         await this.stop();
         throw error;
@@ -220,8 +243,7 @@ export class RpcProcess {
     fields: Readonly<Record<string, unknown>> = {},
   ): Promise<T> {
     if (!type) throw new Error('RPC request type must not be empty');
-    const child = this.child;
-    if (!child || child.stdin.destroyed) throw this.notRunningError();
+    if (!this.canWrite(this.session)) throw this.notRunningError();
     if (this.fatalError) throw this.fatalError;
 
     const id = `rpc-${++this.nextRequestId}`;
@@ -282,48 +304,185 @@ export class RpcProcess {
   }
 
   public async stop(): Promise<void> {
-    this.disposeAuthPipe?.();
-    this.disposeAuthPipe = undefined;
+    const session = this.session;
+    if (session) this.disposeAuthPipe(session);
     if (this.stopping) return this.stopping;
-    const child = this.child;
-    if (!child) return;
+    if (!session) return;
 
-    this.stopping = this.stopChild(child);
+    const stopping = this.stopChild(session).finally(() => {
+      if (this.stopping === stopping) this.stopping = null;
+    });
+    this.stopping = stopping;
+    await stopping;
+  }
+
+  private async stopChild(session: ChildSession): Promise<void> {
+    session.stopped = true;
+    const stopTimeout = this.options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
+    const killTimeout = this.options.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
+
+    if (!session.exited) {
+      const abort = this.abort().catch(() => undefined);
+      await this.waitWithin(abort, stopTimeout);
+      session.child.stdin.end();
+    }
+    if (!session.exited && !(await this.waitWithin(session.exitedPromise, stopTimeout))) {
+      session.child.kill('SIGTERM');
+      if (!session.exited && !(await this.waitWithin(session.exitedPromise, killTimeout))) {
+        session.child.kill('SIGKILL');
+        if (!session.exited && !(await this.waitWithin(session.exitedPromise, killTimeout))) {
+          const error = this.withStderr('RPC process did not exit after SIGKILL');
+          session.abortStartup();
+          this.fatalError = error;
+          this.failAll(error);
+          this.reportError(error);
+          throw error;
+        }
+      }
+    }
+    await session.settledPromise;
+  }
+
+  private async waitWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
     try {
-      await this.stopping;
+      return await Promise.race([
+        promise.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
     } finally {
-      this.stopping = null;
+      if (timer) clearTimeout(timer);
     }
   }
 
-  private async stopChild(child: RpcChildProcess): Promise<void> {
-    const stopTimeout = this.options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
-    const killTimeout = this.options.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
-    const exit = this.exitPromise ?? Promise.resolve();
+  private createSession(child: RpcChildProcess): ChildSession {
+    let resolveExited!: () => void;
+    let resolveSettled!: () => void;
+    const exitedPromise = new Promise<void>((resolve) => {
+      resolveExited = resolve;
+    });
+    const settledPromise = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    let detachStdout = (): void => {};
 
-    const abort = this.abort().catch(() => undefined);
-    await Promise.race([abort, delay(stopTimeout)]);
-    child.stdin.end();
-    if (await this.waitForExit(exit, stopTimeout)) return;
+    const session: ChildSession = {
+      child,
+      exitedPromise,
+      settledPromise,
+      spawned: false,
+      exited: false,
+      settled: false,
+      stopped: false,
+      exitCode: null,
+      exitSignal: null,
+      stdoutEnded: child.stdout.readableEnded || child.stdout.destroyed,
+      stderrEnded: child.stderr.readableEnded || child.stderr.destroyed,
+      abortStartup: () => {
+        if (session.settled) return;
+        session.exited = true;
+        session.settled = true;
+        if (session.drainTimer) {
+          clearTimeout(session.drainTimer);
+          session.drainTimer = undefined;
+        }
+        detachStreams();
+        child.off('exit', onSessionExit);
+        this.disposeAuthPipe(session);
+        if (this.session === session) this.session = null;
+        resolveExited();
+        resolveSettled();
+      },
+    };
 
-    child.kill('SIGTERM');
-    if (await this.waitForExit(exit, killTimeout)) return;
+    const finalizeExit = (): void => {
+      if (session.settled) return;
+      session.settled = true;
+      if (session.drainTimer) {
+        clearTimeout(session.drainTimer);
+        session.drainTimer = undefined;
+      }
+      detachStreams();
+      if (this.session === session) {
+        this.session = null;
+        this.failAll(
+          this.fatalError ?? new Error(this.exitMessage(session.exitCode, session.exitSignal)),
+        );
+      }
+      resolveSettled();
+    };
 
-    child.kill('SIGKILL');
-    if (await this.waitForExit(exit, killTimeout)) return;
+    const maybeFinalizeExit = (): void => {
+      if (session.exited && session.stdoutEnded && session.stderrEnded) {
+        finalizeExit();
+      }
+    };
 
-    const error = this.withStderr('RPC process did not exit after SIGKILL');
-    this.fatalError = error;
-    this.failAll(error);
-    this.reportError(error);
-    throw error;
+    const onStdoutClose = (): void => {
+      session.stdoutEnded = true;
+      maybeFinalizeExit();
+    };
+    const onStderrData = (chunk: Buffer | string): void => {
+      if (this.session === session && !session.settled) this.captureStderr(chunk);
+    };
+    const onStderrEnd = (): void => {
+      session.stderrEnded = true;
+      maybeFinalizeExit();
+    };
+    const detachStreams = (): void => {
+      detachStdout();
+      child.stdout.off('close', onStdoutClose);
+      child.stderr.off('data', onStderrData);
+      child.stderr.off('end', onStderrEnd);
+      child.stderr.off('close', onStderrEnd);
+    };
+
+    detachStdout = this.attachStdout(session, onStdoutClose);
+    child.stdout.on('close', onStdoutClose);
+    child.stdout.on('error', (error) => {
+      this.handleChildError(session, error, 'RPC stdout error');
+      onStdoutClose();
+    });
+    child.stderr.on('data', onStderrData);
+    child.stderr.on('end', onStderrEnd);
+    child.stderr.on('close', onStderrEnd);
+    child.stderr.on('error', (error) => {
+      this.handleChildError(session, error, 'RPC stderr error');
+      onStderrEnd();
+    });
+    child.stdin.on('error', (error) => this.handleChildError(session, error, 'RPC stdin error'));
+    child.on('error', (error) => this.handleChildError(session, error, 'RPC process error'));
+    if (this.options.onAuthPipe) {
+      const pipe = this.authPipe(child);
+      if (pipe instanceof Duplex) pipe.on('error', () => {});
+    }
+    const onSessionExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (session.settled) return;
+      session.exited = true;
+      session.exitCode = code;
+      session.exitSignal = signal;
+      this.disposeAuthPipe(session);
+      resolveExited();
+      if (session.stdoutEnded && session.stderrEnded) {
+        finalizeExit();
+        return;
+      }
+      session.drainTimer = setTimeout(() => {
+        session.drainTimer = undefined;
+        child.stdout.destroy();
+        child.stderr.destroy();
+        finalizeExit();
+      }, DEFAULT_DRAIN_TIMEOUT_MS);
+    };
+    child.once('exit', onSessionExit);
+
+    return session;
   }
 
-  private async waitForExit(exit: Promise<void>, timeout: number): Promise<boolean> {
-    return Promise.race([exit.then(() => true), delay(timeout).then(() => false)]);
-  }
-
-  private attachStdout(child: RpcChildProcess, stdout: Readable): void {
+  private attachStdout(session: ChildSession, onEnded: () => void): () => void {
+    const { stdout } = session.child;
     const decoder = new StringDecoder('utf8');
     const limit = this.options.stdoutFrameLimitBytes ?? DEFAULT_STDOUT_FRAME_LIMIT_BYTES;
     let buffer = '';
@@ -331,7 +490,7 @@ export class RpcProcess {
       buffer = '';
       this.failProtocol(new Error(`RPC stdout frame exceeds ${limit} bytes`));
     };
-    const consume = () => {
+    const consume = (): void => {
       while (true) {
         const newline = buffer.indexOf('\n');
         if (newline < 0) {
@@ -345,30 +504,40 @@ export class RpcProcess {
           return;
         }
         if (line.endsWith('\r')) line = line.slice(0, -1);
-        this.handleLine(line);
+        this.handleLine(session, line);
         if (this.fatalError) return;
       }
     };
-    stdout.on('data', (chunk: Buffer | string) => {
-      if (this.child !== child || this.fatalError) return;
+    const onData = (chunk: Buffer | string): void => {
+      if (this.session !== session || session.settled || this.fatalError) return;
       buffer += typeof chunk === 'string' ? chunk : decoder.write(chunk);
       consume();
-    });
-    stdout.on('end', () => {
-      if (this.child !== child || this.fatalError) return;
-      buffer += decoder.end();
-      if (buffer.length === 0) return;
-      if (Buffer.byteLength(buffer) > limit) {
-        rejectOversizedFrame();
-        return;
+    };
+    const onEnd = (): void => {
+      if (this.session === session && !session.settled && !this.fatalError) {
+        buffer += decoder.end();
+        consume();
+        if (buffer.length > 0) {
+          if (Buffer.byteLength(buffer) > limit) {
+            rejectOversizedFrame();
+          } else {
+            if (buffer.endsWith('\r')) buffer = buffer.slice(0, -1);
+            this.handleLine(session, buffer);
+            buffer = '';
+          }
+        }
       }
-      if (buffer.endsWith('\r')) buffer = buffer.slice(0, -1);
-      this.handleLine(buffer);
-      buffer = '';
-    });
+      onEnded();
+    };
+    stdout.on('data', onData);
+    stdout.on('end', onEnd);
+    return () => {
+      stdout.off('data', onData);
+      stdout.off('end', onEnd);
+    };
   }
 
-  private handleLine(line: string): void {
+  private handleLine(session: ChildSession, line: string): void {
     if (this.fatalError) return;
     let value: unknown;
     try {
@@ -390,7 +559,7 @@ export class RpcProcess {
     if (event.type === 'agent_settled') this.resolveSettledWaiters();
     for (const listener of this.eventListeners) listener(event);
     if (event.type === 'extension_ui_request') {
-      void this.handleExtensionUiRequest(event);
+      void this.handleExtensionUiRequest(session, event);
     }
   }
 
@@ -418,11 +587,12 @@ export class RpcProcess {
     pending.resolve(value as unknown as RpcResponse);
   }
 
-  private async handleExtensionUiRequest(event: RpcRecord): Promise<void> {
+  private async handleExtensionUiRequest(session: ChildSession, event: RpcRecord): Promise<void> {
     if (typeof event.id !== 'string' || typeof event.method !== 'string') {
       this.failProtocol(new Error('Invalid extension_ui_request'));
       return;
     }
+    if (this.session !== session || !this.canWrite(session) || session.stopped) return;
     const request = event as ExtensionUiRequest;
     const callback = this.options.onExtensionUiRequest;
     let result: ExtensionUiResult;
@@ -445,6 +615,7 @@ export class RpcProcess {
         return;
       }
     }
+    if (this.session !== session || !this.canWrite(session) || session.stopped) return;
     this.write({ ...result, type: 'extension_ui_response', id: request.id }, (error) => {
       if (error) this.reportError(this.asError(error, 'Failed to write extension UI response'));
     });
@@ -477,17 +648,43 @@ export class RpcProcess {
     this.settledWaiters.clear();
   }
 
+  private authPipe(child: RpcChildProcess): unknown {
+    const stdio = 'stdio' in child ? child.stdio : undefined;
+    return Array.isArray(stdio) ? stdio[WORKER_AUTH_FD] : undefined;
+  }
+
+  private disposeAuthPipe(session: ChildSession): void {
+    if (session.disposeAuthPipe) {
+      session.disposeAuthPipe();
+      session.disposeAuthPipe = undefined;
+      return;
+    }
+    if (!this.options.onAuthPipe) return;
+    const pipe = this.authPipe(session.child);
+    if (pipe instanceof Duplex) pipe.destroy();
+  }
+
+  private canWrite(session: ChildSession | null): session is ChildSession {
+    return (
+      !!session &&
+      !session.exited &&
+      !session.settled &&
+      !session.child.stdin.destroyed &&
+      !session.child.stdin.writableEnded
+    );
+  }
+
   private write(record: RpcRecord, callback: (error?: Error | null) => void): void {
-    const child = this.child;
-    if (!child || child.stdin.destroyed) {
+    const session = this.session;
+    if (!this.canWrite(session)) {
       callback(this.notRunningError());
       return;
     }
-    child.stdin.write(`${JSON.stringify(record)}\n`, callback);
+    session.child.stdin.write(`${JSON.stringify(record)}\n`, callback);
   }
 
-  private handleChildError(child: RpcChildProcess, error: Error, prefix: string): void {
-    if (this.child !== child) return;
+  private handleChildError(session: ChildSession, error: Error, prefix: string): void {
+    if (this.session !== session || !session.spawned || session.exited || session.settled) return;
     const processError = this.asError(error, prefix);
     this.fatalError = processError;
     this.failAll(processError);
