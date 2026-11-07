@@ -4,18 +4,21 @@
 import { type ChildProcess, spawn, spawnSync, type StdioOptions } from 'node:child_process';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
   rmSync,
+  rmdirSync,
   writeFileSync,
 } from 'node:fs';
 import { type AddressInfo, createServer, Socket as NetSocket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { quote as quoteShell } from 'shell-quote';
 
@@ -735,21 +738,33 @@ function patchProcessGroupKill(child: ChildProcess): void {
 }
 
 async function stopPreparedChild(child: ChildProcess | undefined): Promise<void> {
-  if (!child) return;
+  if (!child || child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+
+  const waitForExit = (timeoutMs: number): Promise<void> => {
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    return new Promise<void>((resolveExit) => {
+      const settleTimer = setTimeout(() => {
+        child.off('exit', onExit);
+        resolveExit();
+      }, timeoutMs);
+      const onExit = (): void => {
+        clearTimeout(settleTimer);
+        resolveExit();
+      };
+      child.once('exit', onExit);
+    });
+  };
+
+  if (process.platform !== 'win32') {
+    child.kill('SIGTERM');
+    await waitForExit(200);
+    if (child.exitCode !== null || child.signalCode !== null) return;
+  }
 
   child.kill('SIGKILL');
-  if (child.exitCode !== null || child.signalCode !== null) return;
-
-  await new Promise<void>((resolve) => {
-    let settleTimer: NodeJS.Timeout | undefined;
-    const done = (): void => {
-      if (settleTimer) clearTimeout(settleTimer);
-      child.removeListener('exit', done);
-      resolve();
-    };
-    child.once('exit', done);
-    settleTimer = setTimeout(done, 1_000);
-  });
+  await waitForExit(1_000);
 }
 
 async function showPermissionPrompt(
@@ -1978,10 +1993,71 @@ function createLandstripIntegrationWithPrompts(
     let childEnd: NetSocket | undefined;
     let preparedChild: ChildProcess | undefined;
     let disposed = false;
+    const isolatedTmpDir = (() => {
+      if (process.platform !== 'linux') return undefined;
+      const raw = options.env?.TMPDIR?.trim();
+      if (!raw) return undefined;
+      const resolved = canonicalizePath(raw, options.cwd);
+      if (resolved === canonicalizePath(tmpdir(), options.cwd)) return undefined;
+      const hostTmpDir = process.env.TMPDIR?.trim();
+      if (hostTmpDir && resolved === canonicalizePath(hostTmpDir, options.cwd)) return undefined;
+      return resolved;
+    })();
     const cleanup = async (): Promise<unknown[]> => {
       const errors: unknown[] = [];
       for (const release of [
         () => stopPreparedChild(preparedChild),
+        async () => {
+          if (preparedChild?.pid === undefined || !isolatedTmpDir) return;
+          const deadline = Date.now() + 2_000;
+          for (;;) {
+            let parentDev: number;
+            let entries: string[];
+            try {
+              parentDev = lstatSync(isolatedTmpDir).dev;
+              entries = readdirSync(isolatedTmpDir);
+            } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code;
+              if (code === 'ENOENT' || code === 'ENOTDIR') return;
+              throw error;
+            }
+            const mounts = entries.filter((entry) => entry.startsWith('.mount_'));
+            if (mounts.length === 0) return;
+            for (const entry of mounts) {
+              const mountPath = join(isolatedTmpDir, entry);
+              try {
+                if (lstatSync(mountPath).dev === parentDev) {
+                  rmdirSync(mountPath);
+                }
+              } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+                if (code === 'ENOENT' || code === 'EBUSY') continue;
+                if (code === 'ENOTCONN' || code === 'ECONNABORTED') {
+                  for (const tool of ['fusermount', 'fusermount3']) {
+                    const result = spawnSync(tool, ['-u', '-q', '-z', mountPath], {
+                      stdio: 'ignore',
+                    });
+                    if (result.status === 0) break;
+                  }
+                  try {
+                    rmdirSync(mountPath);
+                  } catch (removeError) {
+                    const removeCode = (removeError as NodeJS.ErrnoException).code;
+                    if (removeCode !== 'ENOENT' && removeCode !== 'EBUSY') {
+                      throw removeError;
+                    }
+                  }
+                  continue;
+                }
+                throw error;
+              }
+            }
+            if (Date.now() >= deadline) {
+              throw new Error(`Timed out waiting for AppImage mount cleanup in ${isolatedTmpDir}`);
+            }
+            await delay(5);
+          }
+        },
         () => trapSocket?.destroy(),
         () => childEnd?.destroy(),
         () => {
