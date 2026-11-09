@@ -23,6 +23,7 @@ clap = { version = "4.5", features = ["derive"] }
 dirs = "7.0.0"
 env_logger = "0.11.10"
 globset = "0.4.21"
+hex = "0.4"
 libc = "0.2"
 log = "0.4.30"
 path-clean = "1.0"
@@ -46,7 +47,6 @@ nix = { version = "0.31", features = ["fs", "ioctl", "mount", "poll", "process",
 [target.'cfg(target_os = "windows")'.dependencies]
 chacha20 = { version = "0.10", features = ["rng", "zeroize"] }
 getrandom = "0.4"
-hex = "0.4"
 rand = "0.10"
 zeroize = "1.8"
 windows-sys = { version = "0.61", features = [

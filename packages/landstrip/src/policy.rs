@@ -31,16 +31,18 @@ use serde::Serialize;
 #[cfg(target_os = "linux")]
 use std::env;
 #[cfg(target_os = "linux")]
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::fd::BorrowedFd;
 #[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use walkdir::DirEntryExt as _;
 
 #[derive(Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -425,8 +427,10 @@ impl SupervisorSocketSet {
         // SAFETY: getuid(2) is always defined and has no preconditions.
         let uid = unsafe { libc::getuid() };
         let uid_runtime = Path::new("/run/user").join(uid.to_string());
-        let runtime =
-            env::var_os("XDG_RUNTIME_DIR").map_or_else(|| uid_runtime.clone(), PathBuf::from);
+        let runtime = dirs::runtime_dir()
+            .map(|path| path.normalize())
+            .filter(|path| Self::is_valid_socket_path(path))
+            .unwrap_or_else(|| uid_runtime.clone());
         let mut paths = vec![
             PathBuf::from("/run/dbus/system_bus_socket"),
             runtime.join("bus"),
@@ -439,33 +443,89 @@ impl SupervisorSocketSet {
             ["DBUS_SYSTEM_BUS_ADDRESS", "DBUS_SESSION_BUS_ADDRESS"]
                 .into_iter()
                 .filter_map(env::var_os)
-                .filter_map(|addresses| Self::bus_path(&addresses)),
+                .flat_map(|addresses| Self::bus_paths(&addresses)),
         );
         paths
+            .into_iter()
+            .map(|path| path.normalize())
+            .filter(|path| Self::is_valid_socket_path(path))
+            .collect()
     }
 
-    /// First pathname in a D-Bus server address list.
-    fn bus_path(addresses: &OsStr) -> Option<PathBuf> {
+    fn is_valid_socket_path(path: &Path) -> bool {
+        path.is_absolute()
+            && !path.as_os_str().as_bytes().contains(&0)
+            && path.clean_lexically() != Path::new("/")
+    }
+
+    /// All valid pathname sockets in a `;`-separated D-Bus server address list.
+    fn bus_paths(addresses: &OsStr) -> Vec<PathBuf> {
         addresses
             .as_bytes()
             .split(|byte| *byte == b';')
             .filter_map(|entry| entry.strip_prefix(b"unix:"))
-            .find_map(|params| {
+            .filter_map(|params| {
                 params
                     .split(|byte| *byte == b',')
                     .find_map(|param| param.strip_prefix(b"path="))
             })
-            .map(|path| PathBuf::from(OsStr::from_bytes(path)))
+            .filter_map(Self::unescape_bus_value)
+            .map(|bytes| PathBuf::from(OsString::from_vec(bytes)))
+            .filter(|path| Self::is_valid_socket_path(path))
+            .collect()
+    }
+
+    fn unescape_bus_value(encoded: &[u8]) -> Option<Vec<u8>> {
+        if encoded.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(encoded.len());
+        let mut rest = encoded;
+        while let Some((&first, tail)) = rest.split_first() {
+            let decoded = if first == b'%' {
+                let (pair, after) = tail.split_at_checked(2)?;
+                let mut byte = [0_u8; 1];
+                hex::decode_to_slice(pair, &mut byte).ok()?;
+                rest = after;
+                byte[0]
+            } else {
+                rest = tail;
+                first
+            };
+            if decoded == 0 {
+                return None;
+            }
+            out.push(decoded);
+        }
+        Some(out)
     }
 
     fn same_inode(left: BorrowedFd<'_>, right: &Path) -> bool {
         let Ok(stat) = fstat(left) else {
             return true;
         };
-        let Ok(right) = fs::metadata(right) else {
+        let Ok(right_meta) = fs::metadata(right) else {
             return false;
         };
-        stat.st_dev == right.dev() && stat.st_ino == right.ino()
+        if stat.st_dev == right_meta.dev() && stat.st_ino == right_meta.ino() {
+            return true;
+        }
+        right_meta.is_dir()
+            && stat.st_dev == right_meta.dev()
+            && walkdir::WalkDir::new(right)
+                .max_depth(5)
+                .follow_links(false)
+                .follow_root_links(true)
+                .same_file_system(true)
+                .into_iter()
+                .flatten()
+                .any(|entry| {
+                    !entry.file_type().is_symlink()
+                        && entry.ino() == stat.st_ino
+                        && entry.metadata().is_ok_and(|meta| {
+                            meta.dev() == stat.st_dev && meta.ino() == stat.st_ino
+                        })
+                })
     }
 }
 
