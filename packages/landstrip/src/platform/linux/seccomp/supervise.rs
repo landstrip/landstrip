@@ -221,12 +221,8 @@ impl SyscallClass {
         } else {
             &[]
         };
-        policy
-            .network_access
-            .needs_bind_broker()
-            .then_some(libc::SYS_bind)
+        [libc::SYS_bind, libc::SYS_connect]
             .into_iter()
-            .chain(std::iter::once(libc::SYS_connect))
             .chain(Self::ACCESS.iter().copied())
             .chain(datagram.iter().copied())
             .chain(filesystem.iter().copied())

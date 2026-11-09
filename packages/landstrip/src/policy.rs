@@ -354,18 +354,6 @@ impl NetworkAccess {
     pub(crate) fn restricts_connect_tcp(&self) -> bool {
         matches!(self, Self::Restricted { .. })
     }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn needs_bind_broker(&self) -> bool {
-        match self {
-            Self::Unrestricted { unix_socket_access } => unix_socket_access.needs_broker(),
-            Self::Restricted {
-                bind,
-                unix_socket_access,
-                ..
-            } => matches!(bind, IpBindAccess::Localhost) || unix_socket_access.needs_broker(),
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Serialize)]

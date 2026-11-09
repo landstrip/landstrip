@@ -439,7 +439,12 @@ impl UnixSocketOp {
             );
             return Err(BrokerError::PolicyDenied);
         }
-        if matches!(self, Self::Bind) && policy.write_reason(&target.label, true).is_some() {
+        if matches!(self, Self::Bind)
+            && (policy.write_reason(&target.label, true).is_some()
+                || policy
+                    .write_denials
+                    .is_denied_pair(&target.label, &target.lexical))
+        {
             return denials.deny(
                 Denial::Network(
                     operation,
