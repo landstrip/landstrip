@@ -46,6 +46,12 @@ impl<'a> ProcFd<'a> {
         Self::open_path(&self.proc_path(), flags)
     }
 
+    pub(super) fn dup_above_stdio(self) -> SysResult<OwnedFd> {
+        let dup = unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        let dup = Errno::result(dup)?;
+        Ok(unsafe { OwnedFd::from_raw_fd(dup) })
+    }
+
     pub(super) fn read_link(self) -> SysResult<PathBuf> {
         fs::read_link(self.proc_path()).map_err(BrokerError::from)
     }

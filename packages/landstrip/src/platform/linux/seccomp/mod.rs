@@ -10,12 +10,14 @@
 //!
 //! Unix sockets are denied by default. `allowUnixSockets` mediates pathname
 //! `connect` and `bind`; unnamed sockets and `socketpair` are not path-mediated.
-//! `allowAllUnixSockets` permits new Unix sockets without path checks. systemd
-//! and D-Bus control sockets stay denied either way: they start processes that
-//! would inherit neither Landlock nor seccomp. Host-created abstract Unix sockets
+//! `allowAllUnixSockets` permits new Unix sockets without path checks. System
+//! and systemd control sockets stay denied either way, while discovered user
+//! D-Bus session sockets route approved `connect` requests through
+//! `xdg-dbus-proxy` (`org.freedesktop.secrets` only). Host-created abstract Unix sockets
 //! are denied by Landlock scope on ABI 6+ (Linux 6.12+); the broker cannot tell
 //! those apart from sockets the child created itself.
 
+mod dbus;
 mod error;
 mod fs;
 mod grant;

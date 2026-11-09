@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
+use super::dbus::{DbusProxies, InodeKey};
 use super::error::{BrokerError, SysResult};
 use super::notify::{NotificationChannel, NotificationResponse};
 use super::process::ResolvedPath;
@@ -8,11 +9,14 @@ use super::procfs::{Anchor, OpenHow, ProcFd};
 use crate::policy::AccessPolicy;
 use nix::errno::Errno;
 use nix::sys::stat::fstat;
+use socket2::{SockAddr, SockRef};
 use std::ffi::{CStr, CString, OsStr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::thread;
+use std::time::Duration;
 
 pub(super) const SYS_FCHMODAT2: i64 = 452;
 
@@ -24,10 +28,17 @@ pub(super) enum Grant {
     // Preparation failures still await the policy decision before being returned.
     Mutation(SysResult<MutationGrant>),
     Socket(SocketGrant),
+    SessionBus(SessionBusGrant),
 }
 
 impl Grant {
-    pub(super) fn apply(&self, policy: &AccessPolicy, notify: NotificationChannel<'_>, id: u64) {
+    pub(super) fn apply(
+        &self,
+        policy: &AccessPolicy,
+        dbus_proxies: &mut DbusProxies,
+        notify: NotificationChannel<'_>,
+        id: u64,
+    ) {
         match self {
             Self::Open(grant) => grant.apply(policy, notify, id),
             Self::Mutation(Ok(grant)) => grant.apply(notify, id),
@@ -35,6 +46,7 @@ impl Grant {
                 let _ = notify.respond(NotificationResponse::error(id, error.errno()));
             }
             Self::Socket(grant) => grant.apply(notify, id),
+            Self::SessionBus(grant) => grant.apply(dbus_proxies, notify, id),
         }
     }
 }
@@ -54,6 +66,111 @@ impl From<MutationGrant> for Grant {
 impl From<SocketGrant> for Grant {
     fn from(grant: SocketGrant) -> Self {
         Self::Socket(grant)
+    }
+}
+
+impl From<SessionBusGrant> for Grant {
+    fn from(grant: SessionBusGrant) -> Self {
+        Self::SessionBus(grant)
+    }
+}
+
+struct NonblockScope<'a> {
+    sock: SockRef<'a>,
+    was_nonblocking: bool,
+}
+
+impl<'a> NonblockScope<'a> {
+    fn enter(fd: &'a OwnedFd) -> SysResult<Self> {
+        let sock = SockRef::from(fd);
+        let was_nonblocking = sock.nonblocking()?;
+        if !was_nonblocking {
+            sock.set_nonblocking(true)?;
+        }
+        Ok(Self {
+            sock,
+            was_nonblocking,
+        })
+    }
+}
+
+impl Drop for NonblockScope<'_> {
+    fn drop(&mut self) {
+        if !self.was_nonblocking {
+            let _ = self.sock.set_nonblocking(false);
+        }
+    }
+}
+
+pub(super) struct SessionBusGrant {
+    sock: OwnedFd,
+    upstream: OwnedFd,
+}
+
+impl SessionBusGrant {
+    pub(super) fn new(sock: OwnedFd, upstream: OwnedFd) -> Self {
+        Self { sock, upstream }
+    }
+
+    fn connect_proxy(
+        &self,
+        dbus_proxies: &mut DbusProxies,
+        notify: NotificationChannel<'_>,
+        id: u64,
+    ) -> SysResult<Option<i64>> {
+        let key = InodeKey::try_from(self.upstream.as_fd())?;
+        for attempt in 0..2 {
+            let proc_path = {
+                let proxy_fd = dbus_proxies.socket_for(key, self.upstream.as_fd())?;
+                ProcFd::new(proxy_fd).proc_path()
+            };
+            if !notify.is_id_valid(id).unwrap_or(false) {
+                return Ok(None);
+            }
+            let addr = SockAddr::unix(proc_path)?;
+            let scope = NonblockScope::enter(&self.sock)?;
+            let mut retry_dead_proxy = false;
+            for step in 0..200 {
+                if step > 0 && !notify.is_id_valid(id).unwrap_or(false) {
+                    return Ok(None);
+                }
+                match scope.sock.connect(&addr) {
+                    Ok(()) => return Ok(Some(0)),
+                    Err(error) => {
+                        let errno = error.raw_os_error().unwrap_or(libc::EIO);
+                        if errno == libc::EAGAIN && !scope.was_nonblocking && step < 199 {
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        if errno == libc::ECONNREFUSED && attempt == 0 {
+                            retry_dead_proxy = true;
+                            break;
+                        }
+                        return Err(BrokerError::syscall(errno));
+                    }
+                }
+            }
+            drop(scope);
+            if retry_dead_proxy && dbus_proxies.evict(key) {
+                continue;
+            }
+            return Err(BrokerError::syscall(libc::ECONNREFUSED));
+        }
+        Err(BrokerError::syscall(libc::ECONNREFUSED))
+    }
+
+    pub(super) fn apply(
+        &self,
+        dbus_proxies: &mut DbusProxies,
+        notify: NotificationChannel<'_>,
+        id: u64,
+    ) {
+        let response = match self.connect_proxy(dbus_proxies, notify, id) {
+            Ok(Some(value)) => NotificationResponse::success(id, value),
+            Ok(None) => return,
+            Err(error) => NotificationResponse::error(id, error.errno()),
+        };
+        let _ = notify.respond(response);
     }
 }
 

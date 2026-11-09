@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::error::{BrokerError, SysResult};
-use super::grant::{Grant, SocketAddrCall, SocketGrant};
+use super::grant::{Grant, SessionBusGrant, SocketAddrCall, SocketGrant};
 use super::notify::NotificationResult;
 use super::process::{MissingTarget, TargetProcess};
 use super::procfs::ProcFd;
@@ -211,6 +211,7 @@ pub(super) fn handle_bind(
 
 pub(super) fn handle_connect(
     policy: &AccessPolicy,
+    proxy_available: bool,
     request: &libc::seccomp_notif,
     denials: &mut Denials<'_>,
 ) -> SysResult<NotificationResult> {
@@ -262,7 +263,9 @@ pub(super) fn handle_connect(
 
             Ok(NotificationResult::grant(socket.into_grant(libc::connect)))
         }
-        SocketKind::Unix => UnixSocketOp::Connect.handle(policy, request.pid, socket, denials),
+        SocketKind::Unix => {
+            UnixSocketOp::Connect { proxy_available }.handle(policy, request.pid, socket, denials)
+        }
         SocketKind::Other => Ok(NotificationResult::Continue),
         SocketKind::NotSupported if policy.network_access.is_unrestricted() => {
             Ok(NotificationResult::Continue)
@@ -377,21 +380,21 @@ pub(super) fn handle_sendmmsg(
 
 #[derive(Clone, Copy)]
 enum UnixSocketOp {
-    Connect,
+    Connect { proxy_available: bool },
     Bind,
 }
 
 impl UnixSocketOp {
     fn operation(self) -> NetworkOperation {
         match self {
-            Self::Connect => NetworkOperation::Connect,
+            Self::Connect { .. } => NetworkOperation::Connect,
             Self::Bind => NetworkOperation::Bind,
         }
     }
 
     fn call(self) -> SocketAddrCall {
         match self {
-            Self::Connect => libc::connect,
+            Self::Connect { .. } => libc::connect,
             Self::Bind => libc::bind,
         }
     }
@@ -411,7 +414,7 @@ impl UnixSocketOp {
                 UnixSocketAccess::Unrestricted
             ) {
                 return Ok(match self {
-                    Self::Connect => NotificationResult::Continue,
+                    Self::Connect { .. } => NotificationResult::Continue,
                     Self::Bind => NotificationResult::grant(socket.into_grant(libc::bind)),
                 });
             }
@@ -423,21 +426,40 @@ impl UnixSocketOp {
         };
         let filesystem = process.filesystem()?;
         let (follow, missing) = match self {
-            Self::Connect => (true, MissingTarget::Disallow),
+            Self::Connect { .. } => (true, MissingTarget::Disallow),
             Self::Bind => (false, MissingTarget::File),
         };
         let target = filesystem.resolve(libc::AT_FDCWD, &path, follow, missing, 0)?;
         let anchor = target.anchor.ok_or(BrokerError::SystemCall {
             errno: libc::ENOENT,
         })?;
-        let access =
-            policy.unix_path_access(&target.label, anchor.target.as_ref().map(AsFd::as_fd));
-        if matches!(access, UnixPathAccess::Supervisor) {
-            log::debug!(
-                "service manager socket {operation:?} denied: {}",
-                target.label.display()
-            );
-            return Err(BrokerError::PolicyDenied);
+        let access = policy.unix_path_access(
+            &target.label,
+            anchor.target.as_ref().map(AsFd::as_fd),
+            matches!(self, Self::Connect { .. }),
+        );
+        match access {
+            UnixPathAccess::Supervisor => {
+                log::debug!(
+                    "service manager socket {operation:?} denied: {}",
+                    target.label.display()
+                );
+                return Err(BrokerError::PolicyDenied);
+            }
+            UnixPathAccess::SessionBus { label, allowed } => {
+                let Some(upstream) = anchor.target else {
+                    return Err(BrokerError::PolicyDenied);
+                };
+                return self.handle_session_bus(
+                    socket.sock,
+                    upstream,
+                    label,
+                    allowed,
+                    &process,
+                    denials,
+                );
+            }
+            UnixPathAccess::Allowed | UnixPathAccess::Denied => {}
         }
         if matches!(self, Self::Bind)
             && (policy.write_reason(&target.label, true).is_some()
@@ -456,7 +478,7 @@ impl UnixSocketOp {
             );
         }
         match self {
-            Self::Connect => {
+            Self::Connect { .. } => {
                 let object = anchor.target.as_ref().ok_or(BrokerError::InvalidAddress)?;
                 socket.rewrite_unix_path(&ProcFd::new(object.as_fd()).proc_path())?;
             }
@@ -479,6 +501,49 @@ impl UnixSocketOp {
         }
 
         Ok(NotificationResult::grant(grant))
+    }
+
+    fn handle_session_bus(
+        self,
+        sock: OwnedFd,
+        upstream: OwnedFd,
+        label: &Path,
+        allowed: bool,
+        process: &TargetProcess,
+        denials: &mut Denials<'_>,
+    ) -> SysResult<NotificationResult> {
+        if !matches!(
+            self,
+            Self::Connect {
+                proxy_available: true
+            }
+        ) {
+            log::warn!(
+                "session bus connect denied (install xdg-dbus-proxy for keyring access): {}",
+                label.display()
+            );
+            return Err(BrokerError::PolicyDenied);
+        }
+        let grant = SessionBusGrant::new(sock, upstream);
+        if allowed {
+            return Ok(NotificationResult::grant(grant));
+        }
+        if denials.can_query(true) {
+            return denials.deny(
+                Denial::Network(
+                    self.operation(),
+                    label.to_string_lossy().into_owned(),
+                    process.context(),
+                ),
+                true,
+                Some(Grant::from(grant)),
+            );
+        }
+        log::debug!(
+            "session bus connect denied without interactive broker: {}",
+            label.display()
+        );
+        Err(BrokerError::PolicyDenied)
     }
 }
 

@@ -381,13 +381,25 @@ impl UnixSocketAccess {
 /// Decision for a Unix socket `connect` or `bind` target.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum UnixPathAccess {
+pub(crate) enum UnixPathAccess<'a> {
     Allowed,
     /// Denied by policy; the interactive supervisor may offer a grant.
     Denied,
+    /// User D-Bus session socket filtered via `xdg-dbus-proxy` (`org.freedesktop.secrets`).
+    SessionBus {
+        label: &'a Path,
+        allowed: bool,
+    },
     /// Names a service manager socket. No grant can make this safe, so the
-    /// denial is terminal and the broker only reports it.
+    /// denial is terminal and the broker only reports it at debug level.
     Supervisor,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct SessionBus {
+    path: PathBuf,
+    allowed: bool,
 }
 
 /// Sockets a sandboxed child could use to ask an unsandboxed service manager to
@@ -397,33 +409,84 @@ pub(crate) enum UnixPathAccess {
 /// `DBUS_SESSION_BUS_ADDRESS`, and `XDG_RUNTIME_DIR`; `network.supervisorSockets`
 /// replaces them.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Eq, Hash, PartialEq, Serialize)]
-#[serde(transparent)]
-pub(crate) struct SupervisorSocketSet(Vec<PathBuf>);
+#[derive(Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SupervisorSocketSet {
+    all: Vec<PathBuf>,
+    system: Vec<PathBuf>,
+    session_buses: Vec<SessionBus>,
+}
+
+#[cfg(target_os = "linux")]
+impl Serialize for SupervisorSocketSet {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.all.serialize(serializer)
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl SupervisorSocketSet {
     /// `None` selects the discovered defaults. An explicit list replaces them,
     /// so a policy naming its own service manager is not also restricted by the
     /// sockets this host happens to have.
-    pub(crate) fn new(overrides: Option<Vec<PathBuf>>) -> Self {
-        let mut paths = match overrides {
-            Some(paths) => paths,
-            None => Self::discovered(),
-        };
-        paths.normalize_roots();
-        Self(paths)
+    pub(crate) fn new(overrides: Option<Vec<PathBuf>>, allow_unix_sockets: &[PathBuf]) -> Self {
+        match overrides {
+            Some(mut paths) => {
+                paths.normalize_roots();
+                Self {
+                    system: paths.clone(),
+                    all: paths,
+                    session_buses: Vec::new(),
+                }
+            }
+            None => Self::discovered(allow_unix_sockets),
+        }
     }
 
-    /// Each entry covers the path and, for a directory, its subtree. The inode
-    /// comparison keeps a symlink or hard link from naming a denied socket.
-    pub(crate) fn contains(&self, target: &Path, object: Option<BorrowedFd<'_>>) -> bool {
-        self.0.iter().any(|candidate| {
-            target.is_under(candidate) || object.is_some_and(|fd| Self::same_inode(fd, candidate))
+    pub(crate) fn access(
+        &self,
+        target: &Path,
+        object: Option<BorrowedFd<'_>>,
+        allow_session_bus: bool,
+        unrestricted_unix: bool,
+    ) -> Option<UnixPathAccess<'_>> {
+        if self
+            .system
+            .iter()
+            .any(|path| Self::matches(path, target, object))
+        {
+            return Some(UnixPathAccess::Supervisor);
+        }
+        let mut buses = self
+            .session_buses
+            .iter()
+            .filter(|bus| Self::matches(&bus.path, target, object));
+        let first = buses.next()?;
+        if !allow_session_bus {
+            return Some(UnixPathAccess::Supervisor);
+        }
+        if let Some(bus) = std::iter::once(first).chain(buses).find(|bus| bus.allowed) {
+            return Some(UnixPathAccess::SessionBus {
+                label: &bus.path,
+                allowed: true,
+            });
+        }
+        if unrestricted_unix {
+            return Some(UnixPathAccess::Supervisor);
+        }
+        Some(UnixPathAccess::SessionBus {
+            label: &first.path,
+            allowed: false,
         })
     }
 
-    fn discovered() -> Vec<PathBuf> {
+    fn matches(candidate: &Path, target: &Path, object: Option<BorrowedFd<'_>>) -> bool {
+        target.is_under(candidate) || object.is_some_and(|fd| Self::same_inode(fd, candidate))
+    }
+
+    fn discovered(allow_unix_sockets: &[PathBuf]) -> Self {
         // SAFETY: getuid(2) is always defined and has no preconditions.
         let uid = unsafe { libc::getuid() };
         let uid_runtime = Path::new("/run/user").join(uid.to_string());
@@ -431,25 +494,51 @@ impl SupervisorSocketSet {
             .map(|path| path.normalize())
             .filter(|path| Self::is_valid_socket_path(path))
             .unwrap_or_else(|| uid_runtime.clone());
-        let mut paths = vec![
+
+        let mut system = vec![
             PathBuf::from("/run/dbus/system_bus_socket"),
-            runtime.join("bus"),
-            uid_runtime.join("bus"),
             PathBuf::from("/run/systemd"),
             runtime.join("systemd"),
             uid_runtime.join("systemd"),
         ];
-        paths.extend(
-            ["DBUS_SYSTEM_BUS_ADDRESS", "DBUS_SESSION_BUS_ADDRESS"]
-                .into_iter()
-                .filter_map(env::var_os)
-                .flat_map(|addresses| Self::bus_paths(&addresses)),
-        );
-        paths
+        if let Some(addresses) = env::var_os("DBUS_SYSTEM_BUS_ADDRESS") {
+            system.extend(Self::bus_paths(&addresses));
+        }
+        system = system
             .into_iter()
             .map(|path| path.normalize())
             .filter(|path| Self::is_valid_socket_path(path))
-            .collect()
+            .collect();
+        system.normalize_roots();
+
+        let mut bus_paths = vec![runtime.join("bus"), uid_runtime.join("bus")];
+        if let Some(addresses) = env::var_os("DBUS_SESSION_BUS_ADDRESS") {
+            bus_paths.extend(Self::bus_paths(&addresses));
+        }
+        bus_paths = bus_paths
+            .into_iter()
+            .map(|path| path.normalize())
+            .filter(|path| Self::is_valid_socket_path(path) && !path.is_under_any(&system))
+            .collect();
+        bus_paths.normalize_roots();
+
+        let mut all = system.clone();
+        all.extend(bus_paths.iter().cloned());
+        all.normalize_roots();
+
+        let session_buses = bus_paths
+            .into_iter()
+            .map(|path| {
+                let allowed = path.is_under_any(allow_unix_sockets);
+                SessionBus { path, allowed }
+            })
+            .collect();
+
+        Self {
+            all,
+            system,
+            session_buses,
+        }
     }
 
     fn is_valid_socket_path(path: &Path) -> bool {
@@ -531,16 +620,25 @@ impl SupervisorSocketSet {
 
 #[cfg(target_os = "linux")]
 impl AccessPolicy {
-    /// A service manager socket stays denied whatever the unix socket policy
-    /// says: approving one would start a process outside Landlock and seccomp,
-    /// which no later rule can undo.
+    /// Service manager sockets stay denied whatever the unix socket policy
+    /// says: raw access would start a process outside Landlock and seccomp.
+    /// When `allow_session_bus` is true (`connect`), discovered user D-Bus
+    /// session sockets are mediated through `xdg-dbus-proxy` instead.
     pub(crate) fn unix_path_access(
         &self,
         target: &Path,
         object: Option<BorrowedFd<'_>>,
-    ) -> UnixPathAccess {
-        if self.supervisor_sockets.contains(target, object) {
-            return UnixPathAccess::Supervisor;
+        allow_session_bus: bool,
+    ) -> UnixPathAccess<'_> {
+        let unrestricted = matches!(
+            self.network_access.unix_socket_access(),
+            UnixSocketAccess::Unrestricted
+        );
+        if let Some(access) =
+            self.supervisor_sockets
+                .access(target, object, allow_session_bus, unrestricted)
+        {
+            return access;
         }
         match self.network_access.unix_socket_access() {
             UnixSocketAccess::Unrestricted => UnixPathAccess::Allowed,

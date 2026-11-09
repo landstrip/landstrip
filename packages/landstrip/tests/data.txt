@@ -192,6 +192,7 @@ name=allowAllUnixSockets still denies unix bind inside denyWrite | os=linux | se
 name=allowAllUnixSockets denies unix bind over supervisor socket | os=linux | policy={"network":{"allowAllUnixSockets":true,"supervisorSockets":["%TMP%/sup.sock"]},"filesystem":{"allowWrite":["%TMP%"]}} | trap=true | cmd=%PROBE% unix-bind %TMP%/sup.sock | status=0 | trapfd_empty
 name=approved unix connect is granted | os=linux | policy={"network":{},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | net=unix-reported | grant=true | status=0 | trapfd="state":"query" | trapfd="kind":"network" | trapfd="operation":"connect" | trapfd=reported.sock
 name=supervisor socket denial stays silent and never queried | os=linux | setup=mkdir:runtime | policy={"network":{"allowAllUnixSockets":true}} | net=unix-supervisor-denied | unixsock=runtime/bus | grant=true | status=!0 | out!="kind":"network" | trapfd_empty
+name=session bus proxy filters secret service and blocks systemd | os=linux | launcher=python3 %REPO%/tests/probe/session_bus.py "$1"; exit $? | timeout_secs=30 | status=0 | out=session bus verified
 name=cannot signal process outside sandbox | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%PROBE% signal-outside | status=0
 name=same-process thread signal still works | os=linux | policy={"network":{"allowNetwork":true},"filesystem":{"denyRead":["/"],"allowRead":["/"]}} | cmd=%PROBE% signal-thread | status=0
 

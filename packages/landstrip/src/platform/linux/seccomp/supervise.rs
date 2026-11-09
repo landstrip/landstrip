@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::super::signals::ForwardSignals;
+use super::dbus::DbusProxies;
 use super::error::{BrokerError, SysResult};
 use super::fs::{MUTATION_SYSCALLS, handle_access, handle_mutation, handle_openat};
 use super::grant::Grant;
@@ -288,6 +289,7 @@ pub(super) struct Supervisor<'a> {
     denials: Denials<'a>,
     pending_queries: HashMap<u64, PendingQuery>,
     control_buffer: Vec<u8>,
+    dbus_proxies: DbusProxies,
 }
 
 impl<'a> Supervisor<'a> {
@@ -311,6 +313,7 @@ impl<'a> Supervisor<'a> {
             denials: Denials::new(trap_fd),
             pending_queries: HashMap::new(),
             control_buffer: Vec::new(),
+            dbus_proxies: DbusProxies::new(),
         }
     }
 
@@ -383,7 +386,7 @@ impl<'a> Supervisor<'a> {
                     }
                 }
                 HandleResult::Apply(grant) => {
-                    grant.apply(self.policy, self.notify, request.id);
+                    grant.apply(self.policy, &mut self.dbus_proxies, self.notify, request.id);
                 }
             }
         }
@@ -404,7 +407,12 @@ impl<'a> Supervisor<'a> {
         let syscall = i64::from(request.data.nr);
         let result = match SyscallClass::classify(syscall) {
             Some(SyscallClass::Bind) => handle_bind(self.policy, request, &mut self.denials),
-            Some(SyscallClass::Connect) => handle_connect(self.policy, request, &mut self.denials),
+            Some(SyscallClass::Connect) => handle_connect(
+                self.policy,
+                self.dbus_proxies.is_available(),
+                request,
+                &mut self.denials,
+            ),
             Some(SyscallClass::Sendto) => handle_sendto(request, &mut self.denials),
             Some(SyscallClass::Sendmsg) => handle_sendmsg(request, &mut self.denials),
             Some(SyscallClass::Sendmmsg) => handle_sendmmsg(request, &mut self.denials),
@@ -537,7 +545,9 @@ impl<'a> Supervisor<'a> {
                 }
                 match response.action {
                     ControlAction::Allow => match pending.grant {
-                        Some(grant) => grant.apply(self.policy, self.notify, id),
+                        Some(grant) => {
+                            grant.apply(self.policy, &mut self.dbus_proxies, self.notify, id);
+                        }
                         None => {
                             let _ = self
                                 .notify

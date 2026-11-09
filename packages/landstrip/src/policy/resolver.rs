@@ -32,6 +32,12 @@ impl Settings {
         let resolver = PolicyResolver::new(policy_base)?;
         let write = resolver.resolve_write_policy(&self.filesystem)?;
         let read = resolver.resolve_read_policy(&self.filesystem)?;
+        let unix_socket_paths = resolver.resolve_paths(&self.network.allow_unix_sockets)?;
+        #[cfg(target_os = "linux")]
+        let supervisor_sockets = resolver.resolve_supervisor_sockets(
+            self.network.supervisor_sockets.as_deref(),
+            &unix_socket_paths,
+        )?;
         Ok(AccessPolicy {
             write_roots: write.roots,
             write_denials: write.denials,
@@ -39,10 +45,9 @@ impl Settings {
             read_access: read.access,
             read_denials: read.denials,
             read_symlinks: read.symlinks,
-            network_access: resolver.lower_network_policy(&self.network)?,
+            network_access: PolicyResolver::lower_network_policy(&self.network, unix_socket_paths)?,
             #[cfg(target_os = "linux")]
-            supervisor_sockets: resolver
-                .resolve_supervisor_sockets(self.network.supervisor_sockets.as_deref())?,
+            supervisor_sockets,
             macos: self.macos.normalize()?,
             app_container_mode: self.windows.app_container_mode,
             allow_windows_loopback: self.windows.allow_loopback,
@@ -508,12 +513,13 @@ impl PolicyResolver {
     fn resolve_supervisor_sockets(
         &self,
         overrides: Option<&[PathSelector]>,
+        allow_unix_sockets: &[PathBuf],
     ) -> Result<SupervisorSocketSet> {
         let resolved = match overrides {
             Some(paths) => Some(self.resolve_paths(paths)?),
             None => None,
         };
-        Ok(SupervisorSocketSet::new(resolved))
+        Ok(SupervisorSocketSet::new(resolved, allow_unix_sockets))
     }
 
     fn resolve_paths(&self, paths: &[PathSelector]) -> Result<Vec<PathBuf>> {
@@ -656,8 +662,10 @@ impl PolicyResolver {
         })
     }
 
-    fn lower_network_policy(&self, network: &SandboxNetwork) -> Result<NetworkAccess> {
-        let unix_socket_paths = self.resolve_paths(&network.allow_unix_sockets)?;
+    fn lower_network_policy(
+        network: &SandboxNetwork,
+        unix_socket_paths: Vec<PathBuf>,
+    ) -> Result<NetworkAccess> {
         let unix_socket_access = if network.allow_all_unix_sockets {
             UnixSocketAccess::Unrestricted
         } else if unix_socket_paths.is_empty() {

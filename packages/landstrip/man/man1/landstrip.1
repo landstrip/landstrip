@@ -257,6 +257,14 @@ falling back to
 .Pa /run/systemd ,
 and
 .Pa /run/user/<uid> .
+When
+.Xr xdg-dbus-proxy 1
+is installed, discovered user session bus
+.Fn connect
+requests approved interactively or listed in
+.Va allowUnixSockets
+are routed through a filtered proxy exposing only
+.Li org.freedesktop.secrets .
 .Va supervisorSockets
 replaces that set, so a policy naming its own service manager is not also
 restricted to this host's sockets.
