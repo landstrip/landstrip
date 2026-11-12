@@ -353,6 +353,14 @@ impl Case {
                     let (target, link) = rest.split_once(':').unwrap_or((rest, ""));
                     make_symlink(&resolver.subst(target), &dir.join(resolver.subst(link)))?;
                 }
+                "link" => {
+                    let (target, link) = rest.split_once(':').unwrap_or((rest, ""));
+                    std::fs::hard_link(
+                        dir.join(resolver.subst(target)),
+                        dir.join(resolver.subst(link)),
+                    )
+                    .map_err(|e| format!("link {rest}: {e}"))?;
+                }
                 "homedir" => {
                     let path = resolver.home.join(resolver.subst(rest));
                     std::fs::create_dir_all(&path).map_err(|e| format!("homedir {rest}: {e}"))?;
