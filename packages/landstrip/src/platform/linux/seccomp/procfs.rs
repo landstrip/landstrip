@@ -3,7 +3,8 @@
 
 use super::error::{BrokerError, SysResult};
 use nix::errno::Errno;
-use nix::sys::stat::fstat;
+use nix::fcntl::AtFlags;
+use nix::sys::stat::{fstat, fstatat};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -68,17 +69,8 @@ impl<'a> ProcFd<'a> {
     }
 
     pub(super) fn label_under_root_opt(self, root: &Path) -> SysResult<Option<PathBuf>> {
-        let label = self.read_link()?;
-        if !label.is_absolute() {
+        let Some(label) = FdLabel::try_from(self)?.into_path()? else {
             return Ok(None);
-        }
-        let label = if let Some(label) = label.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
-            if fstat(self.0)?.st_nlink != 0 {
-                return Err(BrokerError::syscall(libc::EACCES));
-            }
-            PathBuf::from(OsStr::from_bytes(label))
-        } else {
-            label
         };
         let relative = label
             .strip_prefix(root)
@@ -89,6 +81,75 @@ impl<'a> ProcFd<'a> {
     pub(super) fn label_under_root(self, root: &Path) -> SysResult<PathBuf> {
         self.label_under_root_opt(root)?
             .ok_or_else(|| BrokerError::syscall(libc::EACCES))
+    }
+}
+
+enum FdLabel {
+    Anonymous,
+    Linked(PathBuf),
+    Unlinked(PathBuf),
+    Relinked {
+        path: PathBuf,
+        dev: libc::dev_t,
+        ino: libc::ino_t,
+    },
+}
+
+impl FdLabel {
+    fn into_path(self) -> SysResult<Option<PathBuf>> {
+        match self {
+            Self::Anonymous => Ok(None),
+            Self::Linked(path) | Self::Unlinked(path) => Ok(Some(path)),
+            Self::Relinked { path, dev, ino } => Self::surviving_link(&path, dev, ino)
+                .map(Some)
+                .ok_or_else(|| BrokerError::syscall(libc::EACCES)),
+        }
+    }
+
+    fn surviving_link(path: &Path, dev: libc::dev_t, ino: libc::ino_t) -> Option<PathBuf> {
+        let dir = ProcFd::open_path(
+            path.parent()?,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+        .ok()?;
+        let dir_fd = ProcFd::new(dir.as_fd());
+        let Ok(Self::Linked(dir_path)) = Self::try_from(dir_fd) else {
+            return None;
+        };
+        fs::read_dir(dir_fd.proc_path())
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .find(|name| {
+                fstatat(&dir, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                    .is_ok_and(|stat| stat.st_dev == dev && stat.st_ino == ino)
+            })
+            .map(|name| dir_path.join(name))
+    }
+}
+
+impl TryFrom<ProcFd<'_>> for FdLabel {
+    type Error = BrokerError;
+
+    fn try_from(fd: ProcFd<'_>) -> SysResult<Self> {
+        let label = fd.read_link()?;
+        if !label.is_absolute() {
+            return Ok(Self::Anonymous);
+        }
+        let Some(path) = label.as_os_str().as_bytes().strip_suffix(b" (deleted)") else {
+            return Ok(Self::Linked(label));
+        };
+        let path = PathBuf::from(OsStr::from_bytes(path));
+        let stat = fstat(fd.0)?;
+        Ok(if stat.st_nlink == 0 {
+            Self::Unlinked(path)
+        } else {
+            Self::Relinked {
+                path,
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+            }
+        })
     }
 }
 
