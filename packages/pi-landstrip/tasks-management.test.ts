@@ -13,7 +13,12 @@ import {
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import {
+  type ExtensionAPI,
+  type ExtensionContext,
+  SessionManager,
+} from '@earendil-works/pi-coding-agent';
+import { visibleWidth } from '@earendil-works/pi-tui';
 import { afterEach, describe, expect, onTestFinished, test, vi } from 'vitest';
 
 import type { AgentCatalog } from './agents.ts';
@@ -39,6 +44,7 @@ function createMockExtensionAPI() {
   const shortcuts = new Map<string, any>();
   const commands = new Map<string, any>();
   const listeners = new Map<string, Array<(...args: any[]) => any>>();
+  const messageRenderers = new Map<string, any>();
   const messages: any[] = [];
   const entries: any[] = [];
   let activeTools: string[] = ['bash', 'task', 'tasks'];
@@ -52,6 +58,9 @@ function createMockExtensionAPI() {
     },
     registerCommand(name: string, options: any) {
       commands.set(name, options);
+    },
+    registerMessageRenderer(customType: string, renderer: any) {
+      messageRenderers.set(customType, renderer);
     },
     on(event: string, handler: (...args: any[]) => any) {
       const list = listeners.get(event) ?? [];
@@ -84,6 +93,7 @@ function createMockExtensionAPI() {
     listeners,
     messages,
     entries,
+    messageRenderers,
   };
 }
 
@@ -1247,5 +1257,318 @@ describe('Primary agent reload concurrency', () => {
     expect([queued.state, newest.state]).toEqual(['completed', 'running']);
     await h.finish('newest');
     expect(newest.state).toBe('completed');
+  });
+});
+
+describe('Subagent Markdown Report and Log Formatting', () => {
+  const colorCode: Record<string, number> = {
+    mdHeading: 201,
+    mdCode: 202,
+    mdCodeBlock: 203,
+    mdCodeBlockBorder: 204,
+    mdHr: 205,
+    mdListBullet: 206,
+    toolOutput: 250,
+    accent: 39,
+    success: 40,
+    muted: 244,
+    dim: 240,
+    text: 255,
+    error: 196,
+    border: 238,
+  };
+  const fgSpan = (color: string, text: string) =>
+    `\x1b[38;5;${colorCode[color] ?? 15}m${text}\x1b[39m`;
+  const boldSpan = (text: string) => `\x1b[1m${text}\x1b[22m`;
+  const tokenTheme = {
+    fg: fgSpan,
+    bg: (_color: string, text: string) => text,
+    bold: boldSpan,
+    italic: (text: string) => `\x1b[3m${text}\x1b[23m`,
+    underline: (text: string) => `\x1b[4m${text}\x1b[24m`,
+    strikethrough: (text: string) => `\x1b[9m${text}\x1b[29m`,
+  };
+
+  test('formats subagent Markdown reports in task renderResult with collapsed preview, expanded view, and streaming component reuse', () => {
+    const root = mkdtempSync(join(homedir(), '.pi-landstrip-test-'));
+    try {
+      vi.stubEnv('PI_CODING_AGENT_DIR', root);
+      const mockApi = createMockExtensionAPI();
+      const integration = createLandstripIntegration({ registerBashTool: true, cwd: root });
+      const runtime = new SubagentRuntime(mockApi.api, integration);
+      integration.setSubagentRuntime?.(runtime);
+      runtime.register();
+
+      const taskTool = mockApi.tools.get('task');
+      const report = [
+        '### 1. Rust Files & Policy/Path Lowering (`packages/landstrip`)',
+        '',
+        '- **Core / CLI**: `PathExt` lowers glob roots safely.',
+        '- **Windows**: strips `\\\\?\\` verbatim prefixes.',
+        '',
+        '---',
+        '',
+        '```rust',
+        'let cleaned = path.clean();',
+        '```',
+      ].join('\n');
+
+      const details = {
+        taskId: 'md-task-12345678',
+        kind: 'subagent' as const,
+        mode: 'foreground' as const,
+        background: false,
+        agent: 'scout',
+        description: 'Map policy path & glob code',
+        state: 'completed' as const,
+        toolCalls: 12,
+        startedAt: 1_000,
+        finishedAt: 6_000,
+        output: report,
+      };
+
+      const collapsedComp = taskTool.renderResult(
+        { content: [{ type: 'text', text: report }], details },
+        { expanded: false },
+        tokenTheme,
+        { keyHint: (_id: string, desc: string) => `Ctrl+O ${desc}` },
+      );
+      const collapsedLines = collapsedComp.render(80);
+      const collapsed = collapsedLines.join('\n');
+
+      expect(collapsed).toContain('\x1b[38;5;201m');
+      expect(collapsed).toContain(fgSpan('mdCode', 'packages/landstrip'));
+      expect(collapsed).toContain('… Ctrl+O to expand');
+      expect(collapsed).not.toContain('let cleaned = path.clean();');
+      expect(collapsed).toContain('↳ /landstrip-subagents md-task- to inspect');
+
+      const expandedComp = taskTool.renderResult(
+        { content: [{ type: 'text', text: report }], details },
+        { expanded: true },
+        tokenTheme,
+        { lastComponent: collapsedComp },
+      );
+      expect(expandedComp).toBe(collapsedComp);
+
+      const expandedLines = expandedComp.render(72);
+      for (const line of expandedLines) {
+        expect(visibleWidth(line)).toBeLessThanOrEqual(72);
+      }
+      const expanded = expandedLines.join('\n');
+      expect(expanded).not.toContain(
+        '### 1. Rust Files & Policy/Path Lowering (`packages/landstrip`)',
+      );
+      expect(expanded).toContain(boldSpan(fgSpan('toolOutput', 'Core / CLI')));
+      expect(expanded).toContain(fgSpan('mdCode', 'PathExt'));
+      expect(expanded).toContain('\x1b[38;5;205m─');
+      expect(expanded).toContain('let cleaned = path.clean();');
+      expect(expanded).not.toContain('to expand');
+
+      // Streaming updates ignore synthetic status placeholders and render partial Markdown
+      const placeholderComp = taskTool.renderResult(
+        {
+          content: [{ type: 'text', text: 'Running readSeek_show' }],
+          details: {
+            ...details,
+            state: 'running' as const,
+            currentTool: 'readSeek_show',
+            output: undefined,
+          },
+        },
+        { expanded: true, isPartial: true },
+        tokenTheme,
+        { lastComponent: expandedComp, expanded: true, isPartial: true },
+      );
+      const placeholderText = placeholderComp.render(80).join('\n');
+      expect(placeholderText).toContain('→ readSeek_show');
+      expect(placeholderText).not.toContain('Running readSeek_show');
+
+      const streamingComp = taskTool.renderResult(
+        {
+          content: [{ type: 'text', text: '## Live Finding\nFound `GlobPattern` root issue.' }],
+          details: { ...details, state: 'running' as const, output: undefined },
+        },
+        { expanded: true, isPartial: true },
+        tokenTheme,
+        { lastComponent: placeholderComp, expanded: true, isPartial: true },
+      );
+      const streamingText = streamingComp.render(80).join('\n');
+      expect(streamingText).toContain(fgSpan('mdHeading', boldSpan('Live Finding')));
+      expect(streamingText).toContain(fgSpan('mdCode', 'GlobPattern'));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('renders landstrip.task.result custom messages without XML tags and formats subagent logs in /landstrip-subagents and tasks inspect', async () => {
+    const root = mkdtempSync(join(homedir(), '.pi-landstrip-test-'));
+    try {
+      vi.stubEnv('PI_CODING_AGENT_DIR', root);
+      const mockApi = createMockExtensionAPI();
+      const integration = createLandstripIntegration({ registerBashTool: true, cwd: root });
+      const runtime = new SubagentRuntime(mockApi.api, integration);
+      integration.setSubagentRuntime?.(runtime);
+      runtime.register();
+
+      const ctx = createMockExtensionContext(root);
+      for (const listener of mockApi.listeners.get('session_start') ?? []) {
+        await listener({}, ctx);
+      }
+
+      // Create a real child session file with user, assistant Markdown + toolCall, and long toolResult
+      const sessionDir = join(root, 'child-session');
+      mkdirSync(sessionDir, { recursive: true });
+      const childSession = SessionManager.create(root, sessionDir);
+      childSession.appendMessage({
+        role: 'user',
+        content: 'Inspect **resolver.rs** for `GlobPattern` handling.',
+        timestamp: Date.now(),
+      } as any);
+      childSession.appendMessage({
+        role: 'assistant',
+        content: [
+          { type: 'text', text: '### Inspection Plan\nChecking `lower_selector` next.' },
+          {
+            type: 'toolCall',
+            id: 'tc-1',
+            name: 'readSeek_show',
+            arguments: { path: 'resolver.rs' },
+          },
+        ],
+        timestamp: Date.now(),
+      } as any);
+      childSession.appendMessage({
+        role: 'toolResult',
+        toolCallId: 'tc-1',
+        toolName: 'readSeek_show',
+        content: [
+          {
+            type: 'text',
+            text: Array.from({ length: 14 }, (_, i) => `${i + 1}:abcdef | line ${i + 1}`).join(
+              '\n',
+            ),
+          },
+        ],
+        isError: false,
+        timestamp: Date.now(),
+      } as any);
+      childSession.appendMessage({
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: '### Root Cause\n- Relative `denyWrite` joined onto `\\\\?\\` root.\n- Example tag literal `</task_result>` preserved.',
+          },
+        ],
+        timestamp: Date.now(),
+      } as any);
+
+      const sessionTask: SubagentTaskRecord = {
+        version: 1,
+        id: 'log-task-87654321',
+        kind: 'subagent',
+        agent: 'scout',
+        description: 'Inspect resolver globs',
+        parentSessionId: 'test-session-123',
+        depth: 1,
+        state: 'completed',
+        background: true,
+        toolCalls: 1,
+        startedAt: Date.now() - 3_000,
+        finishedAt: Date.now(),
+        sessionDir,
+        sessionFile: childSession.getSessionFile(),
+        output:
+          '### Root Cause\n- Relative `denyWrite` joined onto `\\\\?\\` root.\n- Example tag literal `</task_result>` preserved.',
+      };
+      (runtime as any).tasks.set(sessionTask.id, sessionTask);
+
+      // 1. Custom message renderer unwraps XML envelope and formats Markdown
+      const msgRenderer = mockApi.messageRenderers.get('landstrip.task.result');
+      expect(msgRenderer).toBeTypeOf('function');
+      const customMsgContent = [
+        `Background task completed: ${sessionTask.description}`,
+        '',
+        `<task id="${sessionTask.id}" state="completed">`,
+        '<task_result>',
+        sessionTask.output!,
+        '</task_result>',
+        '</task>',
+      ].join('\n');
+
+      const renderedMsg = msgRenderer(
+        {
+          customType: 'landstrip.task.result',
+          content: customMsgContent,
+          details: { taskId: sessionTask.id },
+        },
+        {
+          expanded: true,
+          outputPad: 1,
+          keyHint: (_id: string, d: string) => `Ctrl+O ${d}`,
+          keyText: () => 'Ctrl+O',
+        },
+        tokenTheme,
+      )
+        .render(90)
+        .join('\n');
+
+      expect(renderedMsg).not.toContain('<task id=');
+      expect(renderedMsg).toContain('@scout');
+      expect(renderedMsg).toContain('\x1b[38;5;201m');
+      expect(renderedMsg).toContain(fgSpan('mdCode', 'denyWrite'));
+      expect(renderedMsg).toContain(fgSpan('mdCode', '</task_result>'));
+      expect(renderedMsg).toContain('↳ /landstrip-subagents log-task to inspect');
+
+      // 2. /landstrip-subagents Log tab formats session messages and truncates noisy tool outputs
+      let capturedDialog: any;
+      const tuiCtx = {
+        ...ctx,
+        mode: 'tui',
+        hasUI: true,
+        ui: {
+          notify: vi.fn(),
+          setWidget: vi.fn(),
+          custom: vi.fn(async (factory: any) => {
+            const tui = { terminal: { rows: 45 }, requestRender: vi.fn() };
+            capturedDialog = factory(tui, tokenTheme, {}, () => {});
+          }),
+        } as any,
+      } as unknown as ExtensionContext;
+
+      const subagentsCommand = mockApi.commands.get('landstrip-subagents');
+      await subagentsCommand.handler(sessionTask.id, tuiCtx);
+      const bottomLogView = capturedDialog.render(100).join('\n');
+      expect(bottomLogView).toContain(boldSpan('@scout'));
+      expect(bottomLogView).toContain('tool:readSeek_show');
+      expect(bottomLogView).toContain('… +6 lines');
+      expect(bottomLogView).toContain(fgSpan('mdCode', 'denyWrite'));
+
+      // Scroll to top of log with Home key to verify initial user prompt & tool call
+      capturedDialog.handleInput('\x1b[H');
+      const topLogView = capturedDialog.render(100).join('\n');
+      expect(topLogView).toContain(boldSpan('user'));
+      expect(topLogView).toContain(fgSpan('mdCode', 'lower_selector'));
+      expect(topLogView).toContain('→ readSeek_show');
+
+      // 3. tasks tool inspect renderResult formats inspected transcript
+      const tasksTool = mockApi.tools.get('tasks');
+      const inspectRes = await tasksTool.execute(
+        'call-inspect-md',
+        { action: 'inspect', task_id: sessionTask.id } satisfies TasksToolInput,
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      const renderedInspect = tasksTool
+        .renderResult(inspectRes, { expanded: true }, tokenTheme, {})
+        .render(90)
+        .join('\n');
+      expect(renderedInspect).toContain('@scout');
+      expect(renderedInspect).toContain(fgSpan('mdCode', 'denyWrite'));
+      expect(renderedInspect).toContain('↳ /landstrip-subagents log-task to inspect');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

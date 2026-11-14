@@ -26,12 +26,13 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
-  keyHint,
+  type MessageRenderOptions,
   SessionManager,
   type Theme,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import {
+  Box,
   fuzzyFilter,
   matchesKey,
   Input,
@@ -41,7 +42,6 @@ import {
   Text,
   truncateToWidth,
   visibleWidth,
-  wrapTextWithAnsi,
 } from '@earendil-works/pi-tui';
 import {
   canonicalizeHost,
@@ -97,6 +97,18 @@ import { resolveWorkerAuth, workerAuthHost, workerAuthResolver } from './worker-
 import { serveWorkerAuth } from './worker-auth-channel.ts';
 import { workerEnvironment } from './worker-environment.ts';
 import { collectWorkerResourceReadPaths } from './worker-resources.ts';
+import {
+  extractLogMessageParts,
+  formatExpandHint,
+  isStreamStatusPlaceholder,
+  parseTaskEnvelope,
+  renderMarkdownLines,
+  renderPlainLines,
+  renderSubagentSessionLog,
+  SubagentReportComponent,
+  type SubagentLogEntry,
+  upsertSubagentReportComponent,
+} from './markdown-view.ts';
 import {
   colorizeAgentText,
   combineAbortSignals,
@@ -883,6 +895,78 @@ function taskTranscript(task: TaskRecord): string[] {
   }
 }
 
+function taskLogCacheKey(task: TaskRecord, contentWidth: number): string {
+  let fileStamp = 0;
+  const filePath = task.kind === 'command' ? task.outputFile : task.sessionFile;
+  if (filePath) {
+    try {
+      const st = lstatSync(filePath);
+      fileStamp = st.mtimeMs * 1_000_000 + st.size;
+    } catch {}
+  }
+  return [
+    task.id,
+    contentWidth,
+    task.state,
+    task.toolCalls ?? 0,
+    task.finishedAt ?? 0,
+    fileStamp,
+    (task.output ?? '').length,
+    (task.error ?? '').length,
+  ].join(':');
+}
+
+function renderFormattedTaskLog(task: TaskRecord, contentWidth: number, theme: Theme): string[] {
+  if (task.kind === 'command') {
+    if (task.outputFile) {
+      try {
+        const content = readFileSync(task.outputFile, 'utf8');
+        if (content.trim() !== '') {
+          return renderPlainLines(content, contentWidth, theme, 'toolOutput');
+        }
+        return [theme.fg('muted', 'Command running... (no output yet)')];
+      } catch {}
+    }
+    if (task.error) return renderPlainLines(task.error, contentWidth, theme, 'error');
+    if (task.output) return renderPlainLines(task.output, contentWidth, theme, 'toolOutput');
+    return [theme.fg('muted', 'Command output is not available yet.')];
+  }
+
+  if (!task.sessionFile || !existsSync(task.sessionFile)) {
+    if (task.error) return renderPlainLines(task.error, contentWidth, theme, 'error');
+    if (task.output) return renderMarkdownLines(task.output, contentWidth, theme, 'toolOutput');
+    return [theme.fg('muted', 'Child session is not available yet.')];
+  }
+
+  try {
+    const session = SessionManager.open(task.sessionFile, task.sessionDir);
+    const entries: SubagentLogEntry[] = [];
+    for (const entry of session.buildContextEntries()) {
+      if (entry.type !== 'message') continue;
+      const message = entry.message as unknown;
+      if (!isRecord(message) || typeof message.role !== 'string') continue;
+      const parts = extractLogMessageParts(message);
+      if (parts.length === 0) continue;
+      entries.push({
+        role: message.role,
+        toolName: typeof message.toolName === 'string' ? message.toolName : undefined,
+        parts,
+      });
+    }
+    if (entries.length === 0) {
+      return [theme.fg('muted', 'Child session has no messages yet.')];
+    }
+    return renderSubagentSessionLog(entries, contentWidth, theme, `@${task.agent}`);
+  } catch (error) {
+    return renderPlainLines(
+      `Could not read child session: ${formatError(error)}`,
+      contentWidth,
+      theme,
+      'error',
+    );
+  }
+}
+
 interface RunningTask {
   rpc: RpcProcess;
   promise: Promise<string>;
@@ -1613,6 +1697,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     this.pi.registerTool(this.createTaskTool());
     this.pi.registerTool(this.createTasksTool());
     registerLandstripCommands(this.pi, this, this.integration);
+    this.pi.registerMessageRenderer?.('landstrip.task.result', (message, options, theme) =>
+      this.renderTaskResultMessage(message, options, theme),
+    );
     this.pi.registerShortcut('ctrl+shift+a', {
       description: 'Cycle to the next primary agent',
       handler: async (ctx) => this.cyclePrimaryAgent(ctx),
@@ -2392,6 +2479,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             : current.shellReadMode === 'host'
               ? 'Host-aligned'
               : 'Policy';
+        let cachedTaskLog: { key: string; lines: string[] } | undefined;
         const renderTab: Record<LandstripTab, (frame: TabFrame) => string[]> = {
           overview: (frame) =>
             renderSandboxTab(frame, () => {
@@ -2568,9 +2656,14 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             const { tabs, pane, contentWidth, paneHeight } = frame;
             const task = tasks[selectedTask];
             if (!task) return pane([tabs, '', 'No task sessions in this session.']);
-            const transcript = taskTranscript(task).flatMap((line) =>
-              wrapTextWithAnsi(line, contentWidth),
-            );
+            const logKey = taskLogCacheKey(task, contentWidth);
+            if (!cachedTaskLog || cachedTaskLog.key !== logKey) {
+              cachedTaskLog = {
+                key: logKey,
+                lines: renderFormattedTaskLog(task, contentWidth, theme),
+              };
+            }
+            const transcript = cachedTaskLog.lines;
             const usage = formatTaskUsage(task.usage);
             const baseChrome = 7 + (usage ? 1 : 0);
             const rawBodyLines =
@@ -2606,7 +2699,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
               `${taskState(theme, task)} ${theme.fg('dim', metrics.join(' · '))} ${theme.fg('dim', '·')} ${theme.fg(follow ? 'accent' : 'muted', `Follow: ${follow ? 'on' : 'off'}`)}`,
               ...(usage ? [theme.fg('dim', usage)] : []),
               '',
-              ...shown.map((line) => theme.fg('toolOutput', line)),
+              ...shown,
             ];
             const headerAndBodyTarget = (usage ? 6 : 5) + bodyLines;
             while (lines.length < headerAndBodyTarget) lines.push('');
@@ -3225,6 +3318,84 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         }
         throw new Error(`Unknown action: ${action}`);
       },
+      renderResult: (result, options, theme, context) => {
+        const expanded = context?.expanded ?? options?.expanded ?? false;
+        const text =
+          result.content.find(
+            (item): item is { type: 'text'; text: string } => item.type === 'text',
+          )?.text ?? '';
+        const details = result.details;
+        if (details && 'state' in details && 'taskId' in details) {
+          const marker = '\n\nRecent Output:\n';
+          const markerIndex = text.indexOf(marker);
+          const stateView: SubagentTaskView = {
+            id: details.taskId,
+            agent: details.agent,
+            description: details.description ?? '',
+            state: details.state,
+          };
+          const modeBadge = theme.fg(
+            details.background ? 'accent' : 'muted',
+            details.background ? '[bg]' : '[fg]',
+          );
+          const tag = details.kind === 'command' ? '$ bash' : `@${details.agent}`;
+          const desc = details.description
+            ? `${theme.fg('muted', ' — ')}${theme.fg('text', details.description)}`
+            : '';
+          const headerLines = [
+            `${taskState(theme, stateView)} ${modeBadge} ${theme.fg('accent', theme.bold(tag))}${desc}`,
+          ];
+          const metrics: string[] = [];
+          if (details.toolCalls !== undefined) {
+            metrics.push(`${details.toolCalls} tool call${details.toolCalls === 1 ? '' : 's'}`);
+          }
+          const duration = taskDuration(details);
+          if (duration) metrics.push(duration);
+          const usage = formatTaskUsage(details.usage);
+          if (usage) metrics.push(usage);
+          if (metrics.length > 0) headerLines.push(theme.fg('dim', metrics.join(' · ')));
+
+          if (markerIndex !== -1) {
+            const recentOutput = text.slice(markerIndex + marker.length);
+            const bodyKind =
+              details.kind === 'command'
+                ? details.state === 'error'
+                  ? 'error'
+                  : 'plain'
+                : details.state === 'error' && !recentOutput.includes('\n')
+                  ? 'error'
+                  : 'markdown';
+            return upsertSubagentReportComponent(context?.lastComponent, {
+              headerLines,
+              body: recentOutput,
+              bodyKind,
+              expanded,
+              previewLines: 5,
+              expandHint: formatExpandHint(context),
+              footerLines: [
+                theme.fg('dim', `↳ /landstrip-subagents ${details.taskId.slice(0, 8)} to inspect`),
+              ],
+              theme,
+            });
+          }
+          return new Text(text || headerLines.join('\n'), 0, 0);
+        }
+        if (details && 'count' in details && typeof details.count === 'number') {
+          const summary = theme.fg(
+            'dim',
+            `↳ ${details.count} task${details.count === 1 ? '' : 's'}`,
+          );
+          if (!expanded || details.count === 0) return new Text(summary, 0, 0);
+          return upsertSubagentReportComponent(context?.lastComponent, {
+            headerLines: [summary],
+            body: text,
+            bodyKind: 'plain',
+            expanded: true,
+            theme,
+          });
+        }
+        return new Text(theme.fg('toolOutput', text), 0, 0);
+      },
     };
   }
 
@@ -3483,13 +3654,25 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           details: taskDetails(result.task, result.state),
         };
       },
-      renderResult: (result, { expanded }, theme) => {
+      renderResult: (result, options, theme, context) => {
+        const expanded = context?.expanded ?? options?.expanded ?? false;
+        const isPartial = context?.isPartial ?? options?.isPartial ?? false;
         const details = result.details;
         const fallback =
           result.content.find(
             (item): item is { type: 'text'; text: string } => item.type === 'text',
           )?.text ?? '(no output)';
-        if (!details) return new Text(fallback, 0, 0);
+        if (!details) {
+          const parsed = parseTaskEnvelope(fallback);
+          return upsertSubagentReportComponent(context?.lastComponent, {
+            body: parsed ? parsed.body : fallback,
+            bodyKind: parsed?.isError ? 'error' : parsed?.isCommand ? 'plain' : 'markdown',
+            expanded,
+            previewLines: 3,
+            expandHint: formatExpandHint(context),
+            theme,
+          });
+        }
 
         const stateView: SubagentTaskView = {
           id: details.taskId,
@@ -3501,9 +3684,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           details.background ? 'accent' : 'muted',
           details.background ? '[bg]' : '[fg]',
         );
-        let text = `${taskState(theme, stateView)} ${modeBadge}`;
-        if (details.currentTool) text += theme.fg('muted', `  → ${details.currentTool}`);
-        if (details.retryAttempt) text += theme.fg('warning', `  retry ${details.retryAttempt}`);
+        let statusLine = `${taskState(theme, stateView)} ${modeBadge}`;
+        if (details.currentTool) statusLine += theme.fg('muted', `  → ${details.currentTool}`);
+        if (details.retryAttempt)
+          statusLine += theme.fg('warning', `  retry ${details.retryAttempt}`);
+        const headerLines = [statusLine];
 
         const metrics: string[] = [];
         if (details.toolCalls !== undefined) {
@@ -3513,19 +3698,32 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         if (duration) metrics.push(duration);
         const usage = formatTaskUsage(details.usage);
         if (usage) metrics.push(usage);
-        if (metrics.length > 0) text += `\n${theme.fg('dim', metrics.join(' · '))}`;
+        if (metrics.length > 0) headerLines.push(theme.fg('dim', metrics.join(' · ')));
 
-        const output = details.error ?? details.output ?? '';
-        if (output) {
-          const lines = output.trimEnd().split('\n');
-          const shown = expanded ? lines : lines.slice(0, 3);
-          text += `\n${theme.fg(details.state === 'error' ? 'error' : 'toolOutput', shown.join('\n'))}`;
-          if (!expanded && lines.length > shown.length) {
-            text += `\n${theme.fg('muted', `… ${keyHint('app.tools.expand', 'to expand')}`)}`;
-          }
+        let body = '';
+        let bodyKind: 'markdown' | 'plain' | 'error' =
+          details.kind === 'command' ? 'plain' : 'markdown';
+        if (details.error) {
+          body = details.error;
+          bodyKind = 'error';
+        } else if (details.output) {
+          body = details.output;
+        } else if (isPartial && fallback && !isStreamStatusPlaceholder(fallback)) {
+          body = fallback;
         }
-        text += `\n${theme.fg('dim', `↳ /landstrip-subagents ${details.taskId.slice(0, 8)} to inspect`)}`;
-        return new Text(text, 0, 0);
+
+        return upsertSubagentReportComponent(context?.lastComponent, {
+          headerLines,
+          body,
+          bodyKind,
+          expanded,
+          previewLines: 3,
+          expandHint: formatExpandHint(context),
+          footerLines: [
+            theme.fg('dim', `↳ /landstrip-subagents ${details.taskId.slice(0, 8)} to inspect`),
+          ],
+          theme,
+        });
       },
     };
   }
@@ -3838,6 +4036,13 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       let streamedText = '';
       let workerError: string | undefined;
       worker.rpc.onEvent((event) => {
+        if (
+          event.type === 'message_start' &&
+          isRecord(event.message) &&
+          event.message.role === 'assistant'
+        ) {
+          streamedText = '';
+        }
         if (event.type === 'message_update' && isRecord(event.assistantMessageEvent)) {
           const messageEvent = event.assistantMessageEvent;
           if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string') {
@@ -4413,6 +4618,89 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       { triggerTurn: true, deliverAs: 'followUp' },
     );
     return true;
+  }
+
+  private renderTaskResultMessage(
+    message: { content: unknown; details?: unknown },
+    options: MessageRenderOptions,
+    theme: Theme,
+  ): Box {
+    const rawContent =
+      typeof message.content === 'string' ? message.content : messageContentText(message);
+    const parsed = parseTaskEnvelope(rawContent);
+    const detailsTaskId =
+      isRecord(message.details) && typeof message.details.taskId === 'string'
+        ? message.details.taskId
+        : undefined;
+    const taskId = parsed?.taskId ?? detailsTaskId;
+    const task = taskId ? this.tasks.get(taskId) : undefined;
+    const resolvedState: TaskState =
+      parsed?.state === 'completed' ||
+      parsed?.state === 'running' ||
+      parsed?.state === 'queued' ||
+      parsed?.state === 'cancelled' ||
+      parsed?.state === 'interrupted' ||
+      parsed?.state === 'error'
+        ? parsed.state
+        : (task?.state ?? (parsed?.isError ? 'error' : 'completed'));
+
+    const stateBadge = taskState(theme, {
+      id: taskId ?? '',
+      agent: task?.agent ?? 'subagent',
+      description: task?.description ?? '',
+      state: resolvedState,
+    });
+    const modeBadge = theme.fg('accent', '[bg]');
+    const headerLines: string[] = [];
+    if (task) {
+      const tag = task.kind === 'command' ? '$ bash' : `@${task.agent}`;
+      headerLines.push(
+        `${stateBadge} ${modeBadge} ${theme.fg('accent', theme.bold(tag))}${theme.fg('muted', ' — ')}${theme.fg('text', task.description)}`,
+      );
+      const details = taskDetails(task, resolvedState);
+      const metrics: string[] = [];
+      if (details.toolCalls !== undefined) {
+        metrics.push(`${details.toolCalls} tool call${details.toolCalls === 1 ? '' : 's'}`);
+      }
+      const duration = taskDuration(details);
+      if (duration) metrics.push(duration);
+      const usage = formatTaskUsage(details.usage);
+      if (usage) metrics.push(usage);
+      if (metrics.length > 0) headerLines.push(theme.fg('dim', metrics.join(' · ')));
+    } else {
+      const preamble = parsed?.preamble
+        ? `${theme.fg('muted', ' — ')}${theme.fg('text', parsed.preamble)}`
+        : '';
+      headerLines.push(`${stateBadge} ${modeBadge}${preamble}`);
+    }
+
+    const bodyKind: 'markdown' | 'plain' | 'error' = parsed?.isError
+      ? 'error'
+      : task?.kind === 'command' || parsed?.isCommand
+        ? 'plain'
+        : 'markdown';
+
+    const outputPad = typeof options?.outputPad === 'number' ? options.outputPad : 1;
+    const bgFn =
+      typeof (theme as { bg?: unknown }).bg === 'function'
+        ? (text: string) => theme.bg('customMessageBg', text)
+        : undefined;
+    const box = new Box(outputPad, 1, bgFn);
+    box.addChild(
+      new SubagentReportComponent({
+        headerLines,
+        body: parsed ? parsed.body : rawContent,
+        bodyKind,
+        expanded: Boolean(options?.expanded),
+        previewLines: 5,
+        expandHint: formatExpandHint(options),
+        footerLines: taskId
+          ? [theme.fg('dim', `↳ /landstrip-subagents ${taskId.slice(0, 8)} to inspect`)]
+          : [],
+        theme,
+      }),
+    );
+    return box;
   }
 
   private storeTaskText(task: TaskRecord, value: string, kind: 'output' | 'error'): string {
