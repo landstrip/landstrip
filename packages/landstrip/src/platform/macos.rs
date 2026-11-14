@@ -6,7 +6,7 @@
 use super::unix::close_inherited_fds;
 use crate::config::SandboxDarwin;
 use crate::error::{Error, PolicyViolation};
-use crate::paths::{GlobPatternBuf, OverridesDeny, PathExt};
+use crate::paths::{GlobPattern, OverridesDeny, PathExt};
 use crate::policy::{
     AccessPolicy, Carveouts, DenialScope, NetworkAccess, ReadAccess, UnixSocketAccess,
 };
@@ -229,21 +229,20 @@ impl ProfileBuilder {
         writeln!(self.sb, "(allow system-socket (socket-domain AF_ROUTE))")
     }
 
-    fn render_pattern_filter(pattern: &GlobPatternBuf, carveouts: &Carveouts) -> String {
+    fn render_pattern_filter(pattern: &GlobPattern, carveouts: &Carveouts) -> String {
         let regex = pattern.sbpl_regex();
         let escaped = escape_sbpl_regex_literal(&regex);
-        let glob = pattern.as_glob();
         let filter = format!("(regex #\"{escaped}\")");
         let matching_carveouts: Vec<&Path> = carveouts
             .roots
             .iter()
             .map(PathBuf::as_path)
-            .filter(|carveout| glob.matches_tree(carveout))
+            .filter(|carveout| pattern.matches_tree(carveout))
             .collect();
-        let matching_patterns: Vec<&GlobPatternBuf> = carveouts
+        let matching_patterns: Vec<&GlobPattern> = carveouts
             .patterns
             .iter()
-            .filter(|allow| allow.overrides_deny(&glob))
+            .filter(|allow| allow.overrides_deny(pattern))
             .collect();
         if matching_carveouts.is_empty() && matching_patterns.is_empty() {
             return filter;
@@ -434,7 +433,7 @@ impl ProfileBuilder {
                         .carveouts
                         .patterns
                         .iter()
-                        .map(GlobPatternBuf::base),
+                        .map(|pattern| pattern.base().to_path_buf()),
                 );
                 self.parent_dir_rules(&parent_roots)?;
                 self.symlink_metadata_rules(&policy.read_symlinks)?;

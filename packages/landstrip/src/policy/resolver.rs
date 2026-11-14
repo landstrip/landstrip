@@ -7,11 +7,12 @@ use super::{
     AccessPolicy, Carveouts, DenialScope, DenialTier, DeniedLink, DeniedLinks, DenyRuleSet,
     IpBindAccess, NetworkAccess, ReadAccess, UnixSocketAccess,
 };
-use crate::config::{PathSelector, SandboxDarwin, SandboxFilesystem, SandboxNetwork, Settings};
-use crate::error::{Error, PathIo, PolicyViolation, Result};
-use crate::paths::{
-    GlobPattern, GlobPatternBuf, NormalizePatterns, NormalizeRoots, OverridesDeny, PathExt,
+use crate::config::{
+    PathSelector, SandboxDarwin, SandboxFilesystem, SandboxNetwork, SelectorMode, SelectorPath,
+    Settings,
 };
+use crate::error::{Error, PathIo, PolicyViolation, Result};
+use crate::paths::{GlobPattern, NormalizePatterns, NormalizeRoots, OverridesDeny, PathExt};
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::env;
@@ -76,13 +77,73 @@ struct LoweredReadAccess {
 struct ResolvedDenyPaths {
     concrete: Vec<PathBuf>,
     expanded: Vec<PathBuf>,
-    patterns: Vec<GlobPatternBuf>,
+    patterns: Vec<GlobPattern>,
     check_paths: Vec<PathBuf>,
 }
 
 struct ResolvedAllowPaths {
     roots: Vec<PathBuf>,
-    patterns: Vec<GlobPatternBuf>,
+    patterns: Vec<GlobPattern>,
+}
+
+enum ResolvedSelector {
+    Concrete(PathBuf),
+    Glob {
+        glob: GlobPattern,
+        bare_fallback: Option<PathBuf>,
+    },
+}
+
+impl ResolvedSelector {
+    fn rooted(mode: SelectorMode, raw: &str) -> Result<Self> {
+        let cleaned = Path::new(raw).clean_lexically();
+        match mode {
+            SelectorMode::Literal => Ok(Self::Concrete(cleaned)),
+            SelectorMode::Glob | SelectorMode::Bare => match GlobPattern::parse(raw)? {
+                Some(glob) => Ok(Self::Glob {
+                    glob,
+                    bare_fallback: (mode == SelectorMode::Bare).then_some(cleaned),
+                }),
+                None => Ok(Self::Concrete(cleaned)),
+            },
+        }
+    }
+
+    fn under(mode: SelectorMode, root: &Path, relative: &str) -> Result<Self> {
+        match mode {
+            SelectorMode::Literal => Ok(Self::Concrete(root.join_clean(relative))),
+            SelectorMode::Glob | SelectorMode::Bare => match GlobPattern::under(root, relative)? {
+                Some(glob) => Ok(Self::Glob {
+                    glob,
+                    bare_fallback: (mode == SelectorMode::Bare).then(|| root.join_clean(relative)),
+                }),
+                None => Ok(Self::Concrete(root.join_clean(relative))),
+            },
+        }
+    }
+}
+
+enum RootNameMatcher {
+    Literal(PathBuf),
+    Glob(GlobPattern),
+}
+
+impl RootNameMatcher {
+    fn new(mode: SelectorMode, relative: &str) -> Result<Self> {
+        if mode != SelectorMode::Literal
+            && let Some(glob) = GlobPattern::parse(relative)?
+        {
+            return Ok(Self::Glob(glob));
+        }
+        Ok(Self::Literal(Path::new(relative).clean_lexically()))
+    }
+
+    fn matches(&self, name: &Path) -> bool {
+        match self {
+            Self::Literal(expected) => expected == name,
+            Self::Glob(pattern) => pattern.matches_path(name),
+        }
+    }
 }
 
 struct WriteAnchorRoot {
@@ -190,7 +251,7 @@ impl ResolvedDenyPaths {
             .collect()
     }
 
-    fn carveout_patterns(&self, allow_patterns: &[GlobPatternBuf]) -> Vec<GlobPatternBuf> {
+    fn carveout_patterns(&self, allow_patterns: &[GlobPattern]) -> Vec<GlobPattern> {
         if cfg!(target_os = "windows") {
             return Vec::new();
         }
@@ -206,7 +267,7 @@ impl ResolvedDenyPaths {
         &mut self,
         always: &Self,
         allow: &[PathBuf],
-        allow_patterns: &[GlobPatternBuf],
+        allow_patterns: &[GlobPattern],
     ) -> Carveouts {
         let roots: Vec<PathBuf> = allow
             .iter()
@@ -240,7 +301,7 @@ impl LoweredReadAccess {
     fn lower(
         read_allow: &[PathBuf],
         read_deny: &[PathBuf],
-        read_denied_patterns: &[GlobPatternBuf],
+        read_denied_patterns: &[GlobPattern],
         read_denied_roots: &[PathBuf],
     ) -> Result<Self> {
         let fs_root = Path::new("/").normalize();
@@ -396,28 +457,32 @@ impl PolicyResolver {
         allow.retain_windows_allow_roots();
 
         let mut anchor_paths = allow.clone();
-        anchor_paths.extend(resolved_allow.patterns.iter().map(GlobPatternBuf::base));
+        anchor_paths.extend(
+            resolved_allow
+                .patterns
+                .iter()
+                .map(|pattern| pattern.base().to_path_buf()),
+        );
         anchor_paths.normalize_roots();
         let mut anchor_roots: Vec<WriteAnchorRoot> =
             anchor_paths.into_iter().map(WriteAnchorRoot::new).collect();
 
         let always_selectors =
-            Self::anchor_write_deny_selectors(&filesystem.deny_write_always, &anchor_roots, true)?;
-        let mut resolved_always = self.resolve_deny_paths(&always_selectors, true)?;
+            self.anchor_write_deny_selectors(&filesystem.deny_write_always, &anchor_roots, true)?;
+        let mut resolved_always = Self::lower_deny_selectors(always_selectors, true)?;
         resolved_always.merge_expanded();
         allow.retain(|path| !resolved_always.matches(path));
         anchor_roots.retain(|root| !resolved_always.matches(&root.path));
 
         let deny_selectors =
-            Self::anchor_write_deny_selectors(&filesystem.deny_write, &anchor_roots, false)?;
+            self.anchor_write_deny_selectors(&filesystem.deny_write, &anchor_roots, false)?;
         // Unix mediates denyWrite globs dynamically (seccomp on Linux, Seatbelt
         // regex on macOS); expanding them here scans the entire project tree before
         // even starting a simple command.
         let mut resolved_deny =
-            self.resolve_deny_paths(&deny_selectors, cfg!(target_os = "windows"))?;
+            Self::lower_deny_selectors(deny_selectors, cfg!(target_os = "windows"))?;
         let carveouts =
             resolved_deny.apply_write_carveouts(&resolved_always, &allow, &resolved_allow.patterns);
-
         let mut symlink_ancestors = SymlinkAncestorCollector::default();
         symlink_ancestors.collect(&resolved_deny.check_paths, DenialTier::Queryable);
         symlink_ancestors.collect(&resolved_always.check_paths, DenialTier::Always);
@@ -447,11 +512,15 @@ impl PolicyResolver {
         #[cfg(target_os = "windows")]
         allow.retain_windows_allow_roots();
 
-        let mut resolved_deny = self.resolve_deny_paths(&filesystem.deny_read, true)?;
+        let mut resolved_deny =
+            Self::lower_deny_selectors(self.resolve_selectors(&filesystem.deny_read)?, true)?;
         resolved_deny.merge_expanded();
         let mut denied_roots = resolved_deny.uncarved_roots(&allow);
 
-        let mut resolved_always = self.resolve_deny_paths(&filesystem.deny_read_always, true)?;
+        let mut resolved_always = Self::lower_deny_selectors(
+            self.resolve_selectors(&filesystem.deny_read_always)?,
+            true,
+        )?;
         resolved_always.merge_expanded();
         let carveouts = Carveouts {
             roots: resolved_deny.carveouts(&resolved_always, &allow),
@@ -484,29 +553,41 @@ impl PolicyResolver {
         })
     }
 
-    fn resolve_sandbox_path(&self, path: &str) -> Result<PathBuf> {
-        if path.is_empty() {
-            return Err(PolicyViolation::EmptyPath.into());
+    fn resolve_selector(&self, selector: &PathSelector) -> Result<ResolvedSelector> {
+        let (mode, path) = selector.parse()?;
+        self.resolve_parsed_selector(mode, path)
+    }
+
+    fn resolve_parsed_selector(
+        &self,
+        mode: SelectorMode,
+        path: SelectorPath<'_>,
+    ) -> Result<ResolvedSelector> {
+        match path {
+            SelectorPath::Rooted(raw) => ResolvedSelector::rooted(mode, raw),
+            SelectorPath::Home(None) => {
+                let home = self
+                    .home
+                    .as_deref()
+                    .ok_or(PolicyViolation::HomeUnavailable)?;
+                Ok(ResolvedSelector::Concrete(home.clean_lexically()))
+            }
+            SelectorPath::Home(Some(rest)) => {
+                let home = self
+                    .home
+                    .as_deref()
+                    .ok_or(PolicyViolation::HomeUnavailable)?;
+                ResolvedSelector::under(mode, home, rest)
+            }
+            SelectorPath::Relative(rel) => ResolvedSelector::under(mode, &self.base, rel),
         }
+    }
 
-        let raw = Path::new(path);
-        let resolved = if raw.has_root() {
-            raw.to_path_buf()
-        } else if path == "~" {
-            self.home
-                .as_deref()
-                .map(Path::to_path_buf)
-                .ok_or(PolicyViolation::HomeUnavailable)?
-        } else if let Some(rest) = path.strip_prefix("~/") {
-            self.home
-                .as_deref()
-                .map(|home| home.join(rest))
-                .ok_or(PolicyViolation::HomeUnavailable)?
-        } else {
-            self.base.join(raw)
-        };
-
-        Ok(resolved.clean_lexically())
+    fn resolve_selectors(&self, paths: &[PathSelector]) -> Result<Vec<ResolvedSelector>> {
+        paths
+            .iter()
+            .map(|selector| self.resolve_selector(selector))
+            .collect()
     }
 
     #[cfg(target_os = "linux")]
@@ -527,32 +608,32 @@ impl PolicyResolver {
     }
 
     fn resolve_allow_paths(&self, paths: &[PathSelector]) -> Result<ResolvedAllowPaths> {
+        let selectors = self.resolve_selectors(paths)?;
         let mut roots = Vec::new();
         let mut glob_selectors = Vec::new();
-        for selector in paths {
-            let path = self.resolve_sandbox_path(selector.as_str())?;
-            let path_str = path.to_string_lossy().into_owned();
-            if !selector.is_literal() && GlobPattern::is_glob_str(&path_str) {
-                glob_selectors.push((selector, path, path_str));
-            } else {
-                roots.extend(path.spellings());
+        for selector in selectors {
+            match selector {
+                ResolvedSelector::Concrete(path) => roots.extend(path.spellings()),
+                ResolvedSelector::Glob {
+                    glob,
+                    bare_fallback,
+                } => glob_selectors.push((glob, bare_fallback)),
             }
         }
         roots.normalize_roots();
 
         let mut patterns = Vec::new();
-        for (selector, path, path_str) in glob_selectors {
-            let glob = GlobPattern::new(&path_str)?;
+        for (glob, bare_fallback) in glob_selectors {
             // Recursive globs rooted under an already-granted concrete root only
             // act as dynamic carveouts on Unix; skipping their tree walk avoids
             // scanning large caches at startup.
             let covered_recursive = cfg!(not(target_os = "windows"))
-                && path_str.contains("**")
+                && glob.is_recursive()
                 && glob.base().is_under_any(&roots);
             if !covered_recursive {
                 let matches = glob.expand()?;
-                if matches!(selector, PathSelector::Bare(_))
-                    && matches.is_empty()
+                if matches.is_empty()
+                    && let Some(path) = bare_fallback
                     && fs::symlink_metadata(&path).is_ok()
                 {
                     roots.extend(path.spellings());
@@ -561,13 +642,13 @@ impl PolicyResolver {
                 for candidate in &matches {
                     roots.extend(candidate.spellings());
                 }
-            } else if matches!(selector, PathSelector::Bare(_))
+            } else if let Some(path) = bare_fallback
                 && fs::symlink_metadata(&path).is_ok()
             {
                 roots.extend(path.spellings());
                 continue;
             }
-            patterns.extend(GlobPatternBuf::new(path_str)?.spellings()?);
+            patterns.extend(glob.into_spellings()?);
         }
         roots.normalize_roots();
         patterns.normalize_patterns();
@@ -576,10 +657,11 @@ impl PolicyResolver {
     }
 
     fn anchor_write_deny_selectors(
+        &self,
         paths: &[PathSelector],
         write_allow: &[WriteAnchorRoot],
         anchor_root_name: bool,
-    ) -> Result<Vec<PathSelector>> {
+    ) -> Result<Vec<ResolvedSelector>> {
         let mut anchored = Vec::new();
         let mut push = |selector| -> Result<()> {
             const LIMIT: usize = 65_536;
@@ -593,60 +675,55 @@ impl PolicyResolver {
             Ok(())
         };
         for selector in paths {
-            push(selector.clone())?;
-            if selector.is_base_relative() {
-                let relative = Path::new(selector.as_str()).clean_lexically();
-                let relative_str = relative.to_string_lossy();
-                let pattern = (!selector.is_literal())
-                    .then(|| GlobPattern::new(&relative_str))
+            let (mode, path) = selector.parse()?;
+            push(self.resolve_parsed_selector(mode, path)?)?;
+            if let SelectorPath::Relative(rel) = path {
+                let root_name_matcher = anchor_root_name
+                    .then(|| RootNameMatcher::new(mode, rel))
                     .transpose()?;
                 for root in write_allow {
-                    if anchor_root_name
-                        && root.path.file_name().is_some_and(|name| {
-                            let name = Path::new(name);
-                            match &pattern {
-                                Some(pattern) => pattern.matches_path(name),
-                                None => relative == name,
-                            }
-                        })
+                    if let Some(matcher) = &root_name_matcher
+                        && root
+                            .path
+                            .file_name()
+                            .is_some_and(|name| matcher.matches(Path::new(name)))
                     {
-                        push(PathSelector::literal_path(&root.path))?;
+                        push(ResolvedSelector::Concrete(root.path.clone()))?;
                     }
                     if !root.is_dir() {
                         continue;
                     }
-                    push(selector.join_under(&root.path))?;
+                    push(ResolvedSelector::under(mode, &root.path, rel)?)?;
                 }
             }
         }
         Ok(anchored)
     }
 
-    fn resolve_deny_paths(
-        &self,
-        paths: &[PathSelector],
+    fn lower_deny_selectors(
+        selectors: Vec<ResolvedSelector>,
         expand_globs: bool,
     ) -> Result<ResolvedDenyPaths> {
         let mut concrete: Vec<PathBuf> = Vec::new();
         let mut expanded: Vec<PathBuf> = Vec::new();
-        let mut patterns: Vec<GlobPatternBuf> = Vec::new();
-        let mut check_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
+        let mut patterns: Vec<GlobPattern> = Vec::new();
+        let mut check_paths: Vec<PathBuf> = Vec::with_capacity(selectors.len());
 
-        for selector in paths {
-            let resolved = self.resolve_sandbox_path(selector.as_str())?;
-            let resolved_str = resolved.to_string_lossy();
-            if !selector.is_literal() && GlobPattern::is_glob_str(&resolved_str) {
-                let glob = GlobPattern::new(&resolved_str)?;
-                check_paths.push(glob.base());
-                if expand_globs {
-                    for candidate in glob.expand()? {
-                        expanded.extend(candidate.spellings());
-                    }
+        for selector in selectors {
+            match selector {
+                ResolvedSelector::Concrete(resolved) => {
+                    concrete.extend(resolved.spellings());
+                    check_paths.push(resolved);
                 }
-                patterns.extend(GlobPatternBuf::new(resolved_str.into_owned())?.spellings()?);
-            } else {
-                check_paths.push(resolved.clone());
-                concrete.extend(resolved.spellings());
+                ResolvedSelector::Glob { glob, .. } => {
+                    check_paths.push(glob.base().to_path_buf());
+                    if expand_globs {
+                        for candidate in glob.expand()? {
+                            expanded.extend(candidate.spellings());
+                        }
+                    }
+                    patterns.extend(glob.into_spellings()?);
+                }
             }
         }
 

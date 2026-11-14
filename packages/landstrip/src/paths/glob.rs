@@ -5,19 +5,15 @@ use super::PathExt;
 use crate::error::{Error, PathIo, PolicyViolation, Result};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
-use std::borrow::Cow;
 use std::fmt;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR, Path, PathBuf};
+use std::path::{Component, MAIN_SEPARATOR_STR, Path, PathBuf, is_separator};
 
 const MAX_PATTERN_BYTES: usize = 4096;
 
 fn compile_pattern(pattern: &str) -> Result<(GlobSet, String)> {
-    if pattern.len() > MAX_PATTERN_BYTES {
-        return Err(PolicyViolation::GlobTooLong.into());
-    }
     let glob = GlobBuilder::new(pattern)
         .literal_separator(true)
         .case_insensitive(cfg!(windows))
@@ -35,64 +31,122 @@ fn compile_pattern(pattern: &str) -> Result<(GlobSet, String)> {
     Ok((matcher, regex))
 }
 
-pub(crate) struct GlobPattern<'a> {
-    pattern: &'a str,
-    matcher: Cow<'a, GlobSet>,
+fn is_glob_byte(byte: u8) -> bool {
+    matches!(byte, b'*' | b'?' | b'[' | b']')
 }
 
-impl<'a> GlobPattern<'a> {
-    pub(crate) fn new(pattern: &'a str) -> Result<Self> {
-        let (matcher, _) = compile_pattern(pattern)?;
+fn is_glob_component(component: Component<'_>) -> bool {
+    matches!(
+        component,
+        Component::Normal(part) if part.as_encoded_bytes().iter().copied().any(is_glob_byte)
+    )
+}
+
+fn split_glob(path: &Path) -> Option<(PathBuf, String)> {
+    let cleaned = path.clean_lexically();
+    let mut base = PathBuf::new();
+    let mut suffix = PathBuf::new();
+    let mut has_glob = false;
+    for component in cleaned.components() {
+        if !has_glob && is_glob_component(component) {
+            has_glob = true;
+        }
+        if has_glob {
+            suffix.push(component.as_os_str());
+        } else {
+            base.push(component);
+        }
+    }
+    has_glob.then(|| (base, suffix.to_string_lossy().into_owned()))
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(transparent)]
+pub(crate) struct GlobPattern {
+    pattern: String,
+    #[serde(skip)]
+    base: PathBuf,
+    #[serde(skip)]
+    suffix_offset: usize,
+    #[serde(skip)]
+    matcher: GlobSet,
+    #[serde(skip)]
+    #[cfg(target_os = "macos")]
+    regex: String,
+}
+
+impl PartialEq for GlobPattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern
+    }
+}
+
+impl Eq for GlobPattern {}
+
+impl Hash for GlobPattern {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.pattern.hash(state);
+    }
+}
+
+impl GlobPattern {
+    pub(crate) fn parse(raw: &str) -> Result<Option<Self>> {
+        let Some((base, suffix)) = split_glob(Path::new(raw)) else {
+            return Ok(None);
+        };
+        Self::from_parts(&base, &suffix).map(Some)
+    }
+
+    pub(crate) fn under(root: &Path, relative: &str) -> Result<Option<Self>> {
+        let Some((rel_base, suffix)) = split_glob(Path::new(relative)) else {
+            return Ok(None);
+        };
+        Self::from_parts(&root.join_clean(rel_base), &suffix).map(Some)
+    }
+
+    fn from_parts(base: &Path, suffix: &str) -> Result<Self> {
+        let base = base.clean_lexically();
+        let base_str = base.to_string_lossy();
+        let needs_sep = !base_str.is_empty()
+            && !base_str
+                .chars()
+                .next_back()
+                .is_some_and(|ch| is_separator(ch) || (cfg!(windows) && ch == ':'));
+        let sep = if needs_sep { MAIN_SEPARATOR_STR } else { "" };
+        let pattern = format!("{base_str}{sep}{suffix}");
+        if pattern.len() > MAX_PATTERN_BYTES {
+            return Err(PolicyViolation::GlobTooLong.into());
+        }
+        let suffix_offset = base_str.len() + sep.len();
+        let escaped_base = globset::escape(&base_str);
+        let compiled = format!("{escaped_base}{sep}{suffix}");
+        let (matcher, regex) = compile_pattern(&compiled)?;
+        #[cfg(not(target_os = "macos"))]
+        drop(regex);
         Ok(Self {
             pattern,
-            matcher: Cow::Owned(matcher),
+            base,
+            suffix_offset,
+            matcher,
+            #[cfg(target_os = "macos")]
+            regex,
         })
     }
 
-    pub(crate) fn is_glob_byte(byte: u8) -> bool {
-        matches!(byte, b'*' | b'?' | b'[' | b']')
+    fn suffix(&self) -> &str {
+        &self.pattern[self.suffix_offset..]
     }
 
-    pub(crate) fn is_glob_str(s: &str) -> bool {
-        s.bytes().any(Self::is_glob_byte)
+    pub(crate) fn base(&self) -> &Path {
+        &self.base
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_recursive(&self) -> bool {
-        self.pattern.contains("**")
-    }
-
-    pub(crate) fn base(&self) -> PathBuf {
-        let (prefix, tail) = self.split_literal_prefix();
-        if tail.is_empty() {
-            return PathBuf::from(prefix);
-        }
-        let mut base = if prefix.ends_with(MAIN_SEPARATOR) {
-            PathBuf::from(prefix)
-        } else {
-            Path::new(prefix)
-                .parent()
-                .map_or_else(|| PathBuf::from(prefix), Path::to_path_buf)
-        };
-
-        if base.as_os_str().is_empty() {
-            base.push(MAIN_SEPARATOR_STR);
-        }
-
-        base
-    }
-
-    fn split_literal_prefix(&self) -> (&'a str, &'a [u8]) {
-        let at = self
-            .pattern
-            .bytes()
-            .position(Self::is_glob_byte)
-            .unwrap_or(self.pattern.len());
-        (&self.pattern[..at], &self.pattern.as_bytes()[at..])
+        self.suffix().contains("**")
     }
 
     pub(crate) fn matches_path(&self, path: &Path) -> bool {
-        self.matcher.is_match(path.to_string_lossy().as_ref())
+        self.matcher.is_match(path)
     }
 
     pub(crate) fn matches_tree(&self, path: &Path) -> bool {
@@ -103,17 +157,17 @@ impl<'a> GlobPattern<'a> {
     pub(crate) fn matches_under(&self, root: &Path) -> bool {
         self.has_unexcused_under(root, |_| true)
     }
+
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn has_unexcused_under(
         &self,
         root: &Path,
         mut is_denied: impl FnMut(&Path) -> bool,
     ) -> bool {
-        let base = self.base();
-        if base.is_under(root) {
+        if self.base.is_under(root) {
             return true;
         }
-        if !root.is_under(&base) {
+        if !root.is_under(&self.base) {
             return false;
         }
         let mut matches = Vec::new();
@@ -122,11 +176,10 @@ impl<'a> GlobPattern<'a> {
     }
 
     pub(crate) fn expand(&self) -> Result<Vec<PathBuf>> {
-        let base = self.base();
         let mut matches = Vec::new();
 
-        match fs::symlink_metadata(&base) {
-            Ok(_) => self.collect_matches(&base, &mut matches, 0)?,
+        match fs::symlink_metadata(&self.base) {
+            Ok(_) => self.collect_matches(&self.base, &mut matches, 0)?,
             Err(error) if error.is_opaque() || error.kind() == io::ErrorKind::NotADirectory => {}
             Err(source) => return Err(Error::policy_io(source)),
         }
@@ -207,53 +260,6 @@ impl<'a> GlobPattern<'a> {
 
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(transparent)]
-pub(crate) struct GlobPatternBuf {
-    pattern: String,
-    #[serde(skip)]
-    matcher: GlobSet,
-    #[serde(skip)]
-    #[cfg(target_os = "macos")]
-    regex: String,
-}
-
-impl PartialEq for GlobPatternBuf {
-    fn eq(&self, other: &Self) -> bool {
-        self.pattern == other.pattern
-    }
-}
-
-impl Eq for GlobPatternBuf {}
-
-impl Hash for GlobPatternBuf {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.pattern.hash(state);
-    }
-}
-
-impl GlobPatternBuf {
-    pub(crate) fn new(pattern: impl Into<String>) -> Result<Self> {
-        let pattern = pattern.into();
-        let (matcher, regex) = compile_pattern(&pattern)?;
-        #[cfg(not(target_os = "macos"))]
-        drop(regex);
-        Ok(Self {
-            pattern,
-            matcher,
-            #[cfg(target_os = "macos")]
-            regex,
-        })
-    }
-
-    pub(crate) fn as_glob(&self) -> GlobPattern<'_> {
-        GlobPattern {
-            pattern: &self.pattern,
-            matcher: Cow::Borrowed(&self.matcher),
-        }
-    }
 
     #[cfg(target_os = "macos")]
     pub(crate) fn sbpl_regex(&self) -> String {
@@ -267,52 +273,22 @@ impl GlobPatternBuf {
         }
     }
 
-    pub(crate) fn base(&self) -> PathBuf {
-        self.as_glob().base()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn is_recursive(&self) -> bool {
-        self.as_glob().is_recursive()
-    }
-
-    pub(crate) fn matches_tree(&self, path: &Path) -> bool {
-        self.as_glob().matches_tree(path)
-    }
-
-    pub(crate) fn spellings(&self) -> Result<impl Iterator<Item = Self> + use<'_>> {
-        let base = self.base();
-        let lexical = base.clean_lexically();
-        let canonical = base.canonicalize_existing_prefix().clean_lexically();
-        let lexical_str = lexical.to_string_lossy();
-        let canonical_str = canonical.to_string_lossy();
-        let alias = if canonical == lexical {
-            None
-        } else {
-            self.pattern
-                .strip_prefix(lexical_str.as_ref())
-                .map(|suffix| {
-                    let sep = if !suffix.starts_with(MAIN_SEPARATOR) && lexical_str.as_ref() != "/"
-                    {
-                        MAIN_SEPARATOR_STR
-                    } else {
-                        ""
-                    };
-                    Self::new(format!("{canonical_str}{sep}{suffix}"))
-                })
-                .transpose()?
-        };
-        Ok(std::iter::once(self.clone()).chain(alias))
+    pub(crate) fn into_spellings(self) -> Result<impl Iterator<Item = Self>> {
+        let canonical = self.base.canonicalize_existing_prefix().clean_lexically();
+        let alias = (canonical != self.base)
+            .then(|| Self::from_parts(&canonical, self.suffix()))
+            .transpose()?;
+        Ok(std::iter::once(self).chain(alias))
     }
 }
 
-impl AsRef<str> for GlobPatternBuf {
+impl AsRef<str> for GlobPattern {
     fn as_ref(&self) -> &str {
         &self.pattern
     }
 }
 
-impl fmt::Display for GlobPatternBuf {
+impl fmt::Display for GlobPattern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.pattern)
     }
@@ -322,7 +298,7 @@ pub(crate) trait NormalizePatterns {
     fn normalize_patterns(&mut self);
 }
 
-impl NormalizePatterns for Vec<GlobPatternBuf> {
+impl NormalizePatterns for Vec<GlobPattern> {
     fn normalize_patterns(&mut self) {
         self.sort_unstable_by(|left, right| left.pattern.cmp(&right.pattern));
         self.dedup();
@@ -339,37 +315,28 @@ impl OverridesDeny<Path> for Path {
     }
 }
 
-impl OverridesDeny<GlobPattern<'_>> for Path {
-    fn overrides_deny(&self, deny: &GlobPattern<'_>) -> bool {
+impl OverridesDeny<GlobPattern> for Path {
+    fn overrides_deny(&self, deny: &GlobPattern) -> bool {
         deny.matches_tree(self)
     }
 }
 
-impl OverridesDeny<Path> for GlobPattern<'_> {
+impl OverridesDeny<Path> for GlobPattern {
     fn overrides_deny(&self, deny: &Path) -> bool {
-        self.base().is_under(deny)
+        self.base.is_under(deny)
     }
 }
 
-impl OverridesDeny<GlobPattern<'_>> for GlobPattern<'_> {
-    fn overrides_deny(&self, deny: &GlobPattern<'_>) -> bool {
-        let allow_base = self.base();
-        let deny_base = deny.base();
-        if allow_base.is_strictly_under(&deny_base) {
+impl OverridesDeny<GlobPattern> for GlobPattern {
+    fn overrides_deny(&self, deny: &GlobPattern) -> bool {
+        if self.base.is_strictly_under(&deny.base) {
             return true;
         }
-        if allow_base != deny_base {
+        if self.base != deny.base {
             return false;
         }
-        let base_str = allow_base.to_string_lossy();
-        let allow_tail = self
-            .pattern
-            .strip_prefix(base_str.as_ref())
-            .unwrap_or(self.pattern);
-        let deny_tail = deny
-            .pattern
-            .strip_prefix(base_str.as_ref())
-            .unwrap_or(deny.pattern);
+        let allow_tail = self.suffix();
+        let deny_tail = deny.suffix();
         self.pattern == deny.pattern
             || (!allow_tail.contains("**") && deny_tail.contains("**"))
             || self.pattern.len() >= deny.pattern.len()
@@ -382,21 +349,9 @@ impl OverridesDeny<PathBuf> for Path {
     }
 }
 
-impl OverridesDeny<GlobPatternBuf> for Path {
-    fn overrides_deny(&self, deny: &GlobPatternBuf) -> bool {
-        self.overrides_deny(&deny.as_glob())
-    }
-}
-
-impl OverridesDeny<PathBuf> for GlobPattern<'_> {
+impl OverridesDeny<PathBuf> for GlobPattern {
     fn overrides_deny(&self, deny: &PathBuf) -> bool {
         self.overrides_deny(deny.as_path())
-    }
-}
-
-impl OverridesDeny<GlobPatternBuf> for GlobPattern<'_> {
-    fn overrides_deny(&self, deny: &GlobPatternBuf) -> bool {
-        self.overrides_deny(&deny.as_glob())
     }
 }
 
@@ -406,14 +361,5 @@ where
 {
     fn overrides_deny(&self, deny: &Rhs) -> bool {
         self.as_path().overrides_deny(deny)
-    }
-}
-
-impl<Rhs: ?Sized> OverridesDeny<Rhs> for GlobPatternBuf
-where
-    for<'a> GlobPattern<'a>: OverridesDeny<Rhs>,
-{
-    fn overrides_deny(&self, deny: &Rhs) -> bool {
-        self.as_glob().overrides_deny(deny)
     }
 }

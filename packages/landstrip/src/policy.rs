@@ -24,7 +24,7 @@ pub(crate) mod resolver;
 use crate::config::{AppContainerMode, SandboxDarwin};
 #[cfg(target_os = "linux")]
 use crate::paths::NormalizeRoots;
-use crate::paths::{GlobPattern, GlobPatternBuf, OverridesDeny, PathExt};
+use crate::paths::{GlobPattern, OverridesDeny, PathExt};
 #[cfg(target_os = "linux")]
 use nix::sys::stat::fstat;
 use serde::Serialize;
@@ -71,7 +71,7 @@ pub(crate) struct AccessPolicy {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Carveouts {
     pub(crate) roots: Vec<PathBuf>,
-    pub(crate) patterns: Vec<GlobPatternBuf>,
+    pub(crate) patterns: Vec<GlobPattern>,
 }
 
 #[derive(Debug, Default, Eq, Hash, PartialEq, Serialize)]
@@ -79,12 +79,12 @@ pub(crate) struct Carveouts {
 pub(crate) struct DenialScope {
     pub(crate) roots: Vec<PathBuf>,
     #[cfg_attr(target_os = "windows", allow(dead_code))]
-    pub(crate) patterns: Vec<GlobPatternBuf>,
+    pub(crate) patterns: Vec<GlobPattern>,
     pub(crate) carveouts: Carveouts,
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub(crate) always_roots: Vec<PathBuf>,
     #[cfg_attr(target_os = "windows", allow(dead_code))]
-    pub(crate) always_patterns: Vec<GlobPatternBuf>,
+    pub(crate) always_patterns: Vec<GlobPattern>,
 }
 
 #[cfg(target_os = "linux")]
@@ -135,7 +135,7 @@ impl Carveouts {
     pub(crate) fn overrides<D: ?Sized>(&self, deny: &D, path: &Path) -> bool
     where
         PathBuf: OverridesDeny<D>,
-        GlobPatternBuf: OverridesDeny<D>,
+        GlobPattern: OverridesDeny<D>,
     {
         self.roots
             .iter()
@@ -652,12 +652,12 @@ impl AccessPolicy {
 #[derive(Clone, Copy)]
 pub(crate) struct DenyRuleSet<'a> {
     roots: &'a [PathBuf],
-    patterns: &'a [GlobPatternBuf],
+    patterns: &'a [GlobPattern],
     carveouts: Option<&'a Carveouts>,
 }
 
 impl<'a> DenyRuleSet<'a> {
-    pub(crate) fn new(roots: &'a [PathBuf], patterns: &'a [GlobPatternBuf]) -> Self {
+    pub(crate) fn new(roots: &'a [PathBuf], patterns: &'a [GlobPattern]) -> Self {
         Self {
             roots,
             patterns,
@@ -668,7 +668,7 @@ impl<'a> DenyRuleSet<'a> {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn with_carveouts(
         roots: &'a [PathBuf],
-        patterns: &'a [GlobPatternBuf],
+        patterns: &'a [GlobPattern],
         carveouts: &'a Carveouts,
     ) -> Self {
         Self {
@@ -682,7 +682,7 @@ impl<'a> DenyRuleSet<'a> {
         self.roots
     }
 
-    pub(crate) fn patterns(self) -> &'a [GlobPatternBuf] {
+    pub(crate) fn patterns(self) -> &'a [GlobPattern] {
         self.patterns
     }
 
@@ -712,12 +712,10 @@ impl<'a> DenyRuleSet<'a> {
             .any(|root| root.is_under(dir) && (self.carveouts.is_none() || self.matches(root)));
         root_denied
             || self.patterns.iter().any(|pattern| match self.carveouts {
-                None => pattern.as_glob().matches_under(dir),
+                None => pattern.matches_under(dir),
                 Some(carveouts) => {
                     !carveouts.patterns.contains(pattern)
-                        && pattern
-                            .as_glob()
-                            .has_unexcused_under(dir, |candidate| self.matches(candidate))
+                        && pattern.has_unexcused_under(dir, |candidate| self.matches(candidate))
                 }
             })
     }
@@ -733,7 +731,7 @@ impl OverridesDeny<DenyRuleSet<'_>> for Path {
     }
 }
 
-impl OverridesDeny<DenyRuleSet<'_>> for GlobPattern<'_> {
+impl OverridesDeny<DenyRuleSet<'_>> for GlobPattern {
     fn overrides_deny(&self, deny: &DenyRuleSet<'_>) -> bool {
         deny.roots().iter().any(|root| self.overrides_deny(root))
             || deny

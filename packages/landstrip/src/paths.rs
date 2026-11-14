@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) mod glob;
 
-pub(crate) use glob::{GlobPattern, GlobPatternBuf, NormalizePatterns, OverridesDeny};
+pub(crate) use glob::{GlobPattern, NormalizePatterns, OverridesDeny};
 
 pub(crate) trait PathExt {
     fn is_under(&self, root: impl AsRef<Path>) -> bool;
@@ -22,6 +22,7 @@ pub(crate) trait PathExt {
 
     fn normalize(&self) -> PathBuf;
     fn clean_lexically(&self) -> PathBuf;
+    fn join_clean(&self, relative: impl AsRef<Path>) -> PathBuf;
     fn canonicalize_existing_prefix(&self) -> PathBuf;
     fn spellings(&self) -> impl Iterator<Item = PathBuf>;
 }
@@ -72,6 +73,15 @@ impl PathExt for Path {
             PathBuf::new()
         } else {
             cleaned
+        }
+    }
+
+    fn join_clean(&self, relative: impl AsRef<Path>) -> PathBuf {
+        let cleaned = relative.as_ref().clean_lexically();
+        if cleaned.as_os_str().is_empty() {
+            self.clean_lexically()
+        } else {
+            self.join(cleaned).clean_lexically()
         }
     }
 

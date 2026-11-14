@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use crate::error::{Error, Result};
+use crate::error::{Error, PolicyViolation, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
 pub(crate) enum PolicyFormat {
@@ -91,46 +91,45 @@ pub(crate) enum PathSelector {
     Bare(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SelectorMode {
+    Literal,
+    Glob,
+    Bare,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SelectorPath<'a> {
+    Rooted(&'a str),
+    Home(Option<&'a str>),
+    Relative(&'a str),
+}
+
 impl PathSelector {
-    pub(crate) fn as_str(&self) -> &str {
-        match self {
-            Self::Literal { literal } | Self::Glob { glob: literal } | Self::Bare(literal) => {
-                literal
-            }
+    pub(crate) fn parse(&self) -> Result<(SelectorMode, SelectorPath<'_>)> {
+        let (mode, raw) = match self {
+            Self::Literal { literal } => (SelectorMode::Literal, literal.as_str()),
+            Self::Glob { glob } => (SelectorMode::Glob, glob.as_str()),
+            Self::Bare(raw) => (SelectorMode::Bare, raw.as_str()),
+        };
+        if raw.is_empty() {
+            return Err(PolicyViolation::EmptyPath.into());
         }
-    }
-
-    pub(crate) fn is_literal(&self) -> bool {
-        matches!(self, Self::Literal { .. })
-    }
-
-    /// True when the entry resolves against the policy base rather than naming
-    /// an absolute path or home-relative scope.
-    pub(crate) fn is_base_relative(&self) -> bool {
-        let raw = self.as_str();
-        !Path::new(raw).has_root() && raw != "~" && !raw.starts_with("~/")
-    }
-
-    pub(crate) fn literal_path(path: &Path) -> Self {
-        Self::Literal {
-            literal: path.to_string_lossy().into_owned(),
-        }
-    }
-
-    pub(crate) fn join_under(&self, root: &Path) -> Self {
-        let joined = root.join(self.as_str()).to_string_lossy().into_owned();
-        match self {
-            Self::Literal { .. } => Self::Literal { literal: joined },
-            Self::Glob { .. } => Self::Glob { glob: joined },
-            Self::Bare(_) => Self::Bare(joined),
-        }
+        let path = if has_root_or_prefix(Path::new(raw)) {
+            SelectorPath::Rooted(raw)
+        } else if raw == "~" {
+            SelectorPath::Home(None)
+        } else if let Some(rest) = raw.strip_prefix("~/") {
+            SelectorPath::Home((!rest.is_empty()).then_some(rest))
+        } else {
+            SelectorPath::Relative(raw)
+        };
+        Ok((mode, path))
     }
 }
 
-impl AsRef<str> for PathSelector {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
+fn has_root_or_prefix(path: &Path) -> bool {
+    path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_)))
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
