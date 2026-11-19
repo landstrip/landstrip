@@ -56,6 +56,7 @@ async function withPlugin(options, run) {
     const context = {
       location: { directory: tempDir },
       options,
+      event: { async *subscribe() {} },
       tool: {
         hook: (name, fn) => {
           handlers.tool[name] = fn;

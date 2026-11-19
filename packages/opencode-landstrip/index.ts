@@ -57,6 +57,9 @@ interface BashSandboxState {
   trapServer: ReturnType<typeof createServer> | null;
   trapServerPort: number | null;
   trapLines: string[];
+  shellID?: string;
+  shellExited?: boolean;
+  background?: boolean;
 }
 
 type SandboxPermissionKind = 'read' | 'write' | 'domain';
@@ -416,6 +419,9 @@ const plugin: Plugin.Plugin = {
     const discovery = new TrapPortDiscovery(directory);
     const pendingByCommand = new Map<string, { callID: string; sessionID: string | undefined }>();
     const activeBash = new Map<string, BashSandboxState>();
+    const callByShellID = new Map<string, string>();
+    const exitedShells = new Set<string>();
+    const shellEventsAbort = new AbortController();
     const notified = new Set<string>();
     let enabledNotified = false;
     let landstripCheck: { ok: true; version: string } | { ok: false; reason: string } | undefined;
@@ -527,6 +533,10 @@ const plugin: Plugin.Plugin = {
       if (!state) return;
 
       activeBash.delete(callID);
+      if (pendingByCommand.get(state.wrappedCommand)?.callID === callID) {
+        pendingByCommand.delete(state.wrappedCommand);
+      }
+      if (state.shellID !== undefined) callByShellID.delete(state.shellID);
       if (state.stop) await state.stop().catch(() => undefined);
       if (state.trapServer) {
         await new Promise<void>((resolve) => {
@@ -698,11 +708,6 @@ const plugin: Plugin.Plugin = {
       const args = isRecord(event.input) ? event.input : {};
 
       if (event.tool === 'shell') {
-        if (args.background === true) {
-          throw new Error(
-            'Background shell commands are not supported while the sandbox is enabled',
-          );
-        }
         if (typeof args.command === 'string') {
           await prepareBash(event.id, event.sessionID, args, config);
           pendingByCommand.set(args.command, { callID: event.id, sessionID: event.sessionID });
@@ -733,7 +738,6 @@ const plugin: Plugin.Plugin = {
       if (!config) return;
 
       const pending = pendingByCommand.get(invocation.command);
-      pendingByCommand.delete(invocation.command);
       const callID = pending?.callID || `shell-${randomBytes(6).toString('hex')}`;
       const sessionID = pending?.sessionID;
 
@@ -747,6 +751,50 @@ const plugin: Plugin.Plugin = {
       );
     });
 
+    function trackShell(callID: string, state: BashSandboxState, shellID: string): void {
+      state.shellID = shellID;
+      state.shellExited ||= exitedShells.has(shellID);
+      if (!state.shellExited) callByShellID.set(shellID, callID);
+    }
+
+    const shellEvents = (async () => {
+      for await (const event of context.event.subscribe({
+        types: ['shell.created', 'shell.exited', 'shell.deleted'],
+        signal: shellEventsAbort.signal,
+      })) {
+        if (event.type === 'shell.created') {
+          const { id, command, status } = event.data.info;
+          const pending = pendingByCommand.get(command);
+          if (!pending) continue;
+          const state = activeBash.get(pending.callID);
+          pendingByCommand.delete(command);
+          if (!state) continue;
+          state.shellExited ||= status !== 'running';
+          trackShell(pending.callID, state, id);
+          continue;
+        }
+
+        const { id } = event.data;
+        if (event.type === 'shell.deleted') exitedShells.delete(id);
+        else exitedShells.add(id);
+        const callID = callByShellID.get(id);
+        if (callID === undefined) continue;
+        callByShellID.delete(id);
+        const state = activeBash.get(callID);
+        if (!state) continue;
+        state.shellExited = true;
+        if (state.background) {
+          await finishBash(callID, state, '').catch((error: unknown) => {
+            console.error('opencode-landstrip: Background shell cleanup failed:', error);
+          });
+        }
+      }
+    })().catch((error: unknown) => {
+      if (!shellEventsAbort.signal.aborted) {
+        console.error('opencode-landstrip: Shell event subscription failed:', error);
+      }
+    });
+
     context.tool.hook('execute.after', async (event) => {
       if (event.tool !== 'shell') return;
 
@@ -756,6 +804,13 @@ const plugin: Plugin.Plugin = {
       let outputText = '';
       if (event.status === 'completed') {
         const { output, content } = event.result;
+        if (isRecord(output) && output.status === 'running' && typeof output.shellID === 'string') {
+          trackShell(event.id, state, output.shellID);
+          if (!state.shellExited) {
+            state.background = true;
+            return;
+          }
+        }
         if (typeof output === 'string') {
           outputText = output;
         } else if (isRecord(output) && typeof output.output === 'string') {
@@ -772,6 +827,14 @@ const plugin: Plugin.Plugin = {
             .join('\n');
         }
       }
+      await finishBash(event.id, state, outputText);
+    });
+
+    async function finishBash(
+      callID: string,
+      state: BashSandboxState,
+      outputText: string,
+    ): Promise<void> {
       const serverTrapOutput = state.trapLines.join('\n');
       const combinedOutput = serverTrapOutput ? outputText + '\n' + serverTrapOutput : outputText;
       const traps = parseLandstripTraps(combinedOutput);
@@ -798,12 +861,13 @@ const plugin: Plugin.Plugin = {
         );
       }
 
-      await cleanupBash(event.id);
-    });
+      await cleanupBash(callID);
+    }
 
     return async () => {
+      shellEventsAbort.abort();
+      await shellEvents;
       await Promise.all([...activeBash.keys()].map((callID) => cleanupBash(callID)));
-      activeBash.clear();
     };
   },
 };
