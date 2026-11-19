@@ -180,7 +180,7 @@ impl GlobPattern {
 
         match fs::symlink_metadata(&self.base) {
             Ok(_) => self.collect_matches(&self.base, &mut matches, 0)?,
-            Err(error) if error.is_opaque() || error.kind() == io::ErrorKind::NotADirectory => {}
+            Err(error) if error.is_opaque() => {}
             Err(source) => return Err(Error::policy_io(source)),
         }
 

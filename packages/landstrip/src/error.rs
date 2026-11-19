@@ -328,10 +328,14 @@ impl PathIo for io::Error {
         self.kind() == io::ErrorKind::NotConnected || self.raw_os_error() == Some(libc::EIO)
     }
 
+    /// Whether the path cannot be looked at, as when a component is missing
+    /// or is not a directory.
     fn is_opaque(&self) -> bool {
         matches!(
             self.kind(),
-            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            io::ErrorKind::NotFound
+                | io::ErrorKind::NotADirectory
+                | io::ErrorKind::PermissionDenied
         ) || self.is_transport_failed()
     }
 }
