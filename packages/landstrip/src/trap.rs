@@ -10,8 +10,9 @@ use crate::policy::DenialReason;
 #[cfg(unix)]
 use crate::trap_fd::TrapFd;
 use serde::Serialize;
+use serde_json::Value;
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
@@ -258,7 +259,72 @@ impl Trap {
     }
 
     pub(crate) fn emit(&self) {
-        let _ = writeln!(io::stderr().lock(), "{self}");
+        Self::write_stderr(&self.to_json());
+    }
+
+    /// Writes a record to stderr: as JSON for a program reading it, and as
+    /// text for a person at a terminal.
+    fn write_stderr(json: &str) {
+        let mut stderr = io::stderr().lock();
+        if stderr.is_terminal() {
+            let _ = writeln!(stderr, "{}", Self::describe(json));
+        } else {
+            let _ = writeln!(stderr, "{json}");
+        }
+    }
+
+    /// The text form of a serialized record, which may come from another
+    /// process of the payload.
+    fn describe(json: &str) -> String {
+        use std::fmt::Write as _;
+
+        let Ok(record) = serde_json::from_str::<Value>(json) else {
+            return json.to_owned();
+        };
+        let field = |name: &str| record.get(name).and_then(Value::as_str).unwrap_or_default();
+        match field("kind") {
+            "usage" => field("message").trim_end().to_owned(),
+            "launch" => format!(
+                "landstrip: cannot start {}: {}",
+                field("program"),
+                field("message")
+            ),
+            "internal" => format!("landstrip: {}", field("message")),
+            "filesystem" => {
+                let (path, requested) = (field("path"), field("requested_path"));
+                let mut text = format!(
+                    "landstrip: {} denied: {path} ({}, {})",
+                    field("operation"),
+                    field("syscall"),
+                    field("reason")
+                );
+                if requested != path {
+                    let _ = write!(text, ", requested as {requested}");
+                }
+                if field("state") == "query" {
+                    text.push_str(", asking the responder");
+                }
+                let grant = record.get("suggested_grant").and_then(Value::as_object);
+                for (list, path) in grant.into_iter().flatten() {
+                    let path = path.as_str().unwrap_or_default();
+                    let _ = write!(text, "\n  to allow it, add {path} to {list}");
+                }
+                text
+            }
+            "network" => {
+                let mut text = format!(
+                    "landstrip: {} denied: {} ({})",
+                    field("operation"),
+                    field("target"),
+                    field("syscall")
+                );
+                if field("state") == "query" {
+                    text.push_str(", asking the responder");
+                }
+                text
+            }
+            _ => json.to_owned(),
+        }
     }
 }
 
