@@ -8,22 +8,17 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-pub(crate) enum SandboxImplementation {
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SandboxPlatform {
     #[cfg(target_os = "linux")]
-    #[serde(rename = "landlock+seccomp")]
-    LandlockSeccomp,
+    Linux,
     #[cfg(target_os = "macos")]
-    #[serde(rename = "seatbelt")]
-    Seatbelt,
+    Macos,
     #[cfg(target_os = "windows")]
-    #[serde(rename = "appContainer")]
-    AppContainer,
-    #[cfg(target_os = "windows")]
-    #[serde(rename = "restrictedUser")]
-    RestrictedUser,
+    Windows,
 }
 
-impl SandboxImplementation {
+impl SandboxPlatform {
     fn capabilities(self) -> FeatureCapabilities {
         let capabilities = FeatureCapabilities {
             filesystem_tiers: &[
@@ -40,18 +35,18 @@ impl SandboxImplementation {
         };
         match self {
             #[cfg(target_os = "linux")]
-            Self::LandlockSeccomp => FeatureCapabilities {
+            Self::Linux => FeatureCapabilities {
                 unix_socket_filtering: true,
                 process_isolation: true,
                 ..capabilities
             },
             #[cfg(target_os = "macos")]
-            Self::Seatbelt => FeatureCapabilities {
+            Self::Macos => FeatureCapabilities {
                 unix_socket_filtering: true,
                 ..capabilities
             },
             #[cfg(target_os = "windows")]
-            Self::AppContainer | Self::RestrictedUser => FeatureCapabilities {
+            Self::Windows => FeatureCapabilities {
                 filesystem_tiers: &["allowWrite", "denyWrite", "allowRead", "denyRead"],
                 ..capabilities
             },
@@ -100,8 +95,7 @@ impl TryFrom<Result<()>> for PolicyValidationReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct DoctorReport {
     pub(crate) ok: bool,
-    pub(crate) platform: &'static str,
-    pub(crate) implementation: SandboxImplementation,
+    pub(crate) platform: SandboxPlatform,
     pub(crate) supported: FeatureCapabilities,
     pub(crate) available: FeatureCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -109,9 +103,9 @@ pub(crate) struct DoctorReport {
 }
 
 impl DoctorReport {
-    pub(crate) fn new(implementation: SandboxImplementation, error: Option<String>) -> Self {
+    pub(crate) fn new(platform: SandboxPlatform, error: Option<String>) -> Self {
         let ok = error.is_none();
-        let supported = implementation.capabilities();
+        let supported = platform.capabilities();
         let available = if ok {
             supported
         } else {
@@ -119,8 +113,7 @@ impl DoctorReport {
         };
         Self {
             ok,
-            platform: std::env::consts::OS,
-            implementation,
+            platform,
             supported,
             available,
             error,
@@ -139,10 +132,18 @@ pub(crate) struct FeatureCapabilities {
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum WindowsBackend {
+    AppContainer,
+    RestrictedUser,
+}
+
+#[cfg(target_os = "windows")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WindowsStatusReport {
-    pub(crate) active: SandboxImplementation,
+    pub(crate) active: WindowsBackend,
     pub(crate) installed: bool,
     pub(crate) healthy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,7 +172,7 @@ pub(crate) struct WindowsStatusReport {
 impl WindowsStatusReport {
     pub(crate) fn app_container(error: Option<String>) -> Self {
         Self {
-            active: SandboxImplementation::AppContainer,
+            active: WindowsBackend::AppContainer,
             installed: false,
             healthy: error.is_none(),
             version: None,

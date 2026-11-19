@@ -10,7 +10,7 @@ use super::account;
 use super::lease::Lease;
 use super::state::{INSTALLATION_VERSION, Installation, NetworkMode, StateStore};
 use super::wfp;
-use crate::outcome::{SandboxImplementation, WindowsStatusReport};
+use crate::outcome::{WindowsBackend, WindowsStatusReport};
 use anyhow::{Context, Result};
 use std::env;
 use std::fs;
@@ -60,7 +60,7 @@ pub(in crate::platform::windows) fn status() -> Result<Option<WindowsStatusRepor
     let (accounts_healthy, runner_healthy) = installation.health();
     let healthy = installation.complete && accounts_healthy && runner_healthy;
     Ok(Some(WindowsStatusReport {
-        active: SandboxImplementation::RestrictedUser,
+        active: WindowsBackend::RestrictedUser,
         installed: true,
         healthy,
         version: Some(installation.version),

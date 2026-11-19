@@ -18,8 +18,8 @@ mod unix;
 mod windows;
 
 use crate::outcome::DoctorReport;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::outcome::SandboxImplementation;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+use crate::outcome::SandboxPlatform;
 
 #[cfg(target_os = "windows")]
 #[derive(Debug)]
@@ -75,25 +75,19 @@ pub(crate) fn check(policy: &crate::policy::AccessPolicy) -> crate::error::Resul
 #[cfg(target_os = "linux")]
 #[allow(clippy::unnecessary_wraps, reason = "uniform platform doctor API")]
 pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
-    Ok(doctor_report(
-        SandboxImplementation::LandlockSeccomp,
-        linux::doctor(),
-    ))
+    Ok(doctor_report(SandboxPlatform::Linux, linux::doctor()))
 }
 
 #[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_wraps, reason = "uniform platform doctor API")]
 pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
-    Ok(doctor_report(
-        SandboxImplementation::Seatbelt,
-        macos::doctor(),
-    ))
+    Ok(doctor_report(SandboxPlatform::Macos, macos::doctor()))
 }
 
 #[cfg(target_os = "windows")]
 pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
     let status = windows::status()?;
-    Ok(DoctorReport::new(status.active, status.error))
+    Ok(DoctorReport::new(SandboxPlatform::Windows, status.error))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -102,12 +96,6 @@ pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn doctor_report(
-    implementation: SandboxImplementation,
-    result: anyhow::Result<()>,
-) -> DoctorReport {
-    DoctorReport::new(
-        implementation,
-        result.err().map(|error| format!("{error:#}")),
-    )
+fn doctor_report(platform: SandboxPlatform, result: anyhow::Result<()>) -> DoctorReport {
+    DoctorReport::new(platform, result.err().map(|error| format!("{error:#}")))
 }

@@ -194,11 +194,7 @@ export interface LandstripPolicy {
   windows?: LandstripWindowsPolicy;
 }
 
-export type SandboxImplementation =
-  | 'landlock+seccomp'
-  | 'seatbelt'
-  | 'appContainer'
-  | 'restrictedUser';
+export type SandboxPlatform = 'linux' | 'macos' | 'windows';
 
 export interface FeatureCapabilities {
   filesystemTiers: string[];
@@ -209,8 +205,7 @@ export interface FeatureCapabilities {
 
 export interface DoctorReport {
   ok: boolean;
-  platform: string;
-  implementation: SandboxImplementation;
+  platform: SandboxPlatform;
   supported: FeatureCapabilities;
   available: FeatureCapabilities;
   error?: string;
