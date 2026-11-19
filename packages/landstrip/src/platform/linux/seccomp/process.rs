@@ -175,10 +175,11 @@ impl TargetProcess {
     }
 
     pub(super) fn thread_group_leader(&self) -> SysResult<Pid> {
-        let status = fs::read_to_string(self.proc_path("status"))?;
+        let status = fs::read(self.proc_path("status"))?;
         let value = status
-            .lines()
-            .find_map(|line| line.strip_prefix("Tgid:"))
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(b"Tgid:"))
+            .and_then(|value| std::str::from_utf8(value).ok())
             .ok_or(BrokerError::InvalidAddress)?;
         let tgid = value
             .trim()
@@ -291,11 +292,12 @@ impl TargetFilesystem<'_> {
     }
 
     fn proc_aliases(&self) -> SysResult<(Vec<u8>, Vec<u8>)> {
-        let status = fs::read_to_string(self.process.proc_path("status"))?;
-        let id = |field: &str| -> SysResult<&str> {
+        let status = fs::read(self.process.proc_path("status"))?;
+        let id = |field: &[u8]| -> SysResult<&str> {
             let value = status
-                .lines()
+                .split(|byte| *byte == b'\n')
                 .find_map(|line| line.strip_prefix(field))
+                .and_then(|value| std::str::from_utf8(value).ok())
                 .and_then(|values| values.split_whitespace().last())
                 .ok_or_else(|| BrokerError::syscall(libc::EIO))?;
             if value
@@ -307,8 +309,8 @@ impl TargetFilesystem<'_> {
             }
             Ok(value)
         };
-        let group_id = id("NStgid:")?;
-        let thread_id = id("NSpid:")?;
+        let group_id = id(b"NStgid:")?;
+        let thread_id = id(b"NSpid:")?;
         Ok((
             group_id.as_bytes().to_vec(),
             format!("{group_id}/task/{thread_id}").into_bytes(),
