@@ -75,6 +75,8 @@ fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
             let report = platform::doctor()?;
             Ok(CommandOutcome::json(report.ok, report)?)
         }
+        Command::Selftest(args) => Ok(args.run()?),
+        Command::SelftestWorker(args) => Ok(args.run()),
         #[cfg(target_os = "windows")]
         Command::Windows(command) => {
             let report = platform::manage_windows(command)?;

@@ -251,7 +251,7 @@ npm run ci:extensions:local
   cd packages/landstrip
   cargo fmt --all --check
   cargo build --locked
-  cargo test --all --locked
+  target/debug/landstrip selftest
   cargo clippy --all-targets --locked -- -D warnings
 )
 

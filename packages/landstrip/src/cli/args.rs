@@ -7,6 +7,7 @@ use crate::error::{Error, Mechanism};
 #[cfg(target_os = "windows")]
 use crate::platform::{RESTRICTED_USER_RUNNER, WindowsCommand};
 use crate::policy::AccessPolicy;
+use crate::selftest::{SelftestArgs, WorkerArgs};
 #[cfg(unix)]
 use crate::trap_fd::TrapFd;
 use clap::builder::{PathBufValueParser, TypedValueParser};
@@ -41,6 +42,8 @@ pub(super) enum Command {
     Check(PolicyRequest),
     Resolve(PolicyRequest),
     Doctor,
+    Selftest(SelftestArgs),
+    SelftestWorker(WorkerArgs),
     #[cfg(target_os = "windows")]
     Windows(WindowsCommand),
     #[cfg(target_os = "windows")]
@@ -116,6 +119,10 @@ enum CliCommand {
     Resolve(PolicyRequest),
     /// Verify sandbox health and report supported/available capabilities.
     Doctor,
+    /// Run the randomized model-based self-test against this executable.
+    Selftest(SelftestArgs),
+    #[command(name = WorkerArgs::SUBCOMMAND, hide = true)]
+    SelftestWorker(WorkerArgs),
     #[cfg(target_os = "windows")]
     /// Manage Windows sandbox preparation and restricted-user provisioning.
     Windows(WindowsArgs),
@@ -273,6 +280,8 @@ impl TryFrom<CliCommand> for Command {
             CliCommand::Check(request) => Self::Check(request),
             CliCommand::Resolve(request) => Self::Resolve(request),
             CliCommand::Doctor => Self::Doctor,
+            CliCommand::Selftest(args) => Self::Selftest(args),
+            CliCommand::SelftestWorker(args) => Self::SelftestWorker(args),
             #[cfg(target_os = "windows")]
             CliCommand::Windows(args) => Self::Windows(args.into()),
         })

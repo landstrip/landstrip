@@ -19,6 +19,7 @@ pub(crate) mod outcome;
 pub(crate) mod paths;
 pub(crate) mod platform;
 pub(crate) mod policy;
+pub(crate) mod selftest;
 pub(crate) mod trap;
 #[cfg(unix)]
 pub(crate) mod trap_fd;

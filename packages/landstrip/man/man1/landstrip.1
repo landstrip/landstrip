@@ -40,6 +40,22 @@ Check parsing, paths, executable policy, and platform support.
 Print the normalized merged policy as JSON.
 .It Cm doctor
 Report sandbox health and supported/available capabilities as JSON.
+.It Cm selftest Oo Fl -seed Ar seed Oc Oo Fl -cases Ar n Oc Op Ar scenario ...
+Run the randomized model-based self-test against this executable.
+Scenarios are
+.Cm cli-and-fds ,
+.Cm fs-policy ,
+.Cm network ,
+.Cm process ,
+and
+.Cm compat ;
+all available scenarios run when none is given.
+The
+.Cm compat
+scenario runs system calls the policy does not concern inside and outside the
+sandbox and reports every one that behaves differently.
+The report prints the seed first and a replay command for each failure.
+Exits 0 when every scenario passes and 1 otherwise.
 .It Cm windows install
 Install restricted-user isolation; requires elevation.
 .It Cm windows prepare-appcontainer

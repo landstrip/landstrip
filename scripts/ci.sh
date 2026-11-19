@@ -47,8 +47,8 @@ binary_name=landstrip
   printf '==> cargo build\n'
   $CARGO build
 
-  printf '==> cargo test\n'
-  $CARGO test
+  printf '==> landstrip selftest\n'
+  "target/debug/$binary_name" selftest
 
   printf '==> cargo clippy\n'
   $CARGO clippy --all-targets

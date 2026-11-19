@@ -12,11 +12,6 @@ rust-version = "1.95"
 version = "0.20.29"
 autotests = false
 
-[[test]]
-name = "data"
-path = "tests/data.rs"
-harness = false
-
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -27,6 +22,8 @@ hex = "0.4"
 libc = "0.2"
 log = "0.4.30"
 path-clean = "1.0"
+proptest = { version = "1.12", default-features = false, features = ["handle-panics", "std"] }
+proptest-state-machine = { version = "0.9", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yml = "0.0.13"
@@ -42,7 +39,8 @@ xattr = "1.6"
 landlock = "0.4"
 seccompiler = "0.5"
 socket2 = { version = "0.6", features = ["all"] }
-nix = { version = "0.31", features = ["fs", "ioctl", "mount", "poll", "process", "sched", "signal", "socket", "uio", "user"] }
+syscalls = { version = "0.8", default-features = false }
+nix = { version = "0.31", features = ["fs", "inotify", "ioctl", "mount", "poll", "process", "sched", "signal", "socket", "uio", "user"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 chacha20 = { version = "0.10", features = ["rng", "zeroize"] }
@@ -73,4 +71,3 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
