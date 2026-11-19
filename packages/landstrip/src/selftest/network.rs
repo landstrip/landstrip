@@ -237,8 +237,9 @@ impl Arbitrary for UnixAndAbstractSocketCmd {
 }
 
 impl Step for UnixAndAbstractSocketCmd {
+    #[allow(clippy::too_many_lines)]
     fn apply(&self, state: &mut SandboxState) -> TestCaseResult {
-        use std::os::unix::net::UnixListener;
+        use std::os::unix::net::{UnixDatagram, UnixListener};
 
         let sock_dir = state.root.join("writable/socks");
         let _ = std::fs::create_dir_all(&sock_dir);
@@ -302,6 +303,42 @@ impl Step for UnixAndAbstractSocketCmd {
             ProbeOutcome::Allowed,
             "Unix bind must succeed inside an allowUnixSockets directory"
         );
+
+        let dgram_path = sock_dir.join("dgram.sock");
+        let _ = std::fs::remove_file(&dgram_path);
+        let dgram = UnixDatagram::bind(&dgram_path).require("bind dgram")?;
+        dgram.set_nonblocking(true).require("nonblocking dgram")?;
+        let sendto = Probe::from(NetProbe::UnixSendTo {
+            path: dgram_path.clone(),
+        });
+        let mut dgram_deny = RunSpec::worker(&state.root, &deny_pol, &sendto, &state.ctx)?;
+        dgram_deny.responder = ResponderMode::ObserveFd;
+        prop_assert_eq!(
+            ProbeOutcome::try_from(&state.ctx.execute(&dgram_deny))?,
+            ProbeOutcome::Denied,
+            "Unix datagram sendto must fail without allowUnixSockets"
+        );
+        let mut buf = [0_u8; 7];
+        prop_assert!(
+            dgram.recv(&mut buf).is_err(),
+            "refused Unix datagram must not reach the host socket"
+        );
+        let dgram_pol = vec![json!({
+            "filesystem": {
+                "allowRead": ["/"],
+                "allowWrite": [state.abs_path("writable")]
+            },
+            "network": {
+                "allowUnixSockets": [dgram_path]
+            }
+        })];
+        prop_assert_eq!(
+            state.probe(&dgram_pol, sendto)?,
+            ProbeOutcome::Allowed,
+            "Unix datagram sendto must succeed when listed in allowUnixSockets"
+        );
+        prop_assert_eq!(dgram.recv(&mut buf).ok(), Some(7));
+        prop_assert_eq!(&buf, b"unix-dg");
 
         #[cfg(target_os = "linux")]
         {

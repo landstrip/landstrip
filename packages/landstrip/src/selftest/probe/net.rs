@@ -5,7 +5,7 @@ use super::{OsResult, ProbeError, ProbeResult};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -32,6 +32,9 @@ pub enum NetProbe {
         path: PathBuf,
     },
     UnixConnect {
+        path: PathBuf,
+    },
+    UnixSendTo {
         path: PathBuf,
     },
     #[cfg(target_os = "linux")]
@@ -94,6 +97,12 @@ impl NetProbe {
                 UnixStream::connect(path)
                     .map_err(ProbeError::Denied)?
                     .write_all(b"unix-hi")?;
+                Ok(())
+            }
+            Self::UnixSendTo { path } => {
+                UnixDatagram::unbound()?
+                    .send_to(b"unix-dg", path)
+                    .map_err(ProbeError::denied_on(&[libc::EACCES, libc::EPERM]))?;
                 Ok(())
             }
             #[cfg(target_os = "linux")]
