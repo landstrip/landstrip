@@ -81,6 +81,7 @@ impl NamespaceChild {
         ensure!(getpid() == Pid::from_raw(1), "namespace child is not PID 1");
         prctl::set_pdeathsig(Signal::SIGKILL).context("set namespace parent-death signal")?;
         self.wait_for_broker()?;
+        nix::unistd::setsid().context("isolate sandbox session and process group")?;
         self.configure_id_maps()?;
         mount_filesystems()?;
         drop_capabilities()?;
