@@ -247,6 +247,9 @@ fn resolve_executable(tool: &OsStr, cwd: &Path) -> Result<Option<PathBuf>> {
         Err(which::Error::CannotFindBinaryPath) => return Ok(None),
         Err(source) => return Err(Error::policy_io(io::Error::other(source))),
     };
+    #[cfg(unix)]
+    return Ok(Some(candidate));
+    #[cfg(not(unix))]
     candidate.canonicalize().map(Some).map_err(Error::policy_io)
 }
 
