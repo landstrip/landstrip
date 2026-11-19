@@ -3,7 +3,7 @@
   "version": "0.20.29",
   "description": "OS-level AI command sandboxing for OpenCode with Landstrip",
   "keywords": [
-    "landlock",
+    "kvm",
     "landstrip",
     "opencode-plugin",
     "sandbox"

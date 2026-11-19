@@ -133,6 +133,22 @@ impl GlobPattern {
         })
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn exec_parts(&self) -> (std::ffi::OsString, String) {
+        (self.base.clone().into_os_string(), self.suffix().to_owned())
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn from_exec_parts(base: &Path, suffix: &str) -> Result<Self> {
+        Self::from_parts(base, suffix)
+    }
+
     fn suffix(&self) -> &str {
         &self.pattern[self.suffix_offset..]
     }
@@ -153,12 +169,24 @@ impl GlobPattern {
         path.ancestors().any(|ancestor| self.matches_path(ancestor))
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn matches_under(&self, root: &Path) -> bool {
         self.has_unexcused_under(root, |_| true)
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn has_unexcused_under(
         &self,
         root: &Path,

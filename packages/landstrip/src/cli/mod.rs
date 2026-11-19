@@ -15,7 +15,17 @@ use std::io;
 use std::process;
 
 pub fn execute() {
-    let invocation = match ParseOutcome::parse() {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    if let Some(result) = platform::resume_if_requested() {
+        process::exit(result.unwrap_or_else(|error| {
+            eprintln!("broker restart: {error:#}");
+            127
+        }));
+    }
+    let mut invocation = match ParseOutcome::parse() {
         Ok(ParseOutcome::Invocation(invocation)) => invocation,
         Ok(ParseOutcome::Display(error)) => {
             if let Err(error) = error.print() {
@@ -30,27 +40,19 @@ pub fn execute() {
         Err(error) => exit_with_error(&error.into(), None),
     };
 
-    #[cfg(unix)]
-    let trap_fd = match &invocation.command {
-        Command::Run(command) => command.trap_fd.as_ref(),
-        _ => None,
-    };
-    #[cfg(not(unix))]
-    let trap_fd = None;
-
     if let Err(error) = init_logging(invocation.debug) {
-        exit_with_error(&error, trap_fd);
+        exit_with_error(&error, trap_descriptor(&invocation));
     }
 
-    let outcome = match dispatch(&invocation) {
+    let outcome = match dispatch(&mut invocation) {
         Ok(outcome) => outcome,
-        Err(error) => exit_with_error(&error, trap_fd),
+        Err(error) => exit_with_error(&error, trap_descriptor(&invocation)),
     };
     if let Err(error) = outcome
         .write_to(&mut io::stdout().lock())
         .map_err(anyhow::Error::from)
     {
-        exit_with_error(&error, trap_fd);
+        exit_with_error(&error, trap_descriptor(&invocation));
     }
     let exit_code = outcome.exit_code();
     if exit_code != 0 {
@@ -66,8 +68,22 @@ fn init_logging(debug: bool) -> Result<()> {
     Ok(())
 }
 
-fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
+/// Names the trap descriptor an error is reported on.
+#[cfg(unix)]
+fn trap_descriptor(invocation: &Invocation) -> Option<&TrapFd> {
     match &invocation.command {
+        Command::Run(command) => command.trap_fd.as_ref(),
+        _ => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn trap_descriptor(_invocation: &Invocation) -> Option<&()> {
+    None
+}
+
+fn dispatch(invocation: &mut Invocation) -> Result<CommandOutcome> {
+    match &mut invocation.command {
         Command::Run(command) => run(command),
         Command::Check(request) => check_policy(request),
         Command::Resolve(request) => resolve_policy(request),
@@ -87,7 +103,7 @@ fn dispatch(invocation: &Invocation) -> Result<CommandOutcome> {
     }
 }
 
-fn run(command: &RunCommand) -> Result<CommandOutcome> {
+fn run(command: &mut RunCommand) -> Result<CommandOutcome> {
     let policy = command
         .policy
         .resolve(&command.cwd, Some(command.tool.as_os_str()))?;
@@ -98,7 +114,7 @@ fn run(command: &RunCommand) -> Result<CommandOutcome> {
         &command.cwd,
         &command.tool,
         &command.tool_args,
-        command.trap_fd.as_ref(),
+        command.trap_fd.as_mut(),
         &command
             .inherited_fds
             .iter()

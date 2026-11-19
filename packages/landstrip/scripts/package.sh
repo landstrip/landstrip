@@ -3,8 +3,9 @@
 # Copyright (C) Jarkko Sakkinen 2026
 #
 # Multi-platform release packaging.
-#   host-native triple — cargo
-#   other triples — cargo-zigbuild (Zig linker)
+#   Linux GNU — cargo with static glibc; cross-builds need <arch>-linux-gnu-gcc and its glibc development files
+#   other host-native triples — cargo
+#   remaining triples — cargo-zigbuild (Zig linker)
 #
 # Platforms:
 #   linux-x64, linux-arm64 — x86_64/aarch64-unknown-linux-gnu (AppImage)
@@ -251,13 +252,24 @@ build_with_zigbuild() {
   )
 }
 
-build_native() {
+build_with_cargo() {
   local triple="$1"
   local target_dir="$package_target_root/$triple"
+  local linker
+  local -a config=()
 
   (
     cd "$cargo_root" || exit 1
-    CARGO_TARGET_DIR="$target_dir" "$CARGO" build --release --target "$triple"
+    if [[ "$triple" == *-unknown-linux-gnu ]]; then
+      unset CARGO_ENCODED_RUSTFLAGS
+      export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+crt-static"
+      if [[ "$triple" != "$rust_host_triple" ]]; then
+        linker="${triple%%-*}-linux-gnu-gcc"
+        require_command "$linker"
+        config=(--config "target.$triple.linker=\"$linker\"")
+      fi
+    fi
+    CARGO_TARGET_DIR="$target_dir" "$CARGO" build "${config[@]}" --release --target "$triple"
   )
 }
 
@@ -337,21 +349,21 @@ for platform in "${requested[@]}"; do
     continue
   fi
 
-  # Compare Rust triples because Node's platform omits the libc/toolchain ABI
+  if [[ "$triple" != "$rust_host_triple" ]] && ! rustup_has_target "$triple"; then
+    failed+=("$platform: rustup target not installed: $triple")
+    printf 'fail: %s (rustup target add %s)\n' "$platform" "$triple" >&2
+    continue
+  fi
+
   if [[ "$(package_build_driver "$rust_host_triple" "$triple")" == cargo ]]; then
     printf '==> %s (%s via cargo)\n' "$platform" "$triple"
-    if ! build_native "$triple"; then
+    if ! build_with_cargo "$triple"; then
       failed+=("$platform: cargo build failed")
       printf 'fail: %s (cargo build failed)\n' "$platform" >&2
       continue
     fi
   else
     printf '==> %s (%s via cargo-zigbuild)\n' "$platform" "$triple"
-    if ! rustup_has_target "$triple"; then
-      failed+=("$platform: rustup target not installed: $triple")
-      printf 'fail: %s (rustup target add %s)\n' "$platform" "$triple" >&2
-      continue
-    fi
 
     if ! build_with_zigbuild "$triple"; then
       if [[ "$triple" == *apple-darwin && -z "${SDKROOT:-}" ]]; then
@@ -374,6 +386,12 @@ for platform in "${requested[@]}"; do
 
   mkdir -p "$stage_package_dir/bin"
   if [[ "$platform" == linux-* ]]; then
+    if ! elf_headers="$(LC_ALL=C "$READELF" -W -l -d "$source_bin")" ||
+      [[ "$elf_headers" == *INTERP* || "$elf_headers" == *'(NEEDED)'* ]]; then
+      failed+=("$platform: broker must be a static ELF")
+      printf 'fail: %s (broker must be a static ELF)\n' "$platform" >&2
+      continue
+    fi
     if ! CONTAINER="$CONTAINER" "$script_dir/make-appimage.sh" \
       "$platform" "$source_bin" "$stage_package_dir/bin/$binary"; then
       failed+=("$platform: AppImage packaging failed")

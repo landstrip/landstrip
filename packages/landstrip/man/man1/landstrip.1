@@ -290,10 +290,14 @@ restricted to this host's sockets.
 Commands run in new user, PID, and mount namespaces with a private procfs and
 a PID-1 reaper that forwards termination signals and reaps all descendants
 on exit.
-Landlock enforces filesystem roots; seccomp brokers network/filesystem traps
-and blocks service-manager sockets and io_uring.
-Linux 6.12+ also restricts abstract Unix sockets and signals outside
-the sandbox.
+On x86-64 and AArch64, each process runs unprivileged in a kernel-less KVM
+guest of the host architecture
+.Pq requires read-write access to Pa /dev/kvm ,
+with guest threads sharing memory across multiple vCPUs.
+The host KVM broker mediates filesystem and network system calls, reports
+denials and interactive
+.Fl -trap
+queries, and blocks service-manager sockets and io_uring.
 .It macOS
 Seatbelt fixes the profile at startup.
 .Va macos.allowTrustd ,

@@ -46,7 +46,11 @@ impl Launch {
         let pid = unsafe {
             libc::syscall(
                 libc::SYS_clone,
-                libc::CLONE_NEWUSER | libc::CLONE_NEWPID | libc::CLONE_NEWNS | libc::SIGCHLD,
+                libc::CLONE_NEWUSER
+                    | libc::CLONE_NEWPID
+                    | libc::CLONE_NEWNS
+                    | libc::CLONE_NEWIPC
+                    | libc::SIGCHLD,
                 0_usize,
                 0_usize,
                 0_usize,

@@ -93,10 +93,21 @@ impl Step for TcpMediationCmd {
         }
         #[cfg(target_os = "linux")]
         {
+            let fastopen = Probe::from(NetProbe::TcpFastOpen { addr: other_addr });
+            let mut spec = RunSpec::worker(&state.root, &deny_pol, &fastopen, &state.ctx)?;
+            spec.responder = ResponderMode::ObserveFd;
+            let res = state.ctx.execute(&spec);
             prop_assert_eq!(
-                state.probe(&deny_pol, NetProbe::TcpFastOpen { addr: other_addr })?,
+                ProbeOutcome::try_from(&res)?,
                 ProbeOutcome::Denied,
-                "seccomp must reject TCP Fast Open with EAFNOSUPPORT under DenyAll"
+                "TCP Fast Open send must fail under DenyAll"
+            );
+            prop_assert!(
+                res.has_trap(|t| {
+                    t.get("code").and_then(Value::as_str) == Some("NETWORK_DENIED")
+                }),
+                "expected NETWORK_DENIED trap on TCP Fast Open denial: stderr={}",
+                res.stderr
             );
             other_listener
                 .set_nonblocking(true)

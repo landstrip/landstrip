@@ -21,30 +21,51 @@
 
 pub(crate) mod resolver;
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) mod exec_state;
+
 use crate::config::{AppContainerMode, SandboxDarwin};
 #[cfg(target_os = "linux")]
 use crate::paths::NormalizeRoots;
 use crate::paths::{GlobPattern, OverridesDeny, PathExt};
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use nix::sys::stat::fstat;
 use serde::Serialize;
 #[cfg(target_os = "linux")]
 use std::env;
 #[cfg(target_os = "linux")]
 use std::ffi::{OsStr, OsString};
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use std::os::fd::BorrowedFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use walkdir::DirEntryExt as _;
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AccessPolicy {
     pub(crate) write_roots: Vec<PathBuf>,
@@ -67,14 +88,14 @@ pub(crate) struct AccessPolicy {
     pub(crate) allow_windows_additive_grants: bool,
 }
 
-#[derive(Debug, Default, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Carveouts {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) patterns: Vec<GlobPattern>,
 }
 
-#[derive(Debug, Default, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DenialScope {
     pub(crate) roots: Vec<PathBuf>,
@@ -87,7 +108,10 @@ pub(crate) struct DenialScope {
     pub(crate) always_patterns: Vec<GlobPattern>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl DenialScope {
     pub(crate) fn denied(&self) -> DenyRuleSet<'_> {
         DenyRuleSet::with_carveouts(&self.roots, &self.patterns, &self.carveouts)
@@ -120,12 +144,18 @@ impl DenialScope {
 }
 
 impl Carveouts {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn has_patterns(&self) -> bool {
         !self.patterns.is_empty()
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn matches_pattern(&self, path: &Path) -> bool {
         self.patterns
             .iter()
@@ -174,7 +204,7 @@ impl DeniedLink {
 
 /// Every protected link, sorted by path and collapsed to the strongest tier.
 /// The ordering is an invariant of the type, so membership is a binary search.
-#[derive(Debug, Default, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub(crate) struct DeniedLinks(Vec<DeniedLink>);
 
@@ -195,7 +225,10 @@ impl DeniedLinks {
         self.0.iter()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn find(&self, path: &Path) -> Option<&DeniedLink> {
         self.0
             .binary_search_by(|link| link.path.as_path().cmp(path))
@@ -203,19 +236,28 @@ impl DeniedLinks {
             .map(|index| &self.0[index])
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn contains(&self, path: &Path) -> bool {
         self.find(path).is_some()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn contains_always(&self, path: &Path) -> bool {
         self.find(path)
             .is_some_and(|link| link.tier == DenialTier::Always)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DenialReason {
@@ -223,8 +265,11 @@ pub(crate) enum DenialReason {
     AllowMiss,
 }
 
-// The write broker that consults these lives only in the Linux seccomp path.
-#[cfg(target_os = "linux")]
+// The write broker that consults these lives on Linux.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl AccessPolicy {
     pub(crate) fn is_denied_link(&self, path: &Path) -> bool {
         self.write_denied_links.contains(path)
@@ -265,6 +310,21 @@ impl AccessPolicy {
                     Some(DenialReason::AllowMiss)
                 }
             }
+            ReadAccess::OutsideDenied {
+                denied_roots,
+                allow_roots,
+            } => {
+                if self.read_denials.is_denied(path) {
+                    Some(DenialReason::DenyMatch)
+                } else if !path.is_under_any(denied_roots)
+                    || path.is_under_any(allow_roots)
+                    || self.read_denials.carveouts.matches_pattern(path)
+                {
+                    None
+                } else {
+                    Some(DenialReason::AllowMiss)
+                }
+            }
         }
     }
 
@@ -281,14 +341,20 @@ impl AccessPolicy {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase", tag = "mode", content = "roots")]
 pub(crate) enum ReadAccess {
     Unrestricted,
     AllowRoots(Vec<PathBuf>),
+    #[cfg(target_os = "linux")]
+    #[serde(rename_all = "camelCase")]
+    OutsideDenied {
+        denied_roots: Vec<PathBuf>,
+        allow_roots: Vec<PathBuf>,
+    },
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase", tag = "mode")]
 pub(crate) enum NetworkAccess {
     Unrestricted {
@@ -308,6 +374,14 @@ pub(crate) enum IpBindAccess {
     Localhost,
 }
 
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "windows"
+))]
 impl NetworkAccess {
     pub(crate) fn is_unrestricted(&self) -> bool {
         matches!(self, Self::Unrestricted { .. })
@@ -340,25 +414,9 @@ impl NetworkAccess {
             }
         )
     }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn restricts_bind_ip(&self) -> bool {
-        matches!(
-            self,
-            Self::Restricted {
-                bind: IpBindAccess::Deny,
-                ..
-            }
-        )
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn restricts_connect_tcp(&self) -> bool {
-        matches!(self, Self::Restricted { .. })
-    }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "camelCase", tag = "mode", content = "paths")]
 pub(crate) enum UnixSocketAccess {
     Unrestricted,
@@ -366,20 +424,18 @@ pub(crate) enum UnixSocketAccess {
     Denied,
 }
 
+#[cfg(target_os = "windows")]
 impl UnixSocketAccess {
-    #[cfg(target_os = "linux")]
-    pub(crate) fn needs_broker(&self) -> bool {
-        !matches!(self, Self::Unrestricted)
-    }
-
-    #[cfg(target_os = "windows")]
     pub(crate) fn is_denied(&self) -> bool {
         matches!(self, Self::Denied)
     }
 }
 
 /// Decision for a Unix socket `connect` or `bind` target.
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum UnixPathAccess<'a> {
     Allowed,
@@ -396,20 +452,20 @@ pub(crate) enum UnixPathAccess<'a> {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SessionBus {
     path: PathBuf,
     allowed: bool,
 }
 
 /// Sockets a sandboxed child could use to ask an unsandboxed service manager to
-/// start a process that inherits neither Landlock nor seccomp.
+/// start an unsandboxed process on the host.
 ///
 /// The defaults are discovered from `DBUS_SYSTEM_BUS_ADDRESS`,
 /// `DBUS_SESSION_BUS_ADDRESS`, and `XDG_RUNTIME_DIR`; `network.supervisorSockets`
 /// replaces them.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SupervisorSocketSet {
     all: Vec<PathBuf>,
     system: Vec<PathBuf>,
@@ -445,6 +501,10 @@ impl SupervisorSocketSet {
         }
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     pub(crate) fn access(
         &self,
         target: &Path,
@@ -482,6 +542,10 @@ impl SupervisorSocketSet {
         })
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn matches(candidate: &Path, target: &Path, object: Option<BorrowedFd<'_>>) -> bool {
         target.is_under(candidate) || object.is_some_and(|fd| Self::same_inode(fd, candidate))
     }
@@ -589,6 +653,10 @@ impl SupervisorSocketSet {
         Some(out)
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     fn same_inode(left: BorrowedFd<'_>, right: &Path) -> bool {
         let Ok(stat) = fstat(left) else {
             return true;
@@ -618,10 +686,13 @@ impl SupervisorSocketSet {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl AccessPolicy {
     /// Service manager sockets stay denied whatever the unix socket policy
-    /// says: raw access would start a process outside Landlock and seccomp.
+    /// says: raw access would start an unsandboxed process on the host.
     /// When `allow_session_bus` is true (`connect`), discovered user D-Bus
     /// session sockets are mediated through `xdg-dbus-proxy` instead.
     pub(crate) fn unix_path_access(
@@ -665,7 +736,13 @@ impl<'a> DenyRuleSet<'a> {
         }
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn with_carveouts(
         roots: &'a [PathBuf],
         patterns: &'a [GlobPattern],
@@ -704,7 +781,13 @@ impl<'a> DenyRuleSet<'a> {
         })
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn has_denied_under(self, dir: &Path) -> bool {
         let root_denied = self
             .roots

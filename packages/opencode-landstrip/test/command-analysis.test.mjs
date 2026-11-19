@@ -95,7 +95,7 @@ test('extractDeniedPath resolves structured traps, native errors, and candidate 
 
   // Structured trap
   const trapOutput =
-    '{"kind":"filesystem","code":"FILESYSTEM_DENIED","query_id":"0","path":"/opt/data","requested_path":"/opt/data","operation":"read","state":"denial","syscall":"openat","errno":"EACCES","flags":[],"reason":"deny_match","suggested_grant":{"allowRead":"/opt/data"},"process":{"pid":1,"exe":null,"cwd":null},"mechanism":"seccomp"}';
+    '{"kind":"filesystem","code":"FILESYSTEM_DENIED","query_id":"0","path":"/opt/data","requested_path":"/opt/data","operation":"read","state":"denial","syscall":"openat","errno":"EACCES","flags":[],"reason":"deny_match","suggested_grant":{"allowRead":"/opt/data"},"process":{"pid":1,"exe":null,"cwd":null},"mechanism":"kvm"}';
   assert.equal(extractDeniedPath(trapOutput, { cwd }), canonicalizePath('/opt/data', cwd));
 
   // Native denial
@@ -129,6 +129,20 @@ test('decodeLandstripTrap aligns mechanisms and policy error codes with error.rs
       code: 'SANDBOX_SETUP_FAILED',
       mechanism: 'namespace',
       message: 'unshare failed',
+    },
+  );
+  assert.deepEqual(
+    decodeLandstripTrap({
+      kind: 'internal',
+      code: 'SANDBOX_SETUP_FAILED',
+      mechanism: 'kvm',
+      message: '/dev/kvm is not available',
+    }),
+    {
+      kind: 'internal',
+      code: 'SANDBOX_SETUP_FAILED',
+      mechanism: 'kvm',
+      message: '/dev/kvm is not available',
     },
   );
   assert.deepEqual(

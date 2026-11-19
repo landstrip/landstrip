@@ -559,7 +559,7 @@ const tui: TuiPlugin.Definition = {
     }
 
     // Query-response socket server (Linux-only — landstrip's socket protocol lives
-    // in the seccomp broker). The server plugin connects each sandboxed run's
+    // in the KVM broker). The server plugin connects each sandboxed run's
     // fd 3 here via a /dev/tcp redirect and we answer held writes interactively.
     const sockets = new Set<NetSocket>();
     let socketServer: ReturnType<typeof createServer> | undefined;

@@ -5,24 +5,44 @@
 //! carrying the stable [`Error`] code of the event it reports.
 
 use crate::error::{Error, Mechanism};
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use crate::policy::DenialReason;
 #[cfg(unix)]
 use crate::trap_fd::TrapFd;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use std::path::PathBuf;
 
 /// The code reported for an error the landstrip code space cannot name.
 const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const FILESYSTEM_DENIED: &str = "FILESYSTEM_DENIED";
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 const NETWORK_DENIED: &str = "NETWORK_DENIED";
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum TrapState {
@@ -30,7 +50,10 @@ pub(crate) enum TrapState {
     Info,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl TrapState {
     fn from_query_id(query_id: Option<u64>) -> (Self, String) {
         match query_id {
@@ -40,7 +63,10 @@ impl TrapState {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum TrapOperation {
@@ -48,7 +74,10 @@ pub(crate) enum TrapOperation {
     Write,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SuggestedGrant {
@@ -58,7 +87,10 @@ pub(crate) struct SuggestedGrant {
     pub(crate) allow_write: Option<String>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl TrapOperation {
     fn suggested_grant(self, path: &str) -> SuggestedGrant {
         match self {
@@ -74,7 +106,10 @@ impl TrapOperation {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, strum::IntoStaticStr)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "snake_case")]
@@ -83,7 +118,10 @@ pub(crate) enum NetworkOperation {
     Bind,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct ProcessContext {
     pub(crate) pid: u32,
@@ -91,7 +129,10 @@ pub(crate) struct ProcessContext {
     pub(crate) cwd: Option<String>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[derive(Debug, Serialize)]
 pub(crate) struct FilesystemTrap {
     pub(crate) code: &'static str,
@@ -109,9 +150,36 @@ pub(crate) struct FilesystemTrap {
     pub(crate) mechanism: Mechanism,
 }
 
+/// The answer a responder writes back for a query trap.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReplyAction {
+    Allow,
+    #[serde(other)]
+    Deny,
+}
+
+/// One line of responder answers.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[derive(Debug, Deserialize)]
+pub(crate) struct Reply {
+    pub(crate) query_id: String,
+    pub(crate) action: ReplyAction,
+}
+
 /// A denied filesystem access, shared by the immediate query trap and the
 /// deferred denial record so both describe the event with the same fields.
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct FilesystemDenial {
     pub(crate) operation: TrapOperation,
@@ -123,7 +191,10 @@ pub(crate) struct FilesystemDenial {
     pub(crate) process: ProcessContext,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl FilesystemDenial {
     pub(crate) fn into_trap(self, query_id: Option<u64>) -> Trap {
         let path = self.path.to_string_lossy();
@@ -142,12 +213,15 @@ impl FilesystemDenial {
             reason: self.reason,
             suggested_grant,
             process: self.process,
-            mechanism: Mechanism::Seccomp,
+            mechanism: Mechanism::Kvm,
         }))
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 #[derive(Debug, Serialize)]
 pub(crate) struct NetworkTrap {
     pub(crate) code: &'static str,
@@ -191,9 +265,15 @@ pub(crate) struct InternalTrap {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub(crate) enum Trap {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     Filesystem(Box<FilesystemTrap>),
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     Network(Box<NetworkTrap>),
     Launch(LaunchTrap),
     Usage(UsageTrap),
@@ -201,12 +281,10 @@ pub(crate) enum Trap {
 }
 
 impl Trap {
-    #[cfg(target_os = "linux")]
-    pub(crate) fn filesystem(denial: FilesystemDenial, query_id: Option<u64>) -> Self {
-        denial.into_trap(query_id)
-    }
-
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     pub(crate) fn network(
         operation: NetworkOperation,
         target: String,
@@ -223,7 +301,7 @@ impl Trap {
             target,
             syscall,
             errno: "EACCES",
-            mechanism: Mechanism::Seccomp,
+            mechanism: Mechanism::Kvm,
             process,
         }))
     }
@@ -256,6 +334,20 @@ impl Trap {
             log::debug!("trap fd write failed: {error}");
         }
         self.emit();
+    }
+
+    /// Writes a record that was serialized by another process of the payload.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn emit_record(json: &str, trap_fd: Option<&TrapFd>) {
+        if let Some(trap_fd) = trap_fd
+            && let Err(error) = trap_fd.write_line(json)
+        {
+            log::debug!("trap fd write failed: {error}");
+        }
+        Self::write_stderr(json);
     }
 
     pub(crate) fn emit(&self) {

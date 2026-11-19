@@ -160,7 +160,7 @@ for (const diagnostic of ['native denial', 'filesystem trap']) {
                   reason: 'deny_match',
                   suggested_grant: { allowRead: blockedPath },
                   process: { pid: 1, exe: null, cwd: null },
-                  mechanism: 'seccomp',
+                  mechanism: 'kvm',
                 });
           const event = {
             id: 'diagnostic-call',
@@ -189,7 +189,7 @@ for (const diagnostic of ['native denial', 'filesystem trap']) {
           assert.deepEqual(
             errors,
             hasDiagnostic && diagnostic === 'filesystem trap'
-              ? [`opencode-landstrip: landstrip: filesystem read denied (${blockedPath}) [seccomp]`]
+              ? [`opencode-landstrip: landstrip: filesystem read denied (${blockedPath}) [kvm]`]
               : [],
           );
         },

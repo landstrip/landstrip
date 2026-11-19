@@ -21,12 +21,22 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 #[strum(serialize_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Mechanism {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Landlock,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    Seccomp,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     Namespace,
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
+    Kvm,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Seatbelt,
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -118,10 +128,21 @@ pub(crate) enum Error {
         mechanism: Mechanism,
         source: Cause,
     },
-    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     SuperviseFailed {
         source: Cause,
     },
+    #[cfg_attr(
+        not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "macos",
+            target_os = "windows"
+        )),
+        allow(dead_code)
+    )]
     LaunchFailed {
         tool: PathBuf,
         source: Cause,
@@ -130,10 +151,17 @@ pub(crate) enum Error {
     HostJobIncompatible {
         source: Cause,
     },
-    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     IntegerTooLarge,
     #[cfg_attr(
-        any(target_os = "linux", target_os = "macos", target_os = "windows"),
+        any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "macos",
+            target_os = "windows"
+        ),
         allow(dead_code)
     )]
     PlatformUnsupported,
@@ -158,23 +186,23 @@ impl Error {
         Self::sandbox_setup(Mechanism::Seatbelt, source)
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn landlock(source: impl Into<Cause>) -> Self {
-        Self::sandbox_setup(Mechanism::Landlock, source)
-    }
-
-    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) fn supervise(source: impl Into<Cause>) -> Self {
         Self::SuperviseFailed {
             source: source.into(),
         }
     }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn supervise_errno(errno: nix::errno::Errno) -> Self {
-        Self::supervise(io::Error::from_raw_os_error(errno as i32))
-    }
-
+    #[cfg_attr(
+        not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "macos",
+            target_os = "windows"
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn launch(tool: impl Into<PathBuf>, source: impl Into<Cause>) -> Self {
         Self::LaunchFailed {
             tool: tool.into(),
@@ -229,12 +257,23 @@ impl Error {
             }
             Self::Policy(violation) => Some(violation.message().to_owned()),
             Self::SandboxSetupFailed {
+                mechanism: Mechanism::Kvm,
+                ..
+            } => {
+                let rendered = self.message();
+                if rendered == self.code() {
+                    Some("/dev/kvm is not available".to_owned())
+                } else {
+                    Some(rendered)
+                }
+            }
+            Self::SandboxSetupFailed {
                 mechanism: Mechanism::Namespace,
                 ..
             } => {
                 let rendered = self.message();
                 if rendered == self.code() {
-                    Some("requested namespace isolation is unavailable".to_owned())
+                    Some("user, PID, or mount namespaces are not available".to_owned())
                 } else {
                     Some(rendered)
                 }

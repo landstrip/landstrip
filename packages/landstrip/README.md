@@ -2,7 +2,7 @@
 
 This package builds the `landstrip` binary that the CLI and the Node.js API
 run, and ships its [man page](man/man1/landstrip.1). The binary enforces the
-policy with Landlock on Linux, Seatbelt on macOS, and AppContainer on Windows.
+policy with KVM on Linux, Seatbelt on macOS, and AppContainer on Windows.
 Run `landstrip --help` for the command list.
 
 ## Build

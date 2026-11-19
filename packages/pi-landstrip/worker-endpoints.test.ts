@@ -267,7 +267,7 @@ sandboxTest.for(
             );
             expect(f.ctx.ui.notify).toHaveBeenCalledTimes(1);
             expect(f.ctx.ui.notify).toHaveBeenCalledWith(
-              `landstrip: filesystem write denied (${hardDeniedPath}) [seccomp]`,
+              `landstrip: filesystem write denied (${hardDeniedPath}) [kvm]`,
               'error',
             );
           } else {
@@ -307,7 +307,7 @@ test('formatLandstripTraps deduplicates identical formatted trap lines across PI
       path,
       requested_path: path,
       errno: 'EACCES',
-      mechanism: 'seccomp',
+      mechanism: 'kvm',
       reason: 'deny_match',
       suggested_grant: operation === 'read' ? { allowRead: path } : { allowWrite: path },
       process: { pid, exe: '/usr/bin/node', cwd: '/tmp' },
@@ -321,8 +321,8 @@ test('formatLandstripTraps deduplicates identical formatted trap lines across PI
   );
   expect(formatLandstripTraps(traps)).toBe(
     [
-      'landstrip: filesystem write denied (/tmp/secret.lock) [seccomp]',
-      'landstrip: filesystem read denied (/tmp/other) [seccomp]',
+      'landstrip: filesystem write denied (/tmp/secret.lock) [kvm]',
+      'landstrip: filesystem read denied (/tmp/other) [kvm]',
     ].join('\n'),
   );
 });

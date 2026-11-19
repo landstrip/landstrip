@@ -597,6 +597,16 @@ impl Step for GuestWriteProbe {
             result.stderr
         );
         if !expected_ok {
+            if let ResolvedTarget::Missing {
+                rel: target,
+                parent_exists: true,
+            } = &resolved
+            {
+                prop_assert!(
+                    matches!(state.abs_path(target).symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                    "denied write changed missing target {target}"
+                );
+            }
             return Ok(());
         }
         match resolved {

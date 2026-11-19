@@ -142,8 +142,7 @@ function allowsAllDomains(allowedDomains) {
 }
 
 const LANDSTRIP_MECHANISMS = new Set([
-  'landlock',
-  'seccomp',
+  'kvm',
   'namespace',
   'seatbelt',
   'appcontainer',
@@ -179,7 +178,7 @@ function isDenialRecord(value) {
     (value.state !== 'query' || value.query_id !== '0') &&
     typeof value.syscall === 'string' &&
     typeof value.errno === 'string' &&
-    value.mechanism === 'seccomp' &&
+    value.mechanism === 'kvm' &&
     isRecord(value.process) &&
     Number.isInteger(value.process.pid) &&
     value.process.pid >= 0 &&

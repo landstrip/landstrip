@@ -60,7 +60,7 @@ impl NetProbe {
                 use socket2::{Domain, Socket, Type};
                 Socket::new(Domain::for_address(*addr), Type::STREAM, None)?
                     .send_to_with_flags(b"ping", &(*addr).into(), libc::MSG_FASTOPEN)
-                    .map_err(ProbeError::denied_on(&[libc::EAFNOSUPPORT]))?;
+                    .map_err(ProbeError::denied_on(&[libc::EACCES, libc::EPERM]))?;
                 Ok(())
             }
             #[cfg(target_os = "linux")]

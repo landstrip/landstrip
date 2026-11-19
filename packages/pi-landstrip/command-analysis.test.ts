@@ -68,7 +68,7 @@ describe('command analysis and denial path extraction in pi-landstrip', () => {
   it('extracts denied paths from structured traps and fallbacks', () => {
     expect(
       extractDeniedPath(
-        '{"kind":"filesystem","code":"FILESYSTEM_DENIED","query_id":"0","path":"/workspace/shadow","requested_path":"/workspace/shadow","operation":"read","state":"denial","syscall":"openat","errno":"EACCES","flags":[],"reason":"deny_match","suggested_grant":{"allowRead":"/workspace/shadow"},"process":{"pid":1,"exe":null,"cwd":null},"mechanism":"seccomp"}',
+        '{"kind":"filesystem","code":"FILESYSTEM_DENIED","query_id":"0","path":"/workspace/shadow","requested_path":"/workspace/shadow","operation":"read","state":"denial","syscall":"openat","errno":"EACCES","flags":[],"reason":"deny_match","suggested_grant":{"allowRead":"/workspace/shadow"},"process":{"pid":1,"exe":null,"cwd":null},"mechanism":"kvm"}',
         { cwd },
       ),
     ).toBe(canonicalizePath('/workspace/shadow', cwd));

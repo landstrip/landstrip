@@ -15,6 +15,8 @@ const FORWARDED_SIGNALS: [Signal; 4] = [
     Signal::SIGQUIT,
 ];
 
+/// Forwards termination signals to the payload. The signalfd also receives
+/// `SIGCHLD`, which only wakes the caller for child and tracee stops.
 pub(super) struct ForwardSignals {
     child: Pid,
     sfd: SignalFd,
@@ -27,6 +29,7 @@ impl ForwardSignals {
         for &sig in &FORWARDED_SIGNALS {
             mask.add(sig);
         }
+        mask.add(Signal::SIGCHLD);
         let mut old_mask = SigSet::empty();
         signal::sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), Some(&mut old_mask))
             .context("block forwarded signals")?;
@@ -54,7 +57,9 @@ impl ForwardSignals {
 
     pub(super) fn process_pending(&mut self) -> Result<()> {
         while let Some(info) = self.sfd.read_signal().map_err(Error::supervise)? {
-            if let Ok(sig) = Signal::try_from(info.ssi_signo.cast_signed()) {
+            if let Ok(sig) = Signal::try_from(info.ssi_signo.cast_signed())
+                && FORWARDED_SIGNALS.contains(&sig)
+            {
                 let _ = signal::kill(self.child, sig);
             }
         }

@@ -2,8 +2,7 @@
 
 /** The kernel layer an event is attributed to. */
 export type LandstripMechanism =
-  | 'landlock'
-  | 'seccomp'
+  | 'kvm'
   | 'namespace'
   | 'seatbelt'
   | 'appcontainer'
@@ -44,7 +43,7 @@ export interface LandstripFilesystemTrap {
   /** The policy edit that would permit this access. */
   suggested_grant: { allowRead?: string; allowWrite?: string };
   process: LandstripProcess;
-  mechanism: 'seccomp';
+  mechanism: 'kvm';
 }
 
 /** A network access the policy denies. */
@@ -59,7 +58,7 @@ export interface LandstripNetworkTrap {
   target: string;
   syscall: string;
   errno: string;
-  mechanism: 'seccomp';
+  mechanism: 'kvm';
   process: LandstripProcess;
 }
 

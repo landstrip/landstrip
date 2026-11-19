@@ -82,13 +82,20 @@ impl Step for HostParityCmd {
 
 impl HostParityCmd {
     /// What the sandbox answers whatever the host does. The `EPERM` ones
-    /// reach files or the network without naming a path or an address, or
-    /// leave the namespaces the sandbox runs in. `clone3` is refused so that
-    /// the C library falls back to `clone`, whose flags can be inspected.
+    /// reach files, the network, kernel subsystems, or host process state
+    /// without a brokered path or address, or leave the namespaces and
+    /// protections the sandbox runs in. `clone3` and `rseq` are refused so
+    /// that the C library falls back cleanly.
     const ANSWERS: &[(&str, &str)] = &[
         ("io_uring_setup", "EPERM"),
         ("io_uring_enter", "EPERM"),
         ("io_uring_register", "EPERM"),
+        ("io_setup", "EPERM"),
+        ("io_destroy", "EPERM"),
+        ("io_submit", "EPERM"),
+        ("io_cancel", "EPERM"),
+        ("io_getevents", "EPERM"),
+        ("io_pgetevents", "EPERM"),
         ("unshare", "EPERM"),
         ("setns", "EPERM"),
         ("mount", "EPERM"),
@@ -101,8 +108,49 @@ impl HostParityCmd {
         ("fsmount", "EPERM"),
         ("fspick", "EPERM"),
         ("open_tree", "EPERM"),
+        ("open_tree_attr", "EPERM"),
         ("mount_setattr", "EPERM"),
+        ("statmount", "EPERM"),
+        ("listmount", "EPERM"),
+        ("name_to_handle_at", "EPERM"),
+        ("open_by_handle_at", "EPERM"),
+        ("fanotify_init", "EPERM"),
+        ("fanotify_mark", "EPERM"),
+        ("quotactl", "EPERM"),
+        ("quotactl_fd", "EPERM"),
+        ("acct", "EPERM"),
+        ("swapon", "EPERM"),
+        ("swapoff", "EPERM"),
+        ("sethostname", "EPERM"),
+        ("setdomainname", "EPERM"),
+        ("syslog", "EPERM"),
+        ("init_module", "EPERM"),
+        ("finit_module", "EPERM"),
+        ("delete_module", "EPERM"),
+        ("kexec_load", "EPERM"),
+        ("kexec_file_load", "EPERM"),
+        ("ioperm", "EPERM"),
+        ("iopl", "EPERM"),
+        ("bpf", "EPERM"),
+        ("perf_event_open", "EPERM"),
+        ("userfaultfd", "EPERM"),
+        ("seccomp", "EPERM"),
+        ("landlock_create_ruleset", "EPERM"),
+        ("landlock_add_rule", "EPERM"),
+        ("landlock_restrict_self", "EPERM"),
+        ("pidfd_getfd", "EPERM"),
+        ("process_vm_readv", "EPERM"),
+        ("process_vm_writev", "EPERM"),
+        ("process_madvise", "EPERM"),
+        ("process_mrelease", "EPERM"),
+        ("add_key", "EPERM"),
+        ("request_key", "EPERM"),
+        ("keyctl", "EPERM"),
+        ("lsm_get_self_attr", "EPERM"),
+        ("lsm_set_self_attr", "EPERM"),
+        ("lsm_list_modules", "EPERM"),
         ("clone3", "ENOSYS"),
+        ("rseq", "ENOSYS"),
     ];
     const SWEEP_LIMIT: Duration = Duration::from_mins(2);
 

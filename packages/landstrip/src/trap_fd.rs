@@ -5,6 +5,11 @@
 
 use crate::trap::Trap;
 use std::io;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use std::os::fd::FromRawFd;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -12,30 +17,132 @@ use std::time::{Duration, Instant};
 
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Longest answer a responder may write back.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+const MAX_REPLY_BYTES: usize = 4096;
+
 #[derive(Debug)]
-pub(crate) struct TrapFd(OwnedFd);
+pub(crate) struct TrapFd {
+    fd: std::mem::ManuallyDrop<OwnedFd>,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    broker_registered: bool,
+}
 
 impl From<OwnedFd> for TrapFd {
     fn from(fd: OwnedFd) -> Self {
-        Self(fd)
+        Self {
+            fd: std::mem::ManuallyDrop::new(fd),
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            broker_registered: false,
+        }
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl From<crate::platform::linux::kvm::fds::BrokerFd> for TrapFd {
+    fn from(fd: crate::platform::linux::kvm::fds::BrokerFd) -> Self {
+        Self {
+            fd: std::mem::ManuallyDrop::new(fd.into_unregistered_owned()),
+            broker_registered: true,
+        }
+    }
+}
+
+impl Drop for TrapFd {
+    fn drop(&mut self) {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let raw = self.fd.as_raw_fd();
+        // SAFETY: `self.fd` is dropped once here before unregistering any
+        // broker ownership bit.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.fd) };
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if self.broker_registered {
+            crate::platform::linux::kvm::fds::GuestFd::unregister_broker(raw);
+        }
     }
 }
 
 impl AsFd for TrapFd {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
+        self.fd.as_fd()
     }
 }
 
 impl AsRawFd for TrapFd {
     fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
+        self.fd.as_raw_fd()
     }
 }
 
 impl TrapFd {
+    /// Moves the descriptor above `base`, out of the numbers a payload
+    /// allocates.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn hide(&mut self, base: RawFd) -> io::Result<()> {
+        let old = self.as_raw_fd();
+        let was_registered = self.broker_registered;
+        // SAFETY: the descriptor is open, and the returned descriptor is owned
+        // here.
+        let moved = unsafe { libc::fcntl(old, libc::F_DUPFD_CLOEXEC, base) };
+        if moved < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        crate::platform::linux::kvm::fds::GuestFd::register_broker(moved);
+        // SAFETY: `self.fd` is replaced immediately below with `moved`.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.fd) };
+        if was_registered {
+            crate::platform::linux::kvm::fds::GuestFd::unregister_broker(old);
+        }
+        // SAFETY: `fcntl` returned a new descriptor this process owns.
+        self.fd = std::mem::ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(moved) });
+        self.broker_registered = true;
+        Ok(())
+    }
+
+    /// Duplicates this descriptor above `base` for a broker state that owns its
+    /// own handle.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn clone_above(&self, base: RawFd) -> io::Result<Self> {
+        // SAFETY: the descriptor is open, and the returned descriptor is owned
+        // here.
+        let moved = unsafe { libc::fcntl(self.as_raw_fd(), libc::F_DUPFD_CLOEXEC, base) };
+        if moved < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        crate::platform::linux::kvm::fds::GuestFd::register_broker(moved);
+        // SAFETY: `fcntl` returned a new descriptor this process owns.
+        Ok(Self {
+            fd: std::mem::ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(moved) }),
+            broker_registered: true,
+        })
+    }
+
     pub(crate) fn connect(path: &Path) -> io::Result<Self> {
-        UnixStream::connect(path).map(|stream| Self(OwnedFd::from(stream)))
+        UnixStream::connect(path).map(|stream| Self::from(OwnedFd::from(stream)))
     }
 
     pub(crate) fn is_stream_socket(&self) -> bool {
@@ -71,6 +178,32 @@ impl TrapFd {
         line.push_str(text);
         line.push('\n');
         self.write_all(line.as_bytes())
+    }
+
+    /// Reads the answer a responder writes back, up to the line break.
+    ///
+    /// Only the bytes of one line are taken, so answers that arrive together
+    /// stay in the socket for the next query.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn read_line(
+        line: &mut Vec<u8>,
+        mut read_byte: impl FnMut() -> io::Result<u8>,
+    ) -> io::Result<String> {
+        for _ in line.len()..MAX_REPLY_BYTES {
+            let byte = read_byte()?;
+            if byte == b'\n' {
+                return String::from_utf8(std::mem::take(line))
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "reply is not UTF-8"));
+            }
+            line.push(byte);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reply has no line break",
+        ))
     }
 
     fn write_all(&self, line: &[u8]) -> io::Result<()> {

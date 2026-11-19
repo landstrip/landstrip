@@ -11,7 +11,9 @@ use crate::config::{
     PathSelector, SandboxDarwin, SandboxFilesystem, SandboxNetwork, SelectorMode, SelectorPath,
     Settings,
 };
-use crate::error::{Error, PathIo, PolicyViolation, Result};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::error::PathIo;
+use crate::error::{Error, PolicyViolation, Result};
 use crate::paths::{GlobPattern, NormalizePatterns, NormalizeRoots, OverridesDeny, PathExt};
 use std::cell::OnceCell;
 use std::collections::HashMap;
@@ -374,7 +376,34 @@ impl LoweredReadAccess {
         })
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "uniform with macOS and Windows read lowering"
+    )]
+    fn restricted(
+        read_allow: &[PathBuf],
+        read_deny: &[PathBuf],
+        _read_denied_roots: &[PathBuf],
+    ) -> Result<Self> {
+        let mut denied_roots = read_deny.to_vec();
+        denied_roots.normalize_roots();
+        let mut allow_roots: Vec<PathBuf> = read_allow
+            .iter()
+            .filter(|allow| allow.as_path() != Path::new("/"))
+            .cloned()
+            .collect();
+        allow_roots.normalize_roots();
+        Ok(Self {
+            access: ReadAccess::OutsideDenied {
+                denied_roots,
+                allow_roots,
+            },
+            symlinks: Vec::new(),
+        })
+    }
+
+    #[cfg(target_os = "macos")]
     fn restricted(
         read_allow: &[PathBuf],
         read_deny: &[PathBuf],
@@ -476,7 +505,7 @@ impl PolicyResolver {
 
         let deny_selectors =
             self.anchor_write_deny_selectors(&filesystem.deny_write, &anchor_roots, false)?;
-        // Unix mediates denyWrite globs dynamically (seccomp on Linux, Seatbelt
+        // Unix mediates denyWrite globs dynamically (the KVM broker on Linux, Seatbelt
         // regex on macOS); expanding them here scans the entire project tree before
         // even starting a simple command.
         let mut resolved_deny =
@@ -781,13 +810,16 @@ impl PolicyResolver {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const MAX_TRAVERSAL_DEPTH: u32 = 40;
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 struct RootScan {
     roots: Vec<PathBuf>,
     symlinks: Vec<PathBuf>,
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl RootScan {
     fn scan(root: &Path, denied: &[PathBuf]) -> Result<Self> {
         let mut results = Vec::new();

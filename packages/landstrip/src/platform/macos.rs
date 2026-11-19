@@ -31,11 +31,11 @@ pub(crate) fn execute(
     cwd: &Path,
     tool: &OsStr,
     args: &[OsString],
-    trap_fd: Option<&TrapFd>,
+    trap_fd: Option<&mut TrapFd>,
     inherited_fds: &[std::os::fd::RawFd],
 ) -> Result<i32> {
     SeatbeltProfile::try_from(policy)?.apply()?;
-    close_inherited_fds(trap_fd.map(AsRawFd::as_raw_fd).as_slice(), inherited_fds)
+    close_inherited_fds(trap_fd.map(|fd| fd.as_raw_fd()).as_slice(), inherited_fds)
         .map_err(Error::seatbelt)?;
     let mut command = Command::new(tool);
     command.args(args).current_dir(cwd);

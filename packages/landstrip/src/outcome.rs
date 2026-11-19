@@ -10,7 +10,10 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum SandboxPlatform {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     Linux,
     #[cfg(target_os = "macos")]
     Macos,
@@ -18,6 +21,14 @@ pub(crate) enum SandboxPlatform {
     Windows,
 }
 
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "windows"
+))]
 impl SandboxPlatform {
     fn capabilities(self) -> FeatureCapabilities {
         let capabilities = FeatureCapabilities {
@@ -34,7 +45,10 @@ impl SandboxPlatform {
             process_isolation: false,
         };
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
             Self::Linux => FeatureCapabilities {
                 unix_socket_filtering: true,
                 process_isolation: true,
@@ -102,6 +116,14 @@ pub(crate) struct DoctorReport {
     pub(crate) error: Option<String>,
 }
 
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "windows"
+))]
 impl DoctorReport {
     pub(crate) fn new(platform: SandboxPlatform, error: Option<String>) -> Self {
         let ok = error.is_none();
