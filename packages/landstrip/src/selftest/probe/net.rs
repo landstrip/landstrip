@@ -242,9 +242,13 @@ impl NetProbe {
                 .map_err(io::Error::other)?;
         recv_hdr.msg_iov = recv_iov.as_mut_ptr();
         recv_hdr.msg_iovlen = 1;
-        let got = unsafe { libc::recvmsg(rx.as_raw_fd(), &raw mut recv_hdr, libc::MSG_TRUNC) }
-            .os_result()?;
-        if got != 8
+        #[cfg(target_os = "linux")]
+        let (recv_flags, expected_len) = (libc::MSG_TRUNC, 8);
+        #[cfg(not(target_os = "linux"))]
+        let (recv_flags, expected_len) = (0, 4);
+        let got =
+            unsafe { libc::recvmsg(rx.as_raw_fd(), &raw mut recv_hdr, recv_flags) }.os_result()?;
+        if got != expected_len
             || &short_buf != b"abcd"
             || (recv_hdr.msg_flags & libc::MSG_TRUNC) == 0
             || recv_hdr.msg_namelen == 0
