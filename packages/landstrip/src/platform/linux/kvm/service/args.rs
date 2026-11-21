@@ -1804,7 +1804,14 @@ impl ControlBuffer {
         } else {
             self.words.as_mut_ptr().cast()
         };
-        hdr.msg_controllen = capped;
+        #[cfg(target_env = "musl")]
+        {
+            hdr.msg_controllen = libc::socklen_t::try_from(capped).unwrap_or(libc::socklen_t::MAX);
+        }
+        #[cfg(not(target_env = "musl"))]
+        {
+            hdr.msg_controllen = capped;
+        }
         hdr
     }
 }
@@ -1959,13 +1966,16 @@ impl KernelMsghdr {
         let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const mhdr) };
         while !cmsg.is_null() {
             let hdr = unsafe { *cmsg };
+            let cmsg_len = unsafe {
+                usize::from_ne_bytes(cmsg.cast::<[u8; std::mem::size_of::<usize>()]>().read())
+            };
             let offset = unsafe { cmsg.cast::<u8>().cast_const().offset_from_unsigned(base) };
-            if hdr.cmsg_len < hdr_len || hdr.cmsg_len > len - offset {
+            if cmsg_len < hdr_len || cmsg_len > len - offset {
                 return Err(Errno::EINVAL);
             }
             if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_RIGHTS {
                 let data_ptr = unsafe { libc::CMSG_DATA(cmsg) }.cast_const();
-                let data = unsafe { std::slice::from_raw_parts(data_ptr, hdr.cmsg_len - hdr_len) };
+                let data = unsafe { std::slice::from_raw_parts(data_ptr, cmsg_len - hdr_len) };
                 for chunk in data.chunks_exact(std::mem::size_of::<RawFd>()) {
                     let fd = RawFd::from_ne_bytes(chunk.try_into().unwrap_or([0; 4]));
                     if GuestFd::from_raw(fd).valid().is_none() {
@@ -1990,8 +2000,11 @@ impl KernelMsghdr {
         let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const mhdr) };
         while !cmsg.is_null() {
             let hdr = unsafe { *cmsg };
+            let cmsg_len = unsafe {
+                usize::from_ne_bytes(cmsg.cast::<[u8; std::mem::size_of::<usize>()]>().read())
+            };
             let offset = unsafe { cmsg.cast::<u8>().offset_from_unsigned(base) };
-            if hdr.cmsg_len < hdr_len || hdr.cmsg_len > received - offset {
+            if cmsg_len < hdr_len || cmsg_len > received - offset {
                 if !overflowed {
                     kept_end = offset;
                 }
@@ -1999,7 +2012,7 @@ impl KernelMsghdr {
             }
             let next = unsafe { libc::CMSG_NXTHDR(&raw const mhdr, cmsg) };
             if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_RIGHTS {
-                let data_len = hdr.cmsg_len - hdr_len;
+                let data_len = cmsg_len - hdr_len;
                 let data_ptr = unsafe { libc::CMSG_DATA(cmsg) };
                 let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, data_len) };
                 let mut kept_fds = 0u32;
@@ -2028,7 +2041,10 @@ impl KernelMsghdr {
                         let kept_bytes = kept_fds * 4;
                         let new_len = unsafe { libc::CMSG_LEN(kept_bytes) } as usize;
                         let new_space = unsafe { libc::CMSG_SPACE(kept_bytes) } as usize;
-                        unsafe { (*cmsg).cmsg_len = new_len };
+                        unsafe {
+                            cmsg.cast::<[u8; std::mem::size_of::<usize>()]>()
+                                .write(new_len.to_ne_bytes());
+                        }
                         kept_end = (offset + new_space).min(received);
                     }
                 }
