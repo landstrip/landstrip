@@ -27,15 +27,6 @@ else
   die "neither sha256sum nor shasum is available"
 fi
 
-platform_extension() {
-  local platform="$1"
-  if [[ "$platform" == linux-* ]]; then
-    printf 'AppImage\n'
-  else
-    printf 'tar.gz\n'
-  fi
-}
-
 platforms=(
   darwin-arm64
   darwin-x64
@@ -167,7 +158,7 @@ stage_github_release() {
   local asset name downloaded
   local missing=()
   local assets=()
-  for pattern in "$workdir"/release/*.AppImage "$workdir"/release/*.tar.gz \
+  for pattern in "$workdir"/release/*.tar.gz \
     "$workdir"/release/*.sha256 "$workdir"/release/*.commit "$workdir"/release/*.tgz; do
     [[ -f "$pattern" ]] && assets+=("$pattern")
   done
@@ -376,7 +367,6 @@ missing=()
 npm_package_dirs=()
 for platform in "${platforms[@]}"; do
   binary="$(platform_binary "$platform")"
-  extension="$(platform_extension "$platform")"
   case "$platform" in
     darwin-arm64) expected_arch=arm64 ;;
     darwin-x64)   expected_arch=x86_64 ;;
@@ -387,7 +377,7 @@ for platform in "${platforms[@]}"; do
   esac
 
   source_bin="npm/$platform/bin/$binary"
-  asset="landstrip-$version-$platform.$extension"
+  asset="landstrip-$version-$platform.tar.gz"
   asset_path="artifacts/$asset"
   checksum_path="$asset_path.sha256"
   commit_path="$asset_path.commit"
@@ -409,18 +399,11 @@ for platform in "${platforms[@]}"; do
   description="$("$FILE" -b "$source_bin")"
   [[ "${description,,}" == *"$expected_arch"* ]] \
     || die "$source_bin has the wrong architecture: $description"
-  if [[ "$platform" == linux-* ]]; then
-    [[ "$(od -An -tx1 -j8 -N3 "$source_bin" | tr -d ' \n')" == 414902 ]] \
-      || die "$source_bin is not a type-2 AppImage"
-    cmp "$source_bin" "$asset_path" >/dev/null \
-      || die "$source_bin differs from $asset_path"
-  else
-    archive_binary="$workdir/$platform-$binary"
-    tar -xOzf "$asset_path" "$binary" >"$archive_binary" \
-      || die "cannot extract $binary from $asset_path"
-    cmp "$source_bin" "$archive_binary" >/dev/null \
-      || die "$source_bin differs from $asset_path contents"
-  fi
+  archive_binary="$workdir/$platform-$binary"
+  tar -xOzf "$asset_path" "$binary" >"$archive_binary" \
+    || die "cannot extract $binary from $asset_path"
+  cmp "$source_bin" "$archive_binary" >/dev/null \
+    || die "$source_bin differs from $asset_path contents"
 
   package_dir="$workdir/packages/$platform"
   cp -a "npm/$platform" "$package_dir"

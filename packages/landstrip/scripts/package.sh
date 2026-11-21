@@ -7,7 +7,7 @@
 #   cross-compiled triples — cargo-zigbuild (Zig linker)
 #
 # Platforms:
-#   linux-x64, linux-arm64 — x86_64/aarch64-unknown-linux-musl (static ELF AppImage)
+#   linux-x64, linux-arm64 — x86_64/aarch64-unknown-linux-musl (static ELF)
 #   win32-x64 — x86_64-pc-windows-gnu
 #   win32-arm64 — aarch64-pc-windows-gnullvm
 #   darwin-arm64, darwin-x64 — aarch64/x86_64-apple-darwin
@@ -28,7 +28,6 @@ source "$script_dir/../../../scripts/sha256.sh"
 CARGO="${CARGO:-cargo}"
 RUSTC="${RUSTC:-rustc}"
 CARGO_ZIGBUILD="${CARGO_ZIGBUILD:-cargo-zigbuild}"
-CONTAINER="${CONTAINER:-docker}"
 NODE="${NODE:-node}"
 FILE="${FILE:-file}"
 GZIP="${GZIP:-gzip}"
@@ -197,7 +196,7 @@ stage_prebuilt() {
   local source_artifact="$prebuilt_root/artifacts/$artifact"
   local digest name
 
-  [[ -n "$prebuilt_root" && "$platform" != linux-* ]] || return 1
+  [[ -n "$prebuilt_root" ]] || return 1
   [[ -f "$source_binary" && -f "$source_artifact" ]] || return 1
   [[ -f "$source_artifact.sha256" && -f "$source_artifact.commit" ]] \
     || die "prebuilt $platform artifact is missing its receipts"
@@ -411,23 +410,13 @@ for platform in "${requested[@]}"; do
   fi
 
   mkdir -p "$stage_package_dir/bin"
-  if [[ "$platform" == linux-* ]]; then
-    if ! verify_static_elf "$source_bin"; then
-      failed+=("$platform: broker must be a static ELF")
-      printf 'fail: %s (broker must be a static ELF)\n' "$platform" >&2
-      continue
-    fi
-    if ! CONTAINER="$CONTAINER" "$script_dir/make-appimage.sh" \
-      "$platform" "$source_bin" "$stage_package_dir/bin/$binary"; then
-      failed+=("$platform: AppImage packaging failed")
-      printf 'fail: %s (AppImage packaging failed)\n' "$platform" >&2
-      continue
-    fi
-    artifact="landstrip-$version-$platform.AppImage"
-  else
-    cp "$source_bin" "$stage_package_dir/bin/$binary"
-    artifact="landstrip-$version-$platform.tar.gz"
+  if [[ "$platform" == linux-* ]] && ! verify_static_elf "$source_bin"; then
+    failed+=("$platform: broker must be a static ELF")
+    printf 'fail: %s (broker must be a static ELF)\n' "$platform" >&2
+    continue
   fi
+  cp "$source_bin" "$stage_package_dir/bin/$binary"
+  artifact="landstrip-$version-$platform.tar.gz"
   chmod 755 "$stage_package_dir/bin/$binary"
 
   if ! smoke_host_binary "$platform" "$stage_package_dir/bin/$binary"; then
@@ -436,12 +425,8 @@ for platform in "${requested[@]}"; do
     continue
   fi
 
-  if [[ "$platform" == linux-* ]]; then
-    cp "$stage_package_dir/bin/$binary" "$stage_root/artifacts/$artifact"
-  else
-    create_tar_artifact \
-      "$stage_package_dir/bin" "$binary" "$stage_root/artifacts/$artifact"
-  fi
+  create_tar_artifact \
+    "$stage_package_dir/bin" "$binary" "$stage_root/artifacts/$artifact"
   digest="$(sha256_digest "$stage_root/artifacts/$artifact")"
   printf '%s  %s\n' "$digest" "$artifact" \
     >"$stage_root/artifacts/$artifact.sha256"
@@ -472,13 +457,8 @@ fi
 for platform in "${built[@]}"; do
   entry="$(platform_entry "$platform")"
   IFS='|' read -r _ _ binary <<<"$entry"
-  if [[ "$platform" == linux-* ]]; then
-    artifact="landstrip-$version-$platform.AppImage"
-    stale_artifact="artifacts/landstrip-$version-$platform.tar.gz"
-  else
-    artifact="landstrip-$version-$platform.tar.gz"
-    stale_artifact="artifacts/landstrip-$version-$platform.AppImage"
-  fi
+  artifact="landstrip-$version-$platform.tar.gz"
+  stale_artifact="artifacts/landstrip-$version-$platform.AppImage"
 
   [[ -f "$stage_root/npm/$platform/bin/$binary" ]] \
     || die "staged binary is missing for $platform"
@@ -505,13 +485,8 @@ for platform in "${built[@]}"; do
   entry="$(platform_entry "$platform")"
   IFS='|' read -r _ _ binary <<<"$entry"
   package_dir="npm/$platform"
-  if [[ "$platform" == linux-* ]]; then
-    artifact="landstrip-$version-$platform.AppImage"
-    stale_artifact="artifacts/landstrip-$version-$platform.tar.gz"
-  else
-    artifact="landstrip-$version-$platform.tar.gz"
-    stale_artifact="artifacts/landstrip-$version-$platform.AppImage"
-  fi
+  artifact="landstrip-$version-$platform.tar.gz"
+  stale_artifact="artifacts/landstrip-$version-$platform.AppImage"
 
   mkdir -p "$package_dir/bin" artifacts \
     || die "cannot prepare release output for $platform"
@@ -530,11 +505,7 @@ publication_committed=1
 for platform in "${built[@]}"; do
   entry="$(platform_entry "$platform")"
   IFS='|' read -r _ _ binary <<<"$entry"
-  if [[ "$platform" == linux-* ]]; then
-    artifact="landstrip-$version-$platform.AppImage"
-  else
-    artifact="landstrip-$version-$platform.tar.gz"
-  fi
+  artifact="landstrip-$version-$platform.tar.gz"
   printf 'packaged %s -> npm/%s/bin/%s and artifacts/%s{,.sha256,.commit}\n' \
     "$platform" "$platform" "$binary" "$artifact"
 done
