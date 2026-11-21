@@ -5,7 +5,7 @@ package_build_driver() {
   local host_triple="$1"
   local target_triple="$2"
 
-  if [[ "$target_triple" == "$host_triple" || "$target_triple" == *-unknown-linux-gnu ]]; then
+  if [[ "$target_triple" == "$host_triple" ]]; then
     printf 'cargo\n'
   else
     printf 'zigbuild\n'

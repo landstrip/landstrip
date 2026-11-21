@@ -3,12 +3,11 @@
 # Copyright (C) Jarkko Sakkinen 2026
 #
 # Multi-platform release packaging.
-#   Linux GNU — cargo with static glibc; cross-builds need <arch>-linux-gnu-gcc and its glibc development files
-#   other host-native triples — cargo
-#   remaining triples — cargo-zigbuild (Zig linker)
+#   host-native triples — cargo
+#   cross-compiled triples — cargo-zigbuild (Zig linker)
 #
 # Platforms:
-#   linux-x64, linux-arm64 — x86_64/aarch64-unknown-linux-gnu (AppImage)
+#   linux-x64, linux-arm64 — x86_64/aarch64-unknown-linux-musl (static ELF AppImage)
 #   win32-x64 — x86_64-pc-windows-gnu
 #   win32-arm64 — aarch64-pc-windows-gnullvm
 #   darwin-arm64, darwin-x64 — aarch64/x86_64-apple-darwin
@@ -33,7 +32,6 @@ CONTAINER="${CONTAINER:-docker}"
 NODE="${NODE:-node}"
 FILE="${FILE:-file}"
 GZIP="${GZIP:-gzip}"
-READELF="${READELF:-readelf}"
 TAR="${TAR:-tar}"
 ZIG="${ZIG:-zig}"
 
@@ -144,8 +142,8 @@ fi
 
 # platform|rust-triple|binary-name
 platforms=(
-  'linux-x64|x86_64-unknown-linux-gnu|landstrip'
-  'linux-arm64|aarch64-unknown-linux-gnu|landstrip'
+  'linux-x64|x86_64-unknown-linux-musl|landstrip'
+  'linux-arm64|aarch64-unknown-linux-musl|landstrip'
   'win32-x64|x86_64-pc-windows-gnu|landstrip.exe'
   'win32-arm64|aarch64-pc-windows-gnullvm|landstrip.exe'
   'darwin-arm64|aarch64-apple-darwin|landstrip'
@@ -255,22 +253,50 @@ build_with_zigbuild() {
 build_with_cargo() {
   local triple="$1"
   local target_dir="$package_target_root/$triple"
-  local linker
-  local -a config=()
 
   (
     cd "$cargo_root" || exit 1
-    if [[ "$triple" == *-unknown-linux-gnu ]]; then
-      unset CARGO_ENCODED_RUSTFLAGS
-      export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+crt-static"
-      if [[ "$triple" != "$rust_host_triple" ]]; then
-        linker="${triple%%-*}-linux-gnu-gcc"
-        require_command "$linker"
-        config=(--config "target.$triple.linker=\"$linker\"")
-      fi
-    fi
-    CARGO_TARGET_DIR="$target_dir" "$CARGO" build "${config[@]}" --release --target "$triple"
+    CARGO_TARGET_DIR="$target_dir" "$CARGO" build --release --target "$triple"
   )
+}
+
+verify_static_elf() {
+  "$NODE" -e '
+    const fs = require("node:fs");
+    const buf = fs.readFileSync(process.argv[1]);
+    if (
+      buf.length < 64 ||
+      buf[0] !== 0x7f || buf[1] !== 0x45 || buf[2] !== 0x4c || buf[3] !== 0x46 ||
+      buf[4] !== 2 || buf[5] !== 1 || buf[6] !== 1
+    ) {
+      process.exit(1);
+    }
+    const phoff = Number(buf.readBigUInt64LE(32));
+    const phentsize = buf.readUInt16LE(54);
+    const phnum = buf.readUInt16LE(56);
+    if (phentsize !== 56 || phnum === 0 || phoff + phnum * phentsize > buf.length) {
+      process.exit(1);
+    }
+    for (let i = 0; i < phnum; i++) {
+      const base = phoff + i * phentsize;
+      const ptype = buf.readUInt32LE(base);
+      if (ptype === 3) {
+        process.exit(1);
+      }
+      if (ptype === 2) {
+        const offset = Number(buf.readBigUInt64LE(base + 8));
+        const filesz = Number(buf.readBigUInt64LE(base + 32));
+        if (offset + filesz > buf.length || filesz % 16 !== 0) {
+          process.exit(1);
+        }
+        for (let pos = 0; pos < filesz; pos += 16) {
+          const tag = buf.readBigUInt64LE(offset + pos);
+          if (tag === 0n) break;
+          if (tag === 1n) process.exit(1);
+        }
+      }
+    }
+  ' "$1"
 }
 
 needs_zigbuild=0
@@ -386,8 +412,7 @@ for platform in "${requested[@]}"; do
 
   mkdir -p "$stage_package_dir/bin"
   if [[ "$platform" == linux-* ]]; then
-    if ! elf_headers="$(LC_ALL=C "$READELF" -W -l -d "$source_bin")" ||
-      [[ "$elf_headers" == *INTERP* || "$elf_headers" == *'(NEEDED)'* ]]; then
+    if ! verify_static_elf "$source_bin"; then
       failed+=("$platform: broker must be a static ELF")
       printf 'fail: %s (broker must be a static ELF)\n' "$platform" >&2
       continue
