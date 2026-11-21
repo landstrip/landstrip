@@ -241,9 +241,9 @@ impl Step for UnixAndAbstractSocketCmd {
     fn apply(&self, state: &mut SandboxState) -> TestCaseResult {
         use std::os::unix::net::{UnixDatagram, UnixListener};
 
-        let sock_dir = state.root.join("writable/socks");
+        let sock_dir = state.root.join("writable/s");
         let _ = std::fs::create_dir_all(&sock_dir);
-        let sock_path = sock_dir.join("srv.sock");
+        let sock_path = sock_dir.join("a.sock");
         let _ = std::fs::remove_file(&sock_path);
         let listener = UnixListener::bind(&sock_path).require("bind unix sock")?;
 
@@ -288,23 +288,28 @@ impl Step for UnixAndAbstractSocketCmd {
         );
         prop_assert_eq!(&srv_handle.join().unwrap_or([0; 7]), b"unix-hi");
 
-        let bind_sock = sock_dir.join("bound.sock");
+        let bind_sock = sock_dir.join("b.sock");
+        let bind_allow = if cfg!(target_os = "macos") {
+            &bind_sock
+        } else {
+            &sock_dir
+        };
         let bind_pol = vec![json!({
             "filesystem": {
                 "allowRead": ["/"],
                 "allowWrite": [state.abs_path("writable")]
             },
             "network": {
-                "allowUnixSockets": [sock_dir]
+                "allowUnixSockets": [bind_allow]
             }
         })];
         prop_assert_eq!(
             state.probe(&bind_pol, NetProbe::UnixBind { path: bind_sock })?,
             ProbeOutcome::Allowed,
-            "Unix bind must succeed inside an allowUnixSockets directory"
+            "Unix bind must succeed inside an allowed Unix socket path"
         );
 
-        let dgram_path = sock_dir.join("dgram.sock");
+        let dgram_path = sock_dir.join("d.sock");
         let _ = std::fs::remove_file(&dgram_path);
         let dgram = UnixDatagram::bind(&dgram_path).require("bind dgram")?;
         dgram.set_nonblocking(true).require("nonblocking dgram")?;

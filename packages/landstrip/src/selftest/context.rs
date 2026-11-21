@@ -119,7 +119,7 @@ impl<'a> RunSpec<'a> {
 
 impl SandboxContext {
     pub fn scratch_root() -> PathBuf {
-        std::env::temp_dir().join(format!("landstrip-selftest-{}", std::process::id()))
+        std::env::temp_dir().join(format!("ls-{}", std::process::id()))
     }
 
     pub fn next_id() -> u64 {

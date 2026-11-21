@@ -302,7 +302,7 @@ impl Default for SandboxState {
     fn default() -> Self {
         let ctx = SandboxContext::default();
         let id = STATE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let raw_root = ctx.scratch_root.join(format!("state-{id}"));
+        let raw_root = ctx.scratch_root.join(format!("s{id}"));
         let _ = robust_remove(&raw_root);
         let _ = std::fs::create_dir_all(&raw_root);
         let root = std::fs::canonicalize(&raw_root).unwrap_or(raw_root);
