@@ -365,6 +365,10 @@ impl SandboxState {
     }
 
     pub fn resolve(&self, rel: &str, follow_last: bool) -> ResolvedTarget {
+        self.resolve_traced(rel, follow_last).0
+    }
+
+    pub fn resolve_traced(&self, rel: &str, follow_last: bool) -> (ResolvedTarget, Vec<String>) {
         let root = self.root.to_string_lossy();
         let mut pending: Vec<String> = rel
             .split('/')
@@ -373,35 +377,35 @@ impl SandboxState {
             .map(str::to_owned)
             .collect();
         let mut stack: Vec<String> = Vec::new();
+        let mut symlinks: Vec<String> = Vec::new();
         let mut hops = 0usize;
         while let Some(part) = pending.pop() {
             match part.as_str() {
                 "." => continue,
                 ".." => {
                     if stack.pop().is_none() {
-                        return ResolvedTarget::Escaped;
+                        return (ResolvedTarget::Escaped, symlinks);
                     }
                     continue;
                 }
                 _ => stack.push(part),
             }
-            let target = self
-                .nodes
-                .get(&stack.join("/"))
-                .and_then(NodeKind::symlink_target);
+            let current = stack.join("/");
+            let target = self.nodes.get(&current).and_then(NodeKind::symlink_target);
             let Some(target) = target.filter(|_| follow_last || !pending.is_empty()) else {
                 continue;
             };
+            symlinks.push(current);
             hops += 1;
             if hops > 40 {
-                return ResolvedTarget::Loop;
+                return (ResolvedTarget::Loop, symlinks);
             }
             stack.pop();
             let target = if let Some(inside) = target.strip_prefix(root.as_ref()) {
                 stack.clear();
                 inside
             } else if target.starts_with('/') {
-                return ResolvedTarget::Escaped;
+                return (ResolvedTarget::Escaped, symlinks);
             } else {
                 target
             };
@@ -415,15 +419,18 @@ impl SandboxState {
         }
         let rel = stack.join("/");
         if let Some(kind) = self.nodes.get(&rel) {
-            return ResolvedTarget::Node {
-                rel,
-                kind: kind.clone(),
-            };
+            return (
+                ResolvedTarget::Node {
+                    rel,
+                    kind: kind.clone(),
+                },
+                symlinks,
+            );
         }
         let parent_exists = rel
             .rsplit_once('/')
             .is_none_or(|(parent, _)| matches!(self.nodes.get(parent), Some(NodeKind::Dir { .. })));
-        ResolvedTarget::Missing { rel, parent_exists }
+        (ResolvedTarget::Missing { rel, parent_exists }, symlinks)
     }
 
     /// Mirrors `canonicalize_existing_prefix`: the longest prefix that fully

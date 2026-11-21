@@ -414,10 +414,11 @@ impl Step for GuestReadProbe {
         let outcome = ProbeOutcome::try_from(&result)?;
         let responder = state.policy.responder;
 
+        let (resolved, symlinks) = state.resolve_traced(rel, true);
         let ResolvedTarget::Node {
             rel: target_rel,
             kind: NodeKind::File { bytes, .. },
-        } = state.resolve(rel, true)
+        } = resolved
         else {
             prop_assert_eq!(
                 outcome,
@@ -427,7 +428,14 @@ impl Step for GuestReadProbe {
             );
             return Ok(());
         };
-        let decision = state.oracle()?.read(&target_rel, rel);
+        let oracle = state.oracle()?;
+        let symlink_denied =
+            cfg!(target_os = "macos") && symlinks.iter().any(|link| !oracle.can_read_symlink(link));
+        let decision = if symlink_denied {
+            Decision::DenyMatch
+        } else {
+            oracle.read(&target_rel, rel)
+        };
         let should_succeed = decision.effective_allow(responder);
         prop_assert_eq!(
             outcome,
@@ -532,6 +540,7 @@ impl GuestWriteProbe {
         state: &SandboxState,
         rel: &str,
         resolved: &ResolvedTarget,
+        symlinks: &[String],
     ) -> Result<bool, TestCaseError> {
         let ((
             ResolvedTarget::Node {
@@ -551,6 +560,11 @@ impl GuestWriteProbe {
             return Ok(false);
         };
         let oracle = state.oracle()?;
+        // Seatbelt checks file-read-metadata (`readlink`) on every symlink
+        // traversed during open/truncate, even for write-only operations.
+        if cfg!(target_os = "macos") && symlinks.iter().any(|link| !oracle.can_read_symlink(link)) {
+            return Ok(false);
+        }
         // Linux brokers `truncate` like any other path mutation.
         let decision = if cfg!(target_os = "linux") && self.mode == WriteMode::Truncate {
             let entry = Entry {
@@ -582,8 +596,8 @@ impl Step for GuestWriteProbe {
             },
             WriteMode::Truncate => FsProbe::Truncate { path, len: 4 },
         };
-        let resolved = state.resolve(rel, self.mode != WriteMode::CreateExcl);
-        let expected_ok = self.expected(state, rel, &resolved)?;
+        let (resolved, symlinks) = state.resolve_traced(rel, self.mode != WriteMode::CreateExcl);
+        let expected_ok = self.expected(state, rel, &resolved, &symlinks)?;
         let result = state.run_policy(&state.policy, probe)?;
         prop_assert_eq!(
             ProbeOutcome::try_from(&result)?,

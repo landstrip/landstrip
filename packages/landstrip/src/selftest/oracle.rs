@@ -173,7 +173,7 @@ struct Lowered {
     roots: Vec<Rule>,
     patterns: Vec<Rule>,
     matches: Vec<Rule>,
-    fallback: Option<Rule>,
+    fallback: Vec<Rule>,
 }
 
 #[derive(Default)]
@@ -209,8 +209,19 @@ impl Lowering<'_> {
         }
     }
 
-    fn root(&self, rel: &str) -> Option<Rule> {
-        self.tree.canonical(rel).map(Rule::Root)
+    fn roots(&self, rel: &str) -> Vec<Rule> {
+        let canonical = self.tree.canonical(rel);
+        if cfg!(target_os = "macos") {
+            let mut out = vec![Rule::Root(rel.to_owned())];
+            if let Some(canonical) = canonical
+                && canonical != rel
+            {
+                out.push(Rule::Root(canonical));
+            }
+            out
+        } else {
+            canonical.into_iter().map(Rule::Root).collect()
+        }
     }
 
     fn glob(&self, rel: &str) -> Result<Lowered, TestCaseError> {
@@ -221,13 +232,15 @@ impl Lowering<'_> {
                 .nodes
                 .keys()
                 .filter(|node| node.is_under(base) && matcher.is_match(node.as_str()))
-                .filter_map(|node| self.root(node))
+                .flat_map(|node| self.roots(node))
                 .collect(),
             Rule::Root(_) => Vec::new(),
         };
-        let fallback = matches!(self.tree.resolve(rel, false), ResolvedTarget::Node { .. })
-            .then(|| self.root(rel))
-            .flatten();
+        let fallback = if matches!(self.tree.resolve(rel, false), ResolvedTarget::Node { .. }) {
+            self.roots(rel)
+        } else {
+            Vec::new()
+        };
         let mut patterns = Vec::new();
         if let Some(canonical) = self
             .tree
@@ -250,7 +263,7 @@ impl Lowering<'_> {
             self.glob(rel)
         } else {
             Ok(Lowered {
-                roots: self.root(rel).into_iter().collect(),
+                roots: self.roots(rel),
                 ..Lowered::default()
             })
         }
@@ -306,8 +319,8 @@ impl Lowering<'_> {
                         .any(|root| patterns[0].base().is_under(root.base())));
             if !covered && !matches.is_empty() {
                 set.roots.extend(matches);
-            } else if let Some(fallback) = fallback {
-                set.roots.push(fallback);
+            } else if !fallback.is_empty() {
+                set.roots.extend(fallback);
                 continue;
             }
             set.patterns.extend(patterns);
@@ -535,7 +548,11 @@ impl FsOracle {
         )?;
         let deny = lowering.deny(&policy.deny_read, true)?;
         let always = lowering.deny(&policy.deny_read_always, true)?;
-        let carveouts = AccessRules::carveouts(allow.patterns, &deny);
+        let carveouts = if policy.read_base == ReadBase::Restricted {
+            allow.patterns
+        } else {
+            AccessRules::carveouts(allow.patterns, &deny)
+        };
         let uncarved = deny
             .roots
             .iter()
@@ -626,7 +643,7 @@ impl FsOracle {
     /// Hard denies apply to either spelling; ordinary denies of the
     /// requested spelling only once the canonical path is readable.
     pub fn read(&self, canonical: &str, lexical: &str) -> Decision {
-        let lexical_denial = (lexical != canonical)
+        let lexical_denial = (cfg!(target_os = "linux") && lexical != canonical)
             .then(|| self.read.denial(lexical))
             .flatten();
         if lexical_denial == Some(Decision::Always) {
@@ -650,6 +667,33 @@ impl FsOracle {
             return Decision::AllowMiss;
         }
         lexical_denial.unwrap_or(Decision::Allow)
+    }
+
+    /// Whether macOS Seatbelt permits `file-read-metadata` (`readlink`) on
+    /// `link`. Seatbelt's `read_rules` allows `file-read*` on grants and
+    /// carveouts, `file-read* (literal ...)` on strict ancestors of grant and
+    /// carveout bases (`parent_dir_rules`), and `file-read-metadata` on
+    /// symlinks outside denied roots (`RootScan`), followed by `denial_rules`.
+    pub fn can_read_symlink(&self, link: &str) -> bool {
+        if self.read.denial(link).is_some() {
+            return false;
+        }
+        let ancestor_of_grant = || {
+            self.read
+                .grants
+                .iter()
+                .chain(&self.read.carveouts)
+                .any(|rule| rule.base().is_strictly_under(link))
+        };
+        match self.read_scope {
+            ReadScope::Everything => true,
+            ReadScope::OutsideDenied => {
+                !self.read_denied_roots.iter().any(|rule| rule.covers(link))
+                    || self.read.granted(link)
+                    || ancestor_of_grant()
+            }
+            ReadScope::GrantedOnly => self.read.granted(link) || ancestor_of_grant(),
+        }
     }
 
     /// Writes are decided on `canonical`. A hard deny of the requested
