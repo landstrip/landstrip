@@ -181,6 +181,12 @@ impl Call<'_> {
         let access = if writes { Access::Write } else { Access::Read };
         let trailing_slash = path.as_bytes().is_some_and(|bytes| bytes.ends_with(b"/"));
         let follow = trailing_slash || flags & libc::AT_SYMLINK_NOFOLLOW == 0;
+        if follow
+            && let Some(raw) = path.as_bytes()
+            && self.policy.is_broker_proc_fd(dirfd, raw)
+        {
+            return Errno::ENOENT.negated();
+        }
         let mut request = Request::path(dirfd, &path, access, follow)
             .opens(open_flags)
             .missing(Missing::Kernel);
@@ -202,6 +208,12 @@ impl Call<'_> {
         request.flags = Request::open_flag_names(flags);
         if flags & libc::O_CREAT == 0 {
             request = request.missing(Missing::Kernel);
+        }
+        if follow
+            && let Some(raw) = path.as_bytes()
+            && self.policy.is_broker_proc_fd(dirfd, raw)
+        {
+            return Errno::ENOENT.negated();
         }
         if let Some(errno) = self
             .sink
@@ -264,6 +276,12 @@ impl Call<'_> {
             request.flags = Request::open_flag_names(flags);
             if flags & libc::O_CREAT == 0 {
                 request = request.missing(Missing::Kernel);
+            }
+            if follow
+                && let Some(raw) = path.as_bytes()
+                && self.policy.is_broker_proc_fd(Some(dirfd), raw)
+            {
+                return Errno::ENOENT.negated();
             }
             if let Some(errno) = self
                 .sink

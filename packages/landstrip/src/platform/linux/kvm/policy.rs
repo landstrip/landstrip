@@ -584,12 +584,26 @@ impl Policy {
                 present: true,
             });
         }
-        let label = if follow {
-            lexical.normalize()
-        } else {
-            Resolved::without_follow(&lexical)
-        };
-        let present = Resolved::exists(dirfd, path, follow);
+        if follow {
+            if let Some(resolution) = Self::resolve_proc_self_fd(&lexical, true) {
+                return resolution;
+            }
+            let canonical = fs::canonicalize(&lexical);
+            if canonical.is_err()
+                && let Some(resolution) = Self::resolve_proc_self_fd(&lexical, false)
+            {
+                return resolution;
+            }
+            let label = canonical.unwrap_or_else(|_| lexical.canonicalize_existing_prefix());
+            let present = Resolved::exists(dirfd, path, true);
+            return Resolution::Resolved(Resolved {
+                label,
+                lexical,
+                present,
+            });
+        }
+        let label = Resolved::without_follow(&lexical);
+        let present = Resolved::exists(dirfd, path, false);
         Resolution::Resolved(Resolved {
             label,
             lexical,
@@ -629,15 +643,23 @@ impl Policy {
         let Some(lexical) = resolve.lexical_path(&root_base, path) else {
             return Resolution::Kernel;
         };
+        if follow && Self::is_broker_proc_self_fd(&lexical) {
+            return Resolution::Unresolvable(lexical);
+        }
         match ProbeOpen::open(raw_dirfd, path, follow, false, resolve) {
-            Ok(fd) => match ProbeOpen::label_from_fd(fd.as_fd(), &lexical) {
-                Ok(label) => Resolution::Resolved(Resolved {
-                    label,
-                    lexical,
-                    present: true,
-                }),
-                Err(unres) => Resolution::Unresolvable(unres),
-            },
+            Ok(fd) => {
+                if follow && matches!(FdLabel::resolve(fd.as_fd()), Ok(FdLabel::Anonymous)) {
+                    return Resolution::Kernel;
+                }
+                match ProbeOpen::label_from_fd(fd.as_fd(), &lexical) {
+                    Ok(label) => Resolution::Resolved(Resolved {
+                        label,
+                        lexical,
+                        present: true,
+                    }),
+                    Err(unres) => Resolution::Unresolvable(unres),
+                }
+            }
             Err(libc::ENOENT) if creating => {
                 let Ok(target) = ProbeOpen::creation_target(raw_dirfd, path, resolve) else {
                     return Resolution::Unresolvable(lexical);
@@ -786,6 +808,81 @@ impl Policy {
                 .strip_prefix(&self_root)
                 .ok()
                 .is_some_and(|rel| rel.starts_with("task") && rel.components().count() == 2)
+    }
+
+    pub(crate) fn is_broker_proc_fd(&self, dirfd: Option<i64>, raw_path: &[u8]) -> bool {
+        let candidate = Path::new(OsStr::from_bytes(raw_path));
+        let full = if candidate.is_absolute() {
+            candidate.clean_lexically()
+        } else {
+            match dirfd {
+                None => self.cwd().join(candidate).clean_lexically(),
+                Some(fd) if fd == i64::from(libc::AT_FDCWD) => {
+                    self.cwd().join(candidate).clean_lexically()
+                }
+                Some(fd) => match DescriptorTarget::resolve(fd) {
+                    DescriptorTarget::Path(base) => base.join(candidate).clean_lexically(),
+                    _ => return false,
+                },
+            }
+        };
+        Self::is_broker_proc_self_fd(&full)
+    }
+
+    fn is_broker_proc_self_fd(lexical: &Path) -> bool {
+        Self::proc_self_fd_number(lexical)
+            .and_then(|fd| RawFd::try_from(fd).ok())
+            .is_some_and(|raw| super::fds::GuestFd::from_raw(raw).is_broker())
+    }
+
+    fn resolve_proc_self_fd(lexical: &Path, fast_only: bool) -> Option<Resolution> {
+        if fast_only && !lexical.starts_with("/proc") && !lexical.starts_with("/dev") {
+            return None;
+        }
+        let fd = Self::proc_self_fd_number(lexical)?;
+        if RawFd::try_from(fd)
+            .ok()
+            .is_some_and(|raw| super::fds::GuestFd::from_raw(raw).is_broker())
+        {
+            return Some(Resolution::Unresolvable(lexical.to_path_buf()));
+        }
+        Some(match DescriptorTarget::resolve(fd) {
+            DescriptorTarget::Path(label) => Resolution::Resolved(Resolved {
+                label,
+                lexical: lexical.to_path_buf(),
+                present: true,
+            }),
+            DescriptorTarget::Unresolvable(unres) => Resolution::Unresolvable(unres),
+            DescriptorTarget::Unclassified | DescriptorTarget::Invalid => Resolution::Kernel,
+        })
+    }
+
+    fn proc_self_fd_number(path: &Path) -> Option<i64> {
+        const MAX_SYMLINKS: usize = 40;
+        let self_root = PathBuf::from(format!("/proc/{}", std::process::id()));
+        let mut current = path.to_path_buf();
+        for _ in 0..=MAX_SYMLINKS {
+            let parent = current.parent()?;
+            let name = current.file_name()?.to_str()?;
+            if let Ok(canon_parent) = fs::canonicalize(parent)
+                && let Ok(rel) = canon_parent.strip_prefix(&self_root)
+                && (rel == Path::new("fd")
+                    || (rel.starts_with("task")
+                        && rel.file_name() == Some(OsStr::new("fd"))
+                        && rel.components().count() == 3))
+            {
+                return name.parse::<i64>().ok();
+            }
+            let Ok(target) = fs::read_link(&current) else {
+                return None;
+            };
+            current = if target.is_absolute() {
+                target
+            } else {
+                parent.join(target)
+            };
+        }
+        None
     }
 
     pub(crate) fn process_context(&self) -> ProcessContext {
@@ -1002,5 +1099,111 @@ impl FdLabel {
                     .is_ok_and(|stat| stat.st_dev == dev && stat.st_ino == ino)
             })
             .map(|name| dir_path.join(name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{PolicyFormat, Settings};
+    use anyhow::Result;
+
+    fn test_policy(cwd: &Path) -> Result<Policy> {
+        let doc = r#"{
+            "filesystem": {
+                "denyRead": [],
+                "allowRead": ["/"],
+                "allowWrite": ["/dev/null"]
+            }
+        }"#;
+        let value = PolicyFormat::Json.parse_document(doc)?;
+        let settings: Settings = serde_json::from_value(value)?;
+        let rules = settings.resolve(cwd)?;
+        Ok(Policy::new(&rules, cwd, Path::new("/bin/sh")))
+    }
+
+    #[test]
+    fn open_denial_allows_anonymous_pipe_via_dev_fd_and_proc_self_fd() -> Result<()> {
+        let cwd = std::env::temp_dir();
+        let policy = test_policy(&cwd)?;
+
+        let mut pipe_fds = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let reader = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
+
+        for prefix in ["/dev/fd", "/proc/self/fd", "/proc/thread-self/fd"] {
+            let read_path = PathBuf::from(format!("{prefix}/{}", reader.as_raw_fd()));
+            let write_path = PathBuf::from(format!("{prefix}/{}", writer.as_raw_fd()));
+            assert!(
+                policy
+                    .open_denial(
+                        i64::from(libc::AT_FDCWD),
+                        &read_path,
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                        true,
+                        ResolveFlags::empty(),
+                        Missing::Kernel,
+                    )
+                    .is_none(),
+                "expected read pipe {read_path:?} to be delegated to kernel"
+            );
+            assert!(
+                policy
+                    .open_denial(
+                        i64::from(libc::AT_FDCWD),
+                        &write_path,
+                        libc::O_WRONLY | libc::O_CLOEXEC,
+                        true,
+                        ResolveFlags::empty(),
+                        Missing::Kernel,
+                    )
+                    .is_none(),
+                "expected write pipe {write_path:?} to be delegated to kernel"
+            );
+        }
+
+        // A regular file outside `allowWrite` opened via `/dev/fd/<N>` with `O_WRONLY`
+        // must still be denied by policy!
+        let hosts = fs::File::open("/etc/hosts")?;
+        let hosts_fd_path = PathBuf::from(format!("/dev/fd/{}", hosts.as_raw_fd()));
+        assert!(
+            policy
+                .open_denial(
+                    i64::from(libc::AT_FDCWD),
+                    &hosts_fd_path,
+                    libc::O_WRONLY,
+                    true,
+                    ResolveFlags::empty(),
+                    Missing::Kernel,
+                )
+                .is_some(),
+            "reopening read-only regular file /etc/hosts with O_WRONLY via /dev/fd must be denied"
+        );
+
+        // Broker-owned descriptors must be flagged as broker proc fds and never delegated.
+        let broker_pipe = super::super::fds::GuestFd::duplicate_above(writer.as_raw_fd())?;
+        let broker_raw = format!("/proc/self/fd/{}", broker_pipe.as_raw_fd());
+        assert!(
+            policy.is_broker_proc_fd(Some(i64::from(libc::AT_FDCWD)), broker_raw.as_bytes()),
+            "broker fd via /proc/self/fd must be detected"
+        );
+        assert!(
+            policy
+                .open_denial(
+                    i64::from(libc::AT_FDCWD),
+                    Path::new(&broker_raw),
+                    libc::O_RDONLY,
+                    true,
+                    ResolveFlags::empty(),
+                    Missing::Kernel,
+                )
+                .is_some(),
+            "broker fd via /proc/self/fd must not be allowed"
+        );
+        Ok(())
     }
 }
