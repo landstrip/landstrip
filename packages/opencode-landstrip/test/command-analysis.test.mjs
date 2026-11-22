@@ -173,4 +173,28 @@ test('decodeLandstripTrap aligns mechanisms and policy error codes with error.rs
     }),
     null,
   );
+  assert.deepEqual(
+    decodeLandstripTrap({
+      kind: 'internal',
+      code: 'POLICY_GLOB_TOO_LONG',
+      message: 'glob pattern exceeds limit',
+    }),
+    {
+      kind: 'internal',
+      code: 'POLICY_GLOB_TOO_LONG',
+      message: 'glob pattern exceeds limit',
+    },
+  );
+  assert.deepEqual(
+    decodeLandstripTrap({
+      kind: 'internal',
+      code: 'POLICY_SELECTOR_LIMIT',
+      message: 'too many selectors',
+    }),
+    {
+      kind: 'internal',
+      code: 'POLICY_SELECTOR_LIMIT',
+      message: 'too many selectors',
+    },
+  );
 });

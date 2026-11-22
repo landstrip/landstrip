@@ -94,7 +94,9 @@ export type LandstripPolicyErrorCode =
   | 'POLICY_INVALID_MACH_LOOKUP'
   | 'POLICY_INVALID_LOG_TAG'
   | 'POLICY_HOME_UNAVAILABLE'
-  | 'POLICY_TRAVERSAL_DEPTH';
+  | 'POLICY_TRAVERSAL_DEPTH'
+  | 'POLICY_GLOB_TOO_LONG'
+  | 'POLICY_SELECTOR_LIMIT';
 
 /** The stage that failed before the tool ran. */
 export type LandstripInternalCode =
