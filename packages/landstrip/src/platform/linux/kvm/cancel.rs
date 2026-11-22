@@ -102,6 +102,10 @@ struct Trace {
     cancel: Option<Cancel>,
     /// Whether the exit of this thread releases its guest robust list.
     watch: bool,
+    /// Set once `PTRACE_EVENT_EXIT` has been observed for this thread.
+    exiting: bool,
+    /// Set when tracing of this thread is being torn down asynchronously.
+    detaching: bool,
 }
 
 struct Cancel {
@@ -341,12 +345,29 @@ impl Supervisor {
         Ok(())
     }
 
+    fn is_esrch(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io_err| io_err.raw_os_error() == Some(libc::ESRCH))
+    }
+
     fn host_tid(pid: i32, tid: u64) -> Result<i32> {
         let tasks = std::path::Path::new("/proc")
             .join(pid.to_string())
             .join("task");
-        for entry in std::fs::read_dir(tasks)? {
-            let entry = entry?;
+        let entries = match std::fs::read_dir(tasks) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH).into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             let Ok(status) = std::fs::read(entry.path().join("status")) else {
                 continue;
             };
@@ -463,6 +484,8 @@ impl Supervisor {
                     reply: None,
                     cancel: None,
                     watch: false,
+                    exiting: false,
+                    detaching: false,
                 })
             }
         })
@@ -472,18 +495,32 @@ impl Supervisor {
         match command {
             Command::Attach { return_pc, tids } => {
                 for tid in tids {
-                    let host = Self::host_tid(pid, *tid)?;
-                    self.trace(pid, host)?.cancel.get_or_insert(Cancel {
-                        return_pc,
-                        cancelling: false,
-                        skipped: false,
-                    });
+                    let host = match Self::host_tid(pid, *tid) {
+                        Ok(host) => host,
+                        Err(error) if Self::is_esrch(&error) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    match self.trace(pid, host) {
+                        Ok(trace) => {
+                            if !trace.exiting && !trace.detaching {
+                                trace.cancel.get_or_insert(Cancel {
+                                    return_pc,
+                                    cancelling: false,
+                                    skipped: false,
+                                });
+                            }
+                        }
+                        Err(error) if Self::is_esrch(&error) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             Command::Interrupt => {
                 for (&tid, trace) in &mut self.traced {
-                    let Some(cancel) = trace.cancel.as_mut().filter(|_| trace.process == pid)
-                    else {
+                    if trace.process != pid || trace.exiting || trace.detaching {
+                        continue;
+                    }
+                    let Some(cancel) = trace.cancel.as_mut() else {
                         continue;
                     };
                     cancel.cancelling = true;
@@ -494,51 +531,62 @@ impl Supervisor {
                 }
             }
             Command::Retire(tid) => {
-                let host = Self::host_tid(pid, tid)?;
-                if self.traced.contains_key(&host) {
-                    Self::ptrace(libc::PTRACE_INTERRUPT, host, 0)?;
-                    return Ok(Some(host));
+                let host = match Self::host_tid(pid, tid) {
+                    Ok(host) => host,
+                    Err(error) if Self::is_esrch(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                if self
+                    .traced
+                    .get(&host)
+                    .is_some_and(|trace| !trace.exiting && !trace.detaching)
+                {
+                    match Self::ptrace(libc::PTRACE_INTERRUPT, host, 0) {
+                        Ok(()) => return Ok(Some(host)),
+                        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             }
             Command::WatchRobust(tid) => {
-                let host = Self::host_tid(pid, tid)?;
-                self.trace(pid, host)?.watch = true;
+                let host = match Self::host_tid(pid, tid) {
+                    Ok(host) => host,
+                    Err(error) if Self::is_esrch(&error) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+                match self.trace(pid, host) {
+                    Ok(trace) => {
+                        if !trace.detaching {
+                            trace.watch = true;
+                        }
+                    }
+                    Err(error) if Self::is_esrch(&error) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(None)
     }
 
     fn detach_process(&mut self, pid: i32) -> Result<()> {
-        let tids = self
-            .traced
-            .iter()
-            .filter_map(|(&tid, trace)| (trace.process == pid).then_some(tid))
-            .collect::<Vec<_>>();
-        for tid in tids {
-            match Self::ptrace(libc::PTRACE_INTERRUPT, tid, 0) {
-                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
-                result => {
-                    result?;
-                    let mut status = 0;
-                    loop {
-                        if unsafe { libc::waitpid(tid, &raw mut status, libc::__WALL) } >= 0 {
-                            break;
-                        }
-                        let error = io::Error::last_os_error();
-                        if error.kind() != io::ErrorKind::Interrupted {
-                            return Err(error.into());
-                        }
-                    }
-                    if libc::WIFSTOPPED(status) {
-                        Self::ptrace(libc::PTRACE_DETACH, tid, 0)?;
-                    } else if tid == self.root {
-                        self.exited = Some(status);
-                    }
+        for (&tid, trace) in &mut self.traced {
+            if trace.process != pid {
+                continue;
+            }
+            trace.cancel = None;
+            trace.watch = false;
+            trace.detaching = true;
+            if !trace.exiting {
+                match Self::ptrace(libc::PTRACE_INTERRUPT, tid, 0) {
+                    Ok(()) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                    Err(error) => return Err(error.into()),
                 }
             }
-            self.traced.remove(&tid);
         }
-        Ok(())
+        self.progress()
     }
 
     pub(super) fn progress(&mut self) -> Result<()> {
@@ -569,60 +617,128 @@ impl Supervisor {
                     }
                     break;
                 }
-                let event = status >> 16;
-                if event == libc::PTRACE_EVENT_EXIT {
-                    if self.traced[&tid].watch {
-                        Self::release_robust_list(tid);
-                    }
-                    self.resume(tid, 0)?;
-                    continue;
-                }
-                if self.traced[&tid].reply.is_some() {
-                    let trace = self
-                        .traced
-                        .get_mut(&tid)
-                        .context("missing retiring worker")?;
-                    let reply = trace.reply.take().context("missing retirement reply")?;
-                    if trace.watch {
-                        trace.cancel = None;
-                        Self::ptrace(libc::PTRACE_CONT, tid, 0)?;
-                        Self::respond(&reply, 0)?;
-                        continue;
-                    }
-                    Self::ptrace(libc::PTRACE_DETACH, tid, 0)?;
-                    self.traced.remove(&tid);
-                    Self::respond(&reply, 0)?;
+                if !self.handle_stopped(tid, status)? {
                     break;
-                }
-                let signal = libc::WSTOPSIG(status);
-                if event == libc::PTRACE_EVENT_STOP
-                    && self.traced[&tid].cancel.is_none()
-                    && matches!(
-                        signal,
-                        libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
-                    )
-                {
-                    // Keep a group-stop until `SIGCONT`.
-                    Self::ptrace(libc::PTRACE_LISTEN, tid, 0)?;
-                    continue;
-                }
-                if signal == (libc::SIGTRAP | 0x80) || event == libc::PTRACE_EVENT_STOP {
-                    if let Some(cancel) = self
-                        .traced
-                        .get_mut(&tid)
-                        .and_then(|trace| trace.cancel.as_mut())
-                        .filter(|cancel| cancel.cancelling)
-                    {
-                        let phase = Self::syscall_phase(tid)?;
-                        cancel.skipped = Self::interrupt_syscall(tid, phase, cancel)?;
-                    }
-                    self.resume(tid, 0)?;
-                } else {
-                    self.resume(tid, signal)?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn handle_stopped(&mut self, tid: i32, status: i32) -> Result<bool> {
+        let event = status >> 16;
+        if event == libc::PTRACE_EVENT_EXIT {
+            let watch = if let Some(trace) = self.traced.get_mut(&tid) {
+                trace.exiting = true;
+                if let Some(reply) = trace.reply.take() {
+                    Self::respond(&reply, 0)?;
+                }
+                trace.watch
+            } else {
+                false
+            };
+            if watch {
+                Self::release_robust_list(tid);
+            }
+            self.resume_alive(tid, 0)?;
+            return Ok(true);
+        }
+        if self.traced.get(&tid).is_some_and(|trace| trace.detaching) {
+            if let Some(reply) = self.traced.get_mut(&tid).and_then(|t| t.reply.take()) {
+                Self::respond(&reply, libc::EIO)?;
+            }
+            return match Self::ptrace(libc::PTRACE_DETACH, tid, 0) {
+                Ok(()) => {
+                    self.traced.remove(&tid);
+                    Ok(false)
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(true),
+                Err(error) => Err(error.into()),
+            };
+        }
+        if self.traced[&tid].reply.is_some() {
+            return self.complete_retirement(tid);
+        }
+        let signal = libc::WSTOPSIG(status);
+        if event == libc::PTRACE_EVENT_STOP
+            && self.traced[&tid].cancel.is_none()
+            && matches!(
+                signal,
+                libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU
+            )
+        {
+            // Keep a group-stop until `SIGCONT`.
+            match Self::ptrace(libc::PTRACE_LISTEN, tid, 0) {
+                Ok(()) => return Ok(true),
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => return Ok(true),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if signal == (libc::SIGTRAP | 0x80) || event == libc::PTRACE_EVENT_STOP {
+            if let Some(cancel) = self
+                .traced
+                .get_mut(&tid)
+                .and_then(|trace| trace.cancel.as_mut())
+                .filter(|cancel| cancel.cancelling)
+            {
+                let phase = match Self::syscall_phase(tid) {
+                    Ok(phase) => phase,
+                    Err(error) if Self::is_esrch(&error) => return Ok(true),
+                    Err(error) => return Err(error),
+                };
+                match Self::interrupt_syscall(tid, phase, cancel) {
+                    Ok(skipped) => cancel.skipped = skipped,
+                    Err(error) if Self::is_esrch(&error) => return Ok(true),
+                    Err(error) => return Err(error),
+                }
+            }
+            self.resume_alive(tid, 0)?;
+        } else {
+            self.resume_alive(tid, signal)?;
+        }
+        Ok(true)
+    }
+
+    fn complete_retirement(&mut self, tid: i32) -> Result<bool> {
+        let trace = self
+            .traced
+            .get_mut(&tid)
+            .context("missing retiring worker")?;
+        let reply = trace.reply.take().context("missing retirement reply")?;
+        if trace.watch {
+            trace.cancel = None;
+            return match Self::ptrace(libc::PTRACE_CONT, tid, 0) {
+                Ok(()) => {
+                    Self::respond(&reply, 0)?;
+                    Ok(true)
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                    Self::respond(&reply, 0)?;
+                    Ok(true)
+                }
+                Err(error) => Err(error.into()),
+            };
+        }
+        match Self::ptrace(libc::PTRACE_DETACH, tid, 0) {
+            Ok(()) => {
+                self.traced.remove(&tid);
+                Self::respond(&reply, 0)?;
+                Ok(false)
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
+                Self::respond(&reply, 0)?;
+                Ok(true)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn resume_alive(&self, tid: i32, signal: i32) -> Result<()> {
+        match self.resume(tid, signal) {
+            Ok(()) => Ok(()),
+            Err(error) if Self::is_esrch(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn resume(&self, tid: i32, signal: i32) -> Result<()> {
@@ -796,12 +912,107 @@ impl Supervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn respond_ignores_closed_peer_socket() -> Result<()> {
         let (response, reply) = UnixDatagram::pair()?;
         drop(response);
         Supervisor::respond(&reply, 0)?;
+        Ok(())
+    }
+
+    #[test]
+    fn multithreaded_watch_robust_and_detach_on_exit_do_not_deadlock() -> Result<()> {
+        for iter in 0..16 {
+            let (server, pending) = Client::pair()?;
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                drop(server);
+                let send_raw = |tag: u8, payload: &[u64]| {
+                    let mut msg = Vec::with_capacity(1 + payload.len() * 8);
+                    msg.push(tag);
+                    for word in payload {
+                        msg.extend_from_slice(&word.to_ne_bytes());
+                    }
+                    let fds = [pending.reply.as_raw_fd()];
+                    let _ = sendmsg::<()>(
+                        pending.request.as_raw_fd(),
+                        &[IoSlice::new(&msg)],
+                        &[ControlMessage::ScmRights(&fds)],
+                        MsgFlags::empty(),
+                        None,
+                    );
+                };
+                let leader_tid = u64::try_from(unsafe { libc::gettid() }).unwrap_or(1);
+                send_raw(Request::TAG_WATCH_ROBUST, &[leader_tid]);
+                let mut reply = [0u8; 4];
+                let _ = pending.response.recv(&mut reply);
+
+                let (tx, rx) = std::sync::mpsc::sync_channel::<()>(2);
+                let _worker = std::thread::spawn({
+                    let tx = tx.clone();
+                    let request_fd = pending.request.as_raw_fd();
+                    let reply_fd = pending.reply.as_raw_fd();
+                    move || {
+                        let tid = u64::try_from(unsafe { libc::gettid() }).unwrap_or(1);
+                        let mut msg = vec![Request::TAG_WATCH_ROBUST];
+                        msg.extend_from_slice(&tid.to_ne_bytes());
+                        let fds = [reply_fd];
+                        let _ = sendmsg::<()>(
+                            request_fd,
+                            &[IoSlice::new(&msg)],
+                            &[ControlMessage::ScmRights(&fds)],
+                            MsgFlags::empty(),
+                            None,
+                        );
+                        let _ = tx.send(());
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                });
+                let _ = rx.recv();
+                // Queue a dying-thread WatchRobust and (on odd iterations) an invalid tag to
+                // exercise `detach_process(pid)` concurrently with multithreaded `exit_group`.
+                send_raw(Request::TAG_WATCH_ROBUST, &[u64::MAX - 1]);
+                if iter % 2 == 1 {
+                    send_raw(0xff, &[0]);
+                }
+                unsafe { libc::_exit(0) }
+            }
+            drop(pending);
+            let mut supervisor = Supervisor::new(server, pid);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut reaped = false;
+            while Instant::now() < deadline {
+                supervisor.progress()?;
+                let mut pfd = [PollFd::new(supervisor.as_fd(), PollFlags::POLLIN)];
+                if poll(&mut pfd, PollTimeout::from(5u16)).unwrap_or(0) > 0 {
+                    supervisor.receive()?;
+                }
+                supervisor.progress()?;
+                if supervisor.take_exit().is_some() {
+                    reaped = true;
+                    break;
+                }
+                let mut status = 0;
+                let waited = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+                if waited == pid {
+                    reaped = true;
+                    break;
+                }
+            }
+            assert!(reaped, "supervisor deadlocked on iteration {iter}");
+            // Drain any remaining sub-thread stops.
+            let drain_deadline = Instant::now() + Duration::from_secs(2);
+            while !supervisor.traced.is_empty() && Instant::now() < drain_deadline {
+                supervisor.progress()?;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut status = 0;
+            let _ = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+        }
         Ok(())
     }
 }
