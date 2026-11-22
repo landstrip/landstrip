@@ -499,12 +499,10 @@ impl SyscallArgs {
                         Errno::EBADF.negated()
                     };
                 }
-                GuestFd::guard_created(Self::forward_translated(
-                    registers,
-                    memory,
-                    Sysno::fcntl,
-                    &[Arg::fd(0)],
-                ))
+                GuestFd::guard_created_from(
+                    Self::forward_translated(registers, memory, Sysno::fcntl, &[Arg::fd(0)]),
+                    min_fd,
+                )
             }
             F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
                 Self::forward_translated(
@@ -1525,6 +1523,9 @@ impl SyscallArgs {
         let Some(old_raw) = old.valid() else {
             return Errno::EBADF.negated();
         };
+        if new.is_broker() && new.valid().is_none() {
+            GuestFd::wait_occupy_idle();
+        }
         let Some(new_raw) = new.valid() else {
             return Errno::EBADF.negated();
         };

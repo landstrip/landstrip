@@ -44,6 +44,7 @@ static GUEST_NOFILE_CUR: AtomicU64 = AtomicU64::new(1024);
 static GUEST_NOFILE_MAX: AtomicU64 = AtomicU64::new(1024);
 static GUEST_NOFILE_LOCK: Mutex<()> = Mutex::new(());
 static SELECT_CAP: AtomicI32 = AtomicI32::new(1024);
+static OCCUPY_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 struct BrokerBitmap {
     low: [AtomicU64; LOW_WORDS],
@@ -526,7 +527,52 @@ impl GuestFd {
         u64::try_from(fd).is_ok_and(|val| val < Self::soft_limit()) && !Self(fd).is_broker()
     }
 
+    pub(crate) fn wait_occupy_idle() {
+        let mut spins = 0u32;
+        while OCCUPY_ACTIVE.load(Ordering::Acquire) != 0 {
+            if spins < 64 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                unsafe { libc::sched_yield() };
+            }
+        }
+    }
+
+    fn relocate_displaced(fd: RawFd, min_fd: RawFd) -> RawFd {
+        let floor = Self::reserve_floor();
+        let displaced = !Self::within_soft_limit(fd)
+            || (fd >= floor && min_fd < floor && Self::select_cap() < floor);
+        if !displaced {
+            return fd;
+        }
+        Self::wait_occupy_idle();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return fd;
+        }
+        let cmd = if flags & libc::FD_CLOEXEC != 0 {
+            libc::F_DUPFD_CLOEXEC
+        } else {
+            libc::F_DUPFD
+        };
+        let moved = unsafe { libc::fcntl(fd, cmd, min_fd) };
+        if moved >= 0 && moved < fd {
+            unsafe { libc::close(fd) };
+            moved
+        } else {
+            if moved >= 0 {
+                unsafe { libc::close(moved) };
+            }
+            fd
+        }
+    }
+
     pub(crate) fn guard_created(result: u64) -> u64 {
+        Self::guard_created_from(result, 0)
+    }
+
+    pub(crate) fn guard_created_from(result: u64, min_fd: RawFd) -> u64 {
         let signed = i64::from_ne_bytes(result.to_ne_bytes());
         if signed < 0 {
             return result;
@@ -534,6 +580,7 @@ impl GuestFd {
         let Ok(fd) = RawFd::try_from(signed) else {
             return Errno::EMFILE.negated();
         };
+        let fd = Self::relocate_displaced(fd, min_fd);
         if !Self::within_soft_limit(fd) {
             if !Self(fd).is_broker() {
                 unsafe { libc::close(fd) };
@@ -541,10 +588,14 @@ impl GuestFd {
             return Errno::EMFILE.negated();
         }
         Self::note_guest_fd(fd);
-        result
+        u64::from(fd.cast_unsigned())
     }
 
     pub(crate) fn guard_pair(fds: [RawFd; 2]) -> std::result::Result<[u8; 8], Errno> {
+        let fds = [
+            Self::relocate_displaced(fds[0], 0),
+            Self::relocate_displaced(fds[1], 0),
+        ];
         if !Self::within_soft_limit(fds[0]) || !Self::within_soft_limit(fds[1]) {
             for fd in fds {
                 if !Self(fd).is_broker() {
@@ -594,6 +645,7 @@ impl GuestFd {
 pub(crate) struct Range {
     held: Vec<RawFd>,
     fill: ManuallyDrop<OwnedFd>,
+    occupying: bool,
 }
 
 impl Range {
@@ -636,6 +688,7 @@ impl Range {
         Ok(Self {
             held,
             fill: ManuallyDrop::new(fill),
+            occupying: false,
         })
     }
 
@@ -672,12 +725,14 @@ impl Range {
         let floor = GuestFd::reserve_floor();
         let fill = Self::fill(GuestFd::broker_base())?;
         GuestFd::register_broker(fill.as_raw_fd());
+        OCCUPY_ACTIVE.fetch_add(1, Ordering::AcqRel);
         let mut held = Vec::new();
         loop {
             let fd = unsafe { libc::fcntl(fill.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
             if fd < 0 {
                 let err = io::Error::last_os_error();
                 Self::release_held(&held, fill);
+                OCCUPY_ACTIVE.fetch_sub(1, Ordering::Release);
                 bail!("occupy unused descriptor: {err}");
             }
             if fd >= floor {
@@ -690,6 +745,7 @@ impl Range {
         Ok(Self {
             held,
             fill: ManuallyDrop::new(fill),
+            occupying: true,
         })
     }
 
@@ -728,5 +784,73 @@ impl Drop for Range {
         // SAFETY: `self.fill` is dropped once here before clearing its bit.
         unsafe { ManuallyDrop::drop(&mut self.fill) };
         GuestFd::unregister_broker(fill_raw);
+        if self.occupying {
+            OCCUPY_ACTIVE.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::time::Duration;
+
+    #[test]
+    fn guard_created_relocates_fd_displaced_by_occupy_unused() -> Result<()> {
+        let mut rlim = libc::rlimit64 {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit64(libc::RLIMIT_NOFILE, &raw mut rlim) },
+            0
+        );
+        if rlim.rlim_max <= u64::try_from(DEFAULT_RESERVE_FLOOR + 64).unwrap_or(u64::MAX) {
+            return Ok(());
+        }
+        let raised_limit = rlim.rlim_cur < 8192;
+        if raised_limit {
+            let raised = libc::rlimit64 {
+                rlim_cur: rlim.rlim_max.min(65536),
+                rlim_max: rlim.rlim_max,
+            };
+            let _ = unsafe { libc::setrlimit64(libc::RLIMIT_NOFILE, &raw const raised) };
+        }
+
+        let barrier = std::sync::Arc::new(Barrier::new(2));
+        let worker_barrier = std::sync::Arc::clone(&barrier);
+        let holder = std::thread::spawn(move || -> Result<()> {
+            let range = Range::occupy_unused()?;
+            worker_barrier.wait();
+            std::thread::sleep(Duration::from_millis(10));
+            drop(range);
+            Ok(())
+        });
+
+        barrier.wait();
+        let raw = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        assert!(
+            raw >= GuestFd::reserve_floor(),
+            "expected displaced fd, got {raw}"
+        );
+        let guarded = GuestFd::guard_created(u64::from(raw.cast_unsigned()));
+        holder
+            .join()
+            .map_err(|_| anyhow::anyhow!("join occupy holder"))??;
+
+        let signed = i64::from_ne_bytes(guarded.to_ne_bytes());
+        let ok = signed >= 0 && u64::try_from(signed).unwrap_or(u64::MAX) < GuestFd::soft_limit();
+        if let Ok(fd) = RawFd::try_from(signed) {
+            unsafe { libc::close(fd) };
+        }
+        if raised_limit {
+            let _ = unsafe { libc::setrlimit64(libc::RLIMIT_NOFILE, &raw const rlim) };
+        }
+        assert!(
+            ok,
+            "expected relocated guest fd below soft limit, got {signed}"
+        );
+        Ok(())
     }
 }

@@ -345,13 +345,14 @@ impl Call<'_> {
         if fd < 0 {
             return None;
         }
-        if !GuestFd::within_soft_limit(fd) {
-            if !GuestFd::from_raw(fd).is_broker() {
-                unsafe { libc::close(fd) };
-            }
-            return Some(Errno::EMFILE.negated());
+        let guarded = GuestFd::guard_created(u64::from(fd.cast_unsigned()));
+        let signed = i64::from_ne_bytes(guarded.to_ne_bytes());
+        if signed < 0 {
+            return Some(guarded);
         }
-        GuestFd::note_guest_fd(fd);
+        let Ok(fd) = i32::try_from(signed) else {
+            return Some(Errno::EMFILE.negated());
+        };
         let bytes = content.as_bytes();
         // SAFETY: `fd` is a newly created writable memfd and `bytes` is valid.
         let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
