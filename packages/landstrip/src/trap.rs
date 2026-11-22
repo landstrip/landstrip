@@ -425,10 +425,13 @@ impl Trap {
     #[cfg(unix)]
     pub(crate) fn emit_with_fd(&self, trap_fd: Option<&TrapFd>) {
         let stanza = self.to_string();
-        if let Some(trap_fd) = trap_fd
-            && let Err(error) = trap_fd.write_stanza(&stanza)
+        if !matches!(self, Self::Usage(_))
+            && let Some(trap_fd) = trap_fd
         {
-            log::debug!("trap fd write failed: {error}");
+            match trap_fd.write_stanza(&stanza) {
+                Ok(()) => return,
+                Err(error) => log::debug!("trap fd write failed: {error}"),
+            }
         }
         Self::write_stderr(&stanza);
     }
@@ -439,10 +442,11 @@ impl Trap {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     pub(crate) fn emit_record(stanza: &str, trap_fd: Option<&TrapFd>) {
-        if let Some(trap_fd) = trap_fd
-            && let Err(error) = trap_fd.write_stanza(stanza)
-        {
-            log::debug!("trap fd write failed: {error}");
+        if let Some(trap_fd) = trap_fd {
+            match trap_fd.write_stanza(stanza) {
+                Ok(()) => return,
+                Err(error) => log::debug!("trap fd write failed: {error}"),
+            }
         }
         Self::write_stderr(stanza);
     }

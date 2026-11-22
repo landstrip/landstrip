@@ -147,6 +147,8 @@ impl Step for PolicyValidationTrapCmd {
                 let port_res = state.ctx.execute(&spec);
                 prop_assert!(!port_res.success());
                 prop_assert!(port_res.has_trap(|t| t.get("code") == Some("POLICY_INVALID_PORT")));
+                #[cfg(unix)]
+                prop_assert_eq!(&port_res.stderr, "");
             }
             tag_case => {
                 let bad_tags = ["", "bad\"quote", "bad\\slash", "bad\nline", "bad\u{7f}"];
@@ -202,6 +204,8 @@ impl Step for LaunchFailureTrapCmd {
             res.stderr,
             res.traps
         );
+        #[cfg(unix)]
+        prop_assert_eq!(&res.stderr, "");
         Ok(())
     }
 }

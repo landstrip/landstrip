@@ -359,8 +359,13 @@ fields.
 Linux explicit read denials
 .Pq Dv DenyMatch , Va reason No set to Dq deny_match
 are reported even when the program exits 0.
+When
 .Fl -trap
-receives these events except usage errors.
+is given, non-usage stanzas are written only to
+.Fl -trap ,
+leaving stderr to the program unless writing to
+.Fl -trap
+fails.
 Linux approval queries require a bidirectional stream socket on
 .Fl -trap ;
 reply with a blank-line-terminated stanza containing the unchanged

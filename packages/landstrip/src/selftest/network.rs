@@ -83,12 +83,13 @@ impl Step for TcpMediationCmd {
         );
         if cfg!(target_os = "linux") {
             prop_assert!(
-                deny_conn_res.has_trap(|t| {
+                deny_conn_res.traps.iter().any(|t| {
                     t.get("kind") == Some("network") && t.get("code") == Some("NETWORK_DENIED")
                 }),
-                "expected NETWORK_DENIED trap on Linux TCP denial: stderr={}",
-                deny_conn_res.stderr
+                "expected NETWORK_DENIED trap on Linux TCP denial: traps={:?}",
+                deny_conn_res.traps
             );
+            prop_assert_eq!(&deny_conn_res.stderr, "");
         }
         #[cfg(target_os = "linux")]
         {
@@ -102,10 +103,13 @@ impl Step for TcpMediationCmd {
                 "TCP Fast Open send must fail under DenyAll"
             );
             prop_assert!(
-                res.has_trap(|t| t.get("code") == Some("NETWORK_DENIED")),
-                "expected NETWORK_DENIED trap on TCP Fast Open denial: stderr={}",
-                res.stderr
+                res.traps
+                    .iter()
+                    .any(|t| t.get("code") == Some("NETWORK_DENIED")),
+                "expected NETWORK_DENIED trap on TCP Fast Open denial: traps={:?}",
+                res.traps
             );
+            prop_assert_eq!(&res.stderr, "");
             other_listener
                 .set_nonblocking(true)
                 .require("nonblocking listener")?;
