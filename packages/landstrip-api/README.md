@@ -77,9 +77,14 @@ sandboxed child never inherits the trap transport.
 On Linux, the stream is bidirectional and uses blank-line-terminated `key=value`
 stanzas. For `state: "query"` events, reply on the same socket with
 `controlResponseStanza(trap.query_id, "allow")` (or `"deny"`); the syscall waits
-for an answer, and unlisted reads report only if the command later exits
-non-zero. macOS reports setup/launch failures on the trap transport and closes
-it on successful exec; use Seatbelt logs for runtime denials.
+for an answer, and responder decisions are cached per `(operation, target)` for
+the run. Terminal denials are always reported as `state: "info"` stanzas (deferred
+until non-zero exit for unlisted reads; immediate for writes, explicit
+`DenyMatch` reads, and network denials). When `--trap` is provided, non-usage
+stanzas are written only to `--trap`, leaving child `stderr` untouched unless
+writing to `--trap` fails. macOS reports setup/launch failures on the trap
+transport and closes it on successful exec; use Seatbelt logs for runtime
+denials.
 
 ## Development
 

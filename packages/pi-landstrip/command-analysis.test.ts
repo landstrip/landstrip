@@ -93,5 +93,23 @@ describe('command analysis and denial path extraction in pi-landstrip', () => {
         command: 'cat /workspace/shadow',
       }),
     ).toBe(canonicalizePath('/workspace/shadow', cwd));
+    expect(
+      extractDeniedPath(
+        serializeTrapStanza({
+          kind: 'filesystem',
+          code: 'FILESYSTEM_DENIED',
+          state: 'query',
+          query_id: '7',
+          operation: 'read',
+          path: '/workspace/shadow',
+          syscall: 'openat',
+          errno: 'EACCES',
+          reason: 'allow_miss',
+          mechanism: 'kvm',
+          pid: 1,
+        }),
+        { cwd, command: 'cat /workspace/shadow' },
+      ),
+    ).toBeNull();
   });
 });

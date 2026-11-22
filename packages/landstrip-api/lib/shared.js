@@ -1683,7 +1683,11 @@ function extractTrapBlockedPath(trapOutput, cwd = process.cwd(), operation) {
   if (typeof trapOutput !== 'string') return null;
   const traps = parseLandstripTraps(trapOutput);
   for (const trap of traps) {
-    if (isFilesystemTrap(trap) && (!operation || trap.operation === operation)) {
+    if (
+      isFilesystemTrap(trap) &&
+      trap.state === 'info' &&
+      (!operation || trap.operation === operation)
+    ) {
       return normalizeBlockedPath(trap.path, cwd);
     }
   }
@@ -1706,7 +1710,9 @@ function extractDeniedPath(output, options) {
   // 3. Fallback: if landstrip trapped but path wasn't specified, inspect command candidates
   if (
     command &&
-    landstripTraps.some((trap) => trap.kind === 'filesystem' || trap.kind === 'internal')
+    landstripTraps.some(
+      (trap) => (trap.kind === 'filesystem' && trap.state === 'info') || trap.kind === 'internal',
+    )
   ) {
     for (const candidate of extractCandidatePaths(command)) {
       return normalizeBlockedPath(candidate, cwd);
