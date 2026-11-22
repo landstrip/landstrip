@@ -434,8 +434,18 @@ impl Supervisor {
     }
 
     fn respond(socket: &UnixDatagram, errno: i32) -> Result<()> {
-        socket.send(&errno.to_ne_bytes())?;
-        Ok(())
+        match socket.send(&errno.to_ne_bytes()) {
+            Ok(_) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ECONNREFUSED | libc::EPIPE | libc::ENOTCONN)
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Traces `host`, which may already be traced for the other purpose.
@@ -780,5 +790,18 @@ impl Supervisor {
         } else {
             eligible && phase == 1
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn respond_ignores_closed_peer_socket() -> Result<()> {
+        let (response, reply) = UnixDatagram::pair()?;
+        drop(response);
+        Supervisor::respond(&reply, 0)?;
+        Ok(())
     }
 }
