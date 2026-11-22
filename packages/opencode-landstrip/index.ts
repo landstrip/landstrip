@@ -29,8 +29,10 @@ import {
   evaluateWriteAccess,
   extractDeniedPath,
   extractDomainsFromCommand,
+  extractNativeDeniedPath,
   formatLandstripTraps,
   isDomainAllowed,
+  isFilesystemTrap,
   isQueryTrap,
   isRecord,
   parseLandstripTraps,
@@ -57,6 +59,7 @@ interface BashSandboxState {
   trapServer: ReturnType<typeof createServer> | null;
   trapServerPort: number | null;
   trapStanzas: string[];
+  tuiConnected: boolean;
   shellID?: string;
   shellExited?: boolean;
   background?: boolean;
@@ -248,15 +251,9 @@ function startTrapServer(
                   { allowWrite: effectiveAllowWrite, denyWrite, denyWriteAlways },
                   { baseDirectory },
                 ) === 'allow';
-          if (allowed) {
-            trapSocket.write(controlResponseStanza(queryId, 'allow'));
-          } else {
-            trapSocket.write(controlResponseStanza(queryId, 'deny'));
-            trapStanzas.push(`${stanza}\n\n`);
-          }
+          trapSocket.write(controlResponseStanza(queryId, allowed ? 'allow' : 'deny'));
         } else {
           trapSocket.write(controlResponseStanza(queryId, 'deny'));
-          trapStanzas.push(`${stanza}\n\n`);
         }
       } else {
         trapStanzas.push(`${stanza}\n\n`);
@@ -546,12 +543,17 @@ const plugin: Plugin.Plugin = {
       }
       if (state.shellID !== undefined) callByShellID.delete(state.shellID);
       if (state.stop) await state.stop().catch(() => undefined);
-      if (state.trapServer) {
-        await new Promise<void>((resolve) => {
-          state.trapServer!.close(() => resolve());
-        });
-      }
+      await closeTrapServer(state);
       rmSync(state.policyDir, { recursive: true, force: true });
+    }
+
+    async function closeTrapServer(state: BashSandboxState): Promise<void> {
+      const server = state.trapServer;
+      if (!server) return;
+      state.trapServer = null;
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
     }
 
     async function prepareBash(
@@ -630,7 +632,7 @@ const plugin: Plugin.Plugin = {
           ? await discovery.connectablePort()
           : null;
       const trapServer =
-        tuiTrapPort === null
+        process.platform !== 'win32' && tuiTrapPort === null
           ? await startTrapServer(
               config.filesystem.allowRead,
               config.filesystem.allowWrite,
@@ -662,6 +664,7 @@ const plugin: Plugin.Plugin = {
         trapServer: trapServer?.server ?? null,
         trapServerPort: trapPort,
         trapStanzas: trapServer?.trapStanzas ?? [],
+        tuiConnected: tuiTrapPort !== null,
       });
 
       args.command = wrappedCommand;
@@ -843,30 +846,31 @@ const plugin: Plugin.Plugin = {
       state: BashSandboxState,
       outputText: string,
     ): Promise<void> {
-      const serverTrapOutput = state.trapStanzas.join('');
-      const combinedOutput = serverTrapOutput ? `${outputText}\n\n${serverTrapOutput}` : outputText;
-      const traps = parseLandstripTraps(combinedOutput);
-      const errors = traps.filter(
-        (trap: LandstripTrap) => !(trap.kind === 'filesystem' && trap.state === 'query'),
+      await closeTrapServer(state);
+      const trapOutput = state.trapServerPort !== null ? state.trapStanzas.join('') : outputText;
+      const traps = parseLandstripTraps(trapOutput).filter(
+        (trap: LandstripTrap) => !isQueryTrap(trap),
       );
-      if (errors.length > 0) {
-        console.error(`opencode-landstrip: ${formatLandstripTraps(errors)}`);
+      if (traps.length > 0) {
+        console.error(`opencode-landstrip: ${formatLandstripTraps(traps)}`);
       }
 
-      const blockedTrap = traps.find(
-        (trap): trap is Extract<LandstripTrap, { kind: 'filesystem' }> =>
-          trap.kind === 'filesystem' && trap.state === 'query',
-      );
-      const blockedPath = blockedTrap
-        ? canonicalizePath(blockedTrap.path, directory)
-        : extractDeniedPath(outputText, { cwd: directory, command: state.originalCommand });
-      if (blockedPath) {
-        const blockedOperation = blockedTrap?.operation ?? 'read';
-        await notifyOnce(
-          `blocked:${blockedPath}`,
-          `Sandbox blocked ${blockedOperation} to "${blockedPath}". No live TUI presenter was available, so access remains denied.`,
-          'warning',
-        );
+      if (!state.tuiConnected) {
+        const blockedTrap = traps.find(isFilesystemTrap);
+        const blockedPath = blockedTrap
+          ? canonicalizePath(blockedTrap.path, directory)
+          : (extractDeniedPath(trapOutput, {
+              cwd: directory,
+              command: state.originalCommand,
+            }) ?? extractNativeDeniedPath(outputText, directory));
+        if (blockedPath) {
+          const blockedOperation = blockedTrap?.operation ?? 'read';
+          await notifyOnce(
+            `blocked:${blockedPath}`,
+            `Sandbox blocked ${blockedOperation} to "${blockedPath}". No live TUI presenter was available, so access remains denied.`,
+            'warning',
+          );
+        }
       }
 
       await cleanupBash(callID);

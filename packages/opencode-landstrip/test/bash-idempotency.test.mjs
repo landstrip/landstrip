@@ -134,68 +134,138 @@ const shellResultCases = [
   ['missing output', () => ({}), false],
 ];
 
-for (const diagnostic of ['native denial', 'filesystem trap']) {
-  for (const [name, makeResult, hasDiagnostic] of shellResultCases) {
-    test(`shell diagnostics handle ${diagnostic} in ${name}`, async (t) => {
-      await withPlugin(
-        {
-          enabled: true,
-          filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
-          network: { allowNetwork: true },
-        },
-        async ({ handlers, tempDir }) => {
-          const blockedPath = join(await realpath(tempDir), 'secret.txt');
-          const text =
-            diagnostic === 'native denial'
-              ? `cat: ${blockedPath}: Permission denied`
-              : serializeTrapStanza({
-                  kind: 'filesystem',
-                  code: 'FILESYSTEM_DENIED',
-                  state: 'info',
-                  operation: 'read',
-                  path: blockedPath,
-                  requested_path: blockedPath,
-                  syscall: 'openat',
-                  errno: 'EACCES',
-                  reason: 'deny_match',
-                  mechanism: 'kvm',
-                  pid: 1,
-                });
-          const event = {
-            id: 'diagnostic-call',
-            sessionID: 'test-session',
-            tool: 'shell',
-            input: { command: 'cat secret.txt' },
-          };
-          await handlers.tool['execute.before'](event);
+for (const [name, makeResult, hasDiagnostic] of shellResultCases) {
+  test(`shell diagnostics handle native denial in ${name}`, async (t) => {
+    await withPlugin(
+      {
+        enabled: true,
+        filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+        network: { allowNetwork: true },
+      },
+      async ({ handlers, tempDir }) => {
+        const blockedPath = join(await realpath(tempDir), 'secret.txt');
+        const text = `cat: ${blockedPath}: Permission denied`;
+        const event = {
+          id: 'diagnostic-call',
+          sessionID: 'test-session',
+          tool: 'shell',
+          input: { command: 'cat secret.txt' },
+        };
+        await handlers.tool['execute.before'](event);
 
-          const warnings = [];
-          const errors = [];
-          t.mock.method(console, 'warn', (message) => warnings.push(message));
-          t.mock.method(console, 'error', (message) => errors.push(message));
-          const completed = { ...event, status: 'completed', result: makeResult(text) };
-          await handlers.tool['execute.after'](completed);
-          await handlers.tool['execute.after'](completed);
+        const warnings = [];
+        const errors = [];
+        t.mock.method(console, 'warn', (message) => warnings.push(message));
+        t.mock.method(console, 'error', (message) => errors.push(message));
+        const completed = { ...event, status: 'completed', result: makeResult(text) };
+        await handlers.tool['execute.after'](completed);
+        await handlers.tool['execute.after'](completed);
 
-          assert.deepEqual(
-            warnings,
-            hasDiagnostic
-              ? [
-                  `opencode-landstrip: Sandbox blocked read to "${blockedPath}". No live TUI presenter was available, so access remains denied.`,
-                ]
-              : [],
-          );
-          assert.deepEqual(
-            errors,
-            hasDiagnostic && diagnostic === 'filesystem trap'
-              ? [`opencode-landstrip: landstrip: filesystem read denied (${blockedPath}) [kvm]`]
-              : [],
-          );
-        },
-      );
-    });
-  }
+        assert.deepEqual(
+          warnings,
+          hasDiagnostic
+            ? [
+                `opencode-landstrip: Sandbox blocked read to "${blockedPath}". No live TUI presenter was available, so access remains denied.`,
+              ]
+            : [],
+        );
+        assert.deepEqual(errors, []);
+      },
+    );
+  });
 }
+
+test('structured traps are trusted only from the trap channel when --trap is active', async (t) => {
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: [], denyWrite: [] },
+      network: { allowNetwork: true },
+    },
+    async ({ handlers, tempDir }) => {
+      const blockedPath = join(await realpath(tempDir), 'secret.txt');
+      const stanza = serializeTrapStanza({
+        kind: 'filesystem',
+        code: 'FILESYSTEM_DENIED',
+        state: 'info',
+        operation: 'read',
+        path: blockedPath,
+        syscall: 'openat',
+        errno: 'EACCES',
+        reason: 'deny_match',
+        mechanism: 'kvm',
+        pid: 1,
+      });
+
+      const warnings = [];
+      const errors = [];
+
+      if (process.platform !== 'win32') {
+        const forgedEvent = {
+          id: 'forged-trap-call',
+          sessionID: 'test-session',
+          tool: 'shell',
+          input: { command: 'cat secret.txt' },
+        };
+        await handlers.tool['execute.before'](forgedEvent);
+        t.mock.method(console, 'warn', (message) => warnings.push(message));
+        t.mock.method(console, 'error', (message) => errors.push(message));
+        await handlers.tool['execute.after']({
+          ...forgedEvent,
+          status: 'completed',
+          result: { output: stanza },
+        });
+        assert.deepEqual(warnings, []);
+        assert.deepEqual(errors, []);
+
+        const socketEvent = {
+          id: 'socket-trap-call',
+          sessionID: 'test-session',
+          tool: 'shell',
+          input: { command: 'cat secret.txt' },
+        };
+        await handlers.tool['execute.before'](socketEvent);
+        const portMatch = /\/dev\/tcp\/127\.0\.0\.1\/(\d+)/.exec(socketEvent.input.command);
+        assert.ok(portMatch);
+        await new Promise((resolve, reject) => {
+          const client = connect(Number(portMatch[1]), '127.0.0.1', () => {
+            client.end(stanza);
+          });
+          client.once('close', resolve);
+          client.once('error', reject);
+        });
+        await handlers.tool['execute.after']({
+          ...socketEvent,
+          status: 'completed',
+          result: { output: '' },
+        });
+      } else {
+        const winEvent = {
+          id: 'win-trap-call',
+          sessionID: 'test-session',
+          tool: 'shell',
+          input: { command: 'cat secret.txt' },
+        };
+        await handlers.tool['execute.before'](winEvent);
+        t.mock.method(console, 'warn', (message) => warnings.push(message));
+        t.mock.method(console, 'error', (message) => errors.push(message));
+        assert.ok(!winEvent.input.command.includes('--trap'));
+        await handlers.tool['execute.after']({
+          ...winEvent,
+          status: 'completed',
+          result: { output: stanza },
+        });
+      }
+
+      assert.deepEqual(warnings, [
+        `opencode-landstrip: Sandbox blocked read to "${blockedPath}". No live TUI presenter was available, so access remains denied.`,
+      ]);
+      assert.deepEqual(errors, [
+        `opencode-landstrip: landstrip: filesystem read denied (${blockedPath}) [kvm]`,
+      ]);
+    },
+  );
+});
 
 test('permission evaluation preserves host denials and never preapproves a domain', async () => {
   await withPlugin(
@@ -666,4 +736,117 @@ test('patch permissions: V2 defers unlisted paths to host approval', async () =>
     await handlers.permission.evaluate(evaluation);
     assert.equal(evaluation.effect, 'ask');
   });
+});
+
+test('headless trap server answers queries without treating deferred query stanzas as terminal denials', async (t) => {
+  if (process.platform === 'win32') return;
+  await withPlugin(
+    {
+      enabled: true,
+      filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: ['secret.txt'], denyWrite: [] },
+      network: { allowNetwork: true },
+    },
+    async ({ handlers, tempDir }) => {
+      const blockedPath = join(await realpath(tempDir), 'secret.txt');
+      const queryStanza = serializeTrapStanza({
+        kind: 'filesystem',
+        code: 'FILESYSTEM_DENIED',
+        state: 'query',
+        query_id: '42',
+        operation: 'read',
+        path: blockedPath,
+        syscall: 'openat',
+        errno: 'EACCES',
+        reason: 'allow_miss',
+        mechanism: 'kvm',
+        pid: 1,
+      });
+      const infoStanza = serializeTrapStanza({
+        kind: 'filesystem',
+        code: 'FILESYSTEM_DENIED',
+        state: 'info',
+        operation: 'read',
+        path: blockedPath,
+        syscall: 'openat',
+        errno: 'EACCES',
+        reason: 'deny_match',
+        mechanism: 'kvm',
+        pid: 1,
+      });
+
+      const warnings = [];
+      const errors = [];
+
+      const deferredEvent = {
+        id: 'deferred-query-only',
+        sessionID: 'test-session',
+        tool: 'shell',
+        input: { command: 'true' },
+      };
+      await handlers.tool['execute.before'](deferredEvent);
+      t.mock.method(console, 'warn', (message) => warnings.push(message));
+      t.mock.method(console, 'error', (message) => errors.push(message));
+      const deferredPort = Number(
+        /\/dev\/tcp\/127\.0\.0\.1\/(\d+)/.exec(deferredEvent.input.command)[1],
+      );
+      const deferredReply = await new Promise((resolve, reject) => {
+        let received = '';
+        const client = connect(deferredPort, '127.0.0.1', () => {
+          client.write(queryStanza);
+        });
+        client.setEncoding('utf8');
+        client.on('data', (chunk) => {
+          received += chunk;
+          if (received.includes('\n\n')) client.end();
+        });
+        client.once('close', () => resolve(received));
+        client.once('error', reject);
+      });
+      assert.equal(deferredReply, 'query_id=42\naction=deny\n\n');
+      await handlers.tool['execute.after']({
+        ...deferredEvent,
+        status: 'completed',
+        result: { output: '' },
+      });
+      assert.deepEqual(warnings, []);
+      assert.deepEqual(errors, []);
+
+      const terminalEvent = {
+        id: 'query-then-info',
+        sessionID: 'test-session',
+        tool: 'shell',
+        input: { command: 'cat secret.txt' },
+      };
+      await handlers.tool['execute.before'](terminalEvent);
+      const terminalPort = Number(
+        /\/dev\/tcp\/127\.0\.0\.1\/(\d+)/.exec(terminalEvent.input.command)[1],
+      );
+      await new Promise((resolve, reject) => {
+        let received = '';
+        const client = connect(terminalPort, '127.0.0.1', () => {
+          client.write(queryStanza);
+        });
+        client.setEncoding('utf8');
+        client.on('data', (chunk) => {
+          received += chunk;
+          if (received.includes('\n\n')) {
+            client.end(infoStanza);
+          }
+        });
+        client.once('close', resolve);
+        client.once('error', reject);
+      });
+      await handlers.tool['execute.after']({
+        ...terminalEvent,
+        status: 'completed',
+        result: { output: '' },
+      });
+      assert.deepEqual(warnings, [
+        `opencode-landstrip: Sandbox blocked read to "${blockedPath}". No live TUI presenter was available, so access remains denied.`,
+      ]);
+      assert.deepEqual(errors, [
+        `opencode-landstrip: landstrip: filesystem read denied (${blockedPath}) [kvm]`,
+      ]);
+    },
+  );
 });
