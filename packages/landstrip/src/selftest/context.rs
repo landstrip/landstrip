@@ -356,7 +356,7 @@ impl SandboxContext {
             ResponderMode::ObserveSocket | ResponderMode::GrantAllow | ResponderMode::GrantDeny => {
                 let action = match responder {
                     ResponderMode::GrantAllow => Some("allow"),
-                    ResponderMode::ObserveSocket | ResponderMode::GrantDeny => Some("deny"),
+                    ResponderMode::GrantDeny => Some("deny"),
                     _ => None,
                 };
                 if responder == ResponderMode::ObserveSocket {
@@ -374,6 +374,7 @@ impl SandboxContext {
                         if unsafe { libc::poll(&raw mut pfd, 1, 5000) } > 0
                             && let Ok((mut stream, _)) = listener.accept()
                         {
+                            let _ = stream.shutdown(std::net::Shutdown::Write);
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                             Self::drain_trap_stream(
                                 &mut stream,

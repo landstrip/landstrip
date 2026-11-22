@@ -373,6 +373,11 @@ reply with a blank-line-terminated stanza containing the unchanged
 and
 .Va action
 .Pq Dq allow No or Dq deny .
+Responder decisions are cached per operation and target for the duration of the
+run, and denied queries still follow normal
+.Ql state=info
+reporting (immediate for writes, explicit read denials, and network denials;
+deferred until non-zero exit for unlisted reads).
 .Sh EXIT STATUS
 Program execution returns the program's status after terminating and reaping
 any remaining Linux sandbox descendants.

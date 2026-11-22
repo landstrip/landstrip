@@ -21,18 +21,72 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use syscalls::{Errno, Sysno};
 
+use std::collections::HashMap;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+enum QuerySubject {
+    FilesystemRead(Vec<u8>),
+    FilesystemWrite(Vec<u8>),
+    NetworkConnect(String),
+    NetworkBind(String),
+}
+
+impl QuerySubject {
+    fn filesystem(operation: TrapOperation, path: &Path) -> Self {
+        let raw = path.as_os_str().as_bytes().to_vec();
+        match operation {
+            TrapOperation::Read => Self::FilesystemRead(raw),
+            TrapOperation::Write => Self::FilesystemWrite(raw),
+        }
+    }
+
+    fn network(operation: NetworkOperation, target: &str) -> Self {
+        match operation {
+            NetworkOperation::Connect => Self::NetworkConnect(target.to_owned()),
+            NetworkOperation::Bind => Self::NetworkBind(target.to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(from = "Vec<(QuerySubject, bool)>", into = "Vec<(QuerySubject, bool)>")]
+struct QueryDecisions(HashMap<QuerySubject, bool>);
+
+impl From<Vec<(QuerySubject, bool)>> for QueryDecisions {
+    fn from(entries: Vec<(QuerySubject, bool)>) -> Self {
+        Self(entries.into_iter().collect())
+    }
+}
+
+impl From<QueryDecisions> for Vec<(QuerySubject, bool)> {
+    fn from(decisions: QueryDecisions) -> Self {
+        decisions.0.into_iter().collect()
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(super) struct QueryState {
     queryable: bool,
-    next_query_id: u64,
+    next_query_seq: u32,
     reply_buffer: Vec<u8>,
+    decisions: QueryDecisions,
+}
+
+impl QueryState {
+    fn allocate_query_id(&mut self) -> u64 {
+        let seq = self.next_query_seq.max(1);
+        self.next_query_seq = seq.saturating_add(1);
+        (u64::from(std::process::id()) << 32) | u64::from(seq)
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum QueryOutcome {
     Allowed,
     Denied,
-    NotQueried,
+    Cancelled,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -186,8 +240,9 @@ impl Denials {
             pending: Mutex::new(PendingDenials::default()),
             query: Mutex::new(QueryState {
                 queryable,
-                next_query_id: 1,
+                next_query_seq: 1,
                 reply_buffer: Vec::new(),
+                decisions: QueryDecisions::default(),
             }),
             root: AtomicBool::new(true),
             flushed: AtomicBool::new(false),
@@ -256,19 +311,26 @@ impl Denials {
     /// descriptor, and reports what happened.
     fn query(&self, denial: &FilesystemDenial) -> QueryOutcome {
         let Some(trap_fd) = self.trap.as_ref() else {
-            return QueryOutcome::NotQueried;
+            return QueryOutcome::Denied;
         };
+        let subject = QuerySubject::filesystem(denial.operation, &denial.path);
         let mut state = self
             .query
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.queryable {
-            return QueryOutcome::NotQueried;
+        if let Some(&allowed) = state.decisions.0.get(&subject) {
+            return if allowed {
+                QueryOutcome::Allowed
+            } else {
+                QueryOutcome::Denied
+            };
         }
-        let query_id = state.next_query_id;
-        state.next_query_id = query_id.saturating_add(1);
-        let trap = denial.clone().into_trap(Some(query_id));
-        self.ask(trap_fd, &mut state, query_id, &trap)
+        if !state.queryable {
+            return QueryOutcome::Denied;
+        }
+        let query_id = state.allocate_query_id();
+        let trap = denial.to_trap(Some(query_id));
+        self.ask(trap_fd, &mut state, subject, query_id, &trap)
     }
 
     /// Hands a refused network operation to the responder, and reports what
@@ -280,24 +342,31 @@ impl Denials {
         target: &str,
     ) -> QueryOutcome {
         let Some(trap_fd) = self.trap.as_ref() else {
-            return QueryOutcome::NotQueried;
+            return QueryOutcome::Denied;
         };
+        let subject = QuerySubject::network(operation, target);
         let mut state = self
             .query
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.queryable {
-            return QueryOutcome::NotQueried;
+        if let Some(&allowed) = state.decisions.0.get(&subject) {
+            return if allowed {
+                QueryOutcome::Allowed
+            } else {
+                QueryOutcome::Denied
+            };
         }
-        let query_id = state.next_query_id;
-        state.next_query_id = query_id.saturating_add(1);
+        if !state.queryable {
+            return QueryOutcome::Denied;
+        }
+        let query_id = state.allocate_query_id();
         let trap = Trap::network(
             operation,
             target.to_owned(),
             policy.process_context(),
             Some(query_id),
         );
-        self.ask(trap_fd, &mut state, query_id, &trap)
+        self.ask(trap_fd, &mut state, subject, query_id, &trap)
     }
 
     /// Puts a query to the responder and reads the answer that belongs to it.
@@ -305,6 +374,7 @@ impl Denials {
         &self,
         trap_fd: &TrapFd,
         state: &mut QueryState,
+        subject: QuerySubject,
         query_id: u64,
         trap: &Trap,
     ) -> QueryOutcome {
@@ -317,7 +387,7 @@ impl Denials {
             Ok(guard) => guard,
             Err(error) => {
                 if error.raw_os_error() == Some(libc::ECANCELED) {
-                    return QueryOutcome::Denied;
+                    return QueryOutcome::Cancelled;
                 }
                 log::debug!("kvm: cannot lock the trap descriptor: {error}");
                 state.queryable = false;
@@ -327,7 +397,7 @@ impl Denials {
         if let Err(error) = trap_fd.write(trap) {
             log::debug!("kvm: cannot query the responder: {error}");
             state.queryable = false;
-            return QueryOutcome::NotQueried;
+            return QueryOutcome::Denied;
         }
         // A process the payload forked shares the trap descriptor, so answers
         // for its queries arrive here too.
@@ -338,7 +408,7 @@ impl Denials {
                 Ok(stanza) => stanza,
                 Err(error) => {
                     if error.raw_os_error() == Some(libc::ECANCELED) {
-                        return QueryOutcome::Denied;
+                        return QueryOutcome::Cancelled;
                     }
                     log::debug!("kvm: cannot read the responder answer: {error}");
                     state.queryable = false;
@@ -347,7 +417,9 @@ impl Denials {
             };
             match stanza.parse::<Reply>() {
                 Ok(reply) if reply.query_id == query_id => {
-                    return if matches!(reply.action, ReplyAction::Allow) {
+                    let allowed = matches!(reply.action, ReplyAction::Allow);
+                    state.decisions.0.insert(subject, allowed);
+                    return if allowed {
                         QueryOutcome::Allowed
                     } else {
                         QueryOutcome::Denied
@@ -806,8 +878,8 @@ impl Denials {
         if denial.queryable {
             match self.query(&record) {
                 QueryOutcome::Allowed => return None,
-                QueryOutcome::Denied => return Some(policy::DENIED),
-                QueryOutcome::NotQueried => {}
+                QueryOutcome::Cancelled => return Some(policy::DENIED),
+                QueryOutcome::Denied => {}
             }
         }
         let trap = record.into_trap(None);

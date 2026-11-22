@@ -266,9 +266,16 @@ pub enum DaemonMode {
 #[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExitProbe {
-    Daemon { mode: DaemonMode },
+    Daemon {
+        mode: DaemonMode,
+    },
     OrphanStorm,
     UnhandledSegv,
+    ReadAttempts {
+        path: PathBuf,
+        attempts: usize,
+        exit_code: i32,
+    },
 }
 
 impl ExitProbe {
@@ -281,6 +288,16 @@ impl ExitProbe {
             Self::Daemon { mode } => Self::daemon(*mode),
             Self::OrphanStorm => Ok(Self::orphan_storm()),
             Self::UnhandledSegv => Self::unhandled_segv(),
+            Self::ReadAttempts {
+                path,
+                attempts,
+                exit_code,
+            } => {
+                for _ in 0..*attempts {
+                    let _ = std::fs::read(path);
+                }
+                Ok(*exit_code)
+            }
         }
     }
 

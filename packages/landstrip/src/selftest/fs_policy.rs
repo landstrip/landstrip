@@ -1436,10 +1436,18 @@ impl Step for InteractiveGrantProbe {
             );
         }
 
-        let unlink_soft = Probe::from(FsProbe::Unlink {
-            path: state.abs_path("vault/grant_target.txt"),
-        });
-        soft_spec.args = unlink_soft.argv()?;
+        let grant_target = state.abs_path("vault/grant_target.txt");
+        prop_assert_eq!(
+            soft_res.traps.iter().any(|t| {
+                t.get("state") == Some("info")
+                    && t.get("path").map(Path::new) == Some(grant_target.as_path())
+            }),
+            !self.allow_grant,
+            "denied interactive query must emit state=info denial trap"
+        );
+        Self::verify_memo_and_deferral(state, &mut soft_spec, &grant_target)?;
+
+        soft_spec.args = Probe::from(FsProbe::Unlink { path: grant_target }).argv()?;
         let unlink_res = state.ctx.execute(&soft_spec);
         prop_assert!(
             unlink_res
@@ -1473,6 +1481,93 @@ impl Step for InteractiveGrantProbe {
                 .iter()
                 .any(|t| t.get("state") == Some("query")),
             "denyReadAlways must never emit query"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl InteractiveGrantProbe {
+    fn verify_memo_and_deferral(
+        state: &SandboxState,
+        soft_spec: &mut RunSpec<'_>,
+        grant_target: &Path,
+    ) -> TestCaseResult {
+        let repeat_read = Probe::from(super::probe::ExitProbe::ReadAttempts {
+            path: grant_target.to_path_buf(),
+            attempts: 3,
+            exit_code: 0,
+        });
+        soft_spec.args = repeat_read.argv()?;
+        let repeat_res = state.ctx.execute(soft_spec);
+        let query_count = repeat_res
+            .traps
+            .iter()
+            .filter(|t| {
+                t.get("state") == Some("query")
+                    && t.get("path").map(Path::new) == Some(grant_target)
+            })
+            .count();
+        prop_assert_eq!(
+            query_count,
+            1,
+            "repeated accesses in one run must query once: {:?}",
+            repeat_res.traps
+        );
+
+        let unlisted = state.abs_path("vault/unlisted.txt");
+        let _ = std::fs::write(&unlisted, b"unlisted");
+        let allow_miss_pol = vec![json!({
+            "filesystem": {
+                "allowRead": [
+                    "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/dev",
+                    &state.ctx.exe
+                ],
+                "allowWrite": ["/dev/null"]
+            },
+            "network": { "allowNetwork": true }
+        })];
+        let mut miss_spec = RunSpec {
+            workdir: soft_spec.workdir,
+            cwd: soft_spec.cwd,
+            policies: &allow_miss_pol,
+            delivery: soft_spec.delivery,
+            responder: ResponderMode::GrantDeny,
+            rename_on_query: None,
+            inherited_fds: soft_spec.inherited_fds,
+            env_overrides: soft_spec.env_overrides,
+            tool: soft_spec.tool,
+            args: Probe::from(super::probe::ExitProbe::ReadAttempts {
+                path: unlisted.clone(),
+                attempts: 2,
+                exit_code: 0,
+            })
+            .argv()?,
+            timeout: soft_spec.timeout,
+        };
+        let miss_ok = state.ctx.execute(&miss_spec);
+        prop_assert!(
+            !miss_ok.traps.iter().any(|t| {
+                t.get("state") == Some("info")
+                    && t.get("path").map(Path::new) == Some(unlisted.as_path())
+            }),
+            "AllowMiss query denied on a successful command must not flush state=info: {:?}",
+            miss_ok.traps
+        );
+        miss_spec.args = Probe::from(super::probe::ExitProbe::ReadAttempts {
+            path: unlisted.clone(),
+            attempts: 2,
+            exit_code: 1,
+        })
+        .argv()?;
+        let miss_fail = state.ctx.execute(&miss_spec);
+        prop_assert!(
+            miss_fail.traps.iter().any(|t| {
+                t.get("state") == Some("info")
+                    && t.get("path").map(Path::new) == Some(unlisted.as_path())
+            }),
+            "AllowMiss query denied on a failing command must flush state=info: {:?}",
+            miss_fail.traps
         );
         Ok(())
     }

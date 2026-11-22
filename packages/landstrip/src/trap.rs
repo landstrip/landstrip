@@ -295,7 +295,7 @@ impl FromStr for Reply {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub(crate) struct FilesystemDenial {
     pub(crate) operation: TrapOperation,
     pub(crate) path: PathBuf,
@@ -311,6 +311,25 @@ pub(crate) struct FilesystemDenial {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl FilesystemDenial {
+    pub(crate) fn to_trap(&self, query_id: Option<u64>) -> Trap {
+        let path = self.path.to_string_lossy().into_owned();
+        let requested = self.requested_path.to_string_lossy();
+        let requested_path = (requested.as_ref() != path).then(|| requested.into_owned());
+        Trap::Filesystem(Box::new(FilesystemTrap {
+            code: FILESYSTEM_DENIED,
+            state: TrapState::from(query_id),
+            operation: self.operation,
+            path,
+            requested_path,
+            syscall: self.syscall,
+            errno: "EACCES",
+            flags: self.flags.clone(),
+            reason: self.reason,
+            mechanism: Mechanism::Kvm,
+            process: self.process.clone(),
+        }))
+    }
+
     pub(crate) fn into_trap(self, query_id: Option<u64>) -> Trap {
         let path = self.path.to_string_lossy().into_owned();
         let requested = self.requested_path.to_string_lossy();

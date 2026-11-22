@@ -1509,8 +1509,8 @@ impl Process {
                         &target,
                     ) {
                         QueryOutcome::Allowed => {}
-                        QueryOutcome::Denied => return Some(eacces),
-                        QueryOutcome::NotQueried => {
+                        QueryOutcome::Cancelled => return Some(eacces),
+                        QueryOutcome::Denied => {
                             self.denials.deny_network(
                                 &self.policy,
                                 NetworkOperation::Connect,
@@ -1637,16 +1637,12 @@ impl Process {
                     .query_network(&self.policy, denial.operation, &denial.target)
                 {
                     QueryOutcome::Allowed => return None,
+                    QueryOutcome::Cancelled => return Some(Errno::new(errno).negated()),
                     QueryOutcome::Denied => {}
-                    QueryOutcome::NotQueried => {
-                        self.denials
-                            .deny_network(&self.policy, denial.operation, denial.target);
-                    }
                 }
-            } else {
-                self.denials
-                    .deny_network(&self.policy, denial.operation, denial.target);
             }
+            self.denials
+                .deny_network(&self.policy, denial.operation, denial.target);
         }
         Some(Errno::new(errno).negated())
     }
