@@ -522,10 +522,11 @@ impl Machine {
 
     /// Allocates a fresh vCPU above the payload descriptor ceiling.
     pub(crate) fn allocate_vcpu(&self) -> Result<super::BrokerHandle<VcpuFd>> {
+        let id = self.pool.next_id();
         let _range = super::super::fds::Range::occupy_unused()?;
         self.vm
             .get()
-            .create_vcpu(self.pool.next_id())
+            .create_vcpu(id)
             .map(super::BrokerHandle::register)
             .context("create thread vCPU")
     }
