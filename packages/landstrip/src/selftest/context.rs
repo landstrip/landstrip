@@ -4,6 +4,7 @@
 use super::probe::Probe;
 use proptest::test_runner::TestCaseError;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -49,13 +50,95 @@ impl Default for SandboxContext {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrapRecord(BTreeMap<String, String>);
+
+impl TrapRecord {
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    fn unescape(raw: &str) -> Option<String> {
+        let mut out = String::with_capacity(raw.len());
+        let mut chars = raw.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('\\') => out.push('\\'),
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    _ => return None,
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        Some(out)
+    }
+
+    fn insert_line(&mut self, line: &str) -> bool {
+        let Some((key, raw_value)) = line.split_once('=') else {
+            return false;
+        };
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        {
+            return false;
+        }
+        let Some(value) = Self::unescape(raw_value) else {
+            return false;
+        };
+        self.0.insert(key.to_owned(), value);
+        true
+    }
+
+    fn is_valid(&self) -> bool {
+        self.0.contains_key("kind") && self.0.contains_key("code")
+    }
+
+    pub fn parse_stream(text: &str) -> Vec<Self> {
+        let mut records = Vec::new();
+        let mut current = Self::default();
+        for line in text.lines() {
+            if line.is_empty() {
+                if current.is_valid() {
+                    records.push(std::mem::take(&mut current));
+                } else {
+                    current.0.clear();
+                }
+                continue;
+            }
+            if line.starts_with("kind=") && !current.0.is_empty() {
+                if current.is_valid() {
+                    records.push(std::mem::take(&mut current));
+                } else {
+                    current.0.clear();
+                }
+            }
+            if !current.insert_line(line) {
+                if current.is_valid() {
+                    records.push(std::mem::take(&mut current));
+                } else {
+                    current.0.clear();
+                }
+            }
+        }
+        if current.is_valid() {
+            records.push(current);
+        }
+        records
+    }
+}
+
 #[derive(Debug)]
 pub struct RunResult {
     pub code: i32,
     pub signal: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: String,
-    pub traps: Vec<Value>,
+    pub traps: Vec<TrapRecord>,
 }
 
 impl RunResult {
@@ -68,15 +151,12 @@ impl RunResult {
         String::from_utf8_lossy(&self.stdout).into_owned()
     }
 
-    pub fn has_trap(&self, pred: impl Fn(&Value) -> bool) -> bool {
+    pub fn has_trap(&self, pred: impl Fn(&TrapRecord) -> bool) -> bool {
         self.traps.iter().any(&pred) || self.stderr_traps().iter().any(&pred)
     }
 
-    pub fn stderr_traps(&self) -> Vec<Value> {
-        self.stderr
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .collect()
+    pub fn stderr_traps(&self) -> Vec<TrapRecord> {
+        TrapRecord::parse_stream(&self.stderr)
     }
 }
 
@@ -252,7 +332,7 @@ impl SandboxContext {
         match responder {
             ResponderMode::None => None,
             ResponderMode::ObserveFd => {
-                let trap_file = stage.join("trap.jsonl");
+                let trap_file = stage.join("trap.stanzas");
                 let file = std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -341,33 +421,42 @@ impl SandboxContext {
         stream: &mut std::os::unix::net::UnixStream,
         action: Option<&str>,
         rename_on_query: &mut Option<(PathBuf, PathBuf)>,
-        records: &mut Vec<Value>,
+        records: &mut Vec<TrapRecord>,
     ) {
         use std::io::{BufRead, BufReader};
         let Ok(cloned) = stream.try_clone() else {
             return;
         };
         let reader = BufReader::new(cloned);
+        let mut current = TrapRecord::default();
         for line in reader.lines() {
             let Ok(line) = line else {
                 break;
             };
-            let Ok(trap) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if trap.get("state").and_then(Value::as_str) == Some("query")
-                && let Some(reply_action) = action
-            {
-                if let Some((from, to)) = rename_on_query.take() {
-                    let _ = std::fs::rename(from, to);
+            if line.is_empty() {
+                if current.is_valid() {
+                    if current.get("state") == Some("query")
+                        && let Some(reply_action) = action
+                        && let Some(query_id) = current.get("query_id")
+                    {
+                        if let Some((from, to)) = rename_on_query.take() {
+                            let _ = std::fs::rename(from, to);
+                        }
+                        let _ = write!(stream, "query_id={query_id}\naction={reply_action}\n\n");
+                        let _ = stream.flush();
+                    }
+                    records.push(std::mem::take(&mut current));
+                } else {
+                    current.0.clear();
                 }
-                let reply = serde_json::json!({
-                    "query_id": trap["query_id"],
-                    "action": reply_action,
-                });
-                let _ = writeln!(stream, "{reply}");
+                continue;
             }
-            records.push(trap);
+            if !current.insert_line(&line) {
+                current.0.clear();
+            }
+        }
+        if current.is_valid() {
+            records.push(current);
         }
     }
 
@@ -456,18 +545,17 @@ enum TrapCollector {
     #[cfg(unix)]
     File(PathBuf),
     #[cfg(unix)]
-    Thread(std::thread::JoinHandle<Vec<Value>>),
+    Thread(std::thread::JoinHandle<Vec<TrapRecord>>),
 }
 
 impl TrapCollector {
-    fn finish(self) -> Vec<Value> {
+    fn finish(self) -> Vec<TrapRecord> {
         match self {
             #[cfg(unix)]
-            Self::File(path) => std::fs::read_to_string(path)
-                .unwrap_or_default()
-                .lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .collect(),
+            Self::File(path) => {
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                TrapRecord::parse_stream(&text)
+            }
             #[cfg(unix)]
             Self::Thread(handle) => handle.join().unwrap_or_default(),
         }

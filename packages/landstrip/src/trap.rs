@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-//! The trap record: one JSON object per landstrip event, tagged by `kind` and
-//! carrying the stable [`Error`] code of the event it reports.
+//! The trap stanza: one blank-line-terminated `key=value` block per landstrip
+//! event, carrying `kind` and the stable [`Error`] code of the event.
 
 use crate::error::{Error, Mechanism};
 #[cfg(all(
@@ -12,20 +12,18 @@ use crate::error::{Error, Mechanism};
 use crate::policy::DenialReason;
 #[cfg(unix)]
 use crate::trap_fd::TrapFd;
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-use serde::Deserialize;
-use serde::Serialize;
-use serde_json::Value;
-use std::fmt;
-use std::io::{self, IsTerminal, Write};
+use std::fmt::{self, Write as _};
+use std::io::{self, Write};
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 use std::path::PathBuf;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use std::str::FromStr;
 
 /// The code reported for an error the landstrip code space cannot name.
 const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
@@ -39,14 +37,72 @@ const FILESYSTEM_DENIED: &str = "FILESYSTEM_DENIED";
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 const NETWORK_DENIED: &str = "NETWORK_DENIED";
+
+struct Stanza<'a, 'b>(&'a mut fmt::Formatter<'b>);
+
+impl Stanza<'_, '_> {
+    fn field(&mut self, key: &str, value: &str) -> fmt::Result {
+        self.0.write_str(key)?;
+        self.0.write_char('=')?;
+        for ch in value.chars() {
+            match ch {
+                '\\' => self.0.write_str(r"\\")?,
+                '\n' => self.0.write_str(r"\n")?,
+                '\r' => self.0.write_str(r"\r")?,
+                other => self.0.write_char(other)?,
+            }
+        }
+        self.0.write_char('\n')
+    }
+
+    fn optional(&mut self, key: &str, value: Option<&str>) -> fmt::Result {
+        if let Some(value) = value {
+            self.field(key, value)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn display(&mut self, key: &str, value: impl fmt::Display) -> fmt::Result {
+        self.0.write_str(key)?;
+        self.0.write_char('=')?;
+        write!(self.0, "{value}")?;
+        self.0.write_char('\n')
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn list(&mut self, key: &str, items: &[&str]) -> fmt::Result {
+        if let Some((first, rest)) = items.split_first() {
+            self.0.write_str(key)?;
+            self.0.write_char('=')?;
+            self.0.write_str(first)?;
+            for item in rest {
+                self.0.write_char(',')?;
+                self.0.write_str(item)?;
+            }
+            self.0.write_char('\n')?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> fmt::Result {
+        self.0.write_char('\n')
+    }
+}
+
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum TrapState {
-    Query,
+    Query(u64),
     Info,
 }
 
@@ -54,11 +110,24 @@ pub(crate) enum TrapState {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
+impl From<Option<u64>> for TrapState {
+    fn from(query_id: Option<u64>) -> Self {
+        query_id.map_or(Self::Info, Self::Query)
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 impl TrapState {
-    fn from_query_id(query_id: Option<u64>) -> (Self, String) {
-        match query_id {
-            Some(id) => (Self::Query, id.to_string()),
-            None => (Self::Info, "0".to_owned()),
+    fn write_fields(self, stanza: &mut Stanza<'_, '_>) -> fmt::Result {
+        match self {
+            Self::Query(query_id) => {
+                stanza.field("state", "query")?;
+                stanza.display("query_id", query_id)
+            }
+            Self::Info => stanza.field("state", "info"),
         }
     }
 }
@@ -67,8 +136,8 @@ impl TrapState {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum TrapOperation {
     Read,
     Write,
@@ -78,41 +147,8 @@ pub(crate) enum TrapOperation {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct SuggestedGrant {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) allow_read: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) allow_write: Option<String>,
-}
-
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-impl TrapOperation {
-    fn suggested_grant(self, path: &str) -> SuggestedGrant {
-        match self {
-            Self::Read => SuggestedGrant {
-                allow_read: Some(path.to_owned()),
-                allow_write: None,
-            },
-            Self::Write => SuggestedGrant {
-                allow_read: None,
-                allow_write: Some(path.to_owned()),
-            },
-        }
-    }
-}
-
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, strum::IntoStaticStr)]
-#[serde(rename_all = "lowercase")]
-#[strum(serialize_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub(crate) enum NetworkOperation {
     Connect,
     Bind,
@@ -122,7 +158,7 @@ pub(crate) enum NetworkOperation {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ProcessContext {
     pub(crate) pid: u32,
     pub(crate) exe: Option<String>,
@@ -133,21 +169,31 @@ pub(crate) struct ProcessContext {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[derive(Debug, Serialize)]
+impl ProcessContext {
+    fn write_fields(&self, stanza: &mut Stanza<'_, '_>) -> fmt::Result {
+        stanza.display("pid", self.pid)?;
+        stanza.optional("exe", self.exe.as_deref())?;
+        stanza.optional("cwd", self.cwd.as_deref())
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[derive(Debug)]
 pub(crate) struct FilesystemTrap {
     pub(crate) code: &'static str,
     pub(crate) state: TrapState,
-    pub(crate) query_id: String,
     pub(crate) operation: TrapOperation,
     pub(crate) path: String,
-    pub(crate) requested_path: String,
+    pub(crate) requested_path: Option<String>,
     pub(crate) syscall: &'static str,
     pub(crate) errno: &'static str,
     pub(crate) flags: Vec<&'static str>,
     pub(crate) reason: DenialReason,
-    pub(crate) suggested_grant: SuggestedGrant,
-    pub(crate) process: ProcessContext,
     pub(crate) mechanism: Mechanism,
+    pub(crate) process: ProcessContext,
 }
 
 /// The answer a responder writes back for a query trap.
@@ -155,23 +201,92 @@ pub(crate) struct FilesystemTrap {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReplyAction {
     Allow,
-    #[serde(other)]
     Deny,
 }
 
-/// One line of responder answers.
+/// One responder answer stanza.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Reply {
-    pub(crate) query_id: String,
+    pub(crate) query_id: u64,
     pub(crate) action: ReplyAction,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl Reply {
+    fn unescape(raw: &str) -> Result<String, &'static str> {
+        let mut out = String::with_capacity(raw.len());
+        let mut chars = raw.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('\\') => out.push('\\'),
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    _ => return Err("invalid escape sequence"),
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl FromStr for Reply {
+    type Err = &'static str;
+
+    fn from_str(stanza: &str) -> Result<Self, Self::Err> {
+        let mut query_id = None;
+        let mut action = None;
+        for line in stanza.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let (key, raw_value) = line.split_once('=').ok_or("missing '=' in reply")?;
+            let value = Self::unescape(raw_value)?;
+            match key {
+                "query_id" => {
+                    if query_id.is_some() {
+                        return Err("duplicate query_id");
+                    }
+                    let parsed = value.parse::<u64>().map_err(|_| "invalid query_id")?;
+                    if parsed == 0 {
+                        return Err("zero query_id");
+                    }
+                    query_id = Some(parsed);
+                }
+                "action" => {
+                    if action.is_some() {
+                        return Err("duplicate action");
+                    }
+                    action = Some(if value == "allow" {
+                        ReplyAction::Allow
+                    } else {
+                        ReplyAction::Deny
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            query_id: query_id.ok_or("missing query_id")?,
+            action: action.ok_or("missing action")?,
+        })
+    }
 }
 
 /// A denied filesystem access, shared by the immediate query trap and the
@@ -197,23 +312,21 @@ pub(crate) struct FilesystemDenial {
 ))]
 impl FilesystemDenial {
     pub(crate) fn into_trap(self, query_id: Option<u64>) -> Trap {
-        let path = self.path.to_string_lossy();
-        let suggested_grant = self.operation.suggested_grant(&path);
-        let (state, query_id) = TrapState::from_query_id(query_id);
+        let path = self.path.to_string_lossy().into_owned();
+        let requested = self.requested_path.to_string_lossy();
+        let requested_path = (requested.as_ref() != path).then(|| requested.into_owned());
         Trap::Filesystem(Box::new(FilesystemTrap {
             code: FILESYSTEM_DENIED,
-            state,
-            query_id,
+            state: TrapState::from(query_id),
             operation: self.operation,
-            path: path.into_owned(),
-            requested_path: self.requested_path.to_string_lossy().into_owned(),
+            path,
+            requested_path,
             syscall: self.syscall,
             errno: "EACCES",
             flags: self.flags,
             reason: self.reason,
-            suggested_grant,
-            process: self.process,
             mechanism: Mechanism::Kvm,
+            process: self.process,
         }))
     }
 }
@@ -222,11 +335,10 @@ impl FilesystemDenial {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct NetworkTrap {
     pub(crate) code: &'static str,
     pub(crate) state: TrapState,
-    pub(crate) query_id: String,
     pub(crate) operation: NetworkOperation,
     pub(crate) target: String,
     pub(crate) syscall: &'static str,
@@ -236,17 +348,16 @@ pub(crate) struct NetworkTrap {
 }
 
 /// The tool did not start.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct LaunchTrap {
     pub(crate) code: &'static str,
     pub(crate) program: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) errno: Option<String>,
     pub(crate) message: String,
 }
 
 /// The command line was rejected.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct UsageTrap {
     pub(crate) code: &'static str,
     pub(crate) message: String,
@@ -254,16 +365,14 @@ pub(crate) struct UsageTrap {
 
 /// Everything that fails before the tool runs: a policy landstrip cannot parse,
 /// resolve, or enforce, and any sandbox it cannot install.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub(crate) struct InternalTrap {
     pub(crate) code: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) mechanism: Option<Mechanism>,
     pub(crate) message: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[derive(Debug)]
 pub(crate) enum Trap {
     #[cfg(all(
         target_os = "linux",
@@ -292,11 +401,9 @@ impl Trap {
         query_id: Option<u64>,
     ) -> Self {
         let syscall = operation.into();
-        let (state, query_id) = TrapState::from_query_id(query_id);
         Self::Network(Box::new(NetworkTrap {
             code: NETWORK_DENIED,
-            state,
-            query_id,
+            state: TrapState::from(query_id),
             operation,
             target,
             syscall,
@@ -315,108 +422,39 @@ impl Trap {
         })
     }
 
-    pub(crate) fn to_json(&self) -> String {
-        match serde_json::to_string(self) {
-            Ok(line) => line,
-            Err(error) => {
-                log::error!("trap: serialize: {error}");
-                r#"{"kind":"internal","code":"INTERNAL_ERROR","message":"failed to serialize trap"}"#
-                    .to_owned()
-            }
-        }
-    }
-
     #[cfg(unix)]
     pub(crate) fn emit_with_fd(&self, trap_fd: Option<&TrapFd>) {
+        let stanza = self.to_string();
         if let Some(trap_fd) = trap_fd
-            && let Err(error) = trap_fd.write(self)
+            && let Err(error) = trap_fd.write_stanza(&stanza)
         {
             log::debug!("trap fd write failed: {error}");
         }
-        self.emit();
+        Self::write_stderr(&stanza);
     }
 
-    /// Writes a record that was serialized by another process of the payload.
+    /// Writes a stanza that was formatted by another process of the payload.
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    pub(crate) fn emit_record(json: &str, trap_fd: Option<&TrapFd>) {
+    pub(crate) fn emit_record(stanza: &str, trap_fd: Option<&TrapFd>) {
         if let Some(trap_fd) = trap_fd
-            && let Err(error) = trap_fd.write_line(json)
+            && let Err(error) = trap_fd.write_stanza(stanza)
         {
             log::debug!("trap fd write failed: {error}");
         }
-        Self::write_stderr(json);
+        Self::write_stderr(stanza);
     }
 
+    #[cfg(not(unix))]
     pub(crate) fn emit(&self) {
-        Self::write_stderr(&self.to_json());
+        Self::write_stderr(&self.to_string());
     }
 
-    /// Writes a record to stderr: as JSON for a program reading it, and as
-    /// text for a person at a terminal.
-    fn write_stderr(json: &str) {
+    fn write_stderr(stanza: &str) {
         let mut stderr = io::stderr().lock();
-        if stderr.is_terminal() {
-            let _ = writeln!(stderr, "{}", Self::describe(json));
-        } else {
-            let _ = writeln!(stderr, "{json}");
-        }
-    }
-
-    /// The text form of a serialized record, which may come from another
-    /// process of the payload.
-    fn describe(json: &str) -> String {
-        use std::fmt::Write as _;
-
-        let Ok(record) = serde_json::from_str::<Value>(json) else {
-            return json.to_owned();
-        };
-        let field = |name: &str| record.get(name).and_then(Value::as_str).unwrap_or_default();
-        match field("kind") {
-            "usage" => field("message").trim_end().to_owned(),
-            "launch" => format!(
-                "landstrip: cannot start {}: {}",
-                field("program"),
-                field("message")
-            ),
-            "internal" => format!("landstrip: {}", field("message")),
-            "filesystem" => {
-                let (path, requested) = (field("path"), field("requested_path"));
-                let mut text = format!(
-                    "landstrip: {} denied: {path} ({}, {})",
-                    field("operation"),
-                    field("syscall"),
-                    field("reason")
-                );
-                if requested != path {
-                    let _ = write!(text, ", requested as {requested}");
-                }
-                if field("state") == "query" {
-                    text.push_str(", asking the responder");
-                }
-                let grant = record.get("suggested_grant").and_then(Value::as_object);
-                for (list, path) in grant.into_iter().flatten() {
-                    let path = path.as_str().unwrap_or_default();
-                    let _ = write!(text, "\n  to allow it, add {path} to {list}");
-                }
-                text
-            }
-            "network" => {
-                let mut text = format!(
-                    "landstrip: {} denied: {} ({})",
-                    field("operation"),
-                    field("target"),
-                    field("syscall")
-                );
-                if field("state") == "query" {
-                    text.push_str(", asking the responder");
-                }
-                text
-            }
-            _ => json.to_owned(),
-        }
+        let _ = stderr.write_all(stanza.as_bytes());
     }
 }
 
@@ -461,6 +499,60 @@ impl From<&anyhow::Error> for Trap {
 
 impl fmt::Display for Trap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_json())
+        let mut stanza = Stanza(f);
+        match self {
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            Self::Filesystem(trap) => {
+                stanza.field("kind", "filesystem")?;
+                stanza.field("code", trap.code)?;
+                trap.state.write_fields(&mut stanza)?;
+                stanza.field("operation", trap.operation.into())?;
+                stanza.field("path", &trap.path)?;
+                stanza.optional("requested_path", trap.requested_path.as_deref())?;
+                stanza.field("syscall", trap.syscall)?;
+                stanza.field("errno", trap.errno)?;
+                stanza.list("flags", &trap.flags)?;
+                stanza.field("reason", trap.reason.into())?;
+                stanza.field("mechanism", trap.mechanism.into())?;
+                trap.process.write_fields(&mut stanza)?;
+            }
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            Self::Network(trap) => {
+                stanza.field("kind", "network")?;
+                stanza.field("code", trap.code)?;
+                trap.state.write_fields(&mut stanza)?;
+                stanza.field("operation", trap.operation.into())?;
+                stanza.field("target", &trap.target)?;
+                stanza.field("syscall", trap.syscall)?;
+                stanza.field("errno", trap.errno)?;
+                stanza.field("mechanism", trap.mechanism.into())?;
+                trap.process.write_fields(&mut stanza)?;
+            }
+            Self::Launch(trap) => {
+                stanza.field("kind", "launch")?;
+                stanza.field("code", trap.code)?;
+                stanza.field("program", &trap.program)?;
+                stanza.optional("errno", trap.errno.as_deref())?;
+                stanza.field("message", &trap.message)?;
+            }
+            Self::Usage(trap) => {
+                stanza.field("kind", "usage")?;
+                stanza.field("code", trap.code)?;
+                stanza.field("message", &trap.message)?;
+            }
+            Self::Internal(trap) => {
+                stanza.field("kind", "internal")?;
+                stanza.field("code", trap.code)?;
+                stanza.optional("mechanism", trap.mechanism.map(Into::into))?;
+                stanza.field("message", &trap.message)?;
+            }
+        }
+        stanza.finish()
     }
 }

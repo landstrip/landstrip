@@ -22,7 +22,7 @@ use proptest::prelude::*;
 use proptest::sample::{Index, select};
 use proptest::strategy::Union;
 use proptest::test_runner::{TestCaseError, TestCaseResult};
-use serde_json::{Value, json};
+use serde_json::json;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -460,9 +460,8 @@ impl Step for GuestReadProbe {
             let target = state.abs_path(&target_rel);
             prop_assert!(
                 !result.traps.iter().any(|t| {
-                    t.get("state").and_then(Value::as_str) == Some("query")
-                        && t.get("path").and_then(Value::as_str).map(Path::new)
-                            == Some(target.as_path())
+                    t.get("state") == Some("query")
+                        && t.get("path").map(Path::new) == Some(target.as_path())
                 }),
                 "hard denyReadAlways must never emit query trap"
             );
@@ -1423,7 +1422,7 @@ impl Step for InteractiveGrantProbe {
             soft_res
                 .traps
                 .iter()
-                .any(|t| t.get("state").and_then(Value::as_str) == Some("query")),
+                .any(|t| t.get("state") == Some("query")),
             "expected interactive query trap on soft denyRead"
         );
         prop_assert_eq!(
@@ -1446,7 +1445,7 @@ impl Step for InteractiveGrantProbe {
             unlink_res
                 .traps
                 .iter()
-                .any(|t| t.get("state").and_then(Value::as_str) == Some("query")),
+                .any(|t| t.get("state") == Some("query")),
             "expected interactive query trap on removing a soft denyRead name"
         );
         prop_assert_eq!(
@@ -1472,7 +1471,7 @@ impl Step for InteractiveGrantProbe {
             !hard_res
                 .traps
                 .iter()
-                .any(|t| t.get("state").and_then(Value::as_str) == Some("query")),
+                .any(|t| t.get("state") == Some("query")),
             "denyReadAlways must never emit query"
         );
         Ok(())

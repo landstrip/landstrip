@@ -95,7 +95,7 @@ impl Step for InvalidCliUsageCmd {
             args = args
         );
         prop_assert!(
-            res.stderr.contains("\"code\":\"USAGE_ERROR\""),
+            res.has_trap(|t| t.get("code") == Some("USAGE_ERROR")),
             "missing USAGE_ERROR trap for `{args:?}`: {}",
             res.stderr
         );
@@ -146,9 +146,7 @@ impl Step for PolicyValidationTrapCmd {
                 spec.responder = ResponderMode::ObserveFd;
                 let port_res = state.ctx.execute(&spec);
                 prop_assert!(!port_res.success());
-                prop_assert!(port_res.has_trap(
-                    |t| t.get("code").and_then(Value::as_str) == Some("POLICY_INVALID_PORT")
-                ));
+                prop_assert!(port_res.has_trap(|t| t.get("code") == Some("POLICY_INVALID_PORT")));
             }
             tag_case => {
                 let bad_tags = ["", "bad\"quote", "bad\\slash", "bad\nline", "bad\u{7f}"];
@@ -199,7 +197,7 @@ impl Step for LaunchFailureTrapCmd {
         let res = state.ctx.execute(&spec);
         prop_assert!(!res.success());
         prop_assert!(
-            res.has_trap(|t| t.get("code").and_then(Value::as_str) == Some("LAUNCH_FAILED")),
+            res.has_trap(|t| t.get("code") == Some("LAUNCH_FAILED")),
             "expected LAUNCH_FAILED trap on missing tool: stderr={} traps={:?}",
             res.stderr,
             res.traps
@@ -247,7 +245,7 @@ impl Step for DescriptorInheritanceCmd {
         });
         let _ = std::fs::write(&pol_path, pol_json.to_string());
 
-        let trap_path = state.root.join("writable/trap_sink.jsonl");
+        let trap_path = state.root.join("writable/trap_sink.stanzas");
         let trap_file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)

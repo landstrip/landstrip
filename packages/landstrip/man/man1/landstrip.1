@@ -348,7 +348,9 @@ and root lookup access to AppContainer package SIDs.
 .Sh OUTPUT
 Policy, doctor, and Windows management commands write one JSON document
 to stdout.
-Failures and reported Linux broker denials are JSON lines on stderr with stable
+Failures and reported Linux broker denials are blank-line-terminated
+.Li key=value
+stanzas on stderr with stable
 .Va kind
 .Pq Va filesystem , network , launch , usage , internal
 and
@@ -361,7 +363,7 @@ are reported even when the program exits 0.
 receives these events except usage errors.
 Linux approval queries require a bidirectional stream socket on
 .Fl -trap ;
-reply with a JSON line containing the unchanged
+reply with a blank-line-terminated stanza containing the unchanged
 .Va query_id
 and
 .Va action

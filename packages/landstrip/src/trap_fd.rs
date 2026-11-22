@@ -3,6 +3,10 @@
 
 //! Separate file descriptor for landstrip trap response blocks.
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 use crate::trap::Trap;
 use std::io;
 #[cfg(all(
@@ -169,40 +173,50 @@ impl TrapFd {
         }
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     pub(crate) fn write(&self, trap: &Trap) -> io::Result<()> {
-        self.write_line(&trap.to_json())
+        self.write_stanza(&trap.to_string())
     }
 
-    pub(crate) fn write_line(&self, text: &str) -> io::Result<()> {
-        let mut line = String::with_capacity(text.len() + 1);
-        line.push_str(text);
-        line.push('\n');
-        self.write_all(line.as_bytes())
+    pub(crate) fn write_stanza(&self, stanza: &str) -> io::Result<()> {
+        self.write_all(stanza.as_bytes())
     }
 
-    /// Reads the answer a responder writes back, up to the line break.
+    /// Reads the answer stanza a responder writes back, up to the blank line.
     ///
-    /// Only the bytes of one line are taken, so answers that arrive together
+    /// Only the bytes of one stanza are taken, so answers that arrive together
     /// stay in the socket for the next query.
     #[cfg(all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
-    pub(crate) fn read_line(
-        line: &mut Vec<u8>,
+    pub(crate) fn read_stanza(
+        stanza: &mut Vec<u8>,
         mut read_byte: impl FnMut() -> io::Result<u8>,
     ) -> io::Result<String> {
-        for _ in line.len()..MAX_REPLY_BYTES {
+        for _ in stanza.len()..MAX_REPLY_BYTES {
             let byte = read_byte()?;
             if byte == b'\n' {
-                return String::from_utf8(std::mem::take(line))
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "reply is not UTF-8"));
+                if stanza.last() == Some(&b'\r') {
+                    stanza.pop();
+                }
+                if stanza.is_empty() {
+                    continue;
+                }
+                if stanza.last() == Some(&b'\n') {
+                    return String::from_utf8(std::mem::take(stanza)).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "reply is not UTF-8")
+                    });
+                }
             }
-            line.push(byte);
+            stanza.push(byte);
         }
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "reply has no line break",
+            "reply has no stanza break",
         ))
     }
 

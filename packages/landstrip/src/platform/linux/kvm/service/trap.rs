@@ -249,7 +249,7 @@ impl Denials {
     }
 
     fn report(&self, trap: &Trap) {
-        self.emit_unique(&trap.to_json());
+        self.emit_unique(&trap.to_string());
     }
 
     /// Hands a refused access to a responder that answers on the trap
@@ -332,10 +332,10 @@ impl Denials {
         // A process the payload forked shares the trap descriptor, so answers
         // for its queries arrive here too.
         for _ in 0..MAX_ANSWERS {
-            let line = match TrapFd::read_line(&mut state.reply_buffer, || {
+            let stanza = match TrapFd::read_stanza(&mut state.reply_buffer, || {
                 self.read_reply_byte(trap_fd.as_raw_fd())
             }) {
-                Ok(line) => line,
+                Ok(stanza) => stanza,
                 Err(error) => {
                     if error.raw_os_error() == Some(libc::ECANCELED) {
                         return QueryOutcome::Denied;
@@ -345,8 +345,8 @@ impl Denials {
                     return QueryOutcome::Denied;
                 }
             };
-            match serde_json::from_str::<Reply>(&line) {
-                Ok(reply) if reply.query_id == query_id.to_string() => {
+            match stanza.parse::<Reply>() {
+                Ok(reply) if reply.query_id == query_id => {
                     return if matches!(reply.action, ReplyAction::Allow) {
                         QueryOutcome::Allowed
                     } else {
@@ -355,7 +355,7 @@ impl Denials {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    log::debug!("kvm: unusable responder answer {line:?}: {error}");
+                    log::debug!("kvm: unusable responder answer {stanza:?}: {error}");
                     state.queryable = false;
                     return QueryOutcome::Denied;
                 }
@@ -368,7 +368,7 @@ impl Denials {
 
     /// Holds a denial back until the payload's failure can be told.
     fn defer(&self, trap: &Trap) {
-        let record = trap.to_json();
+        let record = trap.to_string();
         let already_emitted = self
             .seen
             .lock()

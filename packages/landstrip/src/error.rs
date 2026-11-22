@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
-use serde::{Serialize, Serializer};
 use std::error::Error as StdError;
 use std::fmt::{self, Write as _};
 use std::io;
@@ -16,10 +15,9 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// The OS enforcement layer an error or a denial is attributed to.
 ///
-/// `Display` and `Serialize` render the lowercase name used on the trap wire.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, strum::Display)]
+/// `Display` renders the lowercase name used on the trap wire.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, strum::Display, strum::IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
 pub(crate) enum Mechanism {
     #[cfg_attr(
         not(all(
@@ -401,11 +399,5 @@ impl StdError for Error {
             | Self::HostJobIncompatible { source } => Some(&**source),
             _ => None,
         }
-    }
-}
-
-impl Serialize for Error {
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.code())
     }
 }

@@ -10,7 +10,7 @@ use super::state::{NetworkMode, SandboxState};
 use proptest::prelude::*;
 use proptest::strategy::Union;
 use proptest::test_runner::TestCaseResult;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 #[cfg(target_os = "linux")]
@@ -84,8 +84,7 @@ impl Step for TcpMediationCmd {
         if cfg!(target_os = "linux") {
             prop_assert!(
                 deny_conn_res.has_trap(|t| {
-                    t.get("kind").and_then(Value::as_str) == Some("network")
-                        && t.get("code").and_then(Value::as_str) == Some("NETWORK_DENIED")
+                    t.get("kind") == Some("network") && t.get("code") == Some("NETWORK_DENIED")
                 }),
                 "expected NETWORK_DENIED trap on Linux TCP denial: stderr={}",
                 deny_conn_res.stderr
@@ -103,9 +102,7 @@ impl Step for TcpMediationCmd {
                 "TCP Fast Open send must fail under DenyAll"
             );
             prop_assert!(
-                res.has_trap(|t| {
-                    t.get("code").and_then(Value::as_str) == Some("NETWORK_DENIED")
-                }),
+                res.has_trap(|t| t.get("code") == Some("NETWORK_DENIED")),
                 "expected NETWORK_DENIED trap on TCP Fast Open denial: stderr={}",
                 res.stderr
             );
@@ -437,9 +434,7 @@ impl Step for SupervisorAndDbusCmd {
                 "systemd private socket must remain terminal even via hardlink"
             );
             prop_assert!(
-                !res.traps
-                    .iter()
-                    .any(|t| t.get("state").and_then(Value::as_str) == Some("query")),
+                !res.traps.iter().any(|t| t.get("state") == Some("query")),
                 "systemd private socket must never emit interactive query"
             );
         }
