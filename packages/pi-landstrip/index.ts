@@ -2411,14 +2411,15 @@ function createLandstripIntegrationWithPrompts(
                       callbacks.promptOnBlock === true,
                       querySignal,
                     );
-                    if (result.action === 'deny') {
-                      if (result.reason === 'rejected' && isFilesystemTrap(trap)) {
-                        callbacks.onRejectedPath?.(
-                          trap.operation,
-                          normalizeBlockedPath(trap.path, cwd),
-                        );
-                      }
-                      appendErrorStanza(stanza);
+                    if (
+                      result.action === 'deny' &&
+                      result.reason === 'rejected' &&
+                      isFilesystemTrap(trap)
+                    ) {
+                      callbacks.onRejectedPath?.(
+                        trap.operation,
+                        normalizeBlockedPath(trap.path, cwd),
+                      );
                     }
                     respondQuery(trap.query_id, result.action);
                   })
@@ -2485,11 +2486,12 @@ function createLandstripIntegrationWithPrompts(
                 // Structured traps are trusted only from the trap socket; on
                 // Windows, where --trap is unsupported, use native
                 // kernel-denial text from stderr.
+                const trapSource = trapSocket ? errorFdAcc : stderrAcc;
                 const blockedPath =
-                  extractTrapBlockedPath(errorFdAcc, cwd) ??
+                  extractTrapBlockedPath(trapSource, cwd) ??
                   extractNativeDeniedPath(stderrAcc, cwd);
                 if (!blockedPath && ctx.hasUI) {
-                  const traps = parseLandstripTraps(errorFdAcc);
+                  const traps = parseLandstripTraps(trapSource);
                   const denials = traps.filter(isDenialTrap);
                   if (denials.length > 0) {
                     const formatted = formatLandstripTraps(denials);
@@ -2648,8 +2650,10 @@ function createLandstripIntegrationWithPrompts(
         stderrOutput += stderrOutputDecoder.end();
       }
     };
+    const trustedTrapOutput = (): string =>
+      process.platform === 'win32' ? stderrOutput : landstripErrorOutput;
     const formatTrapErrors = (): string | null => {
-      const landstripErrors = parseLandstripTraps(landstripErrorOutput);
+      const landstripErrors = parseLandstripTraps(trustedTrapOutput());
       if (landstripErrors.length === 0) return null;
       return formatLandstripTraps(landstripErrors);
     };
@@ -2657,9 +2661,8 @@ function createLandstripIntegrationWithPrompts(
       const config = loadConfig(ctx.cwd, ctx);
       if (!enforcesShellReadPolicy(config.shell.readAccess)) return null;
 
-      const trappedPath = extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'read');
+      const trappedPath = extractTrapBlockedPath(trustedTrapOutput(), ctx.cwd, 'read');
       if (trappedPath) return trappedPath;
-
       return extractRetryableNativeReadDeniedPath(
         nativeOutput,
         ctx.cwd,
@@ -2745,7 +2748,7 @@ function createLandstripIntegrationWithPrompts(
       const errorText = formatError(error);
       const fallbackOutput = `${stderrOutput}\n${errorText}`;
       const blockedWritePath =
-        extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'write') ??
+        extractTrapBlockedPath(trustedTrapOutput(), ctx.cwd, 'write') ??
         extractNativeWriteDeniedPath(fallbackOutput, ctx.cwd, params.command);
       if (blockedWritePath) {
         const retryResult = await retryWithAccess('write', blockedWritePath);
@@ -2769,7 +2772,7 @@ function createLandstripIntegrationWithPrompts(
       result.content.unshift({ type: 'text', text: `\n${trapMessage}\n` });
     }
     const blockedWritePath =
-      extractTrapBlockedPath(landstripErrorOutput, ctx.cwd, 'write') ??
+      extractTrapBlockedPath(trustedTrapOutput(), ctx.cwd, 'write') ??
       extractNativeWriteDeniedPath(stderrOutput, ctx.cwd, params.command);
     if (blockedWritePath) {
       const retryResult = await retryWithAccess('write', blockedWritePath);
