@@ -13,7 +13,7 @@ import { Fragment, jsx, jsxs } from '@opentui/solid/jsx-runtime';
 import { createSignal, onMount } from 'solid-js';
 
 import {
-  controlResponseLine,
+  controlResponseStanza,
   evaluateReadAccess,
   evaluateWriteAccess,
   isQueryTrap,
@@ -462,7 +462,7 @@ const tui: TuiPlugin.Definition = {
     }
 
     function respondQuery(socket: NetSocket, queryId: string, action: 'allow' | 'deny'): void {
-      if (!socket.destroyed) socket.write(controlResponseLine(queryId, action));
+      if (!socket.destroyed) socket.write(controlResponseStanza(queryId, action));
     }
 
     function resolveFsQuery(entry: FsQueryEntry, choice: QueryChoice): void {
@@ -584,13 +584,14 @@ const tui: TuiPlugin.Definition = {
             return;
           }
 
-          let newline: number;
-          while ((newline = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, newline);
-            buffer = buffer.slice(newline + 1);
+          let boundary: number;
+          while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+            const stanza = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            if (!stanza.trim()) continue;
 
             if (!sourceSessionID || !routeSessionID || !sessionDirectory) {
-              const hello = decodeTrapSessionHello(line);
+              const hello = decodeTrapSessionHello(stanza);
               const sourceSession = hello ? context.data.session.get(hello.sessionID) : undefined;
               const rootSession = hello
                 ? rootSessionIDFor(hello.sessionID, (sessionID) =>
@@ -608,7 +609,7 @@ const tui: TuiPlugin.Definition = {
             }
 
             const allowances = sessionAllowancesFor(sessionAllowances, routeSessionID);
-            for (const trap of parseLandstripTraps(line)) {
+            for (const trap of parseLandstripTraps(stanza)) {
               if (!isQueryTrap(trap)) continue;
               if (seen.has(trap.query_id)) continue;
               seen.add(trap.query_id);

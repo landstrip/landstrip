@@ -160,24 +160,27 @@ export interface SessionAllowances {
   targets: Set<string>;
 }
 
-export function trapSessionHelloLine(sessionID: string): string {
+export function trapSessionHelloStanza(sessionID: string): string {
   const normalized = sessionID.trim();
-  if (!normalized) throw new Error('OpenCode session ID must not be empty');
-  const hello: TrapSessionHello = { kind: 'opencode-landstrip-session', sessionID: normalized };
-  return JSON.stringify(hello) + '\n';
+  if (!normalized || /[\r\n\\]/.test(normalized)) {
+    throw new Error('OpenCode session ID must be a single line');
+  }
+  return `kind=opencode-landstrip-session\nsession_id=${normalized}\n\n`;
 }
 
-export function decodeTrapSessionHello(line: string): TrapSessionHello | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(line);
-  } catch {
-    return null;
+export function decodeTrapSessionHello(stanza: string): TrapSessionHello | null {
+  let kind: string | undefined;
+  let sessionID: string | undefined;
+  for (const line of stanza.replaceAll('\r\n', '\n').split('\n')) {
+    if (!line) continue;
+    const eq = line.indexOf('=');
+    if (eq <= 0) return null;
+    const key = line.slice(0, eq);
+    const value = line.slice(eq + 1);
+    if (key === 'kind') kind = value;
+    else if (key === 'session_id') sessionID = value.trim();
   }
-  if (!isRecord(value) || value.kind !== 'opencode-landstrip-session') return null;
-  if (typeof value.sessionID !== 'string') return null;
-  const sessionID = value.sessionID.trim();
-  return sessionID ? { kind: 'opencode-landstrip-session', sessionID } : null;
+  return kind === 'opencode-landstrip-session' && sessionID ? { kind, sessionID } : null;
 }
 
 export function sessionAllowancesFor(

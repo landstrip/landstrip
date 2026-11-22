@@ -41,10 +41,11 @@ current process.
 `LandstripControlResponse`, and [`/proxy`](lib/proxy.d.ts) exports the proxy
 helpers. [`/shared`](lib/shared.d.ts) provides:
 
-- `decodeLandstripTrap(value)` / `parseTrapLine(line)`: validated trap or `null`.
+- `decodeLandstripTrap(value)` / `parseTrapStanza(stanza)`: validated trap or `null`.
   Extra fields survive; missing/unknown denial states become `info`, never queries.
+- `serializeTrapStanza(trap)`: formats a validated `LandstripTrap` as a blank-line-terminated `key=value` stanza.
 - `isQueryTrap(trap)`: narrows validated events to `LandstripQueryTrap`.
-  Query IDs are decimal `u64` strings, nonzero for queries.
+  Query IDs are nonzero decimal `u64` strings, present only on queries.
 - `writeLandstripPolicyFile(policy, prefix = 'landstrip-')`: returns `{ dir, path }`.
   Remove `dir` with `rmSync(dir, { recursive: true, force: true })` after use.
   Failed writes clean up; failed cleanup reports both errors and the directory
@@ -73,13 +74,12 @@ Unix domain stream socket path. Start the socket listener before launching
 Landstrip: the host Landstrip process connects before sandbox setup, and the
 sandboxed child never inherits the trap transport.
 
-On Linux, the stream is bidirectional and uses the existing broker query
-protocol, not merely passive monitoring. For `state: "query"` events, reply on
-the same socket with `controlResponseLine(trap.query_id, "allow")` (or `"deny"`);
-the syscall waits for an answer. Completed events have `state: "info"`.
-Explicit read denials (`DenyMatch`, JSON `reason: "deny_match"`) are reported
-even when the command exits 0. macOS reports setup/launch failures on the trap
-transport and closes it on successful exec; use Seatbelt logs for runtime denials.
+On Linux, the stream is bidirectional and uses blank-line-terminated `key=value`
+stanzas. For `state: "query"` events, reply on the same socket with
+`controlResponseStanza(trap.query_id, "allow")` (or `"deny"`); the syscall waits
+for an answer, and unlisted reads report only if the command later exits
+non-zero. macOS reports setup/launch failures on the trap transport and closes
+it on successful exec; use Seatbelt logs for runtime denials.
 
 ## Development
 

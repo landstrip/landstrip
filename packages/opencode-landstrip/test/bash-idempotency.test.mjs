@@ -8,6 +8,7 @@ import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { parse as parseShell } from 'shell-quote';
+import { serializeTrapStanza } from '@landstrip/landstrip-api/shared';
 
 import { packageRoot, transpile } from './helper.mjs';
 
@@ -147,21 +148,18 @@ for (const diagnostic of ['native denial', 'filesystem trap']) {
           const text =
             diagnostic === 'native denial'
               ? `cat: ${blockedPath}: Permission denied`
-              : JSON.stringify({
+              : serializeTrapStanza({
                   kind: 'filesystem',
                   code: 'FILESYSTEM_DENIED',
                   state: 'info',
                   operation: 'read',
                   path: blockedPath,
                   requested_path: blockedPath,
-                  query_id: '0',
                   syscall: 'openat',
                   errno: 'EACCES',
-                  flags: [],
                   reason: 'deny_match',
-                  suggested_grant: { allowRead: blockedPath },
-                  process: { pid: 1, exe: null, cwd: null },
                   mechanism: 'kvm',
+                  pid: 1,
                 });
           const event = {
             id: 'diagnostic-call',

@@ -23,7 +23,7 @@ import {
   allowsAllDomains,
   buildLandstripPolicy,
   canonicalizePath,
-  controlResponseLine,
+  controlResponseStanza,
   evaluateDomainAccess,
   evaluateReadAccess,
   evaluateWriteAccess,
@@ -34,7 +34,7 @@ import {
   isQueryTrap,
   isRecord,
   parseLandstripTraps,
-  parseTrapLine,
+  parseTrapStanza,
   writeLandstripPolicyFile,
 } from '@landstrip/landstrip-api/shared';
 
@@ -43,7 +43,7 @@ import {
   TrapPortDiscovery,
   landstripBinaryPath,
   normalizeOptions,
-  trapSessionHelloLine,
+  trapSessionHelloStanza,
 } from './shared.js';
 
 interface BashSandboxState {
@@ -56,7 +56,7 @@ interface BashSandboxState {
   stop: (() => Promise<void>) | null;
   trapServer: ReturnType<typeof createServer> | null;
   trapServerPort: number | null;
-  trapLines: string[];
+  trapStanzas: string[];
   shellID?: string;
   shellExited?: boolean;
   background?: boolean;
@@ -223,51 +223,59 @@ function startTrapServer(
   baseDirectory: string,
   denyReadAlways: string[] = [],
   denyWriteAlways: string[] = [],
-): Promise<{ server: ReturnType<typeof createServer>; port: number; trapLines: string[] }> {
-  const trapLines: string[] = [];
+): Promise<{ server: ReturnType<typeof createServer>; port: number; trapStanzas: string[] }> {
+  const trapStanzas: string[] = [];
   const server = createServer((trapSocket) => {
     trapSocket.setEncoding('utf8');
     let buffer = '';
-    trapSocket.on('data', (data: string) => {
-      buffer += data;
-      let nl = buffer.indexOf('\n');
-      while (nl !== -1) {
-        const line = buffer.slice(0, nl);
-        buffer = buffer.slice(nl + 1);
-        nl = buffer.indexOf('\n');
-        if (line.length === 0) continue;
-        const trap = parseTrapLine(line);
-        if (trap && isQueryTrap(trap)) {
-          const queryId = trap.query_id;
-          if (trap.kind === 'filesystem') {
-            const path = canonicalizePath(trap.path, baseDirectory);
-            const operation = trap.operation;
-            const allowed =
-              operation === 'read'
-                ? evaluateReadAccess(
-                    path,
-                    { allowRead: effectiveAllowRead, denyRead, denyReadAlways },
-                    { baseDirectory, requireAllowMatch: true },
-                  ) === 'allow'
-                : evaluateWriteAccess(
-                    path,
-                    { allowWrite: effectiveAllowWrite, denyWrite, denyWriteAlways },
-                    { baseDirectory },
-                  ) === 'allow';
-            if (allowed) {
-              trapSocket.write(controlResponseLine(queryId, 'allow'));
-            } else {
-              trapSocket.write(controlResponseLine(queryId, 'deny'));
-              trapLines.push(line);
-            }
+    const handleStanza = (stanza: string): void => {
+      if (stanza.trim().length === 0) return;
+      const trap = parseTrapStanza(stanza);
+      if (trap && isQueryTrap(trap)) {
+        const queryId = trap.query_id;
+        if (trap.kind === 'filesystem') {
+          const path = canonicalizePath(trap.path, baseDirectory);
+          const operation = trap.operation;
+          const allowed =
+            operation === 'read'
+              ? evaluateReadAccess(
+                  path,
+                  { allowRead: effectiveAllowRead, denyRead, denyReadAlways },
+                  { baseDirectory, requireAllowMatch: true },
+                ) === 'allow'
+              : evaluateWriteAccess(
+                  path,
+                  { allowWrite: effectiveAllowWrite, denyWrite, denyWriteAlways },
+                  { baseDirectory },
+                ) === 'allow';
+          if (allowed) {
+            trapSocket.write(controlResponseStanza(queryId, 'allow'));
           } else {
-            trapSocket.write(controlResponseLine(queryId, 'deny'));
-            trapLines.push(line);
+            trapSocket.write(controlResponseStanza(queryId, 'deny'));
+            trapStanzas.push(`${stanza}\n\n`);
           }
         } else {
-          trapLines.push(line);
+          trapSocket.write(controlResponseStanza(queryId, 'deny'));
+          trapStanzas.push(`${stanza}\n\n`);
         }
+      } else {
+        trapStanzas.push(`${stanza}\n\n`);
       }
+    };
+    trapSocket.on('data', (data: string) => {
+      buffer += data;
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary !== -1) {
+        const stanza = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        boundary = buffer.indexOf('\n\n');
+        handleStanza(stanza);
+      }
+    });
+    trapSocket.once('end', () => {
+      const rest = buffer.trim();
+      buffer = '';
+      if (rest.length > 0) handleStanza(rest);
     });
     trapSocket.on('error', () => {});
   });
@@ -277,7 +285,7 @@ function startTrapServer(
     server.listen(0, '127.0.0.1', () => {
       server.removeListener('error', reject);
       const address = server.address() as AddressInfo;
-      resolve({ server, port: address.port, trapLines });
+      resolve({ server, port: address.port, trapStanzas });
     });
   });
 }
@@ -308,7 +316,7 @@ function buildWrappedCommand(
     ...shellArgs(shell, command),
   ]);
   const identifySession = sessionID
-    ? ` && printf '%s' ${quoteShell([trapSessionHelloLine(sessionID)])} >&3`
+    ? ` && printf '%s' ${quoteShell([trapSessionHelloStanza(sessionID)])} >&3`
     : '';
   const openTrap = `exec 3<>/dev/tcp/127.0.0.1/${trapPort}${identifySession} && exec "$@"`;
   return quoteShell(['bash', '-c', openTrap, 'bash']) + ` ${trapped}`;
@@ -653,7 +661,7 @@ const plugin: Plugin.Plugin = {
         stop: proxy ? proxy.stop : null,
         trapServer: trapServer?.server ?? null,
         trapServerPort: trapPort,
-        trapLines: trapServer?.trapLines ?? [],
+        trapStanzas: trapServer?.trapStanzas ?? [],
       });
 
       args.command = wrappedCommand;
@@ -835,8 +843,8 @@ const plugin: Plugin.Plugin = {
       state: BashSandboxState,
       outputText: string,
     ): Promise<void> {
-      const serverTrapOutput = state.trapLines.join('\n');
-      const combinedOutput = serverTrapOutput ? outputText + '\n' + serverTrapOutput : outputText;
+      const serverTrapOutput = state.trapStanzas.join('');
+      const combinedOutput = serverTrapOutput ? `${outputText}\n\n${serverTrapOutput}` : outputText;
       const traps = parseLandstripTraps(combinedOutput);
       const errors = traps.filter(
         (trap: LandstripTrap) => !(trap.kind === 'filesystem' && trap.state === 'query'),

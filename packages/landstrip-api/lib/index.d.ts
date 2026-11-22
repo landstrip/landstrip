@@ -18,32 +18,26 @@ export type LandstripTrapState = 'query' | 'info';
 /** Why a filesystem access was mediated. */
 export type LandstripTrapReason = 'allow_miss' | 'deny_match';
 
-export interface LandstripProcess {
-  pid: number;
-  exe: string | null;
-  cwd: string | null;
-}
-
 /** A filesystem access the policy denies. */
 export interface LandstripFilesystemTrap {
   kind: 'filesystem';
   code: 'FILESYSTEM_DENIED';
   state: LandstripTrapState;
-  /** Decimal `u64`; `"0"` marks a terminal `info` event. */
-  query_id: string;
+  /** Nonzero decimal `u64` present on `state: "query"` traps. */
+  query_id?: string;
   operation: 'read' | 'write';
   /** The resolved path. */
   path: string;
-  /** The path the tool asked for, before resolution. */
-  requested_path: string;
+  /** The path the tool asked for, when distinct from `path`. */
+  requested_path?: string;
   syscall: string;
   errno: string;
-  flags: string[];
+  flags?: string[];
   reason: LandstripTrapReason;
-  /** The policy edit that would permit this access. */
-  suggested_grant: { allowRead?: string; allowWrite?: string };
-  process: LandstripProcess;
   mechanism: 'kvm';
+  pid: number;
+  exe?: string;
+  cwd?: string;
 }
 
 /** A network access the policy denies. */
@@ -51,15 +45,17 @@ export interface LandstripNetworkTrap {
   kind: 'network';
   code: 'NETWORK_DENIED';
   state: LandstripTrapState;
-  /** Decimal `u64`; `"0"` marks a terminal `info` event. */
-  query_id: string;
+  /** Nonzero decimal `u64` present on `state: "query"` traps. */
+  query_id?: string;
   operation: 'connect' | 'bind';
-  /** `address:port`. */
+  /** `address:port` or Unix socket path. */
   target: string;
   syscall: string;
   errno: string;
   mechanism: 'kvm';
-  process: LandstripProcess;
+  pid: number;
+  exe?: string;
+  cwd?: string;
 }
 
 /** The sandbox was installed but the tool did not start. */
@@ -97,7 +93,6 @@ export type LandstripPolicyErrorCode =
   | 'POLICY_TRAVERSAL_DEPTH'
   | 'POLICY_GLOB_TOO_LONG'
   | 'POLICY_SELECTOR_LIMIT';
-
 /** The stage that failed before the tool ran. */
 export type LandstripInternalCode =
   | LandstripPolicyErrorCode
@@ -138,9 +133,10 @@ export type LandstripTrap =
 export type LandstripCode = LandstripTrap['code'];
 
 /**
- * The answer to a `state: "query"` trap, written back to the trap socket as one
- * JSON line. `query_id` is an opaque decimal `u64` copied verbatim from the
- * trap. An unanswered query holds the sandboxed syscall.
+ * The answer to a `state: "query"` trap, written back to the trap socket as a
+ * blank-line-terminated `key=value` stanza. `query_id` is an opaque nonzero
+ * decimal `u64` copied verbatim from the trap. An unanswered query holds the
+ * sandboxed syscall.
  */
 export interface LandstripControlResponse {
   query_id: string;
@@ -295,7 +291,6 @@ export function binaryPath(platform?: string, arch?: string): string;
 
 /** Name of the binary package for the given platform. */
 export function packageName(platform?: string, arch?: string): string;
-
 
 export type {
   ProxyPortRange,

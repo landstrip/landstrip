@@ -6,6 +6,7 @@ import {
   extractNativeWriteDeniedPath,
   extractDeniedPath,
   canonicalizePath,
+  serializeTrapStanza,
 } from '@landstrip/landstrip-api/shared';
 
 describe('command analysis and denial path extraction in pi-landstrip', () => {
@@ -68,7 +69,18 @@ describe('command analysis and denial path extraction in pi-landstrip', () => {
   it('extracts denied paths from structured traps and fallbacks', () => {
     expect(
       extractDeniedPath(
-        '{"kind":"filesystem","code":"FILESYSTEM_DENIED","query_id":"0","path":"/workspace/shadow","requested_path":"/workspace/shadow","operation":"read","state":"denial","syscall":"openat","errno":"EACCES","flags":[],"reason":"deny_match","suggested_grant":{"allowRead":"/workspace/shadow"},"process":{"pid":1,"exe":null,"cwd":null},"mechanism":"kvm"}',
+        serializeTrapStanza({
+          kind: 'filesystem',
+          code: 'FILESYSTEM_DENIED',
+          state: 'info',
+          operation: 'read',
+          path: '/workspace/shadow',
+          syscall: 'openat',
+          errno: 'EACCES',
+          reason: 'deny_match',
+          mechanism: 'kvm',
+          pid: 1,
+        }),
         { cwd },
       ),
     ).toBe(canonicalizePath('/workspace/shadow', cwd));
@@ -76,7 +88,7 @@ describe('command analysis and denial path extraction in pi-landstrip', () => {
       canonicalizePath('/workspace/shadow', cwd),
     );
     expect(
-      extractDeniedPath('{"kind":"internal","code":"INTERNAL_ERROR","message":"Denied"}', {
+      extractDeniedPath('kind=internal\ncode=INTERNAL_ERROR\nmessage=Denied\n\n', {
         cwd,
         command: 'cat /workspace/shadow',
       }),

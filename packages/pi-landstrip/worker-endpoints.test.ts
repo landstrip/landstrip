@@ -10,7 +10,7 @@ import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-a
 import {
   formatLandstripTraps,
   parseLandstripTraps,
-  parseTrapLine,
+  serializeTrapStanza,
 } from '@landstrip/landstrip-api/shared';
 import { afterEach, expect, test, vi } from 'vitest';
 
@@ -242,36 +242,13 @@ sandboxTest.for(
           expect(integration.getContext(f.ctx).sandbox).toBe('enabled');
           const { code, stdout, stderr } = await workerOutput(launch, workerTimeout);
           expect({ code, stderr }).toMatchObject({ code: 0 });
+          expect(stderr).toBe('');
           if (process.platform === 'linux') {
-            // Hard-denied accesses are reported even when the worker exits successfully.
-            const traps = stderr.trim().split('\n').map(parseTrapLine);
-            expect(traps).toEqual(
-              [
-                ['read', authPath],
-                ['write', authPath],
-                ['write', `${authPath}.lock`],
-                ['write', hardDeniedPath],
-                ['write', hardDeniedPath],
-              ].map(([operation, path]) =>
-                expect.objectContaining({
-                  kind: 'filesystem',
-                  code: 'FILESYSTEM_DENIED',
-                  state: 'info',
-                  query_id: '0',
-                  operation,
-                  path,
-                  errno: 'EACCES',
-                  reason: 'deny_match',
-                }),
-              ),
-            );
             expect(f.ctx.ui.notify).toHaveBeenCalledTimes(1);
             expect(f.ctx.ui.notify).toHaveBeenCalledWith(
               `landstrip: filesystem write denied (${hardDeniedPath}) [kvm]`,
               'error',
             );
-          } else {
-            expect(stderr).toBe('');
           }
           const response = JSON.parse(stdout);
           expect(response.status).toBe(denied ? 403 : 200);
@@ -296,28 +273,26 @@ sandboxTest.for(
 
 test('formatLandstripTraps deduplicates identical formatted trap lines across PIDs', () => {
   const makeTrap = (operation: 'read' | 'write', path: string, pid: number): string =>
-    JSON.stringify({
+    serializeTrapStanza({
       kind: 'filesystem',
       code: 'FILESYSTEM_DENIED',
       state: 'info',
-      query_id: '0',
       operation,
       syscall: operation === 'write' ? 'mkdirat' : 'openat',
-      flags: [],
       path,
-      requested_path: path,
       errno: 'EACCES',
       mechanism: 'kvm',
       reason: 'deny_match',
-      suggested_grant: operation === 'read' ? { allowRead: path } : { allowWrite: path },
-      process: { pid, exe: '/usr/bin/node', cwd: '/tmp' },
+      pid,
+      exe: '/usr/bin/node',
+      cwd: '/tmp',
     });
   const traps = parseLandstripTraps(
     [
       makeTrap('write', '/tmp/secret.lock', 1001),
       makeTrap('write', '/tmp/secret.lock', 1002),
       makeTrap('read', '/tmp/other', 1002),
-    ].join('\n'),
+    ].join(''),
   );
   expect(formatLandstripTraps(traps)).toBe(
     [

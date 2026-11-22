@@ -31,7 +31,7 @@ import type {
 } from './index.js';
 
 export type LandstripDenialTrap = LandstripFilesystemTrap | LandstripNetworkTrap;
-export type LandstripQueryTrap = LandstripDenialTrap & { state: 'query' };
+export type LandstripQueryTrap = LandstripDenialTrap & { state: 'query'; query_id: string };
 
 export type {
   DoctorReport,
@@ -85,9 +85,11 @@ export function allowsAllDomains(allowedDomains: string[]): boolean;
 
 export function decodeLandstripTrap(value: unknown): LandstripTrap | null;
 
-export function parseTrapLine(line: string): LandstripTrap | null;
+export function parseTrapStanza(stanza: string): LandstripTrap | null;
 
 export function parseLandstripTraps(output: string): LandstripTrap[];
+
+export function serializeTrapStanza(trap: LandstripTrap): string;
 
 export function isFilesystemTrap(trap: LandstripTrap): trap is LandstripFilesystemTrap;
 
@@ -99,11 +101,10 @@ export function formatLandstripTrap(trap: LandstripTrap): string;
 
 export function formatLandstripTraps(traps: LandstripTrap[]): string;
 
-export function controlResponseLine(
+export function controlResponseStanza(
   queryId: string,
   action: LandstripControlResponse['action'],
 ): string;
-
 
 export interface BuildLandstripPolicyOptions {
   filesystem?: LandstripFilesystemPolicy | undefined;
@@ -136,7 +137,6 @@ export function writeLandstripPolicyFile(
   prefix?: string,
 ): { dir: string; path: string };
 
-
 export function mergeArray<T = string>(base: T[], override?: T[]): T[];
 /** Parses sandbox settings, validating macos.logTag with the same rules as buildLandstripPolicy (null is invalid). */
 export function parseSandboxConfig(value: unknown): SandboxConfigFile;
@@ -146,7 +146,6 @@ export function deepMergeSandboxConfig<T extends SandboxConfig = SandboxConfig>(
   base: T,
   overrides?: SandboxConfigFile,
 ): T;
-
 
 export type PathAccessDecision = 'allow' | 'ask' | 'deny';
 
@@ -246,7 +245,6 @@ export function evaluateDomainAccess(
   network: SandboxNetworkConfig | SandboxNetworkConfigFile,
   options?: EvaluateDomainOptions,
 ): DomainAccessDecision;
-
 
 export function normalizeBlockedPath(filePath: string, cwd?: string): string;
 

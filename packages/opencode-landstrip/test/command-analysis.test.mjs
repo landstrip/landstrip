@@ -7,7 +7,11 @@ import {
   extractNativeWriteDeniedPath,
   extractDeniedPath,
   canonicalizePath,
+  controlResponseStanza,
   decodeLandstripTrap,
+  parseLandstripTraps,
+  parseTrapStanza,
+  serializeTrapStanza,
 } from '@landstrip/landstrip-api/shared';
 
 test('extractDomainsFromCommand extracts unique domains from URLs in commands', () => {
@@ -94,10 +98,19 @@ test('extractDeniedPath resolves structured traps, native errors, and candidate 
   const cwd = '/workspace/test';
 
   // Structured trap
-  const trapOutput =
-    '{"kind":"filesystem","code":"FILESYSTEM_DENIED","query_id":"0","path":"/opt/data","requested_path":"/opt/data","operation":"read","state":"denial","syscall":"openat","errno":"EACCES","flags":[],"reason":"deny_match","suggested_grant":{"allowRead":"/opt/data"},"process":{"pid":1,"exe":null,"cwd":null},"mechanism":"kvm"}';
+  const trapOutput = serializeTrapStanza({
+    kind: 'filesystem',
+    code: 'FILESYSTEM_DENIED',
+    state: 'info',
+    operation: 'read',
+    path: '/opt/data',
+    syscall: 'openat',
+    errno: 'EACCES',
+    reason: 'deny_match',
+    mechanism: 'kvm',
+    pid: 1,
+  });
   assert.equal(extractDeniedPath(trapOutput, { cwd }), canonicalizePath('/opt/data', cwd));
-
   // Native denial
   const nativeOutput = 'cat: /workspace/test/hosts: Permission denied';
   assert.equal(
@@ -106,7 +119,7 @@ test('extractDeniedPath resolves structured traps, native errors, and candidate 
   );
 
   // Command fallback when internal trap occurred
-  const internalTrap = '{"kind":"internal","code":"INTERNAL_ERROR","message":"Access denied"}';
+  const internalTrap = 'kind=internal\ncode=INTERNAL_ERROR\nmessage=Access denied\n\n';
   assert.equal(
     extractDeniedPath(internalTrap, { cwd, command: 'cat /workspace/test/secret.key' }),
     canonicalizePath('/workspace/test/secret.key', cwd),
@@ -197,4 +210,59 @@ test('decodeLandstripTrap aligns mechanisms and policy error codes with error.rs
       message: 'too many selectors',
     },
   );
+});
+
+test('stanza wire format round-trips escaped values, omitted fields, and replies', () => {
+  const queryStanza = serializeTrapStanza({
+    kind: 'filesystem',
+    code: 'FILESYSTEM_DENIED',
+    state: 'query',
+    query_id: '42',
+    operation: 'write',
+    path: '/tmp/dir\\name\nline2.txt',
+    requested_path: './rel.txt',
+    syscall: 'openat',
+    errno: 'EACCES',
+    flags: ['O_WRONLY', 'O_CREAT'],
+    reason: 'allow_miss',
+    mechanism: 'kvm',
+    pid: 412,
+    exe: '/usr/bin/touch',
+  });
+  assert.ok(queryStanza.endsWith('\n\n'));
+  assert.ok(!queryStanza.includes('\ncwd='));
+  assert.deepEqual(parseTrapStanza(queryStanza), {
+    kind: 'filesystem',
+    code: 'FILESYSTEM_DENIED',
+    state: 'query',
+    query_id: '42',
+    operation: 'write',
+    path: '/tmp/dir\\name\nline2.txt',
+    requested_path: './rel.txt',
+    syscall: 'openat',
+    errno: 'EACCES',
+    flags: ['O_WRONLY', 'O_CREAT'],
+    reason: 'allow_miss',
+    mechanism: 'kvm',
+    pid: 412,
+    exe: '/usr/bin/touch',
+  });
+
+  const mixedStderr = [
+    'cat: /etc/shadow: Permission denied',
+    queryStanza.trimEnd(),
+    '',
+    'kind=usage\ncode=USAGE_ERROR\nmessage=missing -- COMMAND\\nhint=run --help\n',
+  ].join('\n');
+  const parsed = parseLandstripTraps(mixedStderr);
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].kind, 'filesystem');
+  assert.deepEqual(parsed[1], {
+    kind: 'usage',
+    code: 'USAGE_ERROR',
+    message: 'missing -- COMMAND\nhint=run --help',
+  });
+
+  assert.equal(controlResponseStanza('42', 'allow'), 'query_id=42\naction=allow\n\n');
+  assert.throws(() => controlResponseStanza('0', 'allow'), TypeError);
 });

@@ -54,7 +54,7 @@ import {
   buildLandstripPolicy as assembleLandstripPolicy,
   allowsAllDomains,
   type LandstripQueryTrap,
-  controlResponseLine,
+  controlResponseStanza,
   deepMergeSandboxConfig as deepMerge,
   domainMatchesAny,
   evaluateDomainAccess,
@@ -74,8 +74,9 @@ import {
   expandPath,
   globToRegExp,
   normalizePathSeparators,
-  parseTrapLine,
+  parseTrapStanza,
   pathUnderDirectory,
+  serializeTrapStanza,
   sessionScopeFor,
   writeLandstripPolicyFile,
   shouldPromptForWrite,
@@ -1804,7 +1805,7 @@ function createLandstripIntegrationWithPrompts(
     };
     const respond = (queryId: string, action: LandstripControlResponse['action']): void => {
       if (socket.destroyed) return;
-      socket.write(controlResponseLine(queryId, action), (error) => {
+      socket.write(controlResponseStanza(queryId, action), (error) => {
         if (error) reportTrapError(`Worker sandbox control response failed: ${error.message}`);
       });
     };
@@ -1830,31 +1831,38 @@ function createLandstripIntegrationWithPrompts(
       reportTrapError(`Worker sandbox control failed: ${error.message}`);
     });
 
+    const handleStanza = (stanza: string): void => {
+      const trap = parseTrapStanza(stanza);
+      if (!trap) return;
+      if (!isQueryTrap(trap)) {
+        if (
+          isFilesystemTrap(trap) &&
+          matchesPattern(normalizeBlockedPath(trap.path, cwd), allowances.protectedPaths ?? [], cwd)
+        ) {
+          return;
+        }
+        reportTrapError(formatLandstripTraps([trap]));
+        return;
+      }
+      handleQuery(trap);
+    };
+
     socket.on('data', (data: Buffer) => {
       buffer += decoder.write(data);
-      let newline = buffer.indexOf('\n');
-      while (newline >= 0) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-        newline = buffer.indexOf('\n');
-        const trap = parseTrapLine(line);
-        if (!trap) continue;
-        if (!isQueryTrap(trap)) {
-          if (
-            isFilesystemTrap(trap) &&
-            matchesPattern(
-              normalizeBlockedPath(trap.path, cwd),
-              allowances.protectedPaths ?? [],
-              cwd,
-            )
-          ) {
-            continue;
-          }
-          reportTrapError(formatLandstripTraps([trap]));
-          continue;
-        }
-        handleQuery(trap);
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary >= 0) {
+        const stanza = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        boundary = buffer.indexOf('\n\n');
+        handleStanza(stanza);
       }
+    });
+
+    socket.once('end', () => {
+      buffer += decoder.end();
+      const rest = buffer.trim();
+      buffer = '';
+      if (rest.length > 0) handleStanza(rest);
     });
   }
 
@@ -2380,18 +2388,18 @@ function createLandstripIntegrationWithPrompts(
               action: LandstripControlResponse['action'],
             ): void => {
               if (!trapSocket || trapSocket.destroyed) return;
-              trapSocket.write(controlResponseLine(queryId, action));
+              trapSocket.write(controlResponseStanza(queryId, action));
             };
 
-            const appendErrorLine = (line: string): void => {
-              const infoLine = line + '\n';
-              errorFdAcc += infoLine;
-              callbacks.onErrorFd?.(Buffer.from(infoLine, 'utf8'));
+            const appendErrorStanza = (stanza: string): void => {
+              const framed = `${stanza.replace(/\n+$/, '')}\n\n`;
+              errorFdAcc += framed;
+              callbacks.onErrorFd?.(Buffer.from(framed, 'utf8'));
             };
 
-            const processTrapLine = (line: string): void => {
-              if (line.length === 0) return;
-              const trap = parseTrapLine(line);
+            const processTrapStanza = (stanza: string): void => {
+              if (stanza.trim().length === 0) return;
+              const trap = parseTrapStanza(stanza);
               if (trap && isQueryTrap(trap)) {
                 queryChain = queryChain
                   .then(async () => {
@@ -2410,7 +2418,7 @@ function createLandstripIntegrationWithPrompts(
                           normalizeBlockedPath(trap.path, cwd),
                         );
                       }
-                      appendErrorLine(line);
+                      appendErrorStanza(stanza);
                     }
                     respondQuery(trap.query_id, result.action);
                   })
@@ -2422,24 +2430,24 @@ function createLandstripIntegrationWithPrompts(
                     ) {
                       const target = isFilesystemTrap(trap) ? trap.path : trap.target;
                       const message = `Sandbox permission request failed (${trap.operation} "${target}"): ${formatError(error)}`;
-                      appendErrorLine(
-                        JSON.stringify({ kind: 'internal', code: 'INTERNAL_ERROR', message }),
+                      appendErrorStanza(
+                        serializeTrapStanza({ kind: 'internal', code: 'INTERNAL_ERROR', message }),
                       );
                       onData(Buffer.from(`pi-landstrip: ${message}\n`, 'utf8'));
                     }
                   });
               } else {
-                appendErrorLine(line);
+                appendErrorStanza(stanza);
               }
             };
 
-            const drainTrapLines = (): void => {
-              let nl = trapBuffer.indexOf('\n');
-              while (nl !== -1) {
-                const line = trapBuffer.slice(0, nl);
-                trapBuffer = trapBuffer.slice(nl + 1);
-                nl = trapBuffer.indexOf('\n');
-                processTrapLine(line);
+            const drainTrapStanzas = (): void => {
+              let boundary = trapBuffer.indexOf('\n\n');
+              while (boundary !== -1) {
+                const stanza = trapBuffer.slice(0, boundary);
+                trapBuffer = trapBuffer.slice(boundary + 2);
+                boundary = trapBuffer.indexOf('\n\n');
+                processTrapStanza(stanza);
               }
             };
 
@@ -2447,10 +2455,10 @@ function createLandstripIntegrationWithPrompts(
               if (trapFlushed) return;
               trapFlushed = true;
               trapBuffer += trapDecoder.end();
-              drainTrapLines();
+              drainTrapStanzas();
               const rest = trapBuffer.trim();
               trapBuffer = '';
-              if (rest.length > 0) processTrapLine(rest);
+              if (rest.length > 0) processTrapStanza(rest);
             };
 
             const finalizeExec = (code: number | null): void => {
@@ -2535,7 +2543,7 @@ function createLandstripIntegrationWithPrompts(
 
             trapSocket?.on('data', (data: Buffer) => {
               trapBuffer += trapDecoder.write(data);
-              drainTrapLines();
+              drainTrapStanzas();
             });
             trapSocket?.once('end', onTrapEnd);
             trapSocket?.once('close', onTrapEnd);

@@ -172,118 +172,323 @@ const LANDSTRIP_INTERNAL_CODES = new Set([
   'INTERNAL_ERROR',
 ]);
 
-function isDenialRecord(value) {
-  return (
-    typeof value.query_id === 'string' &&
-    /^(0|[1-9][0-9]{0,19})$/.test(value.query_id) &&
-    BigInt(value.query_id) <= 18446744073709551615n &&
-    (value.state !== 'query' || value.query_id !== '0') &&
-    typeof value.syscall === 'string' &&
-    typeof value.errno === 'string' &&
-    value.mechanism === 'kvm' &&
-    isRecord(value.process) &&
-    Number.isInteger(value.process.pid) &&
-    value.process.pid >= 0 &&
-    value.process.pid <= 4294967295 &&
-    (value.process.exe === null || typeof value.process.exe === 'string') &&
-    (value.process.cwd === null || typeof value.process.cwd === 'string')
-  );
-}
+const TrapStanza = {
+  escape(value) {
+    return String(value).replaceAll('\\', '\\\\').replaceAll('\n', '\\n').replaceAll('\r', '\\r');
+  },
 
-function isLandstripTrap(value) {
-  if (!isRecord(value)) return false;
+  unescape(raw) {
+    let out = '';
+    for (let i = 0; i < raw.length; i += 1) {
+      const ch = raw[i];
+      if (ch === '\\') {
+        i += 1;
+        if (i >= raw.length) return null;
+        const next = raw[i];
+        if (next === '\\') out += '\\';
+        else if (next === 'n') out += '\n';
+        else if (next === 'r') out += '\r';
+        else return null;
+      } else {
+        out += ch;
+      }
+    }
+    return out;
+  },
+
+  isValidQueryId(value) {
+    return (
+      typeof value === 'string' &&
+      /^[1-9][0-9]{0,19}$/.test(value) &&
+      BigInt(value) <= 18446744073709551615n
+    );
+  },
+
+  parsePid(value) {
+    if (typeof value === 'number') {
+      return Number.isInteger(value) && value >= 0 && value <= 4294967295 ? value : null;
+    }
+    if (typeof value === 'string' && /^(0|[1-9][0-9]{0,9})$/.test(value)) {
+      const parsed = Number(value);
+      return parsed <= 4294967295 ? parsed : null;
+    }
+    return null;
+  },
+
+  parseFlags(value) {
+    if (value === undefined) return [];
+    if (typeof value === 'string') {
+      if (value.length === 0) return [];
+      const items = value.split(',');
+      return items.every((item) => item.length > 0) ? items : null;
+    }
+    if (Array.isArray(value)) {
+      return value.every(
+        (item) => typeof item === 'string' && item.length > 0 && !item.includes(','),
+      )
+        ? [...value]
+        : null;
+    }
+    return null;
+  },
+
+  decodeDenialBase(value) {
+    const pid = TrapStanza.parsePid(value.pid);
+    if (pid === null) return null;
+    if (typeof value.syscall !== 'string' || typeof value.errno !== 'string') return null;
+    if (value.mechanism !== 'kvm') return null;
+    if (value.exe !== undefined && typeof value.exe !== 'string') return null;
+    if (value.cwd !== undefined && typeof value.cwd !== 'string') return null;
+    if (value.state === 'query') {
+      if (!TrapStanza.isValidQueryId(value.query_id)) return null;
+      return { state: 'query', query_id: value.query_id, pid };
+    }
+    return { state: 'info', query_id: undefined, pid };
+  },
+
+  parseLine(line) {
+    const eq = line.indexOf('=');
+    if (eq <= 0) return null;
+    const key = line.slice(0, eq);
+    if (!/^[a-z][a-z_]*$/.test(key)) return null;
+    const value = TrapStanza.unescape(line.slice(eq + 1));
+    if (value === null) return null;
+    return [key, value];
+  },
+
+  formatField(key, value) {
+    return `${key}=${TrapStanza.escape(value)}\n`;
+  },
+
+  parseStanza(stanza) {
+    if (typeof stanza !== 'string') return null;
+    const record = {};
+    let hasProperty = false;
+    for (const line of stanza.replaceAll('\r\n', '\n').split('\n')) {
+      if (line.length === 0) {
+        if (hasProperty) break;
+        continue;
+      }
+      const entry = TrapStanza.parseLine(line);
+      if (!entry) return null;
+      const [key, value] = entry;
+      if (Object.hasOwn(record, key)) return null;
+      record[key] = value;
+      hasProperty = true;
+    }
+    return hasProperty ? decodeLandstripTrap(record) : null;
+  },
+
+  parseStream(output) {
+    if (typeof output !== 'string') return [];
+    const traps = [];
+    let current = null;
+    let invalid = false;
+    const flush = () => {
+      if (current && !invalid) {
+        const trap = decodeLandstripTrap(current);
+        if (trap) traps.push(trap);
+      }
+      current = null;
+      invalid = false;
+    };
+    for (const line of output.replaceAll('\r\n', '\n').split('\n')) {
+      if (line.length === 0) {
+        flush();
+        continue;
+      }
+      const entry = TrapStanza.parseLine(line);
+      if (!entry) {
+        flush();
+        continue;
+      }
+      const [key, value] = entry;
+      if (key === 'kind' && current !== null) {
+        flush();
+      }
+      current ??= {};
+      if (Object.hasOwn(current, key)) {
+        invalid = true;
+        continue;
+      }
+      current[key] = value;
+    }
+    flush();
+    return traps;
+  },
+
+  serialize(trap) {
+    const decoded = decodeLandstripTrap(trap);
+    if (!decoded) throw new TypeError('Invalid Landstrip trap');
+    let out = TrapStanza.formatField('kind', decoded.kind);
+    out += TrapStanza.formatField('code', decoded.code);
+    switch (decoded.kind) {
+      case 'filesystem':
+        out += TrapStanza.formatField('state', decoded.state);
+        if (decoded.query_id !== undefined) {
+          out += TrapStanza.formatField('query_id', decoded.query_id);
+        }
+        out += TrapStanza.formatField('operation', decoded.operation);
+        out += TrapStanza.formatField('path', decoded.path);
+        if (decoded.requested_path !== undefined) {
+          out += TrapStanza.formatField('requested_path', decoded.requested_path);
+        }
+        out += TrapStanza.formatField('syscall', decoded.syscall);
+        out += TrapStanza.formatField('errno', decoded.errno);
+        if (decoded.flags && decoded.flags.length > 0) {
+          out += TrapStanza.formatField('flags', decoded.flags.join(','));
+        }
+        out += TrapStanza.formatField('reason', decoded.reason);
+        out += TrapStanza.formatField('mechanism', decoded.mechanism);
+        out += TrapStanza.formatField('pid', decoded.pid);
+        if (decoded.exe !== undefined) out += TrapStanza.formatField('exe', decoded.exe);
+        if (decoded.cwd !== undefined) out += TrapStanza.formatField('cwd', decoded.cwd);
+        break;
+      case 'network':
+        out += TrapStanza.formatField('state', decoded.state);
+        if (decoded.query_id !== undefined) {
+          out += TrapStanza.formatField('query_id', decoded.query_id);
+        }
+        out += TrapStanza.formatField('operation', decoded.operation);
+        out += TrapStanza.formatField('target', decoded.target);
+        out += TrapStanza.formatField('syscall', decoded.syscall);
+        out += TrapStanza.formatField('errno', decoded.errno);
+        out += TrapStanza.formatField('mechanism', decoded.mechanism);
+        out += TrapStanza.formatField('pid', decoded.pid);
+        if (decoded.exe !== undefined) out += TrapStanza.formatField('exe', decoded.exe);
+        if (decoded.cwd !== undefined) out += TrapStanza.formatField('cwd', decoded.cwd);
+        break;
+      case 'launch':
+        out += TrapStanza.formatField('program', decoded.program);
+        if (decoded.errno !== undefined) out += TrapStanza.formatField('errno', decoded.errno);
+        out += TrapStanza.formatField('message', decoded.message);
+        break;
+      case 'usage':
+        out += TrapStanza.formatField('message', decoded.message);
+        break;
+      case 'internal':
+        if (decoded.mechanism !== undefined) {
+          out += TrapStanza.formatField('mechanism', decoded.mechanism);
+        }
+        out += TrapStanza.formatField('message', decoded.message);
+        break;
+    }
+    return `${out}\n`;
+  },
+};
+
+function decodeLandstripTrap(value) {
+  if (!isRecord(value)) return null;
 
   switch (value.kind) {
     case 'filesystem': {
-      if (!Array.isArray(value.flags)) return false;
-      for (const flag of value.flags) {
-        if (typeof flag !== 'string') return false;
+      if (
+        value.code !== 'FILESYSTEM_DENIED' ||
+        (value.operation !== 'read' && value.operation !== 'write') ||
+        typeof value.path !== 'string' ||
+        (value.requested_path !== undefined && typeof value.requested_path !== 'string') ||
+        (value.reason !== 'allow_miss' && value.reason !== 'deny_match')
+      ) {
+        return null;
       }
-      const grant = value.operation === 'read' ? 'allowRead' : 'allowWrite';
-      const otherGrant = value.operation === 'read' ? 'allowWrite' : 'allowRead';
-      return (
-        value.code === 'FILESYSTEM_DENIED' &&
-        (value.operation === 'read' || value.operation === 'write') &&
-        typeof value.path === 'string' &&
-        typeof value.requested_path === 'string' &&
-        (value.reason === 'allow_miss' || value.reason === 'deny_match') &&
-        isRecord(value.suggested_grant) &&
-        typeof value.suggested_grant[grant] === 'string' &&
-        value.suggested_grant[otherGrant] === undefined &&
-        isDenialRecord(value)
-      );
+      const flags = TrapStanza.parseFlags(value.flags);
+      const base = TrapStanza.decodeDenialBase(value);
+      if (!flags || !base) return null;
+      const result = {
+        ...value,
+        kind: 'filesystem',
+        code: 'FILESYSTEM_DENIED',
+        state: base.state,
+        operation: value.operation,
+        path: value.path,
+        syscall: value.syscall,
+        errno: value.errno,
+        reason: value.reason,
+        mechanism: 'kvm',
+        pid: base.pid,
+      };
+      if (base.query_id !== undefined) result.query_id = base.query_id;
+      else delete result.query_id;
+      if (value.requested_path !== undefined && value.requested_path !== value.path) {
+        result.requested_path = value.requested_path;
+      } else {
+        delete result.requested_path;
+      }
+      if (flags.length > 0) result.flags = flags;
+      else delete result.flags;
+      return result;
     }
-    case 'network':
-      return (
-        value.code === 'NETWORK_DENIED' &&
-        (value.operation === 'connect' || value.operation === 'bind') &&
-        typeof value.target === 'string' &&
-        isDenialRecord(value)
-      );
+    case 'network': {
+      if (
+        value.code !== 'NETWORK_DENIED' ||
+        (value.operation !== 'connect' && value.operation !== 'bind') ||
+        typeof value.target !== 'string'
+      ) {
+        return null;
+      }
+      const base = TrapStanza.decodeDenialBase(value);
+      if (!base) return null;
+      const result = {
+        ...value,
+        kind: 'network',
+        code: 'NETWORK_DENIED',
+        state: base.state,
+        operation: value.operation,
+        target: value.target,
+        syscall: value.syscall,
+        errno: value.errno,
+        mechanism: 'kvm',
+        pid: base.pid,
+      };
+      if (base.query_id !== undefined) result.query_id = base.query_id;
+      else delete result.query_id;
+      return result;
+    }
     case 'launch':
-      return (
-        value.code === 'LAUNCH_FAILED' &&
+      return value.code === 'LAUNCH_FAILED' &&
         typeof value.program === 'string' &&
         typeof value.message === 'string' &&
         (value.errno === undefined || typeof value.errno === 'string')
-      );
+        ? { ...value }
+        : null;
     case 'usage':
-      return value.code === 'USAGE_ERROR' && typeof value.message === 'string';
+      return value.code === 'USAGE_ERROR' && typeof value.message === 'string'
+        ? { ...value }
+        : null;
     case 'internal':
-      return (
-        typeof value.message === 'string' &&
+      return typeof value.message === 'string' &&
         (value.code === 'SANDBOX_SETUP_FAILED'
           ? LANDSTRIP_MECHANISMS.has(value.mechanism)
           : LANDSTRIP_INTERNAL_CODES.has(value.code) && value.mechanism === undefined)
-      );
+        ? { ...value }
+        : null;
     default:
-      return false;
+      return null;
   }
 }
 
-function decodeLandstripTrap(value) {
-  if (!isLandstripTrap(value)) return null;
-  if (isDenialTrap(value) && value.state !== 'query' && value.state !== 'info') {
-    return { ...value, state: 'info' };
-  }
-  return value;
-}
-
-function parseTrapLine(line) {
-  try {
-    return decodeLandstripTrap(JSON.parse(line));
-  } catch {
-    return null;
-  }
+function parseTrapStanza(stanza) {
+  return TrapStanza.parseStanza(stanza);
 }
 
 function parseLandstripTraps(output) {
-  const traps = [];
+  return TrapStanza.parseStream(output);
+}
 
-  for (const line of output.split('\n')) {
-    const trimmed = line.trim();
-    if (trimmed.length === 0 || trimmed[0] !== '{') continue;
-    const trap = parseTrapLine(trimmed);
-    if (trap) traps.push(trap);
-  }
-
-  return traps;
+function serializeTrapStanza(trap) {
+  return TrapStanza.serialize(trap);
 }
 
 function isFilesystemTrap(trap) {
   return trap.kind === 'filesystem';
 }
 
-// filesystem and network traps report an access the policy denied; launch,
-// usage and internal traps report that landstrip itself failed.
 function isDenialTrap(trap) {
   return trap.kind === 'filesystem' || trap.kind === 'network';
 }
 
-// A `state: "query"` trap suspends the child's syscall until the host answers
-// it on the trap socket. An `info` trap is terminal.
 function isQueryTrap(trap) {
-  return isDenialTrap(trap) && trap.state === 'query';
+  return isDenialTrap(trap) && trap.state === 'query' && typeof trap.query_id === 'string';
 }
 
 function formatLandstripTrap(trap) {
@@ -401,11 +606,14 @@ function globToRegExp(globPattern) {
   return result;
 }
 
-// The broker matches an answer to its query by the exact decimal `query_id`
-// string the trap carried. A numeric id fails its deserializer, the line is
-// dropped, and the child's syscall stays suspended.
-function controlResponseLine(queryId, action) {
-  return JSON.stringify({ query_id: queryId, action }) + '\n';
+function controlResponseStanza(queryId, action) {
+  if (!TrapStanza.isValidQueryId(queryId)) {
+    throw new TypeError('queryId must be a nonzero decimal u64 string');
+  }
+  if (action !== 'allow' && action !== 'deny') {
+    throw new TypeError('action must be allow or deny');
+  }
+  return `query_id=${queryId}\naction=${action}\n\n`;
 }
 
 function resolvePathSelector(entry, baseDirectory) {
@@ -1524,14 +1732,15 @@ module.exports = {
   domainMatchesAny,
   allowsAllDomains,
   decodeLandstripTrap,
-  parseTrapLine,
+  parseTrapStanza,
   parseLandstripTraps,
+  serializeTrapStanza,
   isFilesystemTrap,
   isDenialTrap,
   isQueryTrap,
   formatLandstripTrap,
   formatLandstripTraps,
-  controlResponseLine,
+  controlResponseStanza,
   resolveFilesystemPatterns,
   resolveFilesystemPolicy,
   buildLandstripPolicy,
