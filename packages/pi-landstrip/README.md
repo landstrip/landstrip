@@ -77,8 +77,9 @@ and `/landstrip-subagents` for subagent/task management (`Tasks`, `Log`, `Subage
 `Primary`, `Settings`, `Help`). Task IDs accept unique prefixes; bare IDs open logs.
 `/landstrip-subagents tasks cancel <id>` terminates a task. `Ctrl+Shift+A` cycles
 primary agents while idle. The `task` tool accepts `background: true`, `include_context: true`,
-and `task_id` to continue a saved task; the `tasks` tool supports `list`, `inspect`,
-`steer`, and `cancel`. Press `S` in `Tasks` or `Enter` in running/queued logs to steer workers.
+`worktree: true` (runs the worker in an isolated detached Git worktree so
+parallel tasks cannot collide in the parent checkout), and `task_id` to continue
+a saved task; the `tasks` tool supports `list`, `inspect`, `steer`, and `cancel`. Press `S` in `Tasks` or `Enter` in running/queued logs to steer workers.
 
 ### Worker environment and authentication
 

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
+import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -1572,5 +1574,173 @@ describe('Subagent Markdown Report and Log Formatting', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test('isolates subagent tasks in a detached git worktree when worktree: true and cleans up on delete', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pi-landstrip-worktree-'));
+    onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+    const repoDir = join(root, 'repo');
+    const agentHome = join(root, 'agent-home');
+    mkdirSync(repoDir, { recursive: true });
+    mkdirSync(agentHome, { recursive: true });
+    vi.stubEnv('PI_CODING_AGENT_DIR', agentHome);
+
+    execFileSync('git', ['init'], { cwd: repoDir, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], {
+      cwd: repoDir,
+      stdio: 'ignore',
+    });
+    execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: repoDir, stdio: 'ignore' });
+    writeFileSync(join(repoDir, 'tracked.txt'), 'original\n');
+    execFileSync('git', ['add', 'tracked.txt'], { cwd: repoDir, stdio: 'ignore' });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repoDir, stdio: 'ignore' });
+
+    const mockApi = createMockExtensionAPI();
+    const integration = createLandstripIntegration({ registerBashTool: true, cwd: repoDir });
+    integration.register(mockApi.api);
+
+    let observedTaskCwd: string | undefined;
+    const catalog: AgentCatalog = {
+      agents: new Map([
+        [
+          'coder',
+          {
+            name: 'coder',
+            description: 'Isolated worker',
+            mode: 'subagent',
+            prompt: 'Edit safely',
+            permissions: [],
+            providerOptions: {},
+            source: 'built-in',
+            hidden: false,
+            disabled: false,
+          },
+        ],
+      ]),
+      permissions: [{ permission: 'task', pattern: '*', action: 'allow' }],
+      maxSubagents: 2,
+      diagnostics: [],
+    };
+
+    const runtime = new SubagentRuntime(
+      mockApi.api,
+      integration,
+      async (task) => {
+        observedTaskCwd = task.cwd;
+        const fakeRpc = {
+          onEvent: () => () => {},
+          async prompt(promptText: string) {
+            writeFileSync(join(task.cwd!, 'tracked.txt'), `updated:${promptText}\n`);
+          },
+          async getLastAssistantText() {
+            return 'Updated tracked.txt in isolated worktree';
+          },
+          async stop() {},
+          async abort() {},
+          async steer() {},
+          async request() {
+            return {};
+          },
+        } as unknown as RpcProcess;
+        return {
+          rpc: fakeRpc,
+          async dispose() {},
+        };
+      },
+      () => catalog,
+    );
+    integration.setSubagentRuntime?.(runtime);
+    runtime.register();
+    runtime.setMaxSubagents(2);
+
+    const ctx = {
+      cwd: repoDir,
+      hasUI: false,
+      sessionManager: {
+        getSessionId: () => 'wt-session-1',
+        getSessionFile: () => undefined,
+        getBranch: () => [],
+      },
+      modelRegistry: { getAll: () => [] },
+      ui: { notify: vi.fn(), setWidget: vi.fn(), setStatus: vi.fn() },
+    } as unknown as ExtensionContext;
+
+    const taskTool = mockApi.tools.get('task');
+    const tasksTool = mockApi.tools.get('tasks');
+
+    const firstRun = await taskTool.execute(
+      'call-wt-1',
+      {
+        description: 'Edit in worktree',
+        prompt: 'v1',
+        subagent_type: 'coder',
+        worktree: true,
+      },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+
+    const wtPath = firstRun.details.worktreePath as string;
+    expect(wtPath).toBeTruthy();
+    expect(observedTaskCwd).toBe(wtPath);
+    expect(existsSync(wtPath)).toBe(true);
+    // Parent repo stays untouched while worktree has the subagent's edit
+    expect(readFileSync(join(repoDir, 'tracked.txt'), 'utf8')).toBe('original\n');
+    expect(readFileSync(join(wtPath, 'tracked.txt'), 'utf8')).toBe('updated:v1\n');
+    expect(firstRun.content[0].text).toContain(`Worktree: ${wtPath}`);
+    expect(firstRun.content[0].text).toContain('1 changed path');
+
+    // Inspect reports worktree path
+    const inspectRes = await tasksTool.execute(
+      'call-wt-inspect',
+      { action: 'inspect', task_id: firstRun.details.taskId } satisfies TasksToolInput,
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    expect(inspectRes.content[0].text).toContain(`Worktree: ${wtPath}`);
+
+    // Passing worktree alongside task_id is rejected
+    await expect(
+      taskTool.execute(
+        'call-wt-conflict',
+        {
+          description: 'Resume conflict',
+          prompt: 'v2',
+          subagent_type: 'coder',
+          task_id: firstRun.details.taskId,
+          worktree: false,
+        },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      ),
+    ).rejects.toThrow('Cannot change worktree isolation when resuming a task');
+
+    // Resuming with task_id alone reuses the existing worktree
+    const resumed = await taskTool.execute(
+      'call-wt-resume',
+      {
+        description: 'Resume worktree',
+        prompt: 'v2',
+        subagent_type: 'coder',
+        task_id: firstRun.details.taskId,
+      },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    expect(resumed.details.worktreePath).toBe(wtPath);
+    expect(readFileSync(join(wtPath, 'tracked.txt'), 'utf8')).toBe('updated:v2\n');
+
+    // Deleting the task removes the git worktree cleanly
+    expect(runtime.deleteTasks([firstRun.details.taskId], ctx)).toBe(1);
+    expect(existsSync(wtPath)).toBe(false);
+    const worktreeList = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+      cwd: repoDir,
+      encoding: 'utf8',
+    });
+    expect(worktreeList).not.toContain(wtPath);
   });
 });

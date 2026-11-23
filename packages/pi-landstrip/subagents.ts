@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) Jarkko Sakkinen 2026
 
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
@@ -397,6 +398,12 @@ const taskParameters = Type.Object({
       description: 'Seed the subagent prompt with a bounded summary of recent parent conversation',
     }),
   ),
+  worktree: Type.Optional(
+    Type.Boolean({
+      description:
+        'Run the subagent in an isolated git worktree detached at HEAD so parallel tasks do not conflict in the parent checkout; cannot be combined with task_id',
+    }),
+  ),
 });
 
 const BACKGROUND_LAUNCH_GUIDANCE = [
@@ -477,6 +484,7 @@ interface TaskInput {
   command?: string;
   background?: boolean;
   include_context?: boolean;
+  worktree?: boolean;
 }
 
 type TaskState = 'queued' | 'running' | 'completed' | 'error' | 'cancelled' | 'interrupted';
@@ -532,6 +540,10 @@ export interface SubagentTaskRecord extends BaseTaskRecord {
   description: string;
   /** Model override from the task call; reapplied when the task is resumed. */
   modelOverride?: { model: string; variant?: string };
+  /** Isolated git worktree directory created when `worktree: true`. */
+  worktreePath?: string;
+  /** Parent git repository root owning `worktreePath`. */
+  worktreeRepoRoot?: string;
 }
 
 export interface CommandTaskRecord extends BaseTaskRecord {
@@ -579,6 +591,7 @@ export interface TaskDetails {
   exitCode?: number | null;
   parentTaskId?: string;
   depth?: number;
+  worktreePath?: string;
 }
 
 function taskDetails(task: TaskRecord, state: TaskState = task.state): TaskDetails {
@@ -604,7 +617,110 @@ function taskDetails(task: TaskRecord, state: TaskState = task.state): TaskDetai
     exitCode: task.exitCode,
     parentTaskId: task.parentTaskId,
     depth: task.depth,
+    worktreePath: task.kind !== 'command' ? task.worktreePath : undefined,
   };
+}
+
+function createTaskGitWorktree(
+  baseCwd: string,
+  sessionDir: string,
+): { worktreePath: string; repoRoot: string } {
+  let repoRoot: string;
+  try {
+    repoRoot = canonicalizePath(
+      execFileSync('git', ['rev-parse', '--show-toplevel'], {
+        cwd: baseCwd,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim(),
+      baseCwd,
+    );
+    execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch {
+    throw new Error('worktree: true requires a Git repository with an existing HEAD commit');
+  }
+
+  const requestedPath = join(sessionDir, 'worktree');
+  try {
+    execFileSync('git', ['worktree', 'add', '--detach', requestedPath, 'HEAD'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    throw new Error(`Failed to create subagent git worktree: ${formatError(error)}`);
+  }
+
+  return {
+    worktreePath: canonicalizePath(requestedPath, repoRoot),
+    repoRoot,
+  };
+}
+
+function resolveWorktreeGitDirs(
+  worktreePath: string,
+): { gitDir: string; gitCommonDir: string } | undefined {
+  try {
+    const rawGitDir = execFileSync('git', ['rev-parse', '--git-dir'], {
+      cwd: worktreePath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    const rawCommonDir = execFileSync('git', ['rev-parse', '--git-common-dir'], {
+      cwd: worktreePath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    return {
+      gitDir: canonicalizePath(resolve(worktreePath, rawGitDir), worktreePath),
+      gitCommonDir: canonicalizePath(resolve(worktreePath, rawCommonDir), worktreePath),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function summarizeTaskWorktree(worktreePath: string): string | undefined {
+  if (!existsSync(worktreePath)) return undefined;
+  try {
+    const head = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
+      cwd: worktreePath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    const status = execFileSync('git', ['status', '--porcelain'], {
+      cwd: worktreePath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const changed = status
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean).length;
+    const stateLabel =
+      changed === 0 ? 'clean' : `${changed} changed path${changed === 1 ? '' : 's'}`;
+    return `Worktree: ${worktreePath} (HEAD ${head}, ${stateLabel})`;
+  } catch {
+    return `Worktree: ${worktreePath}`;
+  }
+}
+
+function removeTaskGitWorktree(task: SubagentTaskRecord): void {
+  if (!task.worktreePath) return;
+  const repoRoot = task.worktreeRepoRoot ?? dirname(task.worktreePath);
+  try {
+    execFileSync('git', ['worktree', 'remove', '--force', task.worktreePath], {
+      cwd: repoRoot,
+      stdio: 'ignore',
+    });
+  } catch {
+    try {
+      rmSync(task.worktreePath, { recursive: true, force: true });
+      execFileSync('git', ['worktree', 'prune'], { cwd: repoRoot, stdio: 'ignore' });
+    } catch {}
+  }
 }
 
 function taskDuration(details: TaskDetails): string | undefined {
@@ -3239,10 +3355,12 @@ export class SubagentRuntime implements CommandSubagentRuntime {
             details.background && (details.state === 'queued' || details.state === 'running')
               ? '\nNext action: task is still active; do not poll inspect in a loop—end this turn and wait for the automatic completion follow-up turn.'
               : '';
+          const worktreeLine =
+            task.kind !== 'command' && task.worktreePath ? `\nWorktree: ${task.worktreePath}` : '';
           const header =
             task.kind === 'command'
               ? `$ bash ${task.command ?? task.description}\nMode: ${modeLabel}\nCWD: ${task.cwd}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nExit code: ${details.exitCode ?? 'none'}${activeGuidance}`
-              : `@${task.agent}: ${task.description}\nMode: ${modeLabel}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nTool calls: ${task.toolCalls ?? 0}${activeGuidance}`;
+              : `@${task.agent}: ${task.description}\nMode: ${modeLabel}${worktreeLine}\nState: ${details.state}\nDuration: ${taskDuration(details) ?? 'unknown'}\nTool calls: ${task.toolCalls ?? 0}${activeGuidance}`;
           return {
             content: [
               { type: 'text' as const, text: `${header}\n\nRecent Output:\n${outputText}` },
@@ -3749,6 +3867,11 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     if (input.model !== undefined && input.task_id) {
       throw new Error('Cannot change the model when resuming a task (model with task_id)');
     }
+    if (input.worktree !== undefined && input.task_id) {
+      throw new Error(
+        'Cannot change worktree isolation when resuming a task (worktree with task_id)',
+      );
+    }
     const requestedOverride =
       input.model !== undefined ? parseTaskModelOverride(input.model) : undefined;
     if (requestedOverride) assertOverrideModelUsable(ctx, requestedOverride.model);
@@ -3786,6 +3909,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         (!task.sessionFile || !existsSync(task.sessionFile))
       ) {
         throw new Error(`Task ${task.id} session is unavailable`);
+      }
+      if (task.kind !== 'command' && task.worktreePath && !existsSync(task.worktreePath)) {
+        throw new Error(`Task ${task.id} worktree is unavailable`);
       }
     } else {
       task = this.createRecord(input, ctx, parentTask, baseAgent, depth, requestedOverride);
@@ -3962,6 +4088,15 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       id,
     );
     mkdirSync(sessionDir, { recursive: true });
+    let worktree: { worktreePath: string; repoRoot: string } | undefined;
+    if (input.worktree) {
+      try {
+        worktree = createTaskGitWorktree(ctx.cwd, sessionDir);
+      } catch (error) {
+        rmSync(sessionDir, { recursive: true, force: true });
+        throw error;
+      }
+    }
     const task: TaskRecord = {
       version: 1,
       id,
@@ -3969,6 +4104,9 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       parentTaskId: parentTask?.id,
       parentSessionFile: parentSession,
       sessionDir,
+      cwd: worktree?.worktreePath,
+      worktreePath: worktree?.worktreePath,
+      worktreeRepoRoot: worktree?.repoRoot,
       agent: agent.name,
       description: input.description,
       depth,
@@ -4117,8 +4255,17 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         const output = await promise;
         if (workerError) throw new Error(workerError);
         if (signal.aborted) throw new Error('Task cancelled');
+        const worktreeNote =
+          task.kind !== 'command' && task.worktreePath
+            ? summarizeTaskWorktree(task.worktreePath)
+            : undefined;
+        const fullOutput = worktreeNote
+          ? output
+            ? `${output}\n\n${worktreeNote}`
+            : worktreeNote
+          : output;
         task.state = 'completed';
-        task.output = this.storeTaskText(task, output, 'output');
+        task.output = this.storeTaskText(task, fullOutput, 'output');
         task.currentTool = undefined;
         task.retryAttempt = undefined;
         task.finishedAt = Date.now();
@@ -4247,11 +4394,16 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       const settingsPath = join(agentDir, 'settings.json');
       const modelsStorePath = join(agentDir, 'models-store.json');
       const cliEntry = invocation.args[0] ?? invocation.command;
+      const workerCwd = task.cwd ?? ctx.cwd;
+      const worktreeGit =
+        task.kind !== 'command' && task.worktreePath
+          ? resolveWorktreeGitDirs(task.worktreePath)
+          : undefined;
       launch = await this.integration.prepareRpcWorker({
         permissionPromptLabel: workerDialogTitle(task),
         command: invocation.command,
         args,
-        cwd: ctx.cwd,
+        cwd: workerCwd,
         env: {
           ...workerEnvironment(process.env),
           [WORKER_ENV]: Buffer.from(JSON.stringify(config)).toString('base64url'),
@@ -4266,7 +4418,10 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         readPaths: [
           ...new Set(
             [
+              workerCwd,
               ctx.cwd,
+              worktreeGit?.gitCommonDir,
+              worktreeGit?.gitDir,
               ...agentBootstrapPaths(agentDir, !!endpoint.resolveAuth),
               ...(await collectWorkerResourceReadPaths({
                 cwd: ctx.cwd,
@@ -4293,6 +4448,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
         writePaths: [
           sessionWritePath,
           temp,
+          ...(worktreeGit ? [worktreeGit.gitDir] : []),
           ...(endpoint.resolveAuth ? [] : [authPath, `${authPath}.lock`]),
           `${settingsPath}.lock`,
           modelsStorePath,
@@ -4364,6 +4520,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
     };
     return {
       ...context,
+      cwd: task.cwd ?? context.cwd,
       role: 'subagent',
       sessionId: undefined,
       taskId: task.id,
@@ -4436,7 +4593,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
           const derivedResources = permissionResources(
             control.toolName,
             control.toolInput,
-            ctx.cwd,
+            task.cwd ?? ctx.cwd,
           );
           if (
             control.permission !== derivedPermission ||
@@ -4851,6 +5008,7 @@ export class SubagentRuntime implements CommandSubagentRuntime {
       }
       task.deleted = true;
       task.delivered = true;
+      if (task.kind !== 'command') removeTaskGitWorktree(task);
       if (task.sessionDir && existsSync(task.sessionDir)) {
         try {
           rmSync(task.sessionDir, { recursive: true, force: true });
