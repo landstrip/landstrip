@@ -718,6 +718,8 @@ describe('Background Subagent Lifecycle & Context Seeding', () => {
       expect(bashTool?.promptGuidelines?.join('\n')).toContain(
         'Do not sleep or poll tasks to wait',
       );
+      expect(bashTool?.promptGuidelines?.join('\n')).toContain('Sandbox filesystem writes:');
+      expect(bashTool?.promptGuidelines?.join('\n')).toContain('Sandbox network:');
       expect(taskTool?.promptGuidelines?.join('\n')).toContain('Do not poll tasks to wait');
       expect(tasksTool?.promptGuidelines?.join('\n')).toContain('not as a waiting primitive');
 

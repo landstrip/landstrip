@@ -179,6 +179,52 @@ export function resolveProcessReadPolicy(
   return { denyRead, allowRead };
 }
 
+export function formatSandboxPromptGuidelines(
+  config: SandboxConfig,
+  session?: {
+    allowWrite?: readonly string[];
+    allowRead?: readonly string[];
+    domains?: readonly string[];
+  },
+): string[] {
+  if (!config.enabled) return [];
+  const writeRoots = mergeArray(
+    config.filesystem.allowWrite,
+    session?.allowWrite ? [...session.allowWrite] : undefined,
+  );
+  const denyWrites = mergeArray(config.filesystem.denyWrite, config.filesystem.denyWriteAlways);
+  const writeLine = `Sandbox filesystem writes: allowed only in ${writeRoots.length > 0 ? writeRoots.join(', ') : '(none)'}${denyWrites.length > 0 ? `; denied for ${denyWrites.join(', ')}` : ''}.`;
+
+  const enforceReads = enforcesShellReadPolicy(config.shell.readAccess);
+  const allowReads = mergeArray(
+    config.filesystem.allowRead,
+    session?.allowRead ? [...session.allowRead] : undefined,
+  );
+  const denyReads = enforceReads
+    ? mergeArray(config.filesystem.denyRead, config.filesystem.denyReadAlways)
+    : config.filesystem.denyReadAlways;
+  const readLine = enforceReads
+    ? `Sandbox filesystem reads: allowed in ${allowReads.length > 0 ? allowReads.join(', ') : '(none)'}${denyReads.length > 0 ? `; denied for ${denyReads.join(', ')}` : ''}.`
+    : `Sandbox filesystem reads: host-readable${denyReads.length > 0 ? ` except ${denyReads.join(', ')}` : ''}.`;
+
+  const domains = mergeArray(
+    config.network.allowedDomains,
+    session?.domains ? [...session.domains] : undefined,
+  ).filter((domain) => !domainMatchesAny(domain, config.network.deniedDomains));
+  let networkLine: string;
+  if (config.network.allowNetwork) {
+    networkLine = 'Sandbox network: unrestricted.';
+  } else if (allowsAllDomains(domains)) {
+    networkLine = 'Sandbox network: proxied (all non-denied domains allowed).';
+  } else if (domains.length > 0) {
+    networkLine = `Sandbox network: default-deny via proxy; allowed domains: ${domains.join(', ')}.`;
+  } else {
+    networkLine = 'Sandbox network: blocked by default (no allowed domains configured).';
+  }
+
+  return [writeLine, readLine, networkLine];
+}
+
 export { parseSeatbeltDenials };
 
 interface LandstripBashCallbacks {
@@ -2988,12 +3034,17 @@ function createLandstripIntegrationWithPrompts(
     const baseRenderCall = localBash.renderCall;
     const baseRenderResult = localBash.renderResult;
 
+    const initialGuidelines = !getNoSandboxFlag()
+      ? formatSandboxPromptGuidelines(loadConfig(cwd))
+      : [];
+
     return {
       ...localBash,
       label: 'bash (landstrip)',
       description: 'Execute commands with the active Landstrip shell provider.',
       promptGuidelines: [
         ...(localBash.promptGuidelines ?? []),
+        ...initialGuidelines,
         'After launching a bash command with background: true, continue only independent work that does not wait on the command; otherwise end the current turn and wait for the automatic completion follow-up turn. Do not sleep or poll tasks to wait.',
       ],
       parameters: LandstripBashSchema,
@@ -3079,6 +3130,21 @@ function createLandstripIntegrationWithPrompts(
     unpublishRuntime = publishLandstripRuntime(pi, integration);
 
     if (shouldRegisterBashTool) pi.registerTool(createBashTool(localCwd));
+
+    pi.on('before_agent_start', (event, ctx) => {
+      if (!ensureSandboxState(ctx)) return;
+      const config = loadConfig(ctx.cwd, ctx);
+      const session = sessionGrants.overview();
+      const lines = formatSandboxPromptGuidelines(config, {
+        allowWrite: session.sessionWritePaths,
+        allowRead: session.sessionReadPaths,
+        domains: session.sessionDomains,
+      });
+      if (lines.length === 0) return;
+      return {
+        systemPrompt: `${event.systemPrompt}\n\n<sandbox_policy>\n${lines.join('\n')}\n</sandbox_policy>`,
+      };
+    });
 
     pi.on('user_bash', async (_event, ctx) => {
       if (!ensureSandboxState(ctx)) {
