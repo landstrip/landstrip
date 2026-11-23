@@ -71,11 +71,16 @@ import {
   parseSandboxConfig,
   canonicalizeGlobPattern,
   canonicalizePath,
+  createDarwinLogTag,
   expandPath,
+  findReportedSeatbeltDenial,
   globToRegExp,
   normalizePathSeparators,
+  parseSeatbeltDenials,
   parseTrapStanza,
   pathUnderDirectory,
+  querySeatbeltDenials,
+  type SeatbeltDenial,
   serializeTrapStanza,
   sessionScopeFor,
   writeLandstripPolicyFile,
@@ -174,15 +179,19 @@ export function resolveProcessReadPolicy(
   return { denyRead, allowRead };
 }
 
+export { parseSeatbeltDenials };
+
 interface LandstripBashCallbacks {
   onStderr?: (data: Buffer) => void;
   onErrorFd?: (data: Buffer) => void;
+  onSeatbeltDenials?: (denials: readonly SeatbeltDenial[]) => void;
   onRejectedPath?: (operation: 'read' | 'write', path: string) => void;
   promptOnBlock?: boolean;
 }
 
 interface ExecutionAllowances {
   readonly permissionPromptLabel?: string;
+  readonly darwinLogTag?: string;
   // Bootstrap grants must not silently override configured read denials.
   explicitDenyRead?: {
     patterns: string[];
@@ -1536,7 +1545,10 @@ function createLandstripIntegrationWithPrompts(
         denyWrite: mergeArray(config.filesystem.denyWrite, allowances?.protectedPaths),
         denyWriteAlways: mergeArray(config.filesystem.denyWriteAlways, allowances?.protectedPaths),
       },
-      macos: config.macos,
+      macos:
+        allowances?.darwinLogTag !== undefined
+          ? { ...config.macos, logTag: allowances.darwinLogTag }
+          : config.macos,
       windows: config.windows,
       httpProxyPort: proxyPort,
     });
@@ -2281,8 +2293,13 @@ function createLandstripIntegrationWithPrompts(
           }
           if (signal?.aborted) throw new Error('aborted');
 
+          const darwinLogTag =
+            process.platform === 'darwin'
+              ? createDarwinLogTag('pi-landstrip', loadConfig(cwd, ctx).macos?.logTag)
+              : undefined;
           processAllowances = {
             ...allowances,
+            ...(darwinLogTag ? { darwinLogTag } : {}),
             readPaths: [...allowances.readPaths, ...(invocation.readPaths ?? [])],
           };
           processAllowances = withWindowsProcessReadAccess(
@@ -2484,18 +2501,41 @@ function createLandstripIntegrationWithPrompts(
                 }
 
                 // Structured traps are trusted only from the trap socket; on
-                // Windows, where --trap is unsupported, use native
-                // kernel-denial text from stderr.
+                // macOS query correlated Seatbelt unified logs, and on Windows
+                // fall back to native kernel-denial text from stderr.
+                const seatbeltDenials =
+                  code !== 0 &&
+                  process.platform === 'darwin' &&
+                  processAllowances.darwinLogTag !== undefined
+                    ? await querySeatbeltDenials(processAllowances.darwinLogTag, { cwd })
+                    : [];
+                if (seatbeltDenials.length > 0) {
+                  callbacks.onSeatbeltDenials?.(seatbeltDenials);
+                }
+                const seatbeltFsDenial = findReportedSeatbeltDenial(seatbeltDenials, stderrAcc);
                 const trapSource = trapSocket ? errorFdAcc : stderrAcc;
                 const blockedPath =
                   extractTrapBlockedPath(trapSource, cwd) ??
+                  seatbeltFsDenial?.path ??
                   extractNativeDeniedPath(stderrAcc, cwd);
                 if (!blockedPath && ctx.hasUI) {
                   const traps = parseLandstripTraps(trapSource);
                   const denials = traps.filter(isDenialTrap);
+                  const nonFsSeatbeltDenials = seatbeltDenials.filter(
+                    (denial) => denial.kind !== 'filesystem',
+                  );
                   if (denials.length > 0) {
                     const formatted = formatLandstripTraps(denials);
                     notify(ctx, `Sandbox blocked an operation: ${formatted}`, 'warning');
+                  } else if (nonFsSeatbeltDenials.length > 0) {
+                    const summary = nonFsSeatbeltDenials
+                      .map((denial) =>
+                        denial.kind === 'mach'
+                          ? `${denial.action} ${denial.service}`
+                          : `${denial.action} ${denial.target}`,
+                      )
+                      .join(', ');
+                    notify(ctx, `Sandbox blocked an operation: ${summary}`, 'warning');
                   }
 
                   const failures = traps.filter((trap) => !isDenialTrap(trap));
@@ -2613,6 +2653,7 @@ function createLandstripIntegrationWithPrompts(
     let landstripErrorOutput = '';
     let stderrOutput = '';
     let stderrOutputDecoder = new StringDecoder('utf8');
+    let seatbeltDenials: readonly SeatbeltDenial[] = [];
     const rejectedPaths = {
       read: new Set<string>(),
       write: new Set<string>(),
@@ -2633,6 +2674,9 @@ function createLandstripIntegrationWithPrompts(
           onStderr: (data) => {
             stderrOutput += stderrOutputDecoder.write(data);
           },
+          onSeatbeltDenials: (denials) => {
+            seatbeltDenials = denials;
+          },
           onRejectedPath: (operation, path) => {
             rejectedPaths[operation].add(path);
           },
@@ -2652,6 +2696,8 @@ function createLandstripIntegrationWithPrompts(
     };
     const trustedTrapOutput = (): string =>
       process.platform === 'win32' ? stderrOutput : landstripErrorOutput;
+    const seatbeltBlockedPath = (operation: 'read' | 'write', output: string): string | null =>
+      findReportedSeatbeltDenial(seatbeltDenials, output, operation)?.path ?? null;
     const formatTrapErrors = (): string | null => {
       const landstripErrors = parseLandstripTraps(trustedTrapOutput());
       if (landstripErrors.length === 0) return null;
@@ -2661,7 +2707,9 @@ function createLandstripIntegrationWithPrompts(
       const config = loadConfig(ctx.cwd, ctx);
       if (!enforcesShellReadPolicy(config.shell.readAccess)) return null;
 
-      const trappedPath = extractTrapBlockedPath(trustedTrapOutput(), ctx.cwd, 'read');
+      const trappedPath =
+        extractTrapBlockedPath(trustedTrapOutput(), ctx.cwd, 'read') ??
+        seatbeltBlockedPath('read', nativeOutput);
       if (trappedPath) return trappedPath;
       return extractRetryableNativeReadDeniedPath(
         nativeOutput,
@@ -2738,6 +2786,7 @@ function createLandstripIntegrationWithPrompts(
       landstripErrorOutput = '';
       stderrOutput = '';
       stderrOutputDecoder = new StringDecoder('utf8');
+      seatbeltDenials = [];
       return run();
     };
 
@@ -2749,6 +2798,7 @@ function createLandstripIntegrationWithPrompts(
       const fallbackOutput = `${stderrOutput}\n${errorText}`;
       const blockedWritePath =
         extractTrapBlockedPath(trustedTrapOutput(), ctx.cwd, 'write') ??
+        seatbeltBlockedPath('write', fallbackOutput) ??
         extractNativeWriteDeniedPath(fallbackOutput, ctx.cwd, params.command);
       if (blockedWritePath) {
         const retryResult = await retryWithAccess('write', blockedWritePath);
@@ -2773,6 +2823,7 @@ function createLandstripIntegrationWithPrompts(
     }
     const blockedWritePath =
       extractTrapBlockedPath(trustedTrapOutput(), ctx.cwd, 'write') ??
+      seatbeltBlockedPath('write', stderrOutput) ??
       extractNativeWriteDeniedPath(stderrOutput, ctx.cwd, params.command);
     if (blockedWritePath) {
       const retryResult = await retryWithAccess('write', blockedWritePath);
