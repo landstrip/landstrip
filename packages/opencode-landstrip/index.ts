@@ -24,12 +24,14 @@ import {
   buildLandstripPolicy,
   canonicalizePath,
   controlResponseStanza,
+  createDarwinLogTag,
   evaluateDomainAccess,
   evaluateReadAccess,
   evaluateWriteAccess,
   extractDeniedPath,
   extractDomainsFromCommand,
   extractNativeDeniedPath,
+  findReportedSeatbeltDenial,
   formatLandstripTraps,
   isDomainAllowed,
   isFilesystemTrap,
@@ -37,6 +39,7 @@ import {
   isRecord,
   parseLandstripTraps,
   parseTrapStanza,
+  querySeatbeltDenials,
   writeLandstripPolicyFile,
 } from '@landstrip/landstrip-api/shared';
 
@@ -60,6 +63,7 @@ interface BashSandboxState {
   trapServerPort: number | null;
   trapStanzas: string[];
   tuiConnected: boolean;
+  darwinLogTag?: string | undefined;
   shellID?: string;
   shellExited?: boolean;
   background?: boolean;
@@ -187,12 +191,13 @@ function writePolicyFile(
   config: SandboxConfig,
   baseDirectory: string,
   proxyPort: number | null,
+  darwinLogTag?: string,
 ): { dir: string; path: string } {
   return writeLandstripPolicyFile(
     buildLandstripPolicy({
       network: config.network,
       filesystem: config.filesystem,
-      macos: config.macos,
+      macos: darwinLogTag !== undefined ? { ...config.macos, logTag: darwinLogTag } : config.macos,
       windows: config.windows,
       baseDirectory,
       httpProxyPort: proxyPort,
@@ -613,10 +618,14 @@ const plugin: Plugin.Plugin = {
             ...(proxyCredentials ? { authorization: proxyCredentials.authorization } : {}),
           });
       const proxyPort = proxy ? proxy.port : null;
+      const darwinLogTag =
+        process.platform === 'darwin'
+          ? createDarwinLogTag('opencode-landstrip', config.macos?.logTag)
+          : undefined;
       let policy: { dir: string; path: string };
 
       try {
-        policy = writePolicyFile(config, directory, proxyPort);
+        policy = writePolicyFile(config, directory, proxyPort, darwinLogTag);
       } catch (error) {
         if (proxy) await proxy.stop().catch(() => undefined);
         throw error;
@@ -665,6 +674,7 @@ const plugin: Plugin.Plugin = {
         trapServerPort: trapPort,
         trapStanzas: trapServer?.trapStanzas ?? [],
         tuiConnected: tuiTrapPort !== null,
+        darwinLogTag,
       });
 
       args.command = wrappedCommand;
@@ -857,14 +867,21 @@ const plugin: Plugin.Plugin = {
 
       if (!state.tuiConnected) {
         const blockedTrap = traps.find(isFilesystemTrap);
+        const seatbeltDenials =
+          !blockedTrap && process.platform === 'darwin' && state.darwinLogTag !== undefined
+            ? await querySeatbeltDenials(state.darwinLogTag, { cwd: directory })
+            : [];
+        const seatbeltFs = findReportedSeatbeltDenial(seatbeltDenials, outputText);
         const blockedPath = blockedTrap
           ? canonicalizePath(blockedTrap.path, directory)
-          : (extractDeniedPath(trapOutput, {
+          : (seatbeltFs?.path ??
+            extractDeniedPath(trapOutput, {
               cwd: directory,
               command: state.originalCommand,
-            }) ?? extractNativeDeniedPath(outputText, directory));
+            }) ??
+            extractNativeDeniedPath(outputText, directory));
         if (blockedPath) {
-          const blockedOperation = blockedTrap?.operation ?? 'read';
+          const blockedOperation = blockedTrap?.operation ?? seatbeltFs?.operation ?? 'read';
           await notifyOnce(
             `blocked:${blockedPath}`,
             `Sandbox blocked ${blockedOperation} to "${blockedPath}". No live TUI presenter was available, so access remains denied.`,
