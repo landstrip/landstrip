@@ -39,7 +39,9 @@ current process.
 
 [`lib/index.d.ts`](lib/index.d.ts) exports `LandstripTrap` and
 `LandstripControlResponse`, and [`/proxy`](lib/proxy.d.ts) exports the proxy
-helpers. [`/shared`](lib/shared.d.ts) provides:
+helpers (`startFilterProxy` also accepts `allowedMethods`, host-scoped
+`headerRules` with `replaceTokens`/`upgradeHttps`, and loopback `upstreams`
+gateways so guests never need raw upstream credentials). [`/shared`](lib/shared.d.ts) provides:
 
 - `decodeLandstripTrap(value)` / `parseTrapStanza(stanza)`: validated trap or `null`.
   Extra fields survive; missing/unknown denial states become `info`, never queries.

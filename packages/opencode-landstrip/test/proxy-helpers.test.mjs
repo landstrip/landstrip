@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer as createHttpServer, request as requestHttp } from 'node:http';
 import {
   PROXY_ENVIRONMENT_VARIABLES,
   createProxyCredentials,
   createProxyUrl,
   createProxyEnvironment,
+  startFilterProxy,
 } from '@landstrip/landstrip-api/proxy';
 
 test('PROXY_ENVIRONMENT_VARIABLES contains all standard proxy environment variables', () => {
@@ -74,4 +76,74 @@ test('createProxyEnvironment configures environment dictionary with proxy settin
   assert.equal(optionsEnv.USER, 'test');
   assert.equal(optionsEnv.HTTP_PROXY, 'http://landstrip:opt-token@127.0.0.2:54321');
   assert.equal(optionsEnv.NO_PROXY, '');
+});
+
+test('startFilterProxy enforces method allowlists, substitutes tokens per host, and serves gateway routes', async () => {
+  const seen = [];
+  const upstream = createHttpServer((req, res) => {
+    seen.push({ url: req.url, method: req.method, auth: req.headers.authorization });
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const upstreamPort = upstream.address().port;
+
+  const proxy = await startFilterProxy({
+    isDomainAllowed: (domain) => domain === 'localhost' || domain === '127.0.0.1',
+    allowedMethods: ['GET'],
+    headerRules: [
+      {
+        host: 'localhost',
+        replaceTokens: { 'phantom-tok': 'real-secret' },
+      },
+    ],
+    upstreams: {
+      '/svc': {
+        target: `http://localhost:${upstreamPort}/api`,
+        headers: { Authorization: 'Bearer injected-gw' },
+      },
+    },
+  });
+
+  const callProxy = (method, path, headers = {}) =>
+    new Promise((resolve, reject) => {
+      const req = requestHttp(
+        { host: '127.0.0.1', port: proxy.port, method, path, headers },
+        (res) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode));
+        },
+      );
+      req.on('error', reject);
+      req.end();
+    });
+
+  try {
+    assert.equal(
+      await callProxy('GET', `http://localhost:${upstreamPort}/v1`, {
+        Authorization: 'Bearer phantom-tok',
+      }),
+      200,
+    );
+    assert.equal(seen[0].auth, 'Bearer real-secret');
+
+    // Cross-host phantom token leak blocked
+    assert.equal(
+      await callProxy('GET', `http://127.0.0.1:${upstreamPort}/v1`, {
+        Authorization: 'Bearer phantom-tok',
+      }),
+      403,
+    );
+
+    // Disallowed method blocked
+    assert.equal(await callProxy('DELETE', `http://localhost:${upstreamPort}/v1`), 405);
+
+    // Gateway route rewrites prefix and injects header
+    assert.equal(await callProxy('GET', '/svc/items'), 200);
+    assert.equal(seen[1].url, '/api/items');
+    assert.equal(seen[1].auth, 'Bearer injected-gw');
+  } finally {
+    await proxy.stop();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
 });
