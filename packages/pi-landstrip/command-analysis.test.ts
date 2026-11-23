@@ -1,11 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
+  createDarwinLogTag,
   extractDomainsFromCommand,
   extractCandidatePaths,
   extractNativeDeniedPath,
   extractNativeWriteDeniedPath,
   extractDeniedPath,
   canonicalizePath,
+  findReportedSeatbeltDenial,
+  parseSeatbeltDenials,
+  querySeatbeltDenials,
   serializeTrapStanza,
 } from '@landstrip/landstrip-api/shared';
 
@@ -111,5 +115,82 @@ describe('command analysis and denial path extraction in pi-landstrip', () => {
         { cwd, command: 'cat /workspace/shadow' },
       ),
     ).toBeNull();
+  });
+
+  it('correlates macOS Seatbelt unified log denials by logTag', async () => {
+    const tag = createDarwinLogTag('pi-landstrip', 'custom-session');
+    expect(tag.startsWith('custom-session-')).toBe(true);
+
+    const sampleJsonLog = JSON.stringify([
+      {
+        eventMessage: `Sandbox: touch(9120) deny(1) file-write-create /workspace/test/blocked.txt (${tag})`,
+      },
+      {
+        eventMessage:
+          'Sandbox: cat(9121) deny(1) file-read-data /workspace/other.txt (unrelated-tag)',
+      },
+      {
+        eventMessage: `Sandbox: helper(9122) ${tag} deny(1) mach-lookup com.apple.trustd.agent`,
+      },
+    ]);
+
+    const parsed = parseSeatbeltDenials(sampleJsonLog, { logTag: tag, cwd });
+    expect(parsed).toEqual([
+      {
+        kind: 'filesystem',
+        operation: 'write',
+        path: canonicalizePath('/workspace/test/blocked.txt', cwd),
+        action: 'file-write-create',
+      },
+      {
+        kind: 'mach',
+        service: 'com.apple.trustd.agent',
+        action: 'mach-lookup',
+      },
+    ]);
+
+    let capturedArgs: readonly string[] = [];
+    const queried = await querySeatbeltDenials(tag, {
+      cwd,
+      lastSeconds: 15,
+      runLogShow: async (args) => {
+        capturedArgs = args;
+        return sampleJsonLog;
+      },
+    });
+    expect(capturedArgs).toContain(`eventMessage CONTAINS "${tag}"`);
+    expect(queried).toEqual(parsed);
+  });
+
+  it('ignores Seatbelt denials not named by a permission error', () => {
+    const tty = {
+      kind: 'filesystem',
+      operation: 'write',
+      path: '/dev/tty',
+      action: 'file-write-data',
+    } as const;
+    const pem = {
+      kind: 'filesystem',
+      operation: 'write',
+      path: '/workspace/test/test.pem',
+      action: 'file-write-create',
+    } as const;
+    const denials = [
+      { ...tty, path: '/dev/dtracehelper' },
+      tty,
+      { kind: 'mach', service: 'com.apple.trustd.agent', action: 'mach-lookup' } as const,
+      pem,
+    ];
+
+    const output = '/bin/bash: test.pem: Operation not permitted\n';
+    expect(findReportedSeatbeltDenial(denials, output, 'write')).toEqual(pem);
+    expect(findReportedSeatbeltDenial(denials, output, 'read')).toBeUndefined();
+    expect(
+      findReportedSeatbeltDenial(denials, '/bin/bash: readonly.txt: Permission denied\n'),
+    ).toBeUndefined();
+    expect(findReportedSeatbeltDenial(denials, 'not a tty\ntest.pem written\n')).toBeUndefined();
+    expect(
+      findReportedSeatbeltDenial(denials, '/bin/bash: test.pem.bak: Permission denied\n'),
+    ).toBeUndefined();
   });
 });

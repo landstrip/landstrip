@@ -1722,6 +1722,189 @@ function extractDeniedPath(output, options) {
   return null;
 }
 
+const { randomBytes: randomSeatbeltBytes } = require('node:crypto');
+const { execFile: execSeatbeltLogFile } = require('node:child_process');
+
+function sanitizeDarwinLogTagSegment(value) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/["\\\u0000-\u001f\u007f]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+function createDarwinLogTag(prefix = 'landstrip', baseTag) {
+  const cleanBase = sanitizeDarwinLogTagSegment(baseTag);
+  const cleanPrefix = sanitizeDarwinLogTagSegment(prefix) || 'landstrip';
+  const head = (cleanBase || cleanPrefix).slice(0, 64);
+  const tag = `${head}-${randomSeatbeltBytes(6).toString('hex')}`;
+  validateDarwinLogTag(tag);
+  return tag;
+}
+
+function stripTrailingSeatbeltTag(target, logTag) {
+  let value = target.trim();
+  if (logTag) {
+    for (const suffix of [` (${logTag})`, ` [${logTag}]`, ` ${logTag}`]) {
+      if (value.endsWith(suffix)) {
+        value = value.slice(0, -suffix.length).trim();
+        break;
+      }
+    }
+  }
+  return value.replace(/^['"]|['"]$/g, '');
+}
+
+function extractSeatbeltMessages(logOutput) {
+  const trimmed = logOutput.trim();
+  if (!trimmed) return [];
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed.flatMap((entry) =>
+          isRecord(entry) && typeof entry.eventMessage === 'string' ? [entry.eventMessage] : [],
+        );
+      }
+    } catch {
+      // Fall through to line-by-line parsing.
+    }
+  }
+  return trimmed.split(/\r?\n/).flatMap((line) => {
+    const candidate = line.trim();
+    if (!candidate) return [];
+    if (candidate.startsWith('{') && candidate.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(candidate);
+        if (isRecord(parsed) && typeof parsed.eventMessage === 'string') {
+          return [parsed.eventMessage];
+        }
+      } catch {}
+    }
+    return [line];
+  });
+}
+
+function parseSeatbeltDenials(logOutput, options) {
+  if (typeof logOutput !== 'string' || logOutput.length === 0) return [];
+  const cwd = typeof options?.cwd === 'string' ? options.cwd : process.cwd();
+  const logTag = typeof options?.logTag === 'string' && options.logTag.length > 0 ? options.logTag : undefined;
+  const messages = extractSeatbeltMessages(logOutput);
+  const results = [];
+  const seen = new Set();
+
+  for (const message of messages) {
+    if (logTag && !message.includes(logTag)) continue;
+    for (const line of message.split(/\r?\n/)) {
+      const match = line.match(/\bdeny(?:\([^)]*\))?\s+([a-z0-9*-]+)(?:\s+([^\r\n]+))?/i);
+      if (!match) continue;
+      const action = match[1].toLowerCase();
+      const rawTarget = match[2] ? stripTrailingSeatbeltTag(match[2], logTag) : '';
+
+      if (action.startsWith('file-write')) {
+        if (!rawTarget || (!rawTarget.startsWith('/') && !rawTarget.startsWith('.'))) continue;
+        const path = normalizeBlockedPath(rawTarget, cwd);
+        const key = `filesystem:write:${path}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({ kind: 'filesystem', operation: 'write', path, action });
+        }
+        continue;
+      }
+
+      if (action.startsWith('file-read')) {
+        if (!rawTarget || (!rawTarget.startsWith('/') && !rawTarget.startsWith('.'))) continue;
+        const path = normalizeBlockedPath(rawTarget, cwd);
+        const key = `filesystem:read:${path}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({ kind: 'filesystem', operation: 'read', path, action });
+        }
+        continue;
+      }
+
+      if (action.startsWith('mach-lookup')) {
+        if (!rawTarget) continue;
+        const key = `mach:${rawTarget}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({ kind: 'mach', service: rawTarget, action });
+        }
+        continue;
+      }
+
+      if (action.startsWith('network')) {
+        const target = rawTarget || action;
+        const key = `network:${target}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push({ kind: 'network', target, action });
+        }
+      }
+    }
+  }
+
+  return results;
+}
+
+async function querySeatbeltDenials(logTag, options) {
+  validateDarwinLogTag(logTag);
+  const cwd = typeof options?.cwd === 'string' ? options.cwd : process.cwd();
+  const lastSeconds =
+    typeof options?.lastSeconds === 'number' && Number.isFinite(options.lastSeconds)
+      ? Math.max(1, Math.min(300, Math.ceil(options.lastSeconds)))
+      : 30;
+  const args = [
+    'show',
+    '--style',
+    'json',
+    '--no-pager',
+    '--last',
+    `${lastSeconds}s`,
+    '--predicate',
+    `eventMessage CONTAINS "${logTag}"`,
+  ];
+  const runLogShow =
+    typeof options?.runLogShow === 'function'
+      ? options.runLogShow
+      : (logArgs) =>
+          new Promise((resolve) => {
+            if (process.platform !== 'darwin') {
+              resolve('');
+              return;
+            }
+            execSeatbeltLogFile(
+              '/usr/bin/log',
+              [...logArgs],
+              { timeout: 3000, maxBuffer: 2 * 1024 * 1024, encoding: 'utf8' },
+              (error, stdout) => {
+                resolve(error ? '' : String(stdout ?? ''));
+              },
+            );
+          });
+  const output = await runLogShow(args);
+  return parseSeatbeltDenials(output, { logTag, cwd });
+}
+
+// Seatbelt logs every denial, including startup probes such as
+// /dev/dtracehelper or /dev/tty that processes tolerate, so only a denial
+// named on a permission-error line of the command output explains a failure.
+function findReportedSeatbeltDenial(denials, output, operation) {
+  if (!Array.isArray(denials) || typeof output !== 'string') return undefined;
+  const lines = output
+    .split(/\r?\n/)
+    .filter((line) =>
+      /operation not permitted|permission denied|access is denied|\bE(?:PERM|ACCES)\b/i.test(line),
+    );
+  if (lines.length === 0) return undefined;
+  return denials.find((denial) => {
+    if (!isRecord(denial) || denial.kind !== 'filesystem') return false;
+    if (operation !== undefined && denial.operation !== operation) return false;
+    const name = basename(denial.path);
+    if (!name) return false;
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const mention = new RegExp(`(?<![\\w.-])${escaped}(?![\\w/-]|\\.\\w)`);
+    return lines.some((line) => mention.test(line));
+  });
+}
+
 module.exports = {
   isRecord,
   expandHomePath,
@@ -1777,4 +1960,8 @@ module.exports = {
   extractNativeDeniedPath,
   extractNativeWriteDeniedPath,
   extractDeniedPath,
+  createDarwinLogTag,
+  parseSeatbeltDenials,
+  querySeatbeltDenials,
+  findReportedSeatbeltDenial,
 };

@@ -274,3 +274,63 @@ export function extractDeniedPath(
   output: string,
   options?: ExtractDeniedPathOptions,
 ): string | null;
+
+export interface SeatbeltFilesystemDenial {
+  kind: 'filesystem';
+  operation: 'read' | 'write';
+  path: string;
+  action: string;
+}
+
+export interface SeatbeltMachDenial {
+  kind: 'mach';
+  service: string;
+  action: string;
+}
+
+export interface SeatbeltNetworkDenial {
+  kind: 'network';
+  target: string;
+  action: string;
+}
+
+export type SeatbeltDenial =
+  | SeatbeltFilesystemDenial
+  | SeatbeltMachDenial
+  | SeatbeltNetworkDenial;
+
+export interface ParseSeatbeltDenialsOptions {
+  logTag?: string | undefined;
+  cwd?: string | undefined;
+}
+
+export interface QuerySeatbeltDenialsOptions {
+  cwd?: string | undefined;
+  lastSeconds?: number | undefined;
+  runLogShow?: ((args: readonly string[]) => Promise<string>) | undefined;
+}
+
+/** Creates a valid per-run `macos.logTag`, preserving an optional base tag prefix. */
+export function createDarwinLogTag(prefix?: string, baseTag?: string): string;
+
+/** Parses macOS Seatbelt unified-log JSON or text output into normalized denials. */
+export function parseSeatbeltDenials(
+  logOutput: string,
+  options?: ParseSeatbeltDenialsOptions,
+): SeatbeltDenial[];
+
+/** Queries `/usr/bin/log show` on macOS for Seatbelt denials matching `logTag`. */
+export function querySeatbeltDenials(
+  logTag: string,
+  options?: QuerySeatbeltDenialsOptions,
+): Promise<SeatbeltDenial[]>;
+
+/**
+ * Returns the first filesystem denial whose path is named on a
+ * permission-error line of the command output.
+ */
+export function findReportedSeatbeltDenial(
+  denials: readonly SeatbeltDenial[],
+  output: string,
+  operation?: 'read' | 'write',
+): SeatbeltFilesystemDenial | undefined;

@@ -8,9 +8,12 @@ import {
   extractDeniedPath,
   canonicalizePath,
   controlResponseStanza,
+  createDarwinLogTag,
   decodeLandstripTrap,
   parseLandstripTraps,
+  parseSeatbeltDenials,
   parseTrapStanza,
+  querySeatbeltDenials,
   serializeTrapStanza,
 } from '@landstrip/landstrip-api/shared';
 
@@ -265,4 +268,31 @@ test('stanza wire format round-trips escaped values, omitted fields, and replies
 
   assert.equal(controlResponseStanza('42', 'allow'), 'query_id=42\naction=allow\n\n');
   assert.throws(() => controlResponseStanza('0', 'allow'), TypeError);
+});
+
+test('createDarwinLogTag and querySeatbeltDenials correlate macOS Seatbelt log output', async () => {
+  const cwd = '/workspace/test';
+  const tag = createDarwinLogTag('opencode-landstrip');
+  assert.match(tag, /^opencode-landstrip-[0-9a-f]{12}$/);
+
+  const rawLines = [
+    `Sandbox: cat(402) deny(1) file-read-data /workspace/test/secret.pem [${tag}]`,
+    'Sandbox: cat(403) deny(1) file-read-data /workspace/test/ignored.pem [other-tag]',
+  ].join('\n');
+  assert.deepEqual(parseSeatbeltDenials(rawLines, { logTag: tag, cwd }), [
+    {
+      kind: 'filesystem',
+      operation: 'read',
+      path: canonicalizePath('/workspace/test/secret.pem', cwd),
+      action: 'file-read-data',
+    },
+  ]);
+
+  const queried = await querySeatbeltDenials(tag, {
+    cwd,
+    runLogShow: async () => rawLines,
+  });
+  assert.equal(queried.length, 1);
+  assert.equal(queried[0].kind, 'filesystem');
+  assert.equal(queried[0].operation, 'read');
 });
