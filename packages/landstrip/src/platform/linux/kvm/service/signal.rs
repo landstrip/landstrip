@@ -868,6 +868,7 @@ impl GuestSignals {
             {
                 prior_regs.rewind_syscall(origin);
             }
+            prior_regs.leave_kernel_stub();
         } else {
             prior_regs.normalize_interrupted();
         }

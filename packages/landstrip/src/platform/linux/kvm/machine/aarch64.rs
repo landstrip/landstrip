@@ -300,6 +300,9 @@ impl Regs {
     }
 
     #[allow(clippy::unused_self)]
+    pub(crate) const fn leave_kernel_stub(&mut self) {}
+
+    #[allow(clippy::unused_self)]
     pub(crate) const fn normalize_interrupted(&mut self) {}
 
     /// Registers of a `clone` or `fork` child, which returns zero from the

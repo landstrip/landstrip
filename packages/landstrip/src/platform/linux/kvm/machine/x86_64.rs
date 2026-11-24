@@ -162,9 +162,21 @@ impl Regs {
         self.raw.rsp
     }
 
-    pub(crate) const fn normalize_interrupted(&mut self) {
+    pub(crate) const fn leave_kernel_stub(&mut self) {
         if self.in_kernel_stub {
             self.raw.rip = self.raw.rcx;
+            self.raw.rflags = self.raw.r11;
+            self.in_kernel_stub = false;
+        }
+    }
+
+    pub(crate) const fn normalize_interrupted(&mut self) {
+        if self.in_kernel_stub {
+            self.raw.rip = if self.raw.rip == STUB {
+                self.raw.rcx.wrapping_sub(SYSCALL_LEN)
+            } else {
+                self.raw.rcx
+            };
             self.raw.rflags = self.raw.r11;
             self.in_kernel_stub = false;
         }
