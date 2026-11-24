@@ -30,10 +30,10 @@ const STUB: u64 = 0x4000;
 const HANDLERS: u64 = 0x5000;
 const IDT: u64 = 0x6000;
 const PT: u64 = 0x7000;
-const TSS_POOL: u64 = 0x8000;
-const TSS_SLOTS: u64 = 64;
+const PD_BASE: u64 = 0x8000;
+const TSS_POOL: u64 = 0x4_8000;
+const TSS_SLOTS: u64 = 1024;
 const TSS_SLOT_BYTES: u64 = 256;
-const PD_BASE: u64 = 0xc000;
 
 const PAGE_PRESENT: u64 = 1 << 0;
 const PAGE_WRITE: u64 = 1 << 1;
@@ -1157,7 +1157,10 @@ impl Machine {
     }
 
     fn ensure_layout_fits(gib_count: u64) -> Result<()> {
-        if gib_count > TABLE_ENTRIES || PD_BASE + gib_count * PAGE_BYTES > RESERVED_END {
+        if gib_count > TABLE_ENTRIES
+            || PD_BASE + gib_count * PAGE_BYTES > TSS_POOL
+            || TSS_POOL + TSS_SLOTS * TSS_SLOT_BYTES > RESERVED_END
+        {
             bail!("guest memory exceeds page-table layout capacity");
         }
         Ok(())
