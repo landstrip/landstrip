@@ -1840,25 +1840,6 @@ impl ControlBuffer {
             self.words.as_mut_ptr().cast()
         }
     }
-
-    fn msghdr(&mut self, controllen: usize) -> libc::msghdr {
-        let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
-        let capped = controllen.min(self.len);
-        hdr.msg_control = if capped == 0 {
-            std::ptr::null_mut()
-        } else {
-            self.words.as_mut_ptr().cast()
-        };
-        #[cfg(target_env = "musl")]
-        {
-            hdr.msg_controllen = libc::socklen_t::try_from(capped).unwrap_or(libc::socklen_t::MAX);
-        }
-        #[cfg(not(target_env = "musl"))]
-        {
-            hdr.msg_controllen = capped;
-        }
-        hdr
-    }
 }
 
 pub(super) struct DecodedMsg {
@@ -2002,24 +1983,37 @@ impl KernelMsghdr {
         Ok(vectors)
     }
 
+    const KERNEL_CMSG_HDR_LEN: usize = 16;
+
+    const fn cmsg_align(len: usize) -> Option<usize> {
+        let Some(padded) = len.checked_add(7) else {
+            return None;
+        };
+        Some(padded & !7)
+    }
+
     fn validate_control(buf: &mut ControlBuffer) -> std::result::Result<(), Errno> {
-        let len = buf.len();
-        let mhdr = buf.msghdr(len);
-        let base = mhdr.msg_control.cast::<u8>().cast_const();
-        let hdr_len = unsafe { libc::CMSG_LEN(0) } as usize;
-        let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const mhdr) };
-        while !cmsg.is_null() {
-            let hdr = unsafe { *cmsg };
-            let cmsg_len = unsafe {
-                usize::from_ne_bytes(cmsg.cast::<[u8; std::mem::size_of::<usize>()]>().read())
+        let bytes = buf.as_slice();
+        let len = bytes.len();
+        let mut offset = 0usize;
+        while len.saturating_sub(offset) >= Self::KERNEL_CMSG_HDR_LEN {
+            let hdr = &bytes[offset..offset + Self::KERNEL_CMSG_HDR_LEN];
+            let Ok(cmsg_len) =
+                usize::try_from(u64::from_ne_bytes(hdr[0..8].try_into().unwrap_or([0; 8])))
+            else {
+                return Err(Errno::EINVAL);
             };
-            let offset = unsafe { cmsg.cast::<u8>().cast_const().offset_from_unsigned(base) };
-            if cmsg_len < hdr_len || cmsg_len > len - offset {
+            let cmsg_level = i32::from_ne_bytes(hdr[8..12].try_into().unwrap_or([0; 4]));
+            let cmsg_type = i32::from_ne_bytes(hdr[12..16].try_into().unwrap_or([0; 4]));
+            if cmsg_len < Self::KERNEL_CMSG_HDR_LEN || cmsg_len > len - offset {
                 return Err(Errno::EINVAL);
             }
-            if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_RIGHTS {
-                let data_ptr = unsafe { libc::CMSG_DATA(cmsg) }.cast_const();
-                let data = unsafe { std::slice::from_raw_parts(data_ptr, cmsg_len - hdr_len) };
+            if cmsg_level == libc::SOL_SOCKET && cmsg_type == libc::SCM_RIGHTS {
+                let data_len = cmsg_len - Self::KERNEL_CMSG_HDR_LEN;
+                if !data_len.is_multiple_of(std::mem::size_of::<RawFd>()) {
+                    return Err(Errno::EINVAL);
+                }
+                let data = &bytes[offset + Self::KERNEL_CMSG_HDR_LEN..offset + cmsg_len];
                 for chunk in data.chunks_exact(std::mem::size_of::<RawFd>()) {
                     let fd = RawFd::from_ne_bytes(chunk.try_into().unwrap_or([0; 4]));
                     if GuestFd::from_raw(fd).valid().is_none() {
@@ -2027,7 +2021,13 @@ impl KernelMsghdr {
                     }
                 }
             }
-            cmsg = unsafe { libc::CMSG_NXTHDR(&raw const mhdr, cmsg) };
+            let Some(step) = Self::cmsg_align(cmsg_len) else {
+                return Err(Errno::EINVAL);
+            };
+            let Some(next) = offset.checked_add(step) else {
+                return Err(Errno::EINVAL);
+            };
+            offset = next;
         }
         Ok(())
     }
@@ -2036,32 +2036,38 @@ impl KernelMsghdr {
         if received == 0 {
             return 0;
         }
-        let mhdr = buf.msghdr(received);
-        let base = mhdr.msg_control.cast::<u8>();
-        let hdr_len = unsafe { libc::CMSG_LEN(0) } as usize;
-        let mut kept_end = received;
+        let capped = received.min(buf.len());
+        let bytes = &mut buf.as_mut_slice()[..capped];
+        let mut kept_end = capped;
         let mut overflowed = false;
-        let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&raw const mhdr) };
-        while !cmsg.is_null() {
-            let hdr = unsafe { *cmsg };
-            let cmsg_len = unsafe {
-                usize::from_ne_bytes(cmsg.cast::<[u8; std::mem::size_of::<usize>()]>().read())
+        let mut offset = 0usize;
+        while capped.saturating_sub(offset) >= Self::KERNEL_CMSG_HDR_LEN {
+            let hdr_slice = &bytes[offset..offset + Self::KERNEL_CMSG_HDR_LEN];
+            let Ok(cmsg_len) = usize::try_from(u64::from_ne_bytes(
+                hdr_slice[0..8].try_into().unwrap_or([0; 8]),
+            )) else {
+                if !overflowed {
+                    kept_end = offset;
+                }
+                break;
             };
-            let offset = unsafe { cmsg.cast::<u8>().offset_from_unsigned(base) };
-            if cmsg_len < hdr_len || cmsg_len > received - offset {
+            let cmsg_level = i32::from_ne_bytes(hdr_slice[8..12].try_into().unwrap_or([0; 4]));
+            let cmsg_type = i32::from_ne_bytes(hdr_slice[12..16].try_into().unwrap_or([0; 4]));
+            if cmsg_len < Self::KERNEL_CMSG_HDR_LEN || cmsg_len > capped - offset {
                 if !overflowed {
                     kept_end = offset;
                 }
                 break;
             }
-            let next = unsafe { libc::CMSG_NXTHDR(&raw const mhdr, cmsg) };
-            if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == libc::SCM_RIGHTS {
-                let data_len = cmsg_len - hdr_len;
-                let data_ptr = unsafe { libc::CMSG_DATA(cmsg) };
-                let data = unsafe { std::slice::from_raw_parts_mut(data_ptr, data_len) };
-                let mut kept_fds = 0u32;
+            let next_offset = Self::cmsg_align(cmsg_len).and_then(|step| offset.checked_add(step));
+            if cmsg_level == libc::SOL_SOCKET && cmsg_type == libc::SCM_RIGHTS {
+                let data_start = offset + Self::KERNEL_CMSG_HDR_LEN;
+                let data_end = offset + cmsg_len;
+                let mut kept_fds = 0usize;
                 let mut truncated_here = false;
-                for chunk in data.chunks_exact_mut(std::mem::size_of::<RawFd>()) {
+                for chunk in
+                    bytes[data_start..data_end].chunks_exact_mut(std::mem::size_of::<RawFd>())
+                {
                     let fd = RawFd::from_ne_bytes(chunk.try_into().unwrap_or([0; 4]));
                     if !overflowed && GuestFd::within_soft_limit(fd) {
                         GuestFd::note_guest_fd(fd);
@@ -2082,18 +2088,18 @@ impl KernelMsghdr {
                     if kept_fds == 0 {
                         kept_end = offset;
                     } else {
-                        let kept_bytes = kept_fds * 4;
-                        let new_len = unsafe { libc::CMSG_LEN(kept_bytes) } as usize;
-                        let new_space = unsafe { libc::CMSG_SPACE(kept_bytes) } as usize;
-                        unsafe {
-                            cmsg.cast::<[u8; std::mem::size_of::<usize>()]>()
-                                .write(new_len.to_ne_bytes());
-                        }
-                        kept_end = (offset + new_space).min(received);
+                        let kept_bytes = kept_fds * std::mem::size_of::<RawFd>();
+                        let new_len = Self::KERNEL_CMSG_HDR_LEN + kept_bytes;
+                        let new_space = Self::cmsg_align(new_len).unwrap_or(new_len);
+                        bytes[offset..offset + 8].copy_from_slice(&(new_len as u64).to_ne_bytes());
+                        kept_end = (offset + new_space).min(capped);
                     }
                 }
             }
-            cmsg = next;
+            let Some(next) = next_offset else {
+                break;
+            };
+            offset = next;
         }
         kept_end
     }
