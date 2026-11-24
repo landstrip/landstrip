@@ -274,13 +274,9 @@ impl GuestMemory {
         shmflg: i32,
     ) -> std::result::Result<(), Errno> {
         let range = self.range(offset, length).map_err(|_| Errno::EINVAL)?;
-        let attached = unsafe {
-            libc::shmat(
-                shmid,
-                self.pointer.add(range.start).cast(),
-                (shmflg & !libc::SHM_RND) | libc::SHM_REMAP,
-            )
-        };
+        let host_flags = (shmflg & !(libc::SHM_RND | libc::SHM_EXEC)) | libc::SHM_REMAP;
+        let attached =
+            unsafe { libc::shmat(shmid, self.pointer.add(range.start).cast(), host_flags) };
         if attached.addr() == usize::MAX {
             return Err(Errno::last_os(Errno::ENOMEM));
         }
