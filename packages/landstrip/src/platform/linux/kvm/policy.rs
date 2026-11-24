@@ -1181,8 +1181,14 @@ impl Mutation {
         }) {
             return deny(index, Access::Write, DenialReason::DenyMatch, false);
         }
-        if name_change && rules.is_denied_link_always(&source.lexical) {
-            return deny(0, Access::Write, DenialReason::DenyMatch, false);
+        if name_change
+            && let Some(index) = paths.iter().position(|target| {
+                rules.is_denied_link_always(&target.lexical)
+                    || (target.label != target.lexical
+                        && rules.is_denied_link_always(&target.label))
+            })
+        {
+            return deny(index, Access::Write, DenialReason::DenyMatch, false);
         }
         for (index, target) in paths.iter().enumerate() {
             if let Some(reason) = rules.write_reason(&target.label, true) {
@@ -1192,8 +1198,13 @@ impl Mutation {
                 return deny(index, Access::Write, DenialReason::DenyMatch, true);
             }
         }
-        if name_change && rules.is_denied_link(&source.lexical) {
-            return deny(0, Access::Write, DenialReason::DenyMatch, true);
+        if name_change
+            && let Some(index) = paths.iter().position(|target| {
+                rules.is_denied_link(&target.lexical)
+                    || (target.label != target.lexical && rules.is_denied_link(&target.label))
+            })
+        {
+            return deny(index, Access::Write, DenialReason::DenyMatch, true);
         }
         if removal {
             if !rules
@@ -1215,15 +1226,11 @@ impl Mutation {
                     .then_some(DenialReason::DenyMatch)
             })
         };
-        if let Some(reason) = unreadable(source)
-            && paths
-                .get(1)
-                .is_none_or(|target| rules.read_reason(&target.label).is_none())
-        {
+        if let Some(reason) = unreadable(source) {
             return deny(0, Access::Read, reason, true);
         }
         let (index, target) = paths.iter().enumerate().nth(1)?;
-        let reason = unreadable(target).filter(|_| rules.read_reason(&source.label).is_none())?;
+        let reason = unreadable(target)?;
         deny(index, Access::Read, reason, true)
     }
 }

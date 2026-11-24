@@ -724,7 +724,27 @@ impl FsOracle {
         let Some(source) = entries.first() else {
             return Decision::Allow;
         };
-        let link = self.denied_links.get(&source.lexical).filter(|_| renames);
+        let link = renames
+            .then(|| {
+                let always = entries.iter().find_map(|entry| {
+                    self.denied_links
+                        .get(&entry.lexical)
+                        .filter(|&&tier| tier == Decision::Always)
+                        .or_else(|| {
+                            self.denied_links
+                                .get(&entry.label)
+                                .filter(|&&tier| tier == Decision::Always)
+                        })
+                });
+                always.or_else(|| {
+                    entries.iter().find_map(|entry| {
+                        self.denied_links
+                            .get(&entry.lexical)
+                            .or_else(|| self.denied_links.get(&entry.label))
+                    })
+                })
+            })
+            .flatten();
         let hard = entries.iter().any(|entry| {
             (renames
                 && (self.read.always.covers_either(entry)
@@ -742,23 +762,21 @@ impl FsOracle {
                     .then_some(Decision::DenyMatch),
                 decision => Some(decision),
             });
-        let readable = |entry: &Entry| self.read(&entry.label, &entry.label) == Decision::Allow;
-        let unreadable =
-            |entry: &Entry| !readable(entry) || self.read.denied_under(tree, &entry.label);
-        let name = match (mutation, entries.get(1)) {
-            (Mutation::Removal, _) => {
-                self.read.denial(&source.label).is_some()
-                    || self.read.denial(&source.lexical).is_some()
-            }
-            (Mutation::Reparent, Some(dest)) => {
-                (unreadable(source) && readable(dest)) || (unreadable(dest) && readable(source))
-            }
-            _ => false,
+        let unreadable = |entry: &Entry| match self.read(&entry.label, &entry.label) {
+            Decision::Allow => self
+                .read
+                .denied_under(tree, &entry.label)
+                .then_some(Decision::DenyMatch),
+            decision => Some(decision),
         };
-        write
-            .or(link.copied())
-            .or(name.then_some(Decision::DenyMatch))
-            .unwrap_or(Decision::Allow)
+        let name = match (mutation, entries.get(1)) {
+            (Mutation::Removal, _) => (self.read.denial(&source.label).is_some()
+                || self.read.denial(&source.lexical).is_some())
+            .then_some(Decision::DenyMatch),
+            (Mutation::Reparent, Some(dest)) => unreadable(source).or_else(|| unreadable(dest)),
+            _ => None,
+        };
+        write.or(link.copied()).or(name).unwrap_or(Decision::Allow)
     }
 
     pub fn read_denied_under(&self, tree: &SandboxState, prefix: &str) -> bool {
