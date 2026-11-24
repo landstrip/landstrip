@@ -925,7 +925,7 @@ impl Denials {
         request: Request<'_>,
     ) -> Option<Errno> {
         let argument = SyscallArgs::raw(registers);
-        let denial = match request.target {
+        let denials = match request.target {
             Target::Path {
                 dirfd,
                 path,
@@ -937,8 +937,11 @@ impl Denials {
                 if empty.names_descriptor(&argument, path) {
                     let fd = dirfd.unwrap_or_else(GuestFd::at_fdcwd);
                     match request.open {
-                        Some(flags) => policy.descriptor_open_denial(fd, flags),
-                        None => policy.descriptor_denial(fd, request.access),
+                        Some(flags) => policy.descriptor_open_denials(fd, flags),
+                        None => policy
+                            .descriptor_denial(fd, request.access)
+                            .into_iter()
+                            .collect(),
                     }
                 } else {
                     let path_ref = path.as_path();
@@ -948,18 +951,36 @@ impl Denials {
                     let dirfd = dirfd.unwrap_or_else(GuestFd::at_fdcwd);
                     match request.open {
                         Some(flags) => {
-                            policy.open_denial(dirfd, path_ref, flags, follow, resolve, missing)
+                            policy.open_denials(dirfd, path_ref, flags, follow, resolve, missing)
                         }
-                        None => policy.denial(dirfd, path_ref, request.access, follow, missing),
+                        None => policy
+                            .denial(dirfd, path_ref, request.access, follow, missing)
+                            .into_iter()
+                            .collect(),
                     }
                 }
             }
-            Target::Descriptor { index } => policy.descriptor_denial(
-                GuestFd::from_reg(argument[index]).policy_dirfd(),
-                request.access,
-            ),
+            Target::Descriptor { index } => policy
+                .descriptor_denial(
+                    GuestFd::from_reg(argument[index]).policy_dirfd(),
+                    request.access,
+                )
+                .into_iter()
+                .collect(),
         };
         let syscall = registers.syscall()?;
-        denial.and_then(|denial| self.refuse(policy, syscall, denial, request.flags))
+        let mut flags = request.flags;
+        let len = denials.len();
+        for (idx, denial) in denials.into_iter().enumerate() {
+            let item_flags = if idx + 1 == len {
+                std::mem::take(&mut flags)
+            } else {
+                flags.clone()
+            };
+            if let Some(errno) = self.refuse(policy, syscall, denial, item_flags) {
+                return Some(errno);
+            }
+        }
+        None
     }
 }

@@ -454,12 +454,7 @@ impl Policy {
         })
     }
 
-    /// Describes the refusal of an `open` of `flags`.
-    ///
-    /// An open that reads and writes is refused by a read rule before a write
-    /// rule, and a rule that holds whatever the payload does refuses it without
-    /// the responder being asked.
-    pub(crate) fn open_denial(
+    pub(crate) fn open_denials(
         &self,
         dirfd: i64,
         path: &Path,
@@ -467,7 +462,7 @@ impl Policy {
         follow: bool,
         resolve: ResolveFlags,
         missing: Missing,
-    ) -> Option<Denial> {
+    ) -> Vec<Denial> {
         const WRITES: i32 = libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC;
         let access = Access::from_open_flags(flags);
         let creating = follow && flags & libc::O_CREAT != 0;
@@ -482,16 +477,16 @@ impl Policy {
             }
         };
         let resolved = match resolution {
-            Resolution::Kernel | Resolution::Unclassified => return None,
+            Resolution::Kernel | Resolution::Unclassified => return Vec::new(),
             Resolution::Unresolvable(unres) => {
                 let mut denial = Denial::unresolvable(access, unres);
                 denial.queryable = !creating;
-                return Some(denial);
+                return vec![denial];
             }
             Resolution::Resolved(resolved) => resolved,
         };
         if missing == Missing::Kernel && !resolved.present {
-            return None;
+            return Vec::new();
         }
         let rules = &self.rules;
         let wants_write = flags & WRITES != 0;
@@ -504,27 +499,33 @@ impl Policy {
             && rules
                 .write_denials
                 .is_denied_always(&resolved.label, &resolved.lexical);
-        let denied = |access, reason| {
-            Some(Denial {
-                access,
+        let queryable = !hard_read && !hard_write;
+        let mut denials = Vec::new();
+        if wants_read
+            && (!hard_write || hard_read)
+            && let Some(reason) = rules.read_access_reason(&resolved.label, &resolved.lexical)
+        {
+            denials.push(Denial {
+                access: Access::Read,
                 path: resolved.label.clone(),
                 requested_path: resolved.lexical.clone(),
                 reason,
-                queryable: !hard_read && !hard_write,
-            })
-        };
-        if wants_write
-            && !hard_read
-            && let Some(reason) = rules.write_reason(&resolved.label, true)
-        {
-            return denied(Access::Write, reason);
+                queryable,
+            });
+            if !queryable {
+                return denials;
+            }
         }
-        if wants_read
-            && let Some(reason) = rules.read_access_reason(&resolved.label, &resolved.lexical)
-        {
-            return denied(Access::Read, reason);
+        if wants_write && let Some(reason) = rules.write_reason(&resolved.label, true) {
+            denials.push(Denial {
+                access: Access::Write,
+                path: resolved.label,
+                requested_path: resolved.lexical,
+                reason,
+                queryable,
+            });
         }
-        None
+        denials
     }
 
     /// Whether a rule refuses `access` to the resolved path whatever the
@@ -732,12 +733,12 @@ impl Policy {
         }
     }
 
-    /// Describes a refused `open`-style (`R_OK` and/or `W_OK`) check through an
-    /// already open descriptor (`faccessat2` with `AT_EMPTY_PATH`).
-    pub(crate) fn descriptor_open_denial(&self, fd: i64, flags: i32) -> Option<Denial> {
+    /// Describes refused `open`-style (`R_OK` and/or `W_OK`) checks through an
+    /// already open descriptor (`faccessat2` with `AT_EMPTY_PATH` or post-open check).
+    pub(crate) fn descriptor_open_denials(&self, fd: i64, flags: i32) -> Vec<Denial> {
         let access = Access::from_open_flags(flags);
         if fd == i64::from(libc::AT_FDCWD) {
-            return self.open_denial(
+            return self.open_denials(
                 fd,
                 Path::new("."),
                 flags,
@@ -747,7 +748,7 @@ impl Policy {
             );
         }
         match DescriptorTarget::resolve(fd) {
-            DescriptorTarget::Path(path) if path.is_absolute() => self.open_denial(
+            DescriptorTarget::Path(path) if path.is_absolute() => self.open_denials(
                 i64::from(libc::AT_FDCWD),
                 &path,
                 flags,
@@ -757,14 +758,14 @@ impl Policy {
             ),
             DescriptorTarget::Invalid
             | DescriptorTarget::Unclassified
-            | DescriptorTarget::Path(_) => None,
-            DescriptorTarget::Unresolvable(path) => Some(Denial {
+            | DescriptorTarget::Path(_) => Vec::new(),
+            DescriptorTarget::Unresolvable(path) => vec![Denial {
                 access,
                 path: path.clone(),
                 requested_path: path,
                 reason: DenialReason::AllowMiss,
                 queryable: true,
-            }),
+            }],
         }
     }
 
