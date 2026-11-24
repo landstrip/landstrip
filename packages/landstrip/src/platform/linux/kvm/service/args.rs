@@ -2068,8 +2068,14 @@ impl KernelMsghdr {
                 for chunk in
                     bytes[data_start..data_end].chunks_exact_mut(std::mem::size_of::<RawFd>())
                 {
-                    let fd = RawFd::from_ne_bytes(chunk.try_into().unwrap_or([0; 4]));
+                    let raw_fd = RawFd::from_ne_bytes(chunk.try_into().unwrap_or([0; 4]));
+                    let fd = if overflowed {
+                        raw_fd
+                    } else {
+                        GuestFd::relocate_received(raw_fd)
+                    };
                     if !overflowed && GuestFd::within_soft_limit(fd) {
+                        chunk.copy_from_slice(&fd.to_ne_bytes());
                         GuestFd::note_guest_fd(fd);
                         kept_fds += 1;
                     } else {

@@ -594,8 +594,7 @@ impl GuestFd {
 
     fn relocate_displaced(fd: RawFd, min_fd: RawFd) -> RawFd {
         let floor = Self::reserve_floor();
-        let displaced = !Self::within_soft_limit(fd)
-            || (fd >= floor && min_fd < floor && Self::select_cap() < floor);
+        let displaced = !Self::within_soft_limit(fd) || (fd >= floor && min_fd < floor);
         if !displaced {
             return fd;
         }
@@ -619,6 +618,13 @@ impl GuestFd {
             }
             fd
         }
+    }
+
+    pub(crate) fn relocate_received(fd: RawFd) -> RawFd {
+        if fd < 0 || Self(fd).is_broker() {
+            return fd;
+        }
+        Self::relocate_displaced(fd, 0)
     }
 
     pub(crate) fn guard_created(result: u64) -> u64 {
