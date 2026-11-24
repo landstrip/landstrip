@@ -1043,12 +1043,16 @@ impl Process {
             if space.regions_overlap(old_end, new_end) {
                 return space.break_point;
             }
-            let rw = (libc::PROT_READ | libc::PROT_WRITE).cast_unsigned();
-            if self
-                .machine
-                .protect_pages(old_end, new_end - old_end, rw)
+            let ext_len = new_end - old_end;
+            if memory
+                .protect_host(old_end, ext_len, libc::PROT_READ | libc::PROT_WRITE)
                 .is_err()
+                || memory.discard(old_end, ext_len).is_err()
             {
+                return space.break_point;
+            }
+            let rw = (libc::PROT_READ | libc::PROT_WRITE).cast_unsigned();
+            if self.machine.protect_pages(old_end, ext_len, rw).is_err() {
                 return space.break_point;
             }
             space.insert_range(old_end, new_end, MappingMeta::anon(rw));
