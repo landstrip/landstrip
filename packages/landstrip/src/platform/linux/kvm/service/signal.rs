@@ -759,7 +759,7 @@ impl GuestSignals {
         }
         Self::set_thread_mask(mask);
         thread.restore_altstack(saved.regs.stack_pointer(), alt.0, alt.1, alt.2);
-        Machine::restore(vcpu, &saved.state).context("restore vCPU state on sigreturn")?;
+        Machine::restore_signal(vcpu, &saved.state).context("restore vCPU state on sigreturn")?;
         *registers = saved.regs;
         Ok(None)
     }

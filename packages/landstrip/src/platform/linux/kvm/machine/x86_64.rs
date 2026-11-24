@@ -417,10 +417,9 @@ impl Machine {
         })
     }
 
-    /// Restores the state `state` captured when a signal handler returns.
-    pub(crate) fn restore(vcpu: &VcpuFd, state: &VcpuState) -> Result<()> {
-        vcpu.set_sregs(&state.sregs)
-            .context("restore vCPU segments")?;
+    /// Restores floating-point state when a signal handler returns, keeping
+    /// the guest's current TLS segment bases intact.
+    pub(crate) fn restore_signal(vcpu: &VcpuFd, state: &VcpuState) -> Result<()> {
         Self::restore_fpu(vcpu, state)
     }
 

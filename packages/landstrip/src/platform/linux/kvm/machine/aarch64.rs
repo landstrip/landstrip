@@ -472,14 +472,20 @@ impl Machine {
         })
     }
 
-    /// Restores the state `state` captured when a signal handler returns.
+    /// Restores full state (including TLS) for a spawned/forked child.
     pub(crate) fn restore(vcpu: &VcpuFd, state: &VcpuState) -> Result<()> {
+        Self::restore_signal(vcpu, state)?;
+        Register::write(vcpu, Register::TPIDR_EL0, state.tls)
+    }
+
+    /// Restores floating-point state when a signal handler returns, keeping
+    /// the guest's current `TPIDR_EL0` intact.
+    pub(crate) fn restore_signal(vcpu: &VcpuFd, state: &VcpuState) -> Result<()> {
         for (index, value) in state.vectors.iter().enumerate() {
             Register::write_vector(vcpu, Register::v(index), *value)?;
         }
         Register::write_word(vcpu, Register::FPSR, state.fpsr)?;
-        Register::write_word(vcpu, Register::FPCR, state.fpcr)?;
-        Register::write(vcpu, Register::TPIDR_EL0, state.tls)
+        Register::write_word(vcpu, Register::FPCR, state.fpcr)
     }
 
     fn attach(memory: GuestMemory) -> Result<(Self, super::BrokerHandle<VcpuFd>)> {
