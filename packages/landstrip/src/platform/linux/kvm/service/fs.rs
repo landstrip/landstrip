@@ -852,6 +852,13 @@ impl Call<'_> {
                 Some(errno) => return errno.negated(),
                 None => {
                     if let Some(pinned) = pinned {
+                        let trailing_slash = copied
+                            .first()
+                            .and_then(HostCString::as_bytes)
+                            .is_some_and(|bytes| bytes.ends_with(b"/"));
+                        if trailing_slash && !pinned.is_dir() {
+                            return Errno::ENOTDIR.negated();
+                        }
                         return SyscallArgs::with_translated(
                             self.registers,
                             self.memory,
@@ -929,6 +936,12 @@ impl Pinned {
 
     fn path(&self) -> CString {
         CString::new(format!("/proc/self/fd/{}", self.0.as_raw_fd())).unwrap_or_default()
+    }
+
+    fn is_dir(&self) -> bool {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstat(self.0.as_raw_fd(), &raw mut st) };
+        rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFDIR
     }
 
     fn mutate(&self, syscall: Sysno, arguments: &[u64; 6]) -> u64 {
