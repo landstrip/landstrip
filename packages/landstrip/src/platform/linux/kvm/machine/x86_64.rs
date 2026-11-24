@@ -671,62 +671,86 @@ impl Machine {
             let gib = block_base / GIB_BYTES;
             let pd_idx = (block_base % GIB_BYTES) / HUGE_PAGE_SIZE;
             let pd_entry_addr = PD_BASE + gib * PAGE_BYTES + pd_idx * 8;
-            if cursor == block_base && seg_end == block_base + HUGE_PAGE_SIZE {
+            let pd_entry = self.memory.read_supervisor_u64(pd_entry_addr)?;
+            let pt_gpa = PT_ARENA_BASE + (block_base / HUGE_PAGE_SIZE) * PAGE_BYTES;
+            let is_split = pd_entry & PAGE_PRESENT != 0
+                && pd_entry & PAGE_HUGE == 0
+                && (pd_entry & ADDR_MASK_4K) == pt_gpa;
+            if !is_split && cursor == block_base && seg_end == block_base + HUGE_PAGE_SIZE {
                 let block_entry = if leaf_flags == 0 {
                     0
                 } else {
                     block_base | leaf_flags | PAGE_HUGE
                 };
                 self.memory
-                    .write_supervisor_u64(pd_entry_addr, block_entry)?;
+                    .write_supervisor_u64_atomic(pd_entry_addr, block_entry)?;
             } else {
-                let block_id = block_base / HUGE_PAGE_SIZE;
-                let pt_gpa = PT_ARENA_BASE + block_id * PAGE_BYTES;
-                let pd_entry = self.memory.read_supervisor_u64(pd_entry_addr)?;
-                let is_split = pd_entry & PAGE_PRESENT != 0
-                    && pd_entry & PAGE_HUGE == 0
-                    && (pd_entry & ADDR_MASK_4K) == pt_gpa;
-                let mut pt_bytes = if is_split {
-                    self.memory.read_supervisor(pt_gpa, PAGE_BYTES)?
-                } else {
-                    let base_flags = if pd_entry & PAGE_PRESENT == 0 {
-                        0
-                    } else {
-                        pd_entry & (PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_NX)
-                    };
-                    let mut table = vec![0u8; PAGE_LEN];
-                    if base_flags != 0 {
-                        for (idx, slot) in (0..TABLE_ENTRIES).zip(table.chunks_exact_mut(8)) {
-                            let pte = (block_base + idx * PAGE_BYTES) | base_flags;
-                            slot.copy_from_slice(&pte.to_le_bytes());
-                        }
-                    }
-                    table
-                };
-                let first_page = usize::try_from((cursor - block_base) / PAGE_BYTES)?;
-                let last_page = usize::try_from((seg_end - block_base) / PAGE_BYTES)?;
-                for page_idx in first_page..last_page {
-                    let page_phys = block_base + u64::try_from(page_idx)? * PAGE_BYTES;
-                    let pte = if leaf_flags == 0 {
-                        0
-                    } else {
-                        page_phys | leaf_flags
-                    };
-                    let off = page_idx * 8;
-                    pt_bytes[off..off + 8].copy_from_slice(&pte.to_le_bytes());
-                }
-                self.memory.write_supervisor(pt_gpa, &pt_bytes)?;
-                if !is_split {
-                    self.memory.write_supervisor_u64(
-                        pd_entry_addr,
-                        pt_gpa | PAGE_PRESENT | PAGE_WRITE | PAGE_USER,
-                    )?;
-                }
+                self.update_split_pd(
+                    block_base,
+                    cursor,
+                    seg_end,
+                    pd_entry_addr,
+                    pd_entry,
+                    pt_gpa,
+                    is_split,
+                    leaf_flags,
+                )?;
             }
             cursor = seg_end;
         }
         self.pool.bump_tlb();
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_split_pd(
+        &self,
+        block_base: u64,
+        cursor: u64,
+        seg_end: u64,
+        pd_entry_addr: u64,
+        pd_entry: u64,
+        pt_gpa: u64,
+        is_split: bool,
+        leaf_flags: u64,
+    ) -> Result<()> {
+        let first_page = (cursor - block_base) / PAGE_BYTES;
+        let last_page = (seg_end - block_base) / PAGE_BYTES;
+        if is_split {
+            for page_idx in first_page..last_page {
+                let pte = if leaf_flags == 0 {
+                    0
+                } else {
+                    (block_base + page_idx * PAGE_BYTES) | leaf_flags
+                };
+                self.memory
+                    .write_supervisor_u64_atomic(pt_gpa + page_idx * 8, pte)?;
+            }
+            return Ok(());
+        }
+        let base_flags = if pd_entry & PAGE_PRESENT == 0 {
+            0
+        } else {
+            pd_entry & (PAGE_PRESENT | PAGE_WRITE | PAGE_USER | PAGE_NX)
+        };
+        for page_idx in 0..TABLE_ENTRIES {
+            let flags = if (first_page..last_page).contains(&page_idx) {
+                leaf_flags
+            } else {
+                base_flags
+            };
+            let pte = if flags == 0 {
+                0
+            } else {
+                (block_base + page_idx * PAGE_BYTES) | flags
+            };
+            self.memory
+                .write_supervisor_u64_atomic(pt_gpa + page_idx * 8, pte)?;
+        }
+        self.memory.write_supervisor_u64_atomic(
+            pd_entry_addr,
+            pt_gpa | PAGE_PRESENT | PAGE_WRITE | PAGE_USER,
+        )
     }
 
     fn protection_flags(&self, prot: u32) -> u64 {

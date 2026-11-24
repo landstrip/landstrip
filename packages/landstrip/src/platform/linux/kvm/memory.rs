@@ -14,7 +14,7 @@ use std::ops::Range;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use syscalls::Errno;
 use vm_memory::mmap::MmapRegion;
 
@@ -533,8 +533,25 @@ impl GuestMemory {
         self.write(offset, &value.to_le_bytes())
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn write_supervisor_u64(&self, offset: u64, value: u64) -> Result<()> {
         self.write_supervisor(offset, &value.to_le_bytes())
+    }
+
+    pub(crate) fn write_supervisor_u64_atomic(&self, offset: u64, value: u64) -> Result<()> {
+        let range = self.supervisor_range(offset, 8)?;
+        if !offset.is_multiple_of(8) {
+            bail!("supervisor word {offset:#x} is not 8-byte aligned");
+        }
+        // SAFETY: `range` is 8 valid bytes inside the guest mapping.
+        let target = unsafe { self.pointer.add(range.start) };
+        if !target.addr().is_multiple_of(align_of::<AtomicU64>()) {
+            bail!("supervisor word {offset:#x} is not 8-byte aligned");
+        }
+        #[allow(clippy::cast_ptr_alignment)]
+        // SAFETY: `target` was verified to be 8-byte aligned and valid for 8 bytes.
+        unsafe { AtomicU64::from_ptr(target.cast::<u64>()) }.store(value, Ordering::Release);
+        Ok(())
     }
 
     /// Writes a 32-bit word visible to concurrent guest threads and futexes,
