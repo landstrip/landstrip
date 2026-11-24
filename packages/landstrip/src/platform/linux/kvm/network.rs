@@ -62,7 +62,6 @@ enum Kind {
     Udp,
     Unix,
     Unsupported,
-    Other,
 }
 
 impl Info {
@@ -81,7 +80,7 @@ impl Info {
             _ if network.is_unrestricted() => Ok(()),
             Kind::Udp if !network.allows_local_binding() => Err(libc::EAFNOSUPPORT),
             Kind::Unsupported => Err(libc::EAFNOSUPPORT),
-            Kind::Tcp | Kind::Udp | Kind::Unix | Kind::Other => Ok(()),
+            Kind::Tcp | Kind::Udp | Kind::Unix => Ok(()),
         }
     }
     fn from_fd(descriptor: RawFd) -> Option<Self> {
@@ -104,10 +103,8 @@ impl Info {
             Kind::Udp
         } else if self.domain == libc::AF_UNIX {
             Kind::Unix
-        } else if ip || matches!(self.domain, libc::AF_PACKET | libc::AF_NETLINK) {
-            Kind::Unsupported
         } else {
-            Kind::Other
+            Kind::Unsupported
         }
     }
 }
@@ -155,7 +152,6 @@ impl Verdict {
         let rules = policy.rules();
         let network = &rules.network_access;
         match info.kind() {
-            Kind::Other => Self::Allow,
             Kind::Unsupported if network.is_unrestricted() => Self::Allow,
             Kind::Unsupported => Self::Refuse {
                 errno: libc::EAFNOSUPPORT,
@@ -181,7 +177,6 @@ impl Verdict {
                 Self::internet(policy, kind, NetworkOperation::Connect, address)
             }
             Kind::Unix => Self::unix(policy, NetworkOperation::Connect, address),
-            Kind::Other => Self::Allow,
             Kind::Unsupported if policy.rules().network_access.is_unrestricted() => Self::Allow,
             Kind::Unsupported => {
                 Self::refuse(libc::EAFNOSUPPORT, NetworkOperation::Connect, None, false)
