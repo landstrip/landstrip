@@ -1362,7 +1362,9 @@ impl SyscallArgs {
         }
         for (idx, chunk) in host_buf.chunks_exact(8).enumerate() {
             let offset = guest_fds + u64::try_from(idx * 8 + 6).unwrap_or(0);
-            let _ = memory.write(offset, &chunk[6..8]);
+            if memory.write(offset, &chunk[6..8]).is_err() {
+                return Errno::EFAULT.negated();
+            }
         }
         u64::try_from(ready).unwrap_or(0)
     }
@@ -1520,8 +1522,18 @@ impl SyscallArgs {
         };
         translated.raw[len_idx] = (&raw mut host_len).expose_provenance() as u64;
         let result = translated.forward(syscall);
-        if GuestReg(result).as_c_long() >= 0 {
-            let _ = memory.write(guest_len_ptr, &host_len.to_le_bytes());
+        if GuestReg(result).as_c_long() >= 0
+            && memory
+                .write(guest_len_ptr, &host_len.to_le_bytes())
+                .is_err()
+        {
+            if matches!(syscall, Sysno::accept | Sysno::accept4)
+                && let Ok(new_fd) = RawFd::try_from(GuestReg(result).as_c_long())
+                && !GuestFd::from_raw(new_fd).is_broker()
+            {
+                unsafe { libc::close(new_fd) };
+            }
+            return Errno::EFAULT.negated();
         }
         result
     }
@@ -2116,14 +2128,19 @@ impl KernelMsghdr {
         entry: u64,
         guest_control: u64,
         control_buf: &mut ControlBuffer,
-    ) {
+    ) -> std::result::Result<(), Errno> {
         let received = self.controllen.min(control_buf.len());
         let kept = self.sanitize_recv_control(control_buf, received);
         self.controllen = kept;
-        if kept > 0 && guest_control != 0 {
-            let _ = memory.write(guest_control, &control_buf.as_slice()[..kept]);
+        if kept > 0
+            && guest_control != 0
+            && memory
+                .write(guest_control, &control_buf.as_slice()[..kept])
+                .is_err()
+        {
+            return Err(Errno::EFAULT);
         }
-        self.write_back(memory, entry);
+        self.write_back(memory, entry)
     }
 
     pub(super) fn decode(
@@ -2213,10 +2230,20 @@ impl KernelMsghdr {
         })
     }
 
-    fn write_back(&self, memory: &GuestMemory, address: u64) {
-        let _ = memory.write(address + 8, &self.namelen.to_le_bytes());
-        let _ = memory.write_u64(address + 40, u64::try_from(self.controllen).unwrap_or(0));
-        let _ = memory.write(address + 48, &self.flags.to_le_bytes());
+    fn write_back(&self, memory: &GuestMemory, address: u64) -> std::result::Result<(), Errno> {
+        if memory
+            .write(address + 8, &self.namelen.to_le_bytes())
+            .is_err()
+            || memory
+                .write_u64(address + 40, u64::try_from(self.controllen).unwrap_or(0))
+                .is_err()
+            || memory
+                .write(address + 48, &self.flags.to_le_bytes())
+                .is_err()
+        {
+            return Err(Errno::EFAULT);
+        }
+        Ok(())
     }
 
     fn recv_single(args: SyscallArgs, memory: &GuestMemory) -> u64 {
@@ -2239,9 +2266,12 @@ impl KernelMsghdr {
                 0,
             ],
         );
-        if GuestReg(result).as_c_long() >= 0 {
-            msg.hdr
-                .finish_recv(memory, args.0[1], msg.guest_control, &mut msg.control_buf);
+        if GuestReg(result).as_c_long() >= 0
+            && let Err(errno) =
+                msg.hdr
+                    .finish_recv(memory, args.0[1], msg.guest_control, &mut msg.control_buf)
+        {
+            return errno.negated();
         }
         result
     }
@@ -2275,13 +2305,23 @@ impl KernelMsghdr {
             return result;
         }
         let processed = usize::try_from(result).unwrap_or(0).min(items.len());
+        let mut written = 0usize;
         for (index, item) in items.iter().enumerate().take(processed) {
             if let Some(entry) = Self::mmsg_entry(base, index) {
-                let _ = memory.write(entry + MSGHDR_BYTES, &item.len.to_le_bytes());
+                if memory
+                    .write(entry + MSGHDR_BYTES, &item.len.to_le_bytes())
+                    .is_err()
+                {
+                    if index == 0 {
+                        return Errno::EFAULT.negated();
+                    }
+                    break;
+                }
+                written += 1;
             }
         }
         drop(decoded);
-        result
+        u64::try_from(written).unwrap_or(0)
     }
 
     fn recv_multi(args: SyscallArgs, memory: &GuestMemory) -> u64 {
@@ -2315,6 +2355,7 @@ impl KernelMsghdr {
             return result;
         }
         let processed = usize::try_from(result).unwrap_or(0).min(items.len());
+        let mut written = 0usize;
         for (index, (item, msg)) in items
             .iter_mut()
             .zip(decoded.iter_mut())
@@ -2322,11 +2363,22 @@ impl KernelMsghdr {
             .take(processed)
         {
             if let Some(entry) = Self::mmsg_entry(args.0[1], index) {
-                let _ = memory.write(entry + MSGHDR_BYTES, &item.len.to_le_bytes());
-                item.hdr
-                    .finish_recv(memory, entry, msg.guest_control, &mut msg.control_buf);
+                let hdr_ok = memory
+                    .write(entry + MSGHDR_BYTES, &item.len.to_le_bytes())
+                    .is_ok();
+                let recv_ok = item
+                    .hdr
+                    .finish_recv(memory, entry, msg.guest_control, &mut msg.control_buf)
+                    .is_ok();
+                if !hdr_ok || !recv_ok {
+                    if index == 0 {
+                        return Errno::EFAULT.negated();
+                    }
+                    break;
+                }
+                written += 1;
             }
         }
-        result
+        u64::try_from(written).unwrap_or(0)
     }
 }
