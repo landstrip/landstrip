@@ -124,6 +124,7 @@ impl Segment {
 struct Image {
     bytes: Vec<u8>,
     entry: u64,
+    load_bias: u64,
     segments: Vec<Segment>,
     program_headers: u64,
     program_header_size: u64,
@@ -198,6 +199,7 @@ impl Image {
         let mut image = Self {
             bytes,
             entry: header.e_entry,
+            load_bias: 0,
             segments,
             program_headers: header.e_phoff,
             program_header_size: u64::from(header.e_phentsize),
@@ -242,6 +244,7 @@ impl Image {
     }
 
     fn relocate(&mut self, bias: u64) {
+        self.load_bias = bias;
         for segment in &mut self.segments {
             segment.address = segment.address.wrapping_add(bias);
         }
@@ -249,14 +252,37 @@ impl Image {
     }
 
     fn load(&self, memory: &GuestMemory) -> Result<()> {
-        for segment in &self.segments {
-            let start = usize::try_from(segment.offset)?;
-            let end = usize::try_from(segment.offset + segment.file_size)?;
-            let bytes = self
-                .bytes
-                .get(start..end)
-                .context("payload has a truncated segment")?;
-            memory.write(segment.address, bytes)?;
+        for (idx, segment) in self.segments.iter().enumerate() {
+            let page_off = segment.address & (PAGE_BYTES - 1);
+            let page_start = segment.address - page_off;
+            if segment.file_size > 0 {
+                let prefix_free = page_off > 0
+                    && segment.offset >= page_off
+                    && !self.segments[..idx].iter().any(|prev| {
+                        let prev_start = prev.address & !(PAGE_BYTES - 1);
+                        let prev_end = prev.address + prev.memory_size;
+                        prev_start < segment.address && prev_end > page_start
+                    });
+                let (copy_offset, copy_addr, copy_len) = if prefix_free {
+                    (
+                        segment.offset - page_off,
+                        page_start,
+                        segment.file_size + page_off,
+                    )
+                } else {
+                    (segment.offset, segment.address, segment.file_size)
+                };
+                let start = usize::try_from(copy_offset)?;
+                let end = usize::try_from(copy_offset + copy_len)?;
+                let bytes = self
+                    .bytes
+                    .get(start..end)
+                    .context("payload has a truncated segment")?;
+                memory.write(copy_addr, bytes)?;
+                if segment.prot & libc::PROT_EXEC.cast_unsigned() != 0 {
+                    memory.synchronize_instructions(copy_addr, copy_len)?;
+                }
+            }
             if segment.memory_size > segment.file_size {
                 let bss_start = segment.address + segment.file_size;
                 let bss_end = segment.address + segment.memory_size;
@@ -276,9 +302,6 @@ impl Image {
                     }
                 }
             }
-            if segment.prot & libc::PROT_EXEC.cast_unsigned() != 0 && segment.file_size > 0 {
-                memory.synchronize_instructions(segment.address, segment.file_size)?;
-            }
         }
         Ok(())
     }
@@ -292,15 +315,29 @@ impl Image {
     }
 
     fn program_header_address(&self) -> u64 {
+        let Some(phdr_bytes) = self
+            .program_header_count
+            .checked_mul(self.program_header_size)
+        else {
+            return 0;
+        };
+        let Some(phdr_end) = self.program_headers.checked_add(phdr_bytes) else {
+            return 0;
+        };
         self.segments
             .iter()
-            .find(|segment| {
-                self.program_headers >= segment.offset
-                    && self.program_headers < segment.offset + segment.file_size
+            .find_map(|segment| {
+                if segment.file_size == 0 {
+                    return None;
+                }
+                let page_off = segment.address & (PAGE_BYTES - 1);
+                let mapped_file_start = segment.offset.checked_sub(page_off)?;
+                let mapped_vaddr_start = segment.address - page_off;
+                (self.program_headers >= mapped_file_start
+                    && phdr_end <= segment.offset + segment.file_size)
+                    .then(|| mapped_vaddr_start + (self.program_headers - mapped_file_start))
             })
-            .map_or(0, |segment| {
-                segment.address + (self.program_headers - segment.offset)
-            })
+            .unwrap_or(0)
     }
 }
 
@@ -486,7 +523,14 @@ impl Payload {
             header_count: self.image.program_header_count,
             header_address: self.image.program_header_address(),
             interpreter_base: self.interpreter.as_ref().map_or(0, |image| {
-                image.segments.first().map_or(0, |segment| segment.address)
+                if image.load_bias != 0 {
+                    image.load_bias
+                } else {
+                    image
+                        .segments
+                        .first()
+                        .map_or(0, |segment| segment.address & !(PAGE_BYTES - 1))
+                }
             }),
             end: self
                 .interpreter
