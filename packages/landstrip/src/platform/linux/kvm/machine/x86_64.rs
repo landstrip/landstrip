@@ -74,6 +74,7 @@ const EFER_NXE: u64 = 0x800;
 const RFLAGS_RESERVED: u64 = 0x2;
 const RFLAGS_DIRECTION: u64 = 0x400;
 const RFLAGS_USER_MASK: u64 = 0x0005_0dd5;
+const RFLAGS_SYSCALL_CLEAR: u64 = 0x0004_7700;
 
 const MSR_STAR: u32 = 0xc000_0081;
 const MSR_LSTAR: u32 = 0xc000_0082;
@@ -1148,7 +1149,7 @@ impl Machine {
             },
             kvm_msr_entry {
                 index: MSR_FMASK,
-                data: 0,
+                data: RFLAGS_SYSCALL_CLEAR,
                 ..kvm_msr_entry::default()
             },
         ])
