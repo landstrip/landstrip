@@ -503,6 +503,8 @@ impl Broker {
         loop {
             match Self::run_vcpu_loop(&mut process, &mut vcpu, &mut thread) {
                 Ok(ExitKind::Thread(status)) => {
+                    GuestSignals::set_thread_mask(u64::MAX);
+                    let _ = ThreadState::drain_private_signals();
                     SIGNAL_QUEUE.release_orphans(ThreadState::current_tid());
                     thread.release_robust_list(
                         process.robust,
