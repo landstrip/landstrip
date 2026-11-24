@@ -1839,6 +1839,15 @@ impl Process {
         );
         if syscall == Sysno::bind && result == 0 {
             network::Verdict::record_bound_socket(&self.policy, descriptor);
+        } else if syscall == Sysno::connect
+            && (result == 0 || result == Errno::EINPROGRESS.negated())
+            && network::Verdict::is_abstract_unix(descriptor, address)
+            && !network::Verdict::verify_sandbox_peer(descriptor)
+        {
+            unsafe {
+                libc::shutdown(descriptor, libc::SHUT_RDWR);
+            }
+            return Errno::EACCES.negated();
         }
         result
     }

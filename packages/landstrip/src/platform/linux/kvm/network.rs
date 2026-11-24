@@ -169,6 +169,32 @@ impl Verdict {
         }
     }
 
+    pub(crate) fn is_abstract_unix(descriptor: RawFd, address: &[u8]) -> bool {
+        Info::from_fd(descriptor).is_some_and(|info| matches!(info.kind(), Kind::Unix))
+            && matches!(UnixTarget::from(address), UnixTarget::Abstract(_))
+    }
+
+    pub(crate) fn verify_sandbox_peer(descriptor: RawFd) -> bool {
+        let Some(info) = Info::from_fd(descriptor) else {
+            return false;
+        };
+        if !matches!(info.ty, libc::SOCK_STREAM | libc::SOCK_SEQPACKET) {
+            return true;
+        }
+        let mut cred: libc::ucred = unsafe { mem::zeroed() };
+        let mut len = libc::socklen_t::try_from(mem::size_of::<libc::ucred>()).unwrap_or(0);
+        let rc = unsafe {
+            libc::getsockopt(
+                descriptor,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &raw mut len,
+            )
+        };
+        rc == 0 && cred.pid > 1
+    }
+
     pub(crate) fn mediate(
         policy: &Policy,
         descriptor: RawFd,
