@@ -65,6 +65,7 @@ const CR0_LONG_MODE: u64 = 0x8005_0033;
 const CR4_PAE: u64 = 0x20;
 const CR4_OSFXSR: u64 = 0x200;
 const CR4_OSXMMEXCPT: u64 = 0x400;
+const CR4_FSGSBASE: u64 = 0x1_0000;
 const CR4_OSXSAVE: u64 = 0x4_0000;
 const XCR0_FP_SSE: u64 = 0x3;
 const XCR0_AVX: u64 = 0x4;
@@ -368,6 +369,7 @@ pub(crate) struct Machine {
     cpuid: CpuId,
     xcr0: Option<u64>,
     nxe: bool,
+    fsgsbase: bool,
     pub(super) pool: VcpuPool,
 }
 
@@ -465,10 +467,10 @@ impl Machine {
         let mut cpuid = kvm
             .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
             .context("read supported CPUID")?;
-        let (xcr0, nxe) = Self::sanitize_cpuid(&mut cpuid);
+        let (xcr0, nxe, fsgsbase) = Self::sanitize_cpuid(&mut cpuid);
         vcpu.get().set_cpuid2(&cpuid).context("set vCPU CPUID")?;
         vcpu.get()
-            .set_sregs(&Self::long_mode_sregs(xcr0.is_some(), nxe, 0))
+            .set_sregs(&Self::long_mode_sregs(xcr0.is_some(), nxe, fsgsbase, 0))
             .context("set vCPU state")?;
         if let Some(mask) = xcr0 {
             Self::set_xcr0(vcpu.get(), mask)?;
@@ -484,6 +486,7 @@ impl Machine {
                 cpuid,
                 xcr0,
                 nxe,
+                fsgsbase,
                 pool: VcpuPool::new(),
             },
             vcpu,
@@ -506,7 +509,12 @@ impl Machine {
             .set_cpuid2(&self.cpuid)
             .context("set thread vCPU CPUID")?;
         vcpu.get()
-            .set_sregs(&Self::long_mode_sregs(self.xcr0.is_some(), self.nxe, id))
+            .set_sregs(&Self::long_mode_sregs(
+                self.xcr0.is_some(),
+                self.nxe,
+                self.fsgsbase,
+                id,
+            ))
             .context("set initial thread vCPU state")?;
         Ok(vcpu)
     }
@@ -527,7 +535,7 @@ impl Machine {
         } else {
             0
         };
-        let mut sregs = Self::long_mode_sregs(self.xcr0.is_some(), self.nxe, slot);
+        let mut sregs = Self::long_mode_sregs(self.xcr0.is_some(), self.nxe, self.fsgsbase, slot);
         sregs.fs.base = tls.unwrap_or(state.sregs.fs.base);
         sregs.gs.base = state.sregs.gs.base;
         vcpu.set_sregs(&sregs).context("set thread vCPU segments")?;
@@ -986,9 +994,10 @@ impl Machine {
         [0xe7, low]
     }
 
-    fn sanitize_cpuid(cpuid: &mut CpuId) -> (Option<u64>, bool) {
+    fn sanitize_cpuid(cpuid: &mut CpuId) -> (Option<u64>, bool, bool) {
         let mut xcr0 = None;
         let mut nxe = false;
+        let mut fsgsbase = false;
         for entry in cpuid.as_mut_slice() {
             if entry.function == 0x8000_0001 && entry.edx & (1 << 20) != 0 {
                 nxe = true;
@@ -1000,6 +1009,9 @@ impl Machine {
                 }
                 xcr0 = Some(mask);
                 entry.ecx |= 1 << 27;
+            }
+            if entry.function == 0x7 && entry.index == 0 && entry.ebx & 1 != 0 {
+                fsgsbase = true;
             }
         }
         for entry in cpuid.as_mut_slice() {
@@ -1060,7 +1072,7 @@ impl Machine {
                 _ => {}
             }
         }
-        (xcr0, nxe)
+        (xcr0, nxe, fsgsbase)
     }
 
     fn set_xcr0(vcpu: &VcpuFd, mask: u64) -> Result<()> {
@@ -1073,13 +1085,15 @@ impl Machine {
         vcpu.set_xcrs(&xcrs).context("set vCPU XCR0")
     }
 
-    fn long_mode_sregs(xsave: bool, nxe: bool, vcpu_id: u64) -> kvm_sregs {
+    fn long_mode_sregs(xsave: bool, nxe: bool, fsgsbase: bool, vcpu_id: u64) -> kvm_sregs {
         let mut sregs = kvm_sregs::default();
         sregs.cs = Self::segment(USER_CS, SEGMENT_TYPE_CODE, 3, true);
         sregs.ds = Self::segment(USER_DS, SEGMENT_TYPE_DATA, 3, false);
         sregs.es = sregs.ds;
         sregs.fs = sregs.ds;
+        sregs.fs.selector = 0;
         sregs.gs = sregs.ds;
+        sregs.gs.selector = 0;
         sregs.ss = sregs.ds;
         sregs.tr = Self::segment(TSS_SELECTOR, SEGMENT_TYPE_BUSY_TSS, 0, false);
         sregs.tr.base = TSS_POOL + (vcpu_id % TSS_SLOTS) * TSS_SLOT_BYTES;
@@ -1092,7 +1106,11 @@ impl Machine {
         sregs.idt.limit = IDT_LIMIT;
         sregs.cr0 = CR0_LONG_MODE;
         sregs.cr3 = PML4;
-        sregs.cr4 = CR4_PAE | CR4_OSFXSR | CR4_OSXMMEXCPT | if xsave { CR4_OSXSAVE } else { 0 };
+        sregs.cr4 = CR4_PAE
+            | CR4_OSFXSR
+            | CR4_OSXMMEXCPT
+            | if fsgsbase { CR4_FSGSBASE } else { 0 }
+            | if xsave { CR4_OSXSAVE } else { 0 };
         sregs.efer = EFER_SCE_LME_LMA | if nxe { EFER_NXE } else { 0 };
         sregs
     }
