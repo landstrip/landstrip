@@ -145,6 +145,30 @@ impl Verdict {
         Self::Allow { pinned: None }
     }
 
+    pub(crate) fn record_bound_socket(policy: &Policy, descriptor: RawFd) {
+        let Some(info) = Info::from_fd(descriptor) else {
+            return;
+        };
+        if !matches!(info.kind(), Kind::Unix) {
+            return;
+        }
+        let mut storage: libc::sockaddr_storage = unsafe { mem::zeroed() };
+        let mut len =
+            libc::socklen_t::try_from(mem::size_of::<libc::sockaddr_storage>()).unwrap_or(0);
+        if unsafe { libc::getsockname(descriptor, (&raw mut storage).cast(), &raw mut len) } < 0 {
+            return;
+        }
+        let Ok(actual) = usize::try_from(len) else {
+            return;
+        };
+        let capped = actual.min(mem::size_of::<libc::sockaddr_storage>());
+        let bytes =
+            unsafe { std::slice::from_raw_parts((&raw const storage).cast::<u8>(), capped) };
+        if let UnixTarget::Abstract(name) = UnixTarget::from(bytes) {
+            policy.record_abstract_socket(name);
+        }
+    }
+
     pub(crate) fn mediate(
         policy: &Policy,
         descriptor: RawFd,
@@ -270,10 +294,7 @@ impl Verdict {
                     );
                 }
                 match operation {
-                    NetworkOperation::Bind => {
-                        policy.record_abstract_socket(name);
-                        Self::allow()
-                    }
+                    NetworkOperation::Bind => Self::allow(),
                     NetworkOperation::Connect if policy.owns_abstract_socket(name) => Self::allow(),
                     NetworkOperation::Connect => {
                         Self::refuse(libc::EACCES, operation, Some("abstract".to_owned()), false)

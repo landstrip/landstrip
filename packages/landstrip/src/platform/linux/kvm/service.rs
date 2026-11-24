@@ -1758,9 +1758,11 @@ impl Process {
                     pinned
                 }
             };
-        Some(Self::forward_socket_endpoint(
-            syscall, registers, memory, descriptor, &address, pinned_fd,
-        ))
+        Some(
+            self.forward_socket_endpoint(
+                syscall, registers, memory, descriptor, &address, pinned_fd,
+            ),
+        )
     }
 
     fn connect_session_bus(
@@ -1801,6 +1803,7 @@ impl Process {
     }
 
     fn forward_socket_endpoint(
+        &self,
         syscall: Sysno,
         registers: &Regs,
         memory: &GuestMemory,
@@ -1828,12 +1831,16 @@ impl Process {
                 };
             }
         }
-        SyscallArgs::forward_translated(
+        let result = SyscallArgs::forward_translated(
             registers,
             memory,
             syscall,
             &[Arg::fd(0), Arg::copied_bytes(1, address)],
-        )
+        );
+        if syscall == Sysno::bind && result == 0 {
+            network::Verdict::record_bound_socket(&self.policy, descriptor);
+        }
+        result
     }
 
     fn datagram_syscall(&self, registers: &Regs, memory: &GuestMemory, syscall: Sysno) -> u64 {
