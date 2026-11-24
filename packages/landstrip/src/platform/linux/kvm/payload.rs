@@ -350,7 +350,7 @@ impl<'a> Shebang<'a> {
     fn parse(bytes: &'a [u8]) -> Option<Self> {
         let line = bytes.strip_prefix(b"#!")?;
         let line = line.get(..line.len().min(SHEBANG_LIMIT))?;
-        let line = match line.iter().position(|byte| *byte == b'\n') {
+        let line = match line.iter().position(|byte| *byte == b'\n' || *byte == 0) {
             Some(end) => line.get(..end)?,
             None => line,
         };
