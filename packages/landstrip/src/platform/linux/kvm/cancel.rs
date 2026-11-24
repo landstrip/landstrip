@@ -486,7 +486,9 @@ impl Supervisor {
                 Self::ptrace(
                     libc::PTRACE_SEIZE,
                     host,
-                    (libc::PTRACE_O_TRACESYSGOOD | libc::PTRACE_O_TRACEEXIT) as usize,
+                    (libc::PTRACE_O_TRACESYSGOOD
+                        | libc::PTRACE_O_TRACEEXIT
+                        | libc::PTRACE_O_TRACEEXEC) as usize,
                 )?;
                 vacant.insert(Trace {
                     process: pid,
@@ -501,6 +503,7 @@ impl Supervisor {
     }
 
     fn command(&mut self, command: Command<'_>, pid: i32) -> Result<Option<i32>> {
+        self.progress()?;
         match command {
             Command::Attach { return_pc, tids } => {
                 for tid in tids {
@@ -636,6 +639,19 @@ impl Supervisor {
 
     fn handle_stopped(&mut self, tid: i32, status: i32) -> Result<bool> {
         let event = status >> 16;
+        if event == libc::PTRACE_EVENT_EXEC {
+            if let Some(trace) = self.traced.get_mut(&tid) {
+                trace.exiting = false;
+                trace.detaching = false;
+                trace.cancel = None;
+                trace.watch = false;
+                if let Some(reply) = trace.reply.take() {
+                    Self::respond(&reply, 0)?;
+                }
+            }
+            self.resume_alive(tid, 0)?;
+            return Ok(true);
+        }
         if event == libc::PTRACE_EVENT_EXIT {
             let watch = if let Some(trace) = self.traced.get_mut(&tid) {
                 trace.exiting = true;
