@@ -191,6 +191,7 @@ impl ProbeOpen {
             mode: 0,
             resolve: resolve.bits(),
         };
+        let _fd_lock = super::fds::GuestFd::read_fd_table();
         let rc = unsafe {
             syscalls::syscall!(
                 syscalls::Sysno::openat2,
@@ -1075,17 +1076,20 @@ impl FdLabel {
 
     fn surviving_link(path: &Path, dev: libc::dev_t, ino: libc::ino_t) -> Option<PathBuf> {
         let cpath = CString::new(path.parent()?.as_os_str().as_bytes()).ok()?;
-        let raw = unsafe {
-            libc::open(
-                cpath.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
+        let dir = {
+            let _fd_lock = super::fds::GuestFd::read_fd_table();
+            let raw = unsafe {
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                return None;
+            }
+            let dir = unsafe { OwnedFd::from_raw_fd(raw) };
+            super::fds::GuestFd::relocate_above(dir).ok()?
         };
-        if raw < 0 {
-            return None;
-        }
-        let dir = unsafe { OwnedFd::from_raw_fd(raw) };
-        let dir = super::fds::GuestFd::relocate_above(dir).ok()?;
         let Ok(Self::Linked(dir_path)) = Self::resolve(dir.as_fd()) else {
             return None;
         };

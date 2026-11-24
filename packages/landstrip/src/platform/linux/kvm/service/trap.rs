@@ -576,6 +576,7 @@ pub(crate) struct Channel {
 
 impl Channel {
     pub(crate) fn new() -> Result<Self> {
+        let _fd_lock = GuestFd::read_fd_table();
         let (reader, writer) = UnixDatagram::pair().context("create the denial channel")?;
         Ok(Self {
             reader: GuestFd::relocate_above(OwnedFd::from(reader))

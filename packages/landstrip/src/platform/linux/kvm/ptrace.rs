@@ -41,6 +41,7 @@ unsafe impl Sync for PtraceTable {}
 
 impl PtraceTable {
     pub(super) fn new() -> Result<Self> {
+        let _fd_lock = GuestFd::read_fd_table();
         let owned = memfd_create("landstrip-ptrace", MFdFlags::MFD_CLOEXEC)
             .context("create ptrace state memfd")?;
         if unsafe { libc::ftruncate(owned.as_raw_fd(), TABLE_LEN) } < 0 {

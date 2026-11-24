@@ -345,6 +345,7 @@ impl Verdict {
 
     fn open_path_fd(path: &Path) -> std::result::Result<super::fds::BrokerFd, i32> {
         let cpath = CString::new(OsStr::as_bytes(path.as_os_str())).map_err(|_| libc::EINVAL)?;
+        let _fd_lock = super::fds::GuestFd::read_fd_table();
         let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if raw < 0 {
             return Err(std::io::Error::last_os_error()

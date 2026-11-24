@@ -1520,12 +1520,13 @@ impl SyscallArgs {
         let [old_reg, new_reg, flags_reg, ..] = registers.arguments();
         let old = GuestFd::from_reg(old_reg);
         let new = GuestFd::from_reg(new_reg);
-        let Some(old_raw) = old.valid() else {
-            return Errno::EBADF.negated();
-        };
         if new.is_broker() && new.valid().is_none() {
             GuestFd::wait_occupy_idle();
         }
+        let _fd_lock = GuestFd::write_fd_table();
+        let Some(old_raw) = old.valid() else {
+            return Errno::EBADF.negated();
+        };
         let Some(new_raw) = new.valid() else {
             return Errno::EBADF.negated();
         };
@@ -1564,6 +1565,7 @@ impl SyscallArgs {
         if first > last || flags & !valid_flags != 0 {
             return Errno::EINVAL.negated();
         }
+        let _fd_lock = GuestFd::write_fd_table();
         let kernel_flags = flags & !libc::CLOSE_RANGE_UNSHARE;
         let broker_fds = GuestFd::broker_fds_in(first, last);
         let mut cursor = first;

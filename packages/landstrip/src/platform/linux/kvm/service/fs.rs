@@ -788,6 +788,7 @@ struct Pinned(BrokerFd);
 impl Pinned {
     fn open(path: &std::path::Path) -> Option<Self> {
         let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let _fd_lock = GuestFd::read_fd_table();
         let fd = unsafe {
             libc::open(
                 path.as_ptr(),

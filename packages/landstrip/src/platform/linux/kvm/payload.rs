@@ -686,15 +686,23 @@ impl Executable {
         if !follow {
             flags |= libc::O_NOFOLLOW;
         }
-        let raw = unsafe { libc::openat(dirfd, cpath.as_ptr(), flags) };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
         if relocate {
-            let fd = GuestFd::relocate_above(owned)?;
+            let fd = {
+                let _fd_lock = GuestFd::read_fd_table();
+                let raw = unsafe { libc::openat(dirfd, cpath.as_ptr(), flags) };
+                if raw < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+                GuestFd::relocate_above(owned)?
+            };
             Self::read_fd(std::os::fd::AsFd::as_fd(&fd), !follow)
         } else {
+            let raw = unsafe { libc::openat(dirfd, cpath.as_ptr(), flags) };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
             Self::read_fd(std::os::fd::AsFd::as_fd(&owned), !follow)
         }
     }

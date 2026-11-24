@@ -144,6 +144,7 @@ impl Inherited {
         name: &str,
         write: impl FnOnce(&mut File) -> Result<()>,
     ) -> Result<RawFd> {
+        let _fd_lock = GuestFd::read_fd_table();
         let fd = memfd_create(name, MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING)
             .context("create broker handoff file")?;
         let mut file = File::from(fd);

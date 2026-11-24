@@ -221,9 +221,13 @@ struct Proxy {
 impl Proxy {
     fn start(binary: &Path, upstream: BorrowedFd<'_>) -> Result<Self, i32> {
         let dir = TempDir::new()?;
-        let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC).map_err(|_| libc::EACCES)?;
-        let keepalive = GuestFd::relocate_above(read_fd).map_err(|_| libc::EACCES)?;
-        let sync_fd = GuestFd::relocate_above(write_fd).map_err(|_| libc::EACCES)?;
+        let (keepalive, sync_fd) = {
+            let _fd_lock = GuestFd::read_fd_table();
+            let (read_fd, write_fd) = pipe2(OFlag::O_CLOEXEC).map_err(|_| libc::EACCES)?;
+            let keepalive = GuestFd::relocate_above(read_fd).map_err(|_| libc::EACCES)?;
+            let sync_fd = GuestFd::relocate_above(write_fd).map_err(|_| libc::EACCES)?;
+            (keepalive, sync_fd)
+        };
         let upstream_fd =
             GuestFd::duplicate_above(upstream.as_raw_fd()).map_err(|_| libc::EACCES)?;
 
@@ -400,20 +404,24 @@ impl TempDir {
                 return Err(errno);
             }
         };
-        let raw = unsafe {
-            libc::open(
-                cpath.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if raw < 0 {
-            let _ = fs::remove_dir_all(&path);
-            return Err(libc::EACCES);
-        }
-        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-        let Ok(fd) = GuestFd::relocate_above(owned) else {
-            let _ = fs::remove_dir_all(&path);
-            return Err(libc::EACCES);
+        let fd = {
+            let _fd_lock = GuestFd::read_fd_table();
+            let raw = unsafe {
+                libc::open(
+                    cpath.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                let _ = fs::remove_dir_all(&path);
+                return Err(libc::EACCES);
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+            let Ok(fd) = GuestFd::relocate_above(owned) else {
+                let _ = fs::remove_dir_all(&path);
+                return Err(libc::EACCES);
+            };
+            fd
         };
         let guard = Self {
             path: Some(path),
@@ -438,20 +446,23 @@ impl TempDir {
                 .bits(),
         };
         let name = c"bus";
-        let raw = unsafe {
-            syscalls::syscall!(
-                syscalls::Sysno::openat2,
-                self.fd.as_raw_fd().cast_unsigned() as usize,
-                name.as_ptr().expose_provenance(),
-                (&raw const how).expose_provenance(),
-                std::mem::size_of::<open_how>()
-            )
-        }
-        .ok()
-        .and_then(|fd| RawFd::try_from(fd).ok())
-        .ok_or(libc::EACCES)?;
-        let socket = unsafe { OwnedFd::from_raw_fd(raw) };
-        let socket = GuestFd::relocate_above(socket).map_err(|_| libc::EACCES)?;
+        let socket = {
+            let _fd_lock = GuestFd::read_fd_table();
+            let raw = unsafe {
+                syscalls::syscall!(
+                    syscalls::Sysno::openat2,
+                    self.fd.as_raw_fd().cast_unsigned() as usize,
+                    name.as_ptr().expose_provenance(),
+                    (&raw const how).expose_provenance(),
+                    std::mem::size_of::<open_how>()
+                )
+            }
+            .ok()
+            .and_then(|fd| RawFd::try_from(fd).ok())
+            .ok_or(libc::EACCES)?;
+            let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+            GuestFd::relocate_above(socket).map_err(|_| libc::EACCES)?
+        };
         let stat = fstat(socket.as_fd()).map_err(|_| libc::EACCES)?;
         let euid = unsafe { libc::geteuid() };
         if (stat.st_mode & libc::S_IFMT) != libc::S_IFSOCK

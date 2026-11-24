@@ -149,6 +149,7 @@ impl Client {
     }
 
     fn socket_pair() -> Result<(BrokerHandle<UnixDatagram>, BrokerHandle<UnixDatagram>)> {
+        let _fd_lock = GuestFd::read_fd_table();
         let (left, right) = UnixDatagram::pair()?;
         Ok((
             GuestFd::relocate_above(OwnedFd::from(left))?.map_same_fd(UnixDatagram::from),

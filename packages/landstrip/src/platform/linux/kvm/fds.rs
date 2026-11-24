@@ -12,7 +12,7 @@ use std::io;
 use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use syscalls::Errno;
 
 const DEFAULT_RESERVE_FLOOR: RawFd = 4096;
@@ -43,6 +43,7 @@ static CONFIG: OnceLock<FdConfig> = OnceLock::new();
 static GUEST_NOFILE_CUR: AtomicU64 = AtomicU64::new(1024);
 static GUEST_NOFILE_MAX: AtomicU64 = AtomicU64::new(1024);
 static GUEST_NOFILE_LOCK: Mutex<()> = Mutex::new(());
+static FD_TABLE_LOCK: RwLock<()> = RwLock::new(());
 static SELECT_CAP: AtomicI32 = AtomicI32::new(1024);
 static OCCUPY_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
@@ -419,6 +420,18 @@ impl GuestFd {
         Ok(())
     }
 
+    pub(crate) fn read_fd_table() -> RwLockReadGuard<'static, ()> {
+        FD_TABLE_LOCK
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn write_fd_table() -> RwLockWriteGuard<'static, ()> {
+        FD_TABLE_LOCK
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn select_cap() -> RawFd {
         SELECT_CAP.load(Ordering::Acquire)
     }
@@ -613,6 +626,7 @@ impl GuestFd {
     }
 
     pub(crate) fn close(self) -> u64 {
+        let _fd_lock = Self::write_fd_table();
         let Some(descriptor) = self.valid() else {
             return Errno::EBADF.negated();
         };
