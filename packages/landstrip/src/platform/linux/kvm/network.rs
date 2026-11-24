@@ -145,6 +145,44 @@ impl Verdict {
         Self::Allow { pinned: None }
     }
 
+    pub(crate) fn mediate_listen(policy: &Policy, descriptor: RawFd) -> Self {
+        let Some(info) = Info::from_fd(descriptor) else {
+            return Self::allow();
+        };
+        let network = &policy.rules().network_access;
+        if network.is_unrestricted() {
+            return Self::allow();
+        }
+        match info.kind() {
+            Kind::Unsupported => Self::Refuse {
+                errno: libc::EAFNOSUPPORT,
+                denial: None,
+                pinned: None,
+            },
+            Kind::Udp | Kind::Unix => Self::allow(),
+            Kind::Tcp => {
+                let borrowed = unsafe { BorrowedFd::borrow_raw(descriptor) };
+                let sock = SockRef::from(&borrowed);
+                let Some(endpoint) = sock.local_addr().ok().and_then(|addr| addr.as_socket())
+                else {
+                    return Self::refuse(libc::EACCES, NetworkOperation::Bind, None, false);
+                };
+                let bound = endpoint.port() != 0;
+                let loopback = endpoint.ip().to_canonical().is_loopback();
+                if bound && loopback && network.allows_local_binding() {
+                    Self::allow()
+                } else {
+                    Self::refuse(
+                        libc::EACCES,
+                        NetworkOperation::Bind,
+                        Some(endpoint.to_string()),
+                        bound,
+                    )
+                }
+            }
+        }
+    }
+
     pub(crate) fn record_bound_socket(policy: &Policy, descriptor: RawFd) {
         let Some(info) = Info::from_fd(descriptor) else {
             return;

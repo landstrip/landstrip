@@ -1711,6 +1711,7 @@ impl Process {
         let operation = match syscall {
             Sysno::bind => NetworkOperation::Bind,
             Sysno::connect => NetworkOperation::Connect,
+            Sysno::listen => return Some(self.listen_syscall(registers, memory)),
             Sysno::sendto | Sysno::sendmsg | Sysno::sendmmsg => {
                 return Some(self.datagram_syscall(registers, memory, syscall));
             }
@@ -1763,6 +1764,20 @@ impl Process {
                 syscall, registers, memory, descriptor, &address, pinned_fd,
             ),
         )
+    }
+
+    fn listen_syscall(&self, registers: &Regs, memory: &GuestMemory) -> u64 {
+        let arguments = SyscallArgs::raw(registers);
+        let Some(descriptor) = GuestFd::from_reg(arguments[0]).valid() else {
+            return Errno::EBADF.negated();
+        };
+        if let network::Verdict::Refuse { errno, denial, .. } =
+            network::Verdict::mediate_listen(&self.policy, descriptor)
+            && let Some(status) = self.refuse_network(errno, denial)
+        {
+            return status;
+        }
+        SyscallArgs::forward_translated(registers, memory, Sysno::listen, &[Arg::fd(0)])
     }
 
     fn connect_session_bus(

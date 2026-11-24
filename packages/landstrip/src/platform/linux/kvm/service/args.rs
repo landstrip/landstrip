@@ -555,7 +555,7 @@ impl SyscallArgs {
             Sysno::kill | Sysno::tkill | Sysno::tgkill => {
                 Some(Self::signal_syscall(syscall, registers))
             }
-            Sysno::lseek | Sysno::shutdown | Sysno::listen | Sysno::fchdir => {
+            Sysno::lseek | Sysno::shutdown | Sysno::fchdir => {
                 Some(raw.translate_and_forward(memory, syscall, &[Arg::fd(0)]))
             }
             #[cfg(target_arch = "x86_64")]
