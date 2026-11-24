@@ -713,6 +713,11 @@ impl<'a> LoadRequest<'a> {
             }
             LoadSource::Descriptor(fd) => Executable::read_fd(fd, false).map_err(LoadError::Io)?,
         };
+        if !canonical.as_os_str().is_empty()
+            && let Some(errno) = authorize(&canonical)
+        {
+            return Err(LoadError::Denied(errno));
+        }
         let mut argv = self.arguments.to_vec();
         let mut script_name = self.invoked.to_os_string();
         for depth in 0..=MAX_SHEBANG_DEPTH {
