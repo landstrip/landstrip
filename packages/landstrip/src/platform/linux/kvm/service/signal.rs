@@ -862,7 +862,9 @@ impl GuestSignals {
         if let Some(origin) = origin {
             if prior_regs.result() == Errno::EINTR.negated()
                 && action.flags & u64::from(SA_RESTART) != 0
-                && origin.syscall().is_some_and(SysnoExt::is_restartable)
+                && origin
+                    .syscall()
+                    .is_some_and(|sys| sys.is_restartable(origin))
             {
                 prior_regs.rewind_syscall(origin);
             }

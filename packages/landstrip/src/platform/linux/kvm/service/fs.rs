@@ -11,7 +11,10 @@ use super::super::policy::{
 #[cfg(target_arch = "x86_64")]
 use super::TIMEVAL_BYTES;
 use super::{Arg, Denials, Empty, GuestReg, Process, Request, SyscallArgs, TIMESPEC_BYTES};
-use linux_raw_sys::general::open_how;
+use linux_raw_sys::general::{
+    FUTEX_CMD_MASK, FUTEX_LOCK_PI, FUTEX_LOCK_PI2, FUTEX_WAIT, FUTEX_WAIT_BITSET,
+    FUTEX_WAIT_REQUEUE_PI, open_how,
+};
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -22,7 +25,7 @@ const UTIMBUF_BYTES: u64 = std::mem::size_of::<libc::utimbuf>() as u64;
 
 pub(super) trait SysnoExt: Copy {
     fn is_denied(self) -> bool;
-    fn is_restartable(self) -> bool;
+    fn is_restartable(self, origin: &Regs) -> bool;
     fn mutation(self) -> Option<(Mutation, &'static [PathSpec])>;
 }
 
@@ -710,11 +713,20 @@ impl SysnoExt for Sysno {
         )
     }
 
-    fn is_restartable(self) -> bool {
+    fn is_restartable(self, origin: &Regs) -> bool {
+        let args = origin.arguments();
         match self {
             #[cfg(target_arch = "x86_64")]
             Self::pause | Self::poll | Self::select | Self::epoll_wait => false,
-            Self::semop | Self::semtimedop | Self::msgsnd | Self::msgrcv => false,
+            Self::semop
+            | Self::semtimedop
+            | Self::msgsnd
+            | Self::msgrcv
+            | Self::futex_wait
+            | Self::futex_waitv
+            | Self::mq_timedsend
+            | Self::mq_timedreceive
+            | Self::restart_syscall => false,
             Self::rt_sigsuspend
             | Self::rt_sigtimedwait
             | Self::ppoll
@@ -723,6 +735,23 @@ impl SysnoExt for Sysno {
             | Self::epoll_pwait2
             | Self::nanosleep
             | Self::clock_nanosleep => false,
+            Self::futex => {
+                let cmd = GuestReg(args[1]).as_u32() & FUTEX_CMD_MASK.cast_unsigned();
+                if matches!(cmd, FUTEX_WAIT | FUTEX_WAIT_BITSET | FUTEX_WAIT_REQUEUE_PI) {
+                    false
+                } else if matches!(cmd, FUTEX_LOCK_PI | FUTEX_LOCK_PI2) {
+                    args[3] == 0
+                } else {
+                    true
+                }
+            }
+            Self::recvmmsg => args[4] == 0 && !socket_has_timeout(args[0], libc::SO_RCVTIMEO),
+            Self::read | Self::readv | Self::recvfrom | Self::recvmsg => {
+                !socket_has_timeout(args[0], libc::SO_RCVTIMEO)
+            }
+            Self::write | Self::writev | Self::sendto | Self::sendmsg | Self::sendmmsg => {
+                !socket_has_timeout(args[0], libc::SO_SNDTIMEO)
+            }
             _ => true,
         }
     }
@@ -1037,4 +1066,22 @@ impl Pinned {
         }
         0
     }
+}
+
+fn socket_has_timeout(fd_reg: u64, optname: i32) -> bool {
+    let Some(fd) = GuestFd::from_reg(fd_reg).valid() else {
+        return false;
+    };
+    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::timeval>()).unwrap_or(0);
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            optname,
+            (&raw mut tv).cast(),
+            &raw mut len,
+        )
+    };
+    rc == 0 && (tv.tv_sec != 0 || tv.tv_usec != 0)
 }
