@@ -262,33 +262,53 @@ impl ProfileBuilder {
         wrapped
     }
 
-    fn denial_rules(&mut self, action: &str, scope: &DenialScope) -> fmt::Result {
+    fn render_root_filter(root: &Path, carveouts: &Carveouts) -> String {
+        let escaped = escape_sbpl_literal(&root.to_string_lossy());
+        let filter = format!("(subpath \"{escaped}\")");
+        let matching_carveouts: Vec<&Path> = carveouts
+            .roots
+            .iter()
+            .map(PathBuf::as_path)
+            .filter(|carveout| carveout.overrides_deny(root))
+            .collect();
+        let matching_patterns: Vec<&GlobPattern> = carveouts
+            .patterns
+            .iter()
+            .filter(|allow| allow.overrides_deny(root))
+            .collect();
+        if matching_carveouts.is_empty() && matching_patterns.is_empty() {
+            return filter;
+        }
+
+        let mut wrapped = format!("(require-all {filter}");
+        for carveout in matching_carveouts {
+            let escaped_carveout = escape_sbpl_literal(&carveout.to_string_lossy());
+            let _ = write!(wrapped, " (require-not (subpath \"{escaped_carveout}\"))");
+        }
+        for allow in matching_patterns {
+            let allow_regex = allow.sbpl_regex();
+            let escaped_allow = escape_sbpl_regex_literal(&allow_regex);
+            let _ = write!(wrapped, " (require-not (regex #\"{escaped_allow}\"))");
+        }
+        wrapped.push(')');
+        wrapped
+    }
+
+    fn soft_denial_rules(&mut self, action: &str, scope: &DenialScope) -> fmt::Result {
         let message = &self.message;
         for root in &scope.roots {
-            let escaped = escape_sbpl_literal(&root.to_string_lossy());
-            writeln!(self.sb, "(deny {action} (subpath \"{escaped}\"){message})")?;
-        }
-        for carveout in &scope.carveouts.roots {
-            if carveout.is_under_any(&scope.roots) {
-                let escaped = escape_sbpl_literal(&carveout.to_string_lossy());
-                writeln!(self.sb, "(allow {action} (subpath \"{escaped}\"))")?;
-            }
-        }
-        for pattern in &scope.carveouts.patterns {
-            if scope
-                .roots
-                .iter()
-                .any(|root| pattern.overrides_deny(root.as_path()))
-            {
-                let regex = pattern.sbpl_regex();
-                let escaped = escape_sbpl_regex_literal(&regex);
-                writeln!(self.sb, "(allow {action} (regex #\"{escaped}\"))")?;
-            }
+            let filter = Self::render_root_filter(root, &scope.carveouts);
+            writeln!(self.sb, "(deny {action} {filter}{message})")?;
         }
         for pattern in &scope.patterns {
             let filter = Self::render_pattern_filter(pattern, &scope.carveouts);
             writeln!(self.sb, "(deny {action} {filter}{message})")?;
         }
+        Ok(())
+    }
+
+    fn hard_denial_rules(&mut self, action: &str, scope: &DenialScope) -> fmt::Result {
+        let message = &self.message;
         for root in &scope.always_roots {
             let escaped = escape_sbpl_literal(&root.to_string_lossy());
             writeln!(self.sb, "(deny {action} (subpath \"{escaped}\"){message})")?;
@@ -299,6 +319,11 @@ impl ProfileBuilder {
             writeln!(self.sb, "(deny {action} (regex #\"{escaped}\"){message})")?;
         }
         Ok(())
+    }
+
+    fn denial_rules(&mut self, action: &str, scope: &DenialScope) -> fmt::Result {
+        self.soft_denial_rules(action, scope)?;
+        self.hard_denial_rules(action, scope)
     }
 
     fn write_rules(&mut self, policy: &AccessPolicy) -> fmt::Result {
@@ -330,11 +355,8 @@ impl ProfileBuilder {
     fn write_unlink_rules(&mut self, policy: &AccessPolicy) -> fmt::Result {
         let message = &self.message;
         for root in &policy.read_denials.roots {
-            let escaped = escape_sbpl_literal(&root.to_string_lossy());
-            writeln!(
-                self.sb,
-                "(deny file-write-unlink (subpath \"{escaped}\"){message})"
-            )?;
+            let filter = Self::render_root_filter(root, &policy.read_denials.carveouts);
+            writeln!(self.sb, "(deny file-write-unlink {filter}{message})")?;
         }
         for pattern in &policy.read_denials.patterns {
             let filter = Self::render_pattern_filter(pattern, &policy.read_denials.carveouts);
@@ -426,20 +448,24 @@ impl ProfileBuilder {
                         "(allow file-read* (literal \"/dev/ptmx\") (regex #\"^/dev/ttys\"))"
                     )?;
                 }
-                let mut parent_roots = roots.clone();
-                parent_roots.extend(
-                    policy
-                        .read_denials
-                        .carveouts
-                        .patterns
-                        .iter()
-                        .map(|pattern| pattern.base().to_path_buf()),
-                );
-                self.parent_dir_rules(&parent_roots)?;
                 self.symlink_metadata_rules(&policy.read_symlinks)?;
             }
         }
-        self.denial_rules("file-read*", &policy.read_denials)?;
+        self.soft_denial_rules("file-read*", &policy.read_denials)?;
+        if let ReadAccess::AllowRoots(roots) = &policy.read_access {
+            let mut parent_roots = roots.clone();
+            parent_roots.extend(policy.read_denials.carveouts.roots.iter().cloned());
+            parent_roots.extend(
+                policy
+                    .read_denials
+                    .carveouts
+                    .patterns
+                    .iter()
+                    .map(|pattern| pattern.base().to_path_buf()),
+            );
+            self.parent_dir_rules(&parent_roots)?;
+        }
+        self.hard_denial_rules("file-read*", &policy.read_denials)?;
         Ok(())
     }
 
@@ -454,7 +480,10 @@ impl ProfileBuilder {
         ancestors.dedup();
         for ancestor in &ancestors {
             let escaped = escape_sbpl_literal(&ancestor.to_string_lossy());
-            writeln!(self.sb, "(allow file-read* (literal \"{escaped}\"))")?;
+            writeln!(
+                self.sb,
+                "(allow file-read-metadata (literal \"{escaped}\"))"
+            )?;
         }
         Ok(())
     }

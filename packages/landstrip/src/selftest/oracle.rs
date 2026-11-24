@@ -671,11 +671,12 @@ impl FsOracle {
 
     /// Whether macOS Seatbelt permits `file-read-metadata` (`readlink`) on
     /// `link`. Seatbelt's `read_rules` allows `file-read*` on grants and
-    /// carveouts, `file-read* (literal ...)` on strict ancestors of grant and
-    /// carveout bases (`parent_dir_rules`), and `file-read-metadata` on
-    /// symlinks outside denied roots (`RootScan`), followed by `denial_rules`.
+    /// carveouts and `file-read-metadata` on symlinks outside denied roots
+    /// (`RootScan`), applies soft `read_denials`, grants `file-read-metadata`
+    /// on strict ancestors of grant and carveout bases (`parent_dir_rules`),
+    /// and finishes with `always` denials.
     pub fn can_read_symlink(&self, link: &str) -> bool {
-        if self.read.denial(link).is_some() {
+        if self.read.always.covers(link) {
             return false;
         }
         let ancestor_of_grant = || {
@@ -685,14 +686,19 @@ impl FsOracle {
                 .chain(&self.read.carveouts)
                 .any(|rule| rule.base().is_strictly_under(link))
         };
+        if ancestor_of_grant() {
+            return true;
+        }
+        if self.read.denial(link).is_some() {
+            return false;
+        }
         match self.read_scope {
             ReadScope::Everything => true,
             ReadScope::OutsideDenied => {
                 !self.read_denied_roots.iter().any(|rule| rule.covers(link))
                     || self.read.granted(link)
-                    || ancestor_of_grant()
             }
-            ReadScope::GrantedOnly => self.read.granted(link) || ancestor_of_grant(),
+            ReadScope::GrantedOnly => self.read.granted(link),
         }
     }
 
