@@ -694,7 +694,7 @@ impl Broker {
                 .sync_tlb(vcpu.get(), &mut thread.tlb_epoch)?;
             match process.machine.run(vcpu.get_mut())? {
                 ExitReason::Syscall => {
-                    let mut registers = Machine::regs(vcpu.get())?;
+                    let mut registers = process.machine.regs(vcpu.get())?;
                     let origin = registers;
                     if let Some(exit) = Self::handle(process, vcpu, thread, &mut registers)? {
                         return Ok(exit);
@@ -1129,7 +1129,7 @@ impl Process {
             );
         }
         SIGNAL_QUEUE.transfer_owner(u64::MAX, tid);
-        let mut registers = Machine::regs(vcpu)?;
+        let mut registers = self.machine.regs(vcpu)?;
         self.commit_exec(
             vcpu,
             &mut registers,

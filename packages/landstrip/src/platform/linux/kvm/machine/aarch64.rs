@@ -558,7 +558,11 @@ impl Machine {
     /// storing to the trap window reports the state the exception was taken
     /// from, rewound to re-issue a system call, so that writing it back
     /// replays the exception instead of losing it.
-    pub(crate) fn regs(vcpu: &VcpuFd) -> Result<Regs> {
+    #[allow(
+        clippy::unused_self,
+        reason = "uniform with x86-64, which unwinds interrupted ring-0 handler frames"
+    )]
+    pub(crate) fn regs(&self, vcpu: &VcpuFd) -> Result<Regs> {
         let mut regs = Regs::default();
         for (index, value) in regs.x.iter_mut().enumerate() {
             *value = Register::read(vcpu, Register::x(index))?;
@@ -650,7 +654,7 @@ impl Machine {
                     || ((VECTORS..LAUNCH).contains(&pc)
                         && (pc - VECTORS) % VECTOR_BYTES == INSTRUCTION_BYTES));
             if !at_eret {
-                let regs = Self::regs(vcpu)?;
+                let regs = self.regs(vcpu)?;
                 Self::set_regs(vcpu, &regs)?;
             }
             Register::write(vcpu, Register::PC, LAUNCH_FLUSH)?;

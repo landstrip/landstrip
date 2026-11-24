@@ -518,14 +518,52 @@ impl Machine {
     }
 
     /// Reads the general-purpose registers of `vcpu`.
-    pub(crate) fn regs(vcpu: &VcpuFd) -> Result<Regs> {
-        let raw = vcpu.get_regs().context("read vCPU registers")?;
+    pub(crate) fn regs(&self, vcpu: &VcpuFd) -> Result<Regs> {
+        let mut raw = vcpu.get_regs().context("read vCPU registers")?;
         let sregs = vcpu.get_sregs().context("read vCPU segments")?;
+        if sregs.cs.selector == KERNEL_CS
+            && (HANDLERS..HANDLERS + EXCEPTION_VECTORS * HANDLER_SIZE).contains(&raw.rip)
+        {
+            self.unwind_interrupted_handler(&mut raw)?;
+            return Ok(Regs {
+                raw,
+                in_kernel_stub: false,
+            });
+        }
         let in_kernel_stub = sregs.cs.selector == KERNEL_CS && Self::in_stub(raw.rip);
         Ok(Regs {
             raw,
             in_kernel_stub,
         })
+    }
+
+    fn unwind_interrupted_handler(&self, raw: &mut kvm_regs) -> Result<()> {
+        let rel = raw.rip - HANDLERS;
+        let vector = rel / HANDLER_SIZE;
+        let offset_in_stub = rel % HANDLER_SIZE;
+        let pushed_rax = offset_in_stub >= 1;
+        let has_err = ERROR_CODE_VECTORS.contains(&vector);
+        let words_needed = 4 + u64::from(pushed_rax) + u64::from(has_err);
+        let frame = self
+            .memory
+            .read_supervisor(raw.rsp, words_needed * 8)
+            .context("read interrupted exception frame")?;
+        let word = |idx: usize| -> u64 {
+            let at = idx * 8;
+            u64::from_le_bytes(frame[at..at + 8].try_into().unwrap_or([0; 8]))
+        };
+        let mut idx = 0usize;
+        if pushed_rax {
+            raw.rax = word(idx);
+            idx += 1;
+        }
+        if has_err {
+            idx += 1;
+        }
+        raw.rip = word(idx);
+        raw.rflags = word(idx + 2);
+        raw.rsp = word(idx + 3);
+        Ok(())
     }
 
     /// Writes the general-purpose registers of `vcpu`, leaving ring 0 when

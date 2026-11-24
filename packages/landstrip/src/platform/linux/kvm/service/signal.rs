@@ -857,7 +857,7 @@ impl GuestSignals {
         origin: Option<&Regs>,
     ) -> Result<Option<ExitKind>> {
         let memory = &machine.memory;
-        let mut prior_regs = Machine::regs(vcpu)?;
+        let mut prior_regs = machine.regs(vcpu)?;
         let prior_state = machine.state(vcpu)?;
         if let Some(origin) = origin {
             if prior_regs.result() == Errno::EINTR.negated()
