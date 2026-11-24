@@ -1,6 +1,6 @@
 {
   "name": "opencode-landstrip",
-  "version": "0.22.0",
+  "version": "0.22.1",
   "description": "OS-level AI command sandboxing for OpenCode with Landstrip",
   "keywords": [
     "kvm",
@@ -48,7 +48,7 @@
     "ci:test": "npm test"
   },
   "dependencies": {
-    "@landstrip/landstrip-api": "^0.22.0",
+    "@landstrip/landstrip-api": "^0.22.1",
     "@opentui/core": ">=0.5.12",
     "@opentui/solid": ">=0.5.12",
     "semver": "^7.8.6",
