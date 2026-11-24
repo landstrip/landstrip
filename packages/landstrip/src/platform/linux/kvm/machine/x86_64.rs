@@ -1020,7 +1020,8 @@ impl Machine {
                     entry.ecx &=
                         !((1 << 12) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29) | (1 << 30));
                 }
-                0x7 => {
+                0x7 if entry.index == 0 => {
+                    entry.eax = 0;
                     let avx2_clear = if xcr0.is_some_and(|mask| mask & XCR0_AVX != 0) {
                         0
                     } else {
@@ -1043,6 +1044,12 @@ impl Machine {
                     entry.ecx = 0;
                     entry.edx &= !((1 << 8) | (1 << 20) | (1 << 22) | (1 << 24) | (1 << 25));
                 }
+                0x7 | 0x1d | 0x1e => {
+                    entry.eax = 0;
+                    entry.ebx = 0;
+                    entry.ecx = 0;
+                    entry.edx = 0;
+                }
                 0xd => match (xcr0, entry.index) {
                     (Some(mask), 0) => {
                         entry.eax &= u32::try_from(mask).unwrap_or(0);
@@ -1063,12 +1070,6 @@ impl Machine {
                         entry.edx = 0;
                     }
                 },
-                0x1d | 0x1e => {
-                    entry.eax = 0;
-                    entry.ebx = 0;
-                    entry.ecx = 0;
-                    entry.edx = 0;
-                }
                 _ => {}
             }
         }
