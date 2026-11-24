@@ -440,6 +440,17 @@ impl Policy {
             Resolution::Unresolvable(unres) => return Some(Denial::unresolvable(access, unres)),
             Resolution::Resolved(resolved) => resolved,
         };
+        if Self::is_forbidden_proc_or_internal(&resolved.label)
+            || Self::is_forbidden_proc_or_internal(&resolved.lexical)
+        {
+            return Some(Denial {
+                access,
+                path: resolved.label,
+                requested_path: resolved.lexical,
+                reason: DenialReason::DenyMatch,
+                queryable: false,
+            });
+        }
         if missing == Missing::Kernel && !resolved.present {
             return None;
         }
@@ -485,6 +496,17 @@ impl Policy {
             }
             Resolution::Resolved(resolved) => resolved,
         };
+        if Self::is_forbidden_proc_or_internal(&resolved.label)
+            || Self::is_forbidden_proc_or_internal(&resolved.lexical)
+        {
+            return vec![Denial {
+                access,
+                path: resolved.label,
+                requested_path: resolved.lexical,
+                reason: DenialReason::DenyMatch,
+                queryable: false,
+            }];
+        }
         if missing == Missing::Kernel && !resolved.present {
             return Vec::new();
         }
@@ -865,6 +887,83 @@ impl Policy {
         false
     }
 
+    pub(crate) fn has_forbidden_proc_target(
+        &self,
+        dirfd: Option<i64>,
+        path: &Path,
+        follow: bool,
+    ) -> bool {
+        let base = dirfd.unwrap_or_else(super::fds::GuestFd::at_fdcwd);
+        match self.resolve_path(base, path, follow, ResolveFlags::empty()) {
+            Resolution::Resolved(resolved) => {
+                Self::is_forbidden_proc_or_internal(&resolved.label)
+                    || Self::is_forbidden_proc_or_internal(&resolved.lexical)
+            }
+            Resolution::Unresolvable(unres) => Self::is_forbidden_proc_or_internal(&unres),
+            Resolution::Kernel | Resolution::Unclassified => false,
+        }
+    }
+
+    pub(crate) fn is_forbidden_proc_or_internal(path: &Path) -> bool {
+        if let Ok(rel) = path.strip_prefix("/tmp")
+            && let Some(first) = rel.components().next()
+            && first.as_os_str().as_bytes().starts_with(b"landstrip-dbus-")
+        {
+            return true;
+        }
+        let Ok(rel) = path.strip_prefix("/proc") else {
+            return false;
+        };
+        let mut comps = rel.components().map(|c| c.as_os_str().to_str());
+        let Some(Some(first)) = comps.next() else {
+            return false;
+        };
+        if matches!(first, "kcore" | "kmem" | "keys" | "key-users") {
+            return true;
+        }
+        let is_self = match first {
+            "self" | "thread-self" => true,
+            _ => match first.parse::<u32>() {
+                Ok(pid) => pid == std::process::id(),
+                Err(_) => return false,
+            },
+        };
+        let Some(Some(second)) = comps.next() else {
+            return false;
+        };
+        let entry = if second == "task" {
+            let Some(Some(_tid)) = comps.next() else {
+                return false;
+            };
+            let Some(Some(task_entry)) = comps.next() else {
+                return false;
+            };
+            task_entry
+        } else {
+            second
+        };
+        if matches!(
+            entry,
+            "mem"
+                | "pagemap"
+                | "clear_refs"
+                | "map_files"
+                | "smaps"
+                | "smaps_rollup"
+                | "numa_maps"
+                | "syscall"
+                | "stack"
+                | "personality"
+        ) {
+            return true;
+        }
+        !is_self
+            && matches!(
+                entry,
+                "maps" | "fd" | "fdinfo" | "exe" | "cwd" | "root" | "environ" | "auxv"
+            )
+    }
+
     pub(crate) fn is_proc_self_fd_dir(fd: RawFd) -> bool {
         let mut stat = MaybeUninit::<libc::stat>::uninit();
         if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
@@ -1058,6 +1157,12 @@ impl Mutation {
             })
         };
 
+        if let Some(index) = paths.iter().position(|target| {
+            Policy::is_forbidden_proc_or_internal(&target.label)
+                || Policy::is_forbidden_proc_or_internal(&target.lexical)
+        }) {
+            return deny(index, Access::Write, DenialReason::DenyMatch, false);
+        }
         if name_change
             && let Some(index) = paths.iter().position(|target| {
                 rules

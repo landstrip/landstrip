@@ -739,10 +739,15 @@ impl SyscallArgs {
                     Ok(path) => path,
                     Err(errno) => return Some(errno.negated()),
                 };
-                if let Some(raw) = path.as_bytes()
-                    && policy.is_broker_proc_fd(None, raw)
-                {
-                    return Some(Errno::ENOENT.negated());
+                if let Some(raw) = path.as_bytes() {
+                    if policy.is_broker_proc_fd(None, raw) {
+                        return Some(Errno::ENOENT.negated());
+                    }
+                    if !raw.is_empty()
+                        && policy.has_forbidden_proc_target(None, path.as_path(), true)
+                    {
+                        return Some(Errno::EACCES.negated());
+                    }
                 }
                 Some(self.translate_and_forward(memory, syscall, &[Arg::copied_path(0, &path)]))
             }

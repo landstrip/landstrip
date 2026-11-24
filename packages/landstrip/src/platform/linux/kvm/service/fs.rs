@@ -178,6 +178,17 @@ impl Call<'_> {
         {
             return Errno::ENOENT.negated();
         }
+        let trailing_slash = path.as_bytes().is_some_and(|bytes| bytes.ends_with(b"/"));
+        let follow = trailing_slash || flags & libc::AT_SYMLINK_NOFOLLOW == 0;
+        if flags & !KNOWN_FLAGS == 0
+            && mode & !KNOWN_MODE == 0
+            && !path.as_path().as_os_str().is_empty()
+            && self
+                .policy
+                .has_forbidden_proc_target(dirfd, path.as_path(), follow)
+        {
+            return Errno::EACCES.negated();
+        }
         let reads = mode & libc::R_OK != 0;
         let writes = mode & libc::W_OK != 0;
         if flags & !KNOWN_FLAGS != 0 || mode & !KNOWN_MODE != 0 || (!reads && !writes) {
@@ -189,8 +200,6 @@ impl Call<'_> {
             _ => libc::O_RDONLY,
         };
         let access = if writes { Access::Write } else { Access::Read };
-        let trailing_slash = path.as_bytes().is_some_and(|bytes| bytes.ends_with(b"/"));
-        let follow = trailing_slash || flags & libc::AT_SYMLINK_NOFOLLOW == 0;
         let mut request = Request::path(dirfd, &path, access, follow)
             .opens(open_flags)
             .missing(Missing::Kernel);
@@ -480,6 +489,13 @@ impl Call<'_> {
                     return Errno::EFAULT.negated();
                 }
                 return u64::try_from(copy_len).unwrap_or(0);
+            }
+            if !raw.is_empty()
+                && self
+                    .policy
+                    .has_forbidden_proc_target(dirfd, path.as_path(), false)
+            {
+                return Errno::EACCES.negated();
             }
         }
         let len = u64::try_from(bufsiz.max(0)).unwrap_or(0);

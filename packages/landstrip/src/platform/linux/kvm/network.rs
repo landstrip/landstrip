@@ -378,6 +378,16 @@ impl Verdict {
                 false,
             );
         };
+        if Policy::is_forbidden_proc_or_internal(&resolved.label)
+            || Policy::is_forbidden_proc_or_internal(&resolved.lexical)
+        {
+            return Self::refuse(
+                libc::EACCES,
+                operation,
+                Some(resolved.label.to_string_lossy().into_owned()),
+                false,
+            );
+        }
         let label = resolved.label;
         let lexical = resolved.lexical;
         let target_fd = match Self::open_path_fd(&label) {
