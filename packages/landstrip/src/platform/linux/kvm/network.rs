@@ -28,8 +28,11 @@ pub(crate) struct NetworkDenial {
 
 /// What the broker does with a socket operation.
 pub(crate) enum Verdict {
-    /// The policy grants the operation.
-    Allow,
+    /// The policy grants the operation; `pinned` holds an `O_PATH` descriptor
+    /// for Unix `connect` so the target inode cannot change across queries.
+    Allow {
+        pinned: Option<super::fds::BrokerFd>,
+    },
     /// User D-Bus session socket filtered through `xdg-dbus-proxy`.
     SessionBus {
         upstream: super::fds::BrokerFd,
@@ -40,6 +43,7 @@ pub(crate) enum Verdict {
     Refuse {
         errno: i32,
         denial: Option<NetworkDenial>,
+        pinned: Option<super::fds::BrokerFd>,
     },
 }
 
@@ -137,6 +141,10 @@ impl Kind {
 }
 
 impl Verdict {
+    const fn allow() -> Self {
+        Self::Allow { pinned: None }
+    }
+
     pub(crate) fn mediate(
         policy: &Policy,
         descriptor: RawFd,
@@ -147,15 +155,17 @@ impl Verdict {
             return Self::Refuse {
                 errno: libc::EBADF,
                 denial: None,
+                pinned: None,
             };
         };
         let rules = policy.rules();
         let network = &rules.network_access;
         match info.kind() {
-            Kind::Unsupported if network.is_unrestricted() => Self::Allow,
+            Kind::Unsupported if network.is_unrestricted() => Self::allow(),
             Kind::Unsupported => Self::Refuse {
                 errno: libc::EAFNOSUPPORT,
                 denial: None,
+                pinned: None,
             },
             Kind::Unix => Self::unix(policy, operation, address),
             Kind::Tcp | Kind::Udp => Self::internet(policy, info.kind(), operation, address),
@@ -164,12 +174,13 @@ impl Verdict {
 
     pub(crate) fn mediate_datagram(policy: &Policy, descriptor: RawFd, address: &[u8]) -> Self {
         if address.is_empty() {
-            return Self::Allow;
+            return Self::allow();
         }
         let Some(info) = Info::from_fd(descriptor) else {
             return Self::Refuse {
                 errno: libc::EBADF,
                 denial: None,
+                pinned: None,
             };
         };
         match info.kind() {
@@ -177,7 +188,7 @@ impl Verdict {
                 Self::internet(policy, kind, NetworkOperation::Connect, address)
             }
             Kind::Unix => Self::unix(policy, NetworkOperation::Connect, address),
-            Kind::Unsupported if policy.rules().network_access.is_unrestricted() => Self::Allow,
+            Kind::Unsupported if policy.rules().network_access.is_unrestricted() => Self::allow(),
             Kind::Unsupported => {
                 Self::refuse(libc::EAFNOSUPPORT, NetworkOperation::Connect, None, false)
             }
@@ -187,11 +198,11 @@ impl Verdict {
     fn internet(policy: &Policy, kind: Kind, operation: NetworkOperation, address: &[u8]) -> Self {
         let network = &policy.rules().network_access;
         if network.is_unrestricted() {
-            return Self::Allow;
+            return Self::allow();
         }
         let endpoint = match kind.endpoint(address) {
             Ok(Some(endpoint)) => endpoint,
-            Ok(None) => return Self::Allow,
+            Ok(None) => return Self::allow(),
             Err(errno) => return Self::refuse(errno, operation, None, false),
         };
         let loopback = endpoint.ip().to_canonical().is_loopback();
@@ -203,7 +214,7 @@ impl Verdict {
             (NetworkOperation::Bind | NetworkOperation::Connect, _) => local && loopback,
         };
         if allowed {
-            Self::Allow
+            Self::allow()
         } else {
             Self::refuse(libc::EACCES, operation, Some(endpoint.to_string()), true)
         }
@@ -218,7 +229,7 @@ impl Verdict {
             UnixTarget::Path(path) => Self::unix_path(policy, operation, &path),
             UnixTarget::Unnamed => {
                 if unrestricted {
-                    Self::Allow
+                    Self::allow()
                 } else {
                     Self::refuse(libc::EACCES, operation, Some("abstract".to_owned()), false)
                 }
@@ -235,9 +246,9 @@ impl Verdict {
                 match operation {
                     NetworkOperation::Bind => {
                         policy.record_abstract_socket(name);
-                        Self::Allow
+                        Self::allow()
                     }
-                    NetworkOperation::Connect if policy.owns_abstract_socket(name) => Self::Allow,
+                    NetworkOperation::Connect if policy.owns_abstract_socket(name) => Self::allow(),
                     NetworkOperation::Connect => {
                         Self::refuse(libc::EACCES, operation, Some("abstract".to_owned()), false)
                     }
@@ -264,6 +275,7 @@ impl Verdict {
                 return Self::Refuse {
                     errno,
                     denial: None,
+                    pinned: None,
                 };
             }
             Err(_) => None,
@@ -288,6 +300,7 @@ impl Verdict {
                     None => Self::Refuse {
                         errno: libc::EACCES,
                         denial: None,
+                        pinned: None,
                     },
                 };
             }
@@ -295,6 +308,7 @@ impl Verdict {
                 return Self::Refuse {
                     errno: libc::EACCES,
                     denial: None,
+                    pinned: None,
                 };
             }
         }
@@ -312,14 +326,19 @@ impl Verdict {
             }
         }
         if matches!(access, UnixPathAccess::Denied) {
-            return Self::refuse(
-                libc::EACCES,
-                operation,
-                Some(label.to_string_lossy().into_owned()),
-                true,
-            );
+            return Self::Refuse {
+                errno: libc::EACCES,
+                denial: Some(NetworkDenial {
+                    operation,
+                    target: label.to_string_lossy().into_owned(),
+                    queryable: true,
+                }),
+                pinned: connect.then_some(target_fd).flatten(),
+            };
         }
-        Self::Allow
+        Self::Allow {
+            pinned: connect.then_some(target_fd).flatten(),
+        }
     }
 
     fn refuse(
@@ -335,6 +354,7 @@ impl Verdict {
                 target,
                 queryable,
             }),
+            pinned: None,
         }
     }
 

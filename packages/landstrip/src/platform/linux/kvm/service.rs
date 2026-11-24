@@ -1737,60 +1737,103 @@ impl Process {
         let Ok(address) = memory.read(arguments[1], length as u64) else {
             return Some(Errno::EFAULT.negated());
         };
-        match network::Verdict::mediate(&self.policy, descriptor, operation, &address) {
-            network::Verdict::Allow => {}
-            network::Verdict::SessionBus {
-                upstream,
-                target,
-                allowed,
-            } => {
-                let eacces = Errno::EACCES.negated();
-                if !self.dbus_proxies.is_available() {
-                    return Some(eacces);
+        let pinned_fd =
+            match network::Verdict::mediate(&self.policy, descriptor, operation, &address) {
+                network::Verdict::Allow { pinned } => pinned,
+                network::Verdict::SessionBus {
+                    upstream,
+                    target,
+                    allowed,
+                } => {
+                    return Some(self.connect_session_bus(descriptor, &upstream, target, allowed));
                 }
-                if !allowed {
-                    if !self.denials.can_query() {
-                        return Some(eacces);
+                network::Verdict::Refuse {
+                    errno,
+                    denial,
+                    pinned,
+                } => {
+                    if let Some(status) = self.refuse_network(errno, denial) {
+                        return Some(status);
                     }
-                    match self.denials.query_network(
-                        &self.policy,
-                        NetworkOperation::Connect,
-                        &target,
-                    ) {
-                        QueryOutcome::Allowed => {}
-                        QueryOutcome::Cancelled => return Some(eacces),
-                        QueryOutcome::Denied => {
-                            self.denials.deny_network(
-                                &self.policy,
-                                NetworkOperation::Connect,
-                                target,
-                            );
-                            return Some(eacces);
-                        }
-                    }
+                    pinned
                 }
-                return Some(
-                    match self
-                        .dbus_proxies
-                        .connect(descriptor, std::os::fd::AsFd::as_fd(&upstream))
-                    {
-                        Ok(()) => 0,
-                        Err(errno) => Errno::new(errno).negated(),
-                    },
-                );
+            };
+        Some(Self::forward_socket_endpoint(
+            syscall, registers, memory, descriptor, &address, pinned_fd,
+        ))
+    }
+
+    fn connect_session_bus(
+        &self,
+        descriptor: RawFd,
+        upstream: &super::fds::BrokerFd,
+        target: String,
+        allowed: bool,
+    ) -> u64 {
+        let eacces = Errno::EACCES.negated();
+        if !self.dbus_proxies.is_available() {
+            return eacces;
+        }
+        if !allowed {
+            if !self.denials.can_query() {
+                return eacces;
             }
-            network::Verdict::Refuse { errno, denial } => {
-                if let Some(status) = self.refuse_network(errno, denial) {
-                    return Some(status);
+            match self
+                .denials
+                .query_network(&self.policy, NetworkOperation::Connect, &target)
+            {
+                QueryOutcome::Allowed => {}
+                QueryOutcome::Cancelled => return eacces,
+                QueryOutcome::Denied => {
+                    self.denials
+                        .deny_network(&self.policy, NetworkOperation::Connect, target);
+                    return eacces;
                 }
             }
         }
-        Some(SyscallArgs::forward_translated(
+        match self
+            .dbus_proxies
+            .connect(descriptor, std::os::fd::AsFd::as_fd(upstream))
+        {
+            Ok(()) => 0,
+            Err(errno) => Errno::new(errno).negated(),
+        }
+    }
+
+    fn forward_socket_endpoint(
+        syscall: Sysno,
+        registers: &Regs,
+        memory: &GuestMemory,
+        descriptor: RawFd,
+        address: &[u8],
+        pinned_fd: Option<super::fds::BrokerFd>,
+    ) -> u64 {
+        if syscall == Sysno::connect
+            && let Some(pinned) = pinned_fd
+        {
+            use std::os::fd::AsRawFd;
+            let proc_path = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+            if let Ok(sock_addr) = socket2::SockAddr::unix(proc_path) {
+                let rc = unsafe {
+                    syscalls::syscall!(
+                        Sysno::connect,
+                        descriptor.cast_unsigned() as usize,
+                        sock_addr.as_ptr().expose_provenance(),
+                        sock_addr.len() as usize
+                    )
+                };
+                return match rc {
+                    Ok(val) => val as u64,
+                    Err(errno) => errno.negated(),
+                };
+            }
+        }
+        SyscallArgs::forward_translated(
             registers,
             memory,
             syscall,
-            &[Arg::fd(0), Arg::copied_bytes(1, &address)],
-        ))
+            &[Arg::fd(0), Arg::copied_bytes(1, address)],
+        )
     }
 
     fn datagram_syscall(&self, registers: &Regs, memory: &GuestMemory, syscall: Sysno) -> u64 {
@@ -1872,9 +1915,9 @@ impl Process {
 
     fn mediate_datagram_bytes(&self, descriptor: RawFd, bytes: &[u8]) -> Option<u64> {
         match network::Verdict::mediate_datagram(&self.policy, descriptor, bytes) {
-            network::Verdict::Allow => None,
+            network::Verdict::Allow { .. } => None,
             network::Verdict::SessionBus { .. } => Some(Errno::EACCES.negated()),
-            network::Verdict::Refuse { errno, denial } => self.refuse_network(errno, denial),
+            network::Verdict::Refuse { errno, denial, .. } => self.refuse_network(errno, denial),
         }
     }
 
