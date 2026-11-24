@@ -528,6 +528,15 @@ impl GuestSignals {
                 );
             }
             let si_code = i32::from_ne_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
+            if matches!(
+                signal,
+                libc::SIGSEGV | libc::SIGBUS | libc::SIGILL | libc::SIGFPE | libc::SIGTRAP
+            ) && si_code > 0
+            {
+                // A synchronous host broker fault must terminate rather than loop.
+                Self::install_host_disposition(signal, 0);
+                return;
+            }
             thread_only = si_code == -6;
         }
         let tid = unsafe { syscalls::syscall!(Sysno::gettid) }.map_or(1, |raw| raw as u64);
@@ -548,7 +557,7 @@ impl GuestSignals {
                     act.sa_sigaction = libc::SIG_IGN;
                 }
                 _ => {
-                    act.sa_flags = libc::SA_SIGINFO;
+                    act.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
                     act.sa_sigaction = Self::catch_siginfo as *const () as libc::sighandler_t;
                 }
             }
@@ -597,12 +606,7 @@ impl GuestSignals {
         }
         if let Some(action) = new_action {
             actions[index] = action;
-            if !matches!(
-                sig,
-                libc::SIGSEGV | libc::SIGBUS | libc::SIGILL | libc::SIGFPE | libc::SIGTRAP
-            ) {
-                Self::install_host_disposition(sig, action.handler);
-            }
+            Self::install_host_disposition(sig, action.handler);
         }
         0
     }
