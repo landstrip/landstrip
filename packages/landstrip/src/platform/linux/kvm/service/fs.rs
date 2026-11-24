@@ -376,7 +376,7 @@ impl Call<'_> {
         // contains only `MFD_CLOEXEC` or zero.
         let fd = unsafe { libc::memfd_create(c"maps".as_ptr(), mfd_flags) };
         if fd < 0 {
-            return None;
+            return Some(Errno::last_os(Errno::EMFILE).negated());
         }
         let guarded = GuestFd::guard_created(u64::from(fd.cast_unsigned()));
         let signed = i64::from_ne_bytes(guarded.to_ne_bytes());
@@ -387,16 +387,33 @@ impl Call<'_> {
             return Some(Errno::EMFILE.negated());
         };
         let bytes = content.as_bytes();
-        // SAFETY: `fd` is a newly created writable memfd and `bytes` is valid.
-        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if written < 0 {
-            // SAFETY: `fd` is owned here on error.
-            unsafe { libc::close(fd) };
-            return None;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            // SAFETY: `fd` is a newly created writable memfd and `bytes[offset..]` is valid.
+            let written =
+                unsafe { libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
+            if written < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                unsafe { libc::close(fd) };
+                return Some(Errno::EIO.negated());
+            }
+            let Ok(step) = usize::try_from(written) else {
+                unsafe { libc::close(fd) };
+                return Some(Errno::EIO.negated());
+            };
+            if step == 0 {
+                unsafe { libc::close(fd) };
+                return Some(Errno::EIO.negated());
+            }
+            offset += step;
         }
-        // SAFETY: rewinding `fd` to offset 0 prepares it for reading.
-        unsafe { libc::lseek(fd, 0, libc::SEEK_SET) };
-        u64::try_from(fd).ok()
+        if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
+            unsafe { libc::close(fd) };
+            return Some(Errno::EIO.negated());
+        }
+        Some(u64::try_from(fd).unwrap_or_else(|_| Errno::EMFILE.negated()))
     }
 
     fn open_proc_exe(
