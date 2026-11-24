@@ -221,6 +221,26 @@ impl Verdict {
     }
 
     fn unix(policy: &Policy, operation: NetworkOperation, address: &[u8]) -> Self {
+        let family = match Family::try_from(address) {
+            Ok(family) => i32::from(family.0),
+            Err(errno) => {
+                return Self::Refuse {
+                    errno,
+                    denial: None,
+                    pinned: None,
+                };
+            }
+        };
+        if family == libc::AF_UNSPEC && matches!(operation, NetworkOperation::Connect) {
+            return Self::allow();
+        }
+        if family != libc::AF_UNIX {
+            return Self::Refuse {
+                errno: libc::EINVAL,
+                denial: None,
+                pinned: None,
+            };
+        }
         let unrestricted = matches!(
             policy.rules().network_access.unix_socket_access(),
             UnixSocketAccess::Unrestricted
@@ -228,8 +248,14 @@ impl Verdict {
         match UnixTarget::from(address) {
             UnixTarget::Path(path) => Self::unix_path(policy, operation, &path),
             UnixTarget::Unnamed => {
-                if unrestricted {
+                if unrestricted && matches!(operation, NetworkOperation::Bind) {
                     Self::allow()
+                } else if matches!(operation, NetworkOperation::Connect) {
+                    Self::Refuse {
+                        errno: libc::EINVAL,
+                        denial: None,
+                        pinned: None,
+                    }
                 } else {
                     Self::refuse(libc::EACCES, operation, Some("abstract".to_owned()), false)
                 }
