@@ -32,7 +32,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 
 /// Error the guest sees when the policy refuses an access.
 pub(crate) const DENIED: syscalls::Errno = syscalls::Errno::EACCES;
@@ -1053,17 +1053,36 @@ enum FdLabel {
 }
 
 impl FdLabel {
+    fn memfd_dev() -> Option<libc::dev_t> {
+        static DEV: OnceLock<Option<libc::dev_t>> = OnceLock::new();
+        *DEV.get_or_init(|| {
+            let raw = unsafe { libc::memfd_create(c"landstrip-dev".as_ptr(), libc::MFD_CLOEXEC) };
+            if raw < 0 {
+                return None;
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+            fstat(&owned).ok().map(|stat| stat.st_dev)
+        })
+    }
+
     fn resolve(fd: BorrowedFd<'_>) -> Result<Self, ()> {
         let proc_path = Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string());
         let label = fs::read_link(proc_path).map_err(|_| ())?;
         if !label.is_absolute() {
             return Ok(Self::Anonymous);
         }
-        let Some(path) = label.as_os_str().as_bytes().strip_suffix(b" (deleted)") else {
+        let raw_bytes = label.as_os_str().as_bytes();
+        let Some(path) = raw_bytes.strip_suffix(b" (deleted)") else {
             return Ok(Self::Linked(label));
         };
-        let path = PathBuf::from(OsStr::from_bytes(path));
         let stat = fstat(fd).map_err(|_| ())?;
+        if stat.st_nlink == 0
+            && raw_bytes.starts_with(b"/memfd:")
+            && Self::memfd_dev() == Some(stat.st_dev)
+        {
+            return Ok(Self::Anonymous);
+        }
+        let path = PathBuf::from(OsStr::from_bytes(path));
         Ok(if stat.st_nlink == 0 {
             Self::Unlinked(path)
         } else {
