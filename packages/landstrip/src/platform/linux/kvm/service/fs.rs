@@ -10,7 +10,7 @@ use super::super::policy::{
 };
 #[cfg(target_arch = "x86_64")]
 use super::TIMEVAL_BYTES;
-use super::{Arg, Denials, Empty, GuestReg, Process, Request, SyscallArgs, TIMESPEC_BYTES, Target};
+use super::{Arg, Denials, Empty, GuestReg, Process, Request, SyscallArgs, TIMESPEC_BYTES};
 use linux_raw_sys::general::open_how;
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -653,6 +653,37 @@ impl SysnoExt for Sysno {
 }
 
 impl Call<'_> {
+    fn spec_names_descriptor(
+        syscall: Sysno,
+        spec_index: usize,
+        dirfd: Option<i64>,
+        path: &HostCString,
+        arguments: &[u64; 6],
+    ) -> bool {
+        if path.is_null() {
+            let Some(fd) = dirfd else {
+                return false;
+            };
+            if fd == i64::from(libc::AT_FDCWD) {
+                return false;
+            }
+            #[cfg(target_arch = "x86_64")]
+            if syscall == Sysno::futimesat && spec_index == 0 {
+                return true;
+            }
+            return syscall == Sysno::utimensat && spec_index == 0;
+        }
+        if !path.is_empty_non_null() || spec_index != 0 {
+            return false;
+        }
+        let flag_arg = match syscall {
+            Sysno::linkat | Sysno::fchownat => Some(4),
+            Sysno::utimensat | Sysno::fchmodat2 => Some(3),
+            _ => None,
+        };
+        flag_arg.is_some_and(|idx| GuestReg(arguments[idx]).as_i32() & libc::AT_EMPTY_PATH != 0)
+    }
+
     fn mutation_status(self, mutation: Mutation, specs: &[PathSpec]) -> u64 {
         let syscall = self.syscall;
         let arguments = SyscallArgs::raw(self.registers);
@@ -665,28 +696,32 @@ impl Call<'_> {
         }
         let ptrs = Self::copied_path_args(specs, &copied, syscall);
         let mut paths: Vec<Resolved> = Vec::with_capacity(specs.len());
-        for (spec, path) in specs.iter().zip(&copied) {
-            let base = spec.dirfd.map_or_else(GuestFd::at_fdcwd, |index| {
-                GuestFd::from_reg(arguments[index]).policy_dirfd()
-            });
-            if path.as_path().as_os_str().is_empty() {
-                let Some(index) = spec.dirfd else {
+        let mut descriptor_target = false;
+        for (spec_index, (spec, path)) in specs.iter().zip(&copied).enumerate() {
+            let dirfd = spec
+                .dirfd
+                .map(|index| GuestFd::from_reg(arguments[index]).policy_dirfd());
+            let base = dirfd.unwrap_or_else(GuestFd::at_fdcwd);
+            let resolution = if path.as_path().as_os_str().is_empty() {
+                if !Self::spec_names_descriptor(syscall, spec_index, dirfd, path, &arguments) {
                     return SyscallArgs::forward_translated(
                         self.registers,
                         self.memory,
                         syscall,
                         &ptrs,
                     );
-                };
-                let request = Request::with(Target::Descriptor { index }, Access::Write);
-                return self.check(request, &ptrs);
-            }
-            let resolved = match self.policy.resolve_path(
-                base,
-                path.as_path(),
-                spec.follow.follows(&arguments),
-                ResolveFlags::empty(),
-            ) {
+                }
+                descriptor_target = true;
+                self.policy.resolve_descriptor(base)
+            } else {
+                self.policy.resolve_path(
+                    base,
+                    path.as_path(),
+                    spec.follow.follows(&arguments),
+                    ResolveFlags::empty(),
+                )
+            };
+            let resolved = match resolution {
                 Resolution::Kernel => {
                     return SyscallArgs::forward_translated(
                         self.registers,
@@ -695,18 +730,14 @@ impl Call<'_> {
                         &ptrs,
                     );
                 }
+                Resolution::Unclassified => continue,
                 Resolution::Unresolvable(unres) => {
                     let denial = policy::Denial::unresolvable(Access::Write, unres);
                     if let Some(errno) = self.sink.refuse(self.policy, syscall, denial, Vec::new())
                     {
                         return errno.negated();
                     }
-                    return SyscallArgs::forward_translated(
-                        self.registers,
-                        self.memory,
-                        syscall,
-                        &ptrs,
-                    );
+                    continue;
                 }
                 Resolution::Resolved(resolved) => resolved,
             };
@@ -717,7 +748,7 @@ impl Call<'_> {
             Mutation::Removal => paths.iter().any(|path| path.present),
             Mutation::Reparent | Mutation::Metadata => true,
         };
-        let pinned = self.sink.can_query().then(|| {
+        let pinned = (self.sink.can_query() && !descriptor_target).then(|| {
             let path = paths.first()?;
             PathSpec::pins(specs, &arguments).then(|| Pinned::open(&path.label))?
         });

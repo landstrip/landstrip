@@ -23,7 +23,7 @@ use self::args::{Arg, KernelMsghdr, SyscallArgs};
 use self::fs::{Call, SysnoExt};
 use self::mm::{AddressSpace, MAPPING_CEILING};
 use self::signal::{AltStack, GuestSignals, PendingSignal, SIGNAL_QUEUE, SavedFrame};
-use self::trap::{Denials, Empty, PendingDenials, QueryOutcome, QueryState, Request, Target};
+use self::trap::{Denials, Empty, PendingDenials, QueryOutcome, QueryState, Request};
 use super::ErrnoExt;
 use super::cancel::{Client, Request as CancelRequest};
 use super::dbus::DbusProxies;

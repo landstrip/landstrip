@@ -92,6 +92,7 @@ pub(crate) struct Resolved {
 
 pub(crate) enum Resolution {
     Kernel,
+    Unclassified,
     Unresolvable(PathBuf),
     Resolved(Resolved),
 }
@@ -435,7 +436,7 @@ impl Policy {
         missing: Missing,
     ) -> Option<Denial> {
         let resolved = match self.resolve_path(dirfd, path, follow, ResolveFlags::empty()) {
-            Resolution::Kernel => return None,
+            Resolution::Kernel | Resolution::Unclassified => return None,
             Resolution::Unresolvable(unres) => return Some(Denial::unresolvable(access, unres)),
             Resolution::Resolved(resolved) => resolved,
         };
@@ -481,7 +482,7 @@ impl Policy {
             }
         };
         let resolved = match resolution {
-            Resolution::Kernel => return None,
+            Resolution::Kernel | Resolution::Unclassified => return None,
             Resolution::Unresolvable(unres) => {
                 let mut denial = Denial::unresolvable(access, unres);
                 denial.queryable = !creating;
@@ -546,7 +547,7 @@ impl Policy {
     pub(crate) fn resolved(&self, dirfd: i64, path: &Path, follow: bool) -> Option<Resolved> {
         match self.resolve_path(dirfd, path, follow, ResolveFlags::empty()) {
             Resolution::Resolved(resolved) => Some(resolved),
-            Resolution::Kernel | Resolution::Unresolvable(_) => None,
+            Resolution::Kernel | Resolution::Unclassified | Resolution::Unresolvable(_) => None,
         }
     }
 
@@ -568,7 +569,8 @@ impl Policy {
             match DescriptorTarget::resolve(dirfd) {
                 DescriptorTarget::Path(base) => Some(base),
                 DescriptorTarget::Unresolvable(unres) => return Resolution::Unresolvable(unres),
-                DescriptorTarget::Invalid | DescriptorTarget::Unclassified => {
+                DescriptorTarget::Unclassified => return Resolution::Unclassified,
+                DescriptorTarget::Invalid => {
                     return Resolution::Kernel;
                 }
             }
@@ -637,7 +639,8 @@ impl Policy {
                     (raw, base)
                 }
                 DescriptorTarget::Unresolvable(unres) => return Resolution::Unresolvable(unres),
-                DescriptorTarget::Invalid | DescriptorTarget::Unclassified => {
+                DescriptorTarget::Unclassified => return Resolution::Unclassified,
+                DescriptorTarget::Invalid => {
                     return Resolution::Kernel;
                 }
             }
@@ -681,6 +684,26 @@ impl Policy {
     /// The rules the broker enforces.
     pub(crate) fn rules(&self) -> &AccessPolicy {
         &self.rules
+    }
+
+    /// Resolves an open descriptor targeted by `AT_EMPTY_PATH` or `NULL`
+    /// timestamp syscalls (`utimensat`/`futimesat`).
+    pub(crate) fn resolve_descriptor(&self, fd: i64) -> Resolution {
+        if fd == i64::from(libc::AT_FDCWD) {
+            return self.resolve_path(fd, Path::new("."), true, ResolveFlags::empty());
+        }
+        match DescriptorTarget::resolve(fd) {
+            DescriptorTarget::Path(label) if label.is_absolute() => {
+                Resolution::Resolved(Resolved {
+                    lexical: label.clone(),
+                    label,
+                    present: true,
+                })
+            }
+            DescriptorTarget::Unresolvable(unres) => Resolution::Unresolvable(unres),
+            DescriptorTarget::Unclassified => Resolution::Unclassified,
+            DescriptorTarget::Invalid | DescriptorTarget::Path(_) => Resolution::Kernel,
+        }
     }
 
     /// Describes a refused access through an already open descriptor.
