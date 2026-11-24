@@ -667,9 +667,6 @@ impl SyscallArgs {
         syscall: Sysno,
     ) -> Option<u64> {
         match syscall {
-            Sysno::inotify_add_watch => {
-                Some(self.translate_and_forward(memory, syscall, &[Arg::fd(0), Arg::cstr(1)]))
-            }
             Sysno::inotify_rm_watch => {
                 Some(self.translate_and_forward(memory, syscall, &[Arg::fd(0)]))
             }

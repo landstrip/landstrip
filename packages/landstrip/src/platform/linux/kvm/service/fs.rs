@@ -61,6 +61,7 @@ impl Call<'_> {
                 1,
                 &arguments,
             ),
+            Sysno::inotify_add_watch => self.inotify_add_watch_syscall(&arguments),
             _ => return None,
         };
         Some(status)
@@ -126,6 +127,26 @@ impl Call<'_> {
             ),
             _ => self.check(request, &[Arg::copied_path(0, &path), Arg::cstr(1)]),
         }
+    }
+
+    fn inotify_add_watch_syscall(self, arguments: &[u64; 6]) -> u64 {
+        if GuestFd::from_reg(arguments[0]).valid().is_none() {
+            return Errno::EBADF.negated();
+        }
+        let path = match HostCString::read(self.memory, arguments[1]) {
+            Ok(path) => path,
+            Err(errno) => return errno.negated(),
+        };
+        if let Some(raw) = path.as_bytes()
+            && self.policy.is_broker_proc_fd(None, raw)
+        {
+            return Errno::ENOENT.negated();
+        }
+        let mask = GuestReg(arguments[2]).as_u32();
+        let trailing_slash = path.as_bytes().is_some_and(|bytes| bytes.ends_with(b"/"));
+        let follow = trailing_slash || mask & libc::IN_DONT_FOLLOW == 0;
+        let request = Request::read(None, &path, follow);
+        self.check(request, &[Arg::fd(0), Arg::copied_path(1, &path)])
     }
 
     fn check(self, request: Request<'_>, specs: &[Arg<'_>]) -> u64 {
