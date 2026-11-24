@@ -468,6 +468,7 @@ impl Broker {
         }
         space.sync_page_tables(&machine)?;
         let robust = RobustMirror::reserve(&machine.memory)?;
+        GuestSignals::init_host_defaults();
         let process = Arc::new(Process {
             machine,
             denials: Denials::new(trap, channel),

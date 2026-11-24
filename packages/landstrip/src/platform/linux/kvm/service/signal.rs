@@ -457,6 +457,11 @@ impl GuestSignals {
         Self(Mutex::new(Box::new([GuestSigAction::default(); 64])))
     }
 
+    pub(super) fn init_host_defaults() {
+        // Rust's runtime ignores SIGPIPE at startup; guests expect SIG_DFL.
+        Self::install_host_disposition(libc::SIGPIPE, 0);
+    }
+
     pub(super) fn ignored_mask(&self) -> u64 {
         self.0
             .lock()
@@ -468,6 +473,9 @@ impl GuestSignals {
     }
 
     pub(super) fn restore_ignored(&self, ignored: u64) {
+        if ignored & (1_u64 << (libc::SIGPIPE - 1)) == 0 {
+            Self::install_host_disposition(libc::SIGPIPE, 0);
+        }
         let mut actions = self
             .0
             .lock()
@@ -475,6 +483,9 @@ impl GuestSignals {
         for (index, action) in actions.iter_mut().enumerate() {
             if ignored & (1_u64 << index) != 0 {
                 action.handler = 1;
+                if let Ok(sig) = i32::try_from(index + 1) {
+                    Self::install_host_disposition(sig, 1);
+                }
             }
         }
     }
