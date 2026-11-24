@@ -540,6 +540,7 @@ impl GuestSignals {
         };
         let mut raw = [0u8; 128];
         let mut thread_only = false;
+        let mut process_directed = false;
         if info.is_null() {
             raw[0..4].copy_from_slice(&signal.to_ne_bytes());
         } else {
@@ -561,9 +562,14 @@ impl GuestSignals {
                 return;
             }
             thread_only = si_code == -6;
+            process_directed = !thread_only && (si_code <= 0 || si_code == libc::SI_KERNEL);
         }
-        let tid = unsafe { syscalls::syscall!(Sysno::gettid) }.map_or(1, |raw| raw as u64);
-        SIGNAL_QUEUE.push(signo, tid, thread_only, &raw);
+        let owner = if process_directed {
+            0
+        } else {
+            unsafe { syscalls::syscall!(Sysno::gettid) }.map_or(1, |raw_tid| raw_tid as u64)
+        };
+        SIGNAL_QUEUE.push(signo, owner, thread_only, &raw);
     }
 
     fn install_host_disposition(sig: i32, guest_handler: u64) {
