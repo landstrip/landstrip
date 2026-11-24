@@ -52,7 +52,7 @@ pub(crate) struct DbusProxies {
 #[derive(Deserialize, Serialize)]
 pub(super) struct ExecProxies {
     binary: Option<std::ffi::OsString>,
-    instances: Vec<(u64, u64, RawFd, RawFd)>,
+    instances: Vec<(u64, u64, RawFd, RawFd, i32)>,
 }
 
 impl ExecProxies {
@@ -60,12 +60,13 @@ impl ExecProxies {
         let instances = self
             .instances
             .into_iter()
-            .map(|(dev, ino, socket, keepalive)| {
+            .map(|(dev, ino, socket, keepalive, pid)| {
                 Ok((
                     InodeKey { dev, ino },
                     Proxy {
                         socket: super::handoff::Inherited::adopt(socket, floor)?,
                         keepalive: super::handoff::Inherited::adopt(keepalive, floor)?,
+                        pid,
                     },
                 ))
             })
@@ -117,6 +118,7 @@ impl DbusProxies {
                     key.ino,
                     inherited.keep(proxy.socket.as_fd())?,
                     inherited.keep(proxy.keepalive.as_fd())?,
+                    proxy.pid,
                 ))
             })
             .collect::<anyhow::Result<_>>()?;
@@ -135,7 +137,7 @@ impl DbusProxies {
         let key = InodeKey::from_fd(upstream)?;
 
         for attempt in 0..2 {
-            let proc_path = {
+            let (proc_path, expected_pid) = {
                 let mut instances = self
                     .instances
                     .lock()
@@ -147,7 +149,10 @@ impl DbusProxies {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => entry.insert(Proxy::start(binary, upstream)?),
                 };
-                PathBuf::from(format!("/proc/self/fd/{}", proxy.socket.as_raw_fd()))
+                (
+                    PathBuf::from(format!("/proc/self/fd/{}", proxy.socket.as_raw_fd())),
+                    proxy.pid,
+                )
             };
 
             let addr = SockAddr::unix(proc_path).map_err(|_| libc::EINVAL)?;
@@ -157,7 +162,15 @@ impl DbusProxies {
                 let borrowed = unsafe { BorrowedFd::borrow_raw(scope.fd) };
                 let sock = SockRef::from(&borrowed);
                 match sock.connect(&addr) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => {
+                        if !Proxy::verify_peer_pid(scope.fd, expected_pid) {
+                            unsafe {
+                                libc::shutdown(scope.fd, libc::SHUT_RDWR);
+                            }
+                            return Err(libc::EACCES);
+                        }
+                        return Ok(());
+                    }
                     Err(error) => {
                         let errno = error.raw_os_error().unwrap_or(libc::EIO);
                         if errno == libc::EAGAIN && !scope.was_nonblocking && step < 199 {
@@ -225,9 +238,28 @@ impl Drop for NonblockScope {
 struct Proxy {
     socket: BrokerFd,
     keepalive: BrokerFd,
+    pid: i32,
 }
 
 impl Proxy {
+    fn verify_peer_pid(fd: RawFd, expected_pid: i32) -> bool {
+        if expected_pid <= 1 {
+            return false;
+        }
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>()).unwrap_or(0);
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &raw mut len,
+            )
+        };
+        rc == 0 && cred.pid == expected_pid
+    }
+
     fn start(binary: &Path, upstream: BorrowedFd<'_>) -> Result<Self, i32> {
         let dir = TempDir::new()?;
         let (keepalive, sync_fd) = {
@@ -259,7 +291,7 @@ impl Proxy {
             sync_fd.as_raw_fd(),
         ];
 
-        Self::spawn_detached(
+        let pid = Self::spawn_detached(
             &binary_c,
             &[
                 binary_c.as_c_str(),
@@ -277,7 +309,11 @@ impl Proxy {
 
         Self::wait_ready(keepalive.as_fd())?;
         let socket = dir.open_and_unlink_bus()?;
-        Ok(Self { socket, keepalive })
+        Ok(Self {
+            socket,
+            keepalive,
+            pid,
+        })
     }
 
     fn is_alive(&self) -> bool {
@@ -298,9 +334,16 @@ impl Proxy {
         binary: &CString,
         args: &[&std::ffi::CStr],
         retained: &[RawFd; 3],
-    ) -> Result<(), i32> {
+    ) -> Result<i32, i32> {
         let mut ptrs: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
         ptrs.push(std::ptr::null());
+        let (pid_reader, pid_writer) = {
+            let _fd_lock = GuestFd::read_fd_table();
+            let (pid_r, pid_w) = pipe2(OFlag::O_CLOEXEC).map_err(|_| libc::EACCES)?;
+            let pid_reader = GuestFd::relocate_above(pid_r).map_err(|_| libc::EACCES)?;
+            let pid_writer = GuestFd::relocate_above(pid_w).map_err(|_| libc::EACCES)?;
+            (pid_reader, pid_writer)
+        };
 
         let middle = unsafe { libc::fork() };
         if middle < 0 {
@@ -312,6 +355,10 @@ impl Proxy {
                 unsafe { libc::_exit(1) };
             }
             if grandchild > 0 {
+                let bytes = grandchild.to_ne_bytes();
+                let _ = unsafe {
+                    libc::write(pid_writer.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
+                };
                 unsafe { libc::_exit(0) };
             }
             let _ = unsafe { libc::setsid() };
@@ -348,6 +395,7 @@ impl Proxy {
                 libc::_exit(127);
             }
         }
+        drop(pid_writer);
 
         let mut status = 0;
         loop {
@@ -359,10 +407,13 @@ impl Proxy {
                 return Err(libc::EACCES);
             }
         }
-        if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-            Ok(())
-        } else {
-            Err(libc::EACCES)
+        if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
+            return Err(libc::EACCES);
+        }
+        let mut pid_bytes = [0u8; 4];
+        match read(pid_reader.as_fd(), &mut pid_bytes) {
+            Ok(4) => Ok(i32::from_ne_bytes(pid_bytes)),
+            _ => Err(libc::EACCES),
         }
     }
 
