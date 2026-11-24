@@ -839,6 +839,32 @@ impl Policy {
                 .is_some_and(|rel| rel.starts_with("task") && rel.components().count() == 2)
     }
 
+    pub(crate) fn is_proc_self_fd_dir(fd: RawFd) -> bool {
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } < 0 {
+            return false;
+        }
+        let stat = unsafe { stat.assume_init() };
+        if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+            return false;
+        }
+        let Ok(target) = fs::read_link(format!("/proc/self/fd/{fd}")) else {
+            return false;
+        };
+        let self_root = PathBuf::from(format!("/proc/{}", std::process::id()));
+        let Ok(rel) = target.strip_prefix(&self_root) else {
+            return false;
+        };
+        rel == Path::new("fd")
+            || rel == Path::new("fdinfo")
+            || (rel.starts_with("task")
+                && matches!(
+                    rel.file_name().and_then(OsStr::to_str),
+                    Some("fd" | "fdinfo")
+                )
+                && rel.components().count() == 3)
+    }
+
     pub(crate) fn is_broker_proc_fd(&self, dirfd: Option<i64>, raw_path: &[u8]) -> bool {
         let candidate = Path::new(OsStr::from_bytes(raw_path));
         let full = if candidate.is_absolute() {

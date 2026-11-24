@@ -780,7 +780,77 @@ impl SyscallArgs {
 
     fn getdents(self, memory: &GuestMemory, syscall: Sysno) -> u64 {
         let len = u64::from(GuestReg(self.0[2]).as_u32());
-        self.translate_and_forward(memory, syscall, &[Arg::fd(0), Arg::bytes(1, len)])
+        let Some(raw_fd) = GuestFd::from_reg(self.0[0]).valid() else {
+            return Errno::EBADF.negated();
+        };
+        if !Policy::is_proc_self_fd_dir(raw_fd) {
+            return self.translate_and_forward(memory, syscall, &[Arg::fd(0), Arg::bytes(1, len)]);
+        }
+        let Ok(cap) = usize::try_from(len) else {
+            return Errno::EINVAL.negated();
+        };
+        if cap == 0 || memory.address(self.0[1], len).is_err() {
+            return self.translate_and_forward(memory, syscall, &[Arg::fd(0), Arg::bytes(1, len)]);
+        }
+        let capped = cap.min(1 << 20);
+        let mut host_buf = vec![0u8; capped];
+        let mut filtered = Vec::with_capacity(capped);
+        let name_off = if syscall == Sysno::getdents64 { 19 } else { 18 };
+        loop {
+            let rc = Self::invoke(
+                syscall,
+                &[
+                    u64::from(raw_fd.cast_unsigned()),
+                    host_buf.as_mut_ptr().expose_provenance() as u64,
+                    u64::try_from(capped).unwrap_or(0),
+                    0,
+                    0,
+                    0,
+                ],
+            );
+            let signed = GuestReg(rc).as_c_long();
+            if signed <= 0 {
+                return rc;
+            }
+            let Ok(read_bytes) = usize::try_from(signed) else {
+                return Errno::EIO.negated();
+            };
+            filtered.clear();
+            let mut offset = 0usize;
+            while offset + name_off < read_bytes {
+                let reclen = usize::from(u16::from_ne_bytes([
+                    host_buf[offset + 16],
+                    host_buf[offset + 17],
+                ]));
+                if reclen < name_off + 2 || offset + reclen > read_bytes {
+                    break;
+                }
+                let name_end = if syscall == Sysno::getdents64 {
+                    offset + reclen
+                } else {
+                    offset + reclen - 1
+                };
+                let raw_name = &host_buf[offset + name_off..name_end];
+                let nul = raw_name
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(raw_name.len());
+                let hide = std::str::from_utf8(&raw_name[..nul])
+                    .ok()
+                    .and_then(|s| s.parse::<RawFd>().ok())
+                    .is_some_and(|fd| GuestFd::from_raw(fd).is_broker());
+                if !hide {
+                    filtered.extend_from_slice(&host_buf[offset..offset + reclen]);
+                }
+                offset += reclen;
+            }
+            if !filtered.is_empty() {
+                if memory.write(self.0[1], &filtered).is_err() {
+                    return Errno::EFAULT.negated();
+                }
+                return u64::try_from(filtered.len()).unwrap_or(0);
+            }
+        }
     }
 
     fn time_or_proc_syscall(
