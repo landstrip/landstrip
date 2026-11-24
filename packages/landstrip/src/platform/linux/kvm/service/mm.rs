@@ -3,6 +3,7 @@
 
 use super::super::ErrnoExt;
 use super::super::fds::GuestFd;
+pub(super) use super::super::machine::MAPPING_CEILING;
 use super::super::machine::{
     Machine, PAGE_BYTES, RESERVED_END, Regs, STACK_TOP, USER_ADDRESS_BYTES,
 };
@@ -29,8 +30,6 @@ const VALID_MPROTECT_FLAGS: u64 = 0x7;
 const VALID_MPROTECT_FLAGS: u64 = 0x17;
 #[allow(clippy::cast_possible_truncation)]
 const PROT_MASK: u32 = VALID_MPROTECT_FLAGS as u32;
-const MAPPING_RESERVE: u64 = 0x0100_0000;
-pub(super) const MAPPING_CEILING: u64 = STACK_TOP - MAPPING_RESERVE;
 
 static NEXT_SHM_ID: AtomicU64 = AtomicU64::new(1);
 

@@ -10,9 +10,11 @@
 
 use super::fds::GuestFd;
 use super::handoff::{Inherited, SealedFile};
-use super::machine::{Machine, PAGE_BYTES, RESERVED_END, STACK_TOP};
+use super::machine::{
+    MAPPING_CEILING, Machine, PAGE_BYTES, RESERVED_END, STACK_TOP, USER_ADDRESS_BYTES,
+};
 use super::memory::GuestMemory;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::Elf;
 #[cfg(target_arch = "aarch64")]
@@ -85,9 +87,20 @@ impl Segment {
         if phdr.p_memsz == 0 {
             return Ok(None);
         }
-        bytes
-            .get(phdr.file_range())
-            .context("payload has a truncated segment")?;
+        if (phdr.p_vaddr ^ phdr.p_offset) & (PAGE_BYTES - 1) != 0 {
+            bail!("payload segment offset and virtual address are misaligned modulo page size");
+        }
+        if phdr.p_filesz > 0 {
+            bytes
+                .get(phdr.file_range())
+                .context("payload has a truncated segment")?;
+        } else {
+            let off = usize::try_from(phdr.p_offset).context("payload segment offset overflow")?;
+            ensure!(
+                off <= bytes.len(),
+                "payload has an out-of-bounds segment offset"
+            );
+        }
         let mut prot = 0u32;
         if phdr.is_read() {
             prot |= libc::PROT_READ.cast_unsigned();
@@ -146,6 +159,17 @@ impl Image {
                 header.e_phentsize
             );
         }
+        let ph_table_bytes = u64::from(header.e_phnum)
+            .checked_mul(u64::from(header.e_phentsize))
+            .context("program header table size overflow")?;
+        let ph_end = header
+            .e_phoff
+            .checked_add(ph_table_bytes)
+            .context("program header table offset overflow")?;
+        ensure!(
+            ph_end <= u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            "payload has a truncated program header table"
+        );
         let phdrs = ProgramHeader::parse(
             &bytes,
             usize::try_from(header.e_phoff)?,
@@ -181,19 +205,28 @@ impl Image {
             interpreter,
         };
         if header.e_type == ET_DYN && base != 0 {
-            let aligned = lowest - lowest % PAGE_BYTES;
-            let bias = base.checked_sub(aligned).context("payload is too large")?;
-            image.relocate(bias)?;
+            let aligned = lowest & !(PAGE_BYTES - 1);
+            let bias = base.wrapping_sub(aligned);
+            image.relocate(bias);
         }
         for segment in &image.segments {
             if segment.address < RESERVED_END {
                 bail!("payload segment maps below the reserved address {RESERVED_END:#x}");
             }
-            segment
+            let seg_end = segment
                 .address
                 .checked_add(segment.memory_size)
                 .context("payload segment overflows the address space")?;
+            ensure!(
+                seg_end <= USER_ADDRESS_BYTES,
+                "payload segment exceeds the guest user address space"
+            );
         }
+        ensure!(
+            image.entry >= RESERVED_END && image.entry < USER_ADDRESS_BYTES,
+            "payload entry point {:#x} lies outside user memory",
+            image.entry
+        );
         Ok(image)
     }
 
@@ -208,13 +241,11 @@ impl Image {
         Ok(PathBuf::from(OsString::from_vec(raw[..end].to_vec())))
     }
 
-    fn relocate(&mut self, bias: u64) -> Result<()> {
-        let shift = |value: u64| value.checked_add(bias).context("payload is too large");
+    fn relocate(&mut self, bias: u64) {
         for segment in &mut self.segments {
-            segment.address = shift(segment.address)?;
+            segment.address = segment.address.wrapping_add(bias);
         }
-        self.entry = shift(self.entry)?;
-        Ok(())
+        self.entry = self.entry.wrapping_add(bias);
     }
 
     fn load(&self, memory: &GuestMemory) -> Result<()> {
@@ -336,7 +367,9 @@ impl Launch {
             environment_pointers.push(cursor);
         }
 
-        cursor -= u64::try_from(RANDOM_SIZE)?;
+        cursor = cursor
+            .checked_sub(u64::try_from(RANDOM_SIZE)?)
+            .context("initial stack underflow")?;
         let random = Self::random_seed()?;
         memory.write(cursor, &random)?;
 
@@ -373,7 +406,14 @@ impl Launch {
         let length = u64::try_from(words.len())?
             .checked_mul(8)
             .context("stack size")?;
-        cursor = (cursor - length) & !0xf;
+        cursor = cursor
+            .checked_sub(length)
+            .context("initial stack underflow")?
+            & !0xf;
+        ensure!(
+            cursor >= MAPPING_CEILING,
+            "initial stack exceeds stack reservation"
+        );
         for (index, word) in words.iter().enumerate() {
             memory.write_u64(cursor + u64::try_from(index)? * 8, *word)?;
         }

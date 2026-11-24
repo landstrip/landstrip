@@ -36,6 +36,8 @@ const PT_ARENA_BYTES: u64 = 128 << 20;
 pub(crate) const USER_ADDRESS_BYTES: u64 = ADDRESS_SPACE_BYTES - PT_ARENA_BYTES;
 const PT_ARENA_BASE: u64 = USER_ADDRESS_BYTES;
 pub(crate) const STACK_TOP: u64 = USER_ADDRESS_BYTES - PAGE_BYTES;
+const MAPPING_RESERVE: u64 = 0x0100_0000;
+pub(crate) const MAPPING_CEILING: u64 = STACK_TOP - MAPPING_RESERVE;
 
 /// Guest page size, which the payload sees as `AT_PAGESZ`.
 const PAGE_LEN: usize = 4096;
