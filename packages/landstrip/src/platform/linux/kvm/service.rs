@@ -29,9 +29,7 @@ use super::cancel::{Client, Request as CancelRequest};
 use super::dbus::DbusProxies;
 use super::fds::{BrokerHandle, GuestFd};
 use super::handoff::RestartImage;
-#[cfg(target_arch = "x86_64")]
-use super::machine::PAGE_BYTES;
-use super::machine::{ExitReason, Machine, RESERVED_END, Regs, VcpuState};
+use super::machine::{ExitReason, Machine, PAGE_BYTES, RESERVED_END, Regs, VcpuState};
 use super::memory::{GuestMemory, HostCString};
 use super::network;
 use super::payload;
@@ -51,9 +49,10 @@ use linux_raw_sys::general::{
 use linux_raw_sys::ioctl::{FICLONE, FICLONERANGE};
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::io;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::io::{self, Read};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -250,9 +249,124 @@ struct Process {
     ptrace: Arc<PtraceTable>,
     robust: RobustMirror,
     restart_image: Option<Arc<RestartImage>>,
+    vfork_sync: Mutex<Option<VforkSync>>,
     /// `membarrier` registration commands of the guest image. The kernel
     /// keeps the broker registered across a guest exec, which clears these.
     membarrier: AtomicU32,
+}
+
+struct VforkSync {
+    tx: BrokerHandle<UnixStream>,
+    shares_vm: bool,
+}
+
+impl VforkSync {
+    fn pair(shares_vm: bool) -> Result<(BrokerHandle<UnixStream>, Self)> {
+        let _fd_lock = GuestFd::read_fd_table();
+        let (rx, tx) = UnixStream::pair().context("create vfork synchronization channel")?;
+        let rx = GuestFd::relocate_above(OwnedFd::from(rx))?.map_same_fd(UnixStream::from);
+        let tx = GuestFd::relocate_above(OwnedFd::from(tx))?.map_same_fd(UnixStream::from);
+        Ok((rx, Self { tx, shares_vm }))
+    }
+
+    fn wait_in_parent(mut rx: BrokerHandle<UnixStream>, memory: &GuestMemory) {
+        let stream = rx.get_mut();
+        let mut header = [0_u8; 8];
+        let mut page = vec![0_u8; usize::try_from(PAGE_BYTES).unwrap_or(4096)];
+        while Self::read_frame_part(stream, &mut header) {
+            if !Self::read_frame_part(stream, &mut page) {
+                break;
+            }
+            let guest_addr = u64::from_le_bytes(header);
+            let _ = memory.write(guest_addr, &page);
+        }
+    }
+
+    fn read_frame_part(stream: &mut UnixStream, mut buf: &mut [u8]) -> bool {
+        while !buf.is_empty() {
+            match stream.read(buf) {
+                Ok(0) => return false,
+                Ok(n) => buf = &mut buf[n..],
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    fn send_all(fd: RawFd, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            let rc =
+                unsafe { libc::send(fd, bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL) };
+            if rc > 0 {
+                let Ok(step) = usize::try_from(rc) else {
+                    return false;
+                };
+                bytes = &bytes[step..];
+            } else if rc < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn finish_in_child(self, process: &Process) {
+        if !self.shares_vm {
+            return;
+        }
+        let pagemap = {
+            let _fd_lock = GuestFd::read_fd_table();
+            let raw = unsafe {
+                libc::open(
+                    c"/proc/self/pagemap".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                return;
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+            let Ok(relocated) = GuestFd::relocate_above(owned) else {
+                return;
+            };
+            relocated.map_same_fd(std::fs::File::from)
+        };
+        let host_base = process.machine.memory.base();
+        let ranges = process.space_snapshot().writable_private_ranges();
+        let mut entries = vec![0_u8; 4096 * 8];
+        for (start, end) in ranges {
+            let mut cursor = start & !(PAGE_BYTES - 1);
+            while cursor < end {
+                let pages = usize::try_from(((end - cursor) / PAGE_BYTES).min(4096)).unwrap_or(0);
+                if pages == 0 {
+                    break;
+                }
+                let host_vfn = (host_base + cursor) / PAGE_BYTES;
+                let slice = &mut entries[..pages * 8];
+                if pagemap.get().read_exact_at(slice, host_vfn * 8).is_err() {
+                    break;
+                }
+                for (idx, raw_entry) in slice.chunks_exact(8).enumerate() {
+                    let word = u64::from_ne_bytes(raw_entry.try_into().unwrap_or([0; 8]));
+                    let present_or_swapped = word & ((1_u64 << 63) | (1_u64 << 62)) != 0;
+                    let anon_exclusive = word & (1_u64 << 56) != 0;
+                    if present_or_swapped && anon_exclusive {
+                        let guest_page = cursor + (idx as u64) * PAGE_BYTES;
+                        if let Ok(bytes) = process.machine.memory.read(guest_page, PAGE_BYTES) {
+                            let hdr = guest_page.to_le_bytes();
+                            if !Self::send_all(self.tx.as_raw_fd(), &hdr)
+                                || !Self::send_all(self.tx.as_raw_fd(), &bytes)
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+                cursor += (pages as u64) * PAGE_BYTES;
+            }
+        }
+    }
 }
 
 struct Threads {
@@ -370,6 +484,7 @@ impl Broker {
             ptrace: Arc::new(ptrace),
             robust,
             restart_image: restart_image.map(Arc::new),
+            vfork_sync: Mutex::new(None),
             membarrier: AtomicU32::new(0),
         });
         Ok(Self { process, vcpu })
@@ -413,10 +528,12 @@ impl Broker {
                     }
                     let final_status = guard.last_status;
                     drop(guard);
+                    process.complete_vfork();
                     process.denials.flush(final_status != 0);
                     return Ok(final_status);
                 }
                 Ok(ExitKind::Group(status)) => {
+                    process.complete_vfork();
                     process.denials.flush(status != 0);
                     let live = process
                         .threads
@@ -430,11 +547,13 @@ impl Broker {
                     unsafe { libc::_exit(status) }
                 }
                 Ok(ExitKind::Signaled(sig)) => {
+                    process.complete_vfork();
                     process.denials.flush(true);
                     Process::terminate_with_signal(sig)
                 }
                 Ok(ExitKind::Retired) => bail!("process leader retired during exec"),
                 Err(error) => {
+                    process.complete_vfork();
                     let live = process
                         .threads
                         .0
@@ -515,14 +634,21 @@ impl Broker {
                 if !retired {
                     guard.last_status = status;
                 }
+                let last_alive = guard.live == 0 && !process.denials.is_cancelled();
                 condvar.notify_all();
+                drop(guard);
+                if last_alive {
+                    process.complete_vfork();
+                }
                 private_signals
             }
             Ok(ExitKind::Group(status)) => {
+                process.complete_vfork();
                 process.denials.flush(status != 0);
                 unsafe { libc::_exit(status) }
             }
             Ok(ExitKind::Signaled(sig)) => {
+                process.complete_vfork();
                 process.denials.flush(true);
                 Process::terminate_with_signal(sig)
             }
@@ -809,10 +935,30 @@ impl Broker {
                 return Ok(());
             }
         }
+        let is_vfork = {
+            #[cfg(target_arch = "x86_64")]
+            let legacy_vfork = syscall == Sysno::vfork;
+            #[cfg(not(target_arch = "x86_64"))]
+            let legacy_vfork = false;
+            legacy_vfork || (syscall == Sysno::clone && flags & u64::from(CLONE_VFORK) != 0)
+        };
+        let shares_vm = {
+            #[cfg(target_arch = "x86_64")]
+            let legacy_vfork = syscall == Sysno::vfork;
+            #[cfg(not(target_arch = "x86_64"))]
+            let legacy_vfork = false;
+            legacy_vfork || (syscall == Sysno::clone && flags & u64::from(CLONE_VM) != 0)
+        };
+        let mut vfork_pair = if is_vfork {
+            Some(VforkSync::pair(shares_vm)?)
+        } else {
+            None
+        };
         let snapshot = process.fork_snapshot(vcpu.get())?;
         let child = unsafe { libc::fork() };
         if child < 0 {
             registers.set_result(Errno::last_os(Errno::EPERM).negated());
+            drop(vfork_pair);
             drop(snapshot);
             return Ok(());
         }
@@ -824,10 +970,18 @@ impl Broker {
                     .memory
                     .write_u32_atomic(registers.arguments()[2], child.cast_unsigned());
             }
+            if let Some((parent_rx, child_tx)) = vfork_pair.take() {
+                drop(child_tx);
+                VforkSync::wait_in_parent(parent_rx, &process.machine.memory);
+            }
             registers.set_result(u64::try_from(child)?);
             return Ok(());
         }
-        snapshot.into_child(process, vcpu, thread, registers, syscall)
+        let child_vfork = vfork_pair.take().map(|(parent_rx, child_tx)| {
+            drop(parent_rx);
+            child_tx
+        });
+        snapshot.into_child(process, vcpu, thread, registers, syscall, child_vfork)
     }
 
     /// Thread pointer a `clone` with `CLONE_SETTLS` installs in the child.
@@ -856,6 +1010,17 @@ impl Broker {
 }
 
 impl Process {
+    fn complete_vfork(&self) {
+        if let Some(sync) = self
+            .vfork_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            sync.finish_in_child(self);
+        }
+    }
+
     fn release_forked_fds(&self) {
         self.machine.release_forked_fds();
         self.denials.release_forked_fds();
@@ -865,6 +1030,11 @@ impl Process {
             && let Ok(stream) = pipe.try_lock()
         {
             stream.close_for_forked_parent();
+        }
+        if let Ok(vfork) = self.vfork_sync.try_lock()
+            && let Some(sync) = vfork.as_ref()
+        {
+            sync.tx.close_for_forked_parent();
         }
     }
 
@@ -1015,6 +1185,7 @@ impl Process {
     }
 
     fn terminate_with_error(&self, error: &anyhow::Error) -> ! {
+        self.complete_vfork();
         if let Some(pipe) = &self.error_pipe
             && let Ok(stream) = pipe.lock()
         {
@@ -1179,6 +1350,7 @@ impl Process {
             Ok(prepared) => prepared,
             Err(errno) => return Ok(Replacement::Failed(errno)),
         };
+        self.complete_vfork();
         let mut threads = self
             .threads
             .0
@@ -1967,6 +2139,7 @@ impl ForkSnapshot {
         thread: &mut ThreadState,
         registers: &mut Regs,
         syscall: Sysno,
+        vfork_sync: Option<VforkSync>,
     ) -> Result<()> {
         let flags = registers.arguments()[0];
         SIGNAL_QUEUE.clear_all();
@@ -2008,6 +2181,7 @@ impl ForkSnapshot {
             ptrace: Arc::clone(&process.ptrace),
             robust: process.robust,
             restart_image: process.restart_image.clone(),
+            vfork_sync: Mutex::new(vfork_sync),
             membarrier: AtomicU32::new(process.membarrier.load(Ordering::Acquire)),
         });
 

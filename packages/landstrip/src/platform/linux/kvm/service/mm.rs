@@ -157,6 +157,16 @@ impl AddressSpace {
             .collect()
     }
 
+    pub(super) fn writable_private_ranges(&self) -> Vec<(u64, u64)> {
+        self.regions
+            .iter()
+            .filter_map(|(&start, &(end, meta))| {
+                (!meta.shared && meta.prot & libc::PROT_WRITE.cast_unsigned() != 0)
+                    .then_some((start, end))
+            })
+            .collect()
+    }
+
     pub(super) fn sync_page_tables(&self, machine: &Machine) -> Result<()> {
         for (&start, &(end, meta)) in &self.regions {
             if start < end {
