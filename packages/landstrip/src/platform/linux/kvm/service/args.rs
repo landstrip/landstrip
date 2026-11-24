@@ -1328,6 +1328,12 @@ impl SyscallArgs {
         let ss_ptr = self.0[3];
         let ss_len = self.0[4];
         if syscall == Sysno::ppoll {
+            if !invalid.is_empty()
+                && self.0[2] != 0
+                && memory.read(self.0[2], TIMESPEC_BYTES).is_err()
+            {
+                return Errno::EFAULT.negated();
+            }
             self.0[2] = memory.translated_address(self.0[2], TIMESPEC_BYTES);
             self.0[3] = memory.translated_address(ss_ptr, ss_len);
         }
@@ -1336,10 +1342,10 @@ impl SyscallArgs {
             tv_nsec: 0,
         };
         if !invalid.is_empty() {
-            if syscall != Sysno::ppoll {
-                self.0[2] = 0;
-            } else if self.0[2] != 1 {
+            if syscall == Sysno::ppoll {
                 self.0[2] = (&raw mut zero_ts).expose_provenance() as u64;
+            } else {
+                self.0[2] = 0;
             }
         }
         self.0[0] = if nfds == 0 {
