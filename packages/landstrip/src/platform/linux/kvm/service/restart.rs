@@ -118,6 +118,7 @@ impl State {
         );
         let state: Self = SealedFile::load_json(Inherited::adopt(capsule, 3)?)?;
         let floor = state.fd_limits.broker_base;
+        GuestFd::restore_limits(state.fd_limits)?;
         let error = state
             .error
             .map(|fd| {
@@ -133,7 +134,6 @@ impl State {
 
     fn run(self, error: Option<&BrokerHandle<UnixStream>>) -> Result<i32> {
         let floor = self.fd_limits.broker_base;
-        GuestFd::restore_limits(self.fd_limits)?;
         let mqueue = MqueueNamespace::from_saved(self.mqueue_device);
         let ptrace = PtraceTable::from_handoff(self.ptrace, floor)?;
         let image = RestartImage::from_handoff(self.image, floor)?;
