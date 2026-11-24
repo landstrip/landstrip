@@ -597,14 +597,16 @@ impl Process {
         if end > memory.size() {
             return Errno::EINVAL.negated();
         }
-        if address < RESERVED_END {
+        if end <= RESERVED_END {
             return 0;
         }
+        let start = address.max(RESERVED_END);
+        let unmap_len = end - start;
         let mut space = self
             .space
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let removed = space.take_overlapping(address, end);
+        let removed = space.take_overlapping(start, end);
         for (seg_start, seg_end, meta) in removed {
             let seg_len = seg_end - seg_start;
             if meta.needs_host_restore() {
@@ -617,7 +619,7 @@ impl Process {
                 let _ = memory.discard(seg_start, seg_len);
             }
         }
-        let _ = self.machine.protect_pages(address, length, 0);
+        let _ = self.machine.protect_pages(start, unmap_len, 0);
         0
     }
 
