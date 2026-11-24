@@ -410,6 +410,10 @@ impl Process {
         if !matches!(map_type, MAP_SHARED | MAP_PRIVATE | MAP_SHARED_VALIDATE) {
             return Errno::EINVAL.negated();
         }
+        let unsupported = u64::from((libc::MAP_GROWSDOWN | libc::MAP_HUGETLB).cast_unsigned());
+        if map_type != MAP_SHARED_VALIDATE && flags & unsupported != 0 {
+            return Errno::EINVAL.negated();
+        }
         let anonymous = flags & u64::from(MAP_ANONYMOUS) != 0;
         if !anonymous && !offset.is_multiple_of(PAGE_BYTES) {
             return Errno::EINVAL.negated();
@@ -557,7 +561,10 @@ impl Process {
         #[cfg(target_arch = "aarch64")]
         let placement_mask = u64::from(MAP_FIXED | MAP_FIXED_NOREPLACE);
 
-        if GuestReg(flags).as_u32() & MAP_TYPE == MAP_SHARED_VALIDATE && (flags >> 32) != 0 {
+        let unsupported = u64::from((libc::MAP_GROWSDOWN | libc::MAP_HUGETLB).cast_unsigned());
+        if GuestReg(flags).as_u32() & MAP_TYPE == MAP_SHARED_VALIDATE
+            && ((flags >> 32) != 0 || flags & unsupported != 0)
+        {
             return Err(Errno::EOPNOTSUPP);
         }
         let (host_fd, file_offset) = if anonymous {
