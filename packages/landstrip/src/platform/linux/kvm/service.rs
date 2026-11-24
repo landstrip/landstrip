@@ -192,11 +192,12 @@ impl ThreadState {
         robust.register(memory, 0);
     }
 
-    fn release_child_tid(&self, memory: &GuestMemory) {
-        if self.clear_child_tid == 0 {
+    fn release_child_tid(&mut self, memory: &GuestMemory) {
+        let tid_addr = std::mem::take(&mut self.clear_child_tid);
+        if tid_addr == 0 {
             return;
         }
-        let Ok(host_address) = memory.write_u32_atomic(self.clear_child_tid, 0) else {
+        let Ok(host_address) = memory.write_u32_atomic(tid_addr, 0) else {
             return;
         };
         let Ok(addr) = usize::try_from(host_address) else {
@@ -811,7 +812,7 @@ impl Process {
         }
     }
 
-    fn finish_native_exec(&self, thread: &ThreadState) -> Result<Option<PreparedExec>> {
+    fn finish_native_exec(&self, thread: &mut ThreadState) -> Result<Option<PreparedExec>> {
         let tid = ThreadState::current_tid();
         let (lock, condvar) = &self.threads;
         let guard = lock
