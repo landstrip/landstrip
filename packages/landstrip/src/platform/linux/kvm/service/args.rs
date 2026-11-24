@@ -1986,17 +1986,16 @@ impl KernelMsghdr {
                 return Err(Errno::EINVAL);
             };
             let host_base = if len == 0 {
-                0
+                0_usize
             } else {
-                let Ok(addr) = memory.address(base, length) else {
-                    return Err(Errno::EFAULT);
-                };
-                addr
+                memory
+                    .address(base, length)
+                    .ok()
+                    .and_then(|addr| usize::try_from(addr).ok())
+                    .unwrap_or(usize::MAX)
             };
             vectors.push(libc::iovec {
-                iov_base: std::ptr::with_exposed_provenance_mut(
-                    usize::try_from(host_base).unwrap_or(1),
-                ),
+                iov_base: std::ptr::with_exposed_provenance_mut(host_base),
                 iov_len: len,
             });
         }
