@@ -245,10 +245,18 @@ impl ResolvedDenyPaths {
             .collect()
     }
 
-    fn carveouts(&self, always: &Self, allow: &[PathBuf]) -> Vec<PathBuf> {
+    fn read_carveouts(&self, always: &Self, allow: &[PathBuf], fs_root: &Path) -> Vec<PathBuf> {
         allow
             .iter()
-            .filter(|path| !always.matches(path) && self.as_rules().matches_patterns(path))
+            .filter(|path| {
+                path.as_path() != fs_root
+                    && !always.matches(path)
+                    && (self.as_rules().matches_patterns(path)
+                        || self
+                            .concrete
+                            .iter()
+                            .any(|deny| deny.as_path() != fs_root && path.is_under(deny)))
+            })
             .cloned()
             .collect()
     }
@@ -536,6 +544,7 @@ impl PolicyResolver {
     }
 
     fn resolve_read_policy(&self, filesystem: &SandboxFilesystem) -> Result<ResolvedReadPolicy> {
+        let fs_root = Path::new("/").normalize();
         let resolved_allow = self.resolve_allow_paths(&filesystem.allow_read)?;
         let mut allow = resolved_allow.roots;
         #[cfg(target_os = "windows")]
@@ -544,7 +553,7 @@ impl PolicyResolver {
         let mut resolved_deny =
             Self::lower_deny_selectors(self.resolve_selectors(&filesystem.deny_read)?, true)?;
         resolved_deny.merge_expanded();
-        let mut denied_roots = resolved_deny.uncarved_roots(&allow);
+        let uncarved_roots = resolved_deny.uncarved_roots(&allow);
 
         let mut resolved_always = Self::lower_deny_selectors(
             self.resolve_selectors(&filesystem.deny_read_always)?,
@@ -552,9 +561,28 @@ impl PolicyResolver {
         )?;
         resolved_always.merge_expanded();
         let carveouts = Carveouts {
-            roots: resolved_deny.carveouts(&resolved_always, &allow),
+            roots: resolved_deny.read_carveouts(&resolved_always, &allow, &fs_root),
             patterns: resolved_deny.carveout_patterns(&resolved_allow.patterns),
         };
+        let mut denied_roots = if cfg!(target_os = "windows") {
+            uncarved_roots.clone()
+        } else {
+            resolved_deny
+                .concrete
+                .iter()
+                .filter(|deny| {
+                    if deny.as_path() == fs_root {
+                        !allow.iter().any(|grant| grant.is_under(deny))
+                    } else {
+                        !carveouts.roots.contains(deny)
+                    }
+                })
+                .cloned()
+                .collect()
+        };
+        resolved_deny
+            .concrete
+            .retain(|deny| deny.as_path() == fs_root || !carveouts.roots.contains(deny));
         resolved_deny.merge_always(&resolved_always, &mut allow);
 
         #[cfg(target_os = "windows")]
@@ -564,7 +592,7 @@ impl PolicyResolver {
             &allow,
             &resolved_deny.concrete,
             &resolved_deny.patterns,
-            &denied_roots,
+            &uncarved_roots,
         )?;
         denied_roots.extend(resolved_always.concrete.iter().cloned());
         denied_roots.normalize_roots();

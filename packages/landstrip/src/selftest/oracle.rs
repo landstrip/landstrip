@@ -546,29 +546,32 @@ impl FsOracle {
             &policy.allow_read,
             policy.read_base.allows_root(&policy.allow_read),
         )?;
-        let deny = lowering.deny(&policy.deny_read, true)?;
+        let mut deny = lowering.deny(&policy.deny_read, true)?;
         let always = lowering.deny(&policy.deny_read_always, true)?;
         let carveouts = if policy.read_base == ReadBase::Restricted {
             allow.patterns
         } else {
             AccessRules::carveouts(allow.patterns, &deny)
         };
-        let uncarved = deny
-            .roots
-            .iter()
-            .filter(|rule| {
-                !allow
-                    .roots
-                    .iter()
-                    .any(|grant| grant.base().is_under(rule.base()))
-            })
-            .cloned()
-            .collect();
         let grants: Vec<Rule> = allow
             .roots
             .into_iter()
             .filter(|grant| !always.covers(grant.base()))
             .collect();
+        let carved: Vec<String> = grants
+            .iter()
+            .filter(|grant| !grant.base().is_empty() && deny.covers(grant.base()))
+            .map(|grant| grant.base().to_owned())
+            .collect();
+        deny.roots.retain(|rule| {
+            if rule.base().is_empty() {
+                !grants
+                    .iter()
+                    .any(|grant| grant.base().is_under(rule.base()))
+            } else {
+                !carved.iter().any(|root| root == rule.base())
+            }
+        });
         let denied_roots: Vec<Rule> = deny.roots.iter().chain(&always.roots).cloned().collect();
         let scope = if policy.read_base == ReadBase::Restricted {
             ReadScope::GrantedOnly
@@ -586,10 +589,7 @@ impl FsOracle {
         };
         let rules = AccessRules {
             always,
-            deny: RuleSet {
-                roots: uncarved,
-                patterns: deny.patterns,
-            },
+            deny,
             grants,
             carveouts,
         };

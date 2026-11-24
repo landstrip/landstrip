@@ -1519,6 +1519,7 @@ impl InteractiveGrantProbe {
         let _ = std::fs::write(&unlisted, b"unlisted");
         let allow_miss_pol = vec![json!({
             "filesystem": {
+                "denyRead": ["/"],
                 "allowRead": [
                     "/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/dev",
                     &state.ctx.exe
