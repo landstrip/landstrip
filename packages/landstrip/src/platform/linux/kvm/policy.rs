@@ -189,7 +189,7 @@ impl ProbeOpen {
         let how = open_how {
             flags: u64::from(open_flags.cast_unsigned()),
             mode: 0,
-            resolve: resolve.bits(),
+            resolve: (resolve - ResolveFlags::CACHED).bits(),
         };
         let _fd_lock = super::fds::GuestFd::read_fd_table();
         let rc = unsafe {
@@ -214,7 +214,8 @@ impl ProbeOpen {
             Ok(FdLabel::Relinked { path, dev, ino }) => {
                 FdLabel::surviving_link(&path, dev, ino).ok_or(path)
             }
-            _ => Ok(fallback.to_path_buf()),
+            Ok(FdLabel::Anonymous) => Ok(fallback.to_path_buf()),
+            Err(()) => Err(fallback.to_path_buf()),
         }
     }
 
@@ -670,7 +671,7 @@ impl Policy {
             Err(errno) if errno == libc::ENOENT || errno == libc::EACCES => {
                 ProbeOpen::resolve_missing(raw_dirfd, &root_base, path, resolve, lexical)
             }
-            Err(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOSYS) if creating => {
+            Err(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOSYS) => {
                 Resolution::Unresolvable(lexical)
             }
             Err(_) => Resolution::Kernel,
