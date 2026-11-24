@@ -6,6 +6,7 @@ use super::super::cancel::Client;
 use super::super::fds::GuestFd;
 use super::super::machine::Regs;
 use super::super::memory::{GuestMemory, HostCString};
+use super::super::policy::Policy;
 use super::super::ptrace::PtraceTable;
 use super::{
     ARG_BYTES_LIMIT, GuestReg, ITIMERSPEC_BYTES, Process, SIGINFO_BYTES, TIMESPEC_BYTES,
@@ -399,20 +400,49 @@ impl SyscallArgs {
         result
     }
 
-    fn stat_syscall(syscall: Sysno, registers: &Regs, memory: &GuestMemory) -> u64 {
+    fn stat_syscall(
+        policy: &Policy,
+        syscall: Sysno,
+        registers: &Regs,
+        memory: &GuestMemory,
+    ) -> u64 {
+        let args = Self::raw(registers);
         if syscall == Sysno::statx {
+            let path = match HostCString::read(memory, args[1]) {
+                Ok(path) => path,
+                Err(errno) => return errno.negated(),
+            };
+            let dirfd = GuestFd::from_reg(args[0]).policy_dirfd();
+            if let Some(raw) = path.as_bytes()
+                && policy.is_broker_proc_fd(Some(dirfd), raw)
+            {
+                return Errno::ENOENT.negated();
+            }
             return Self::forward_translated(
                 registers,
                 memory,
                 Sysno::statx,
-                &[Arg::dirfd(0), Arg::cstr(1), Arg::bytes(4, STATX_BYTES)],
+                &[
+                    Arg::dirfd(0),
+                    Arg::copied_path(1, &path),
+                    Arg::bytes(4, STATX_BYTES),
+                ],
             );
+        }
+        let path = match HostCString::read(memory, args[0]) {
+            Ok(path) => path,
+            Err(errno) => return errno.negated(),
+        };
+        if let Some(raw) = path.as_bytes()
+            && policy.is_broker_proc_fd(None, raw)
+        {
+            return Errno::ENOENT.negated();
         }
         Self::forward_translated(
             registers,
             memory,
             syscall,
-            &[Arg::cstr(0), Arg::bytes(1, STAT_BYTES)],
+            &[Arg::copied_path(0, &path), Arg::bytes(1, STAT_BYTES)],
         )
     }
 
@@ -564,7 +594,7 @@ impl SyscallArgs {
     ) -> Option<u64> {
         let raw = Self::from_regs(registers);
         if let Some(result) = raw
-            .fs_or_io_syscall(registers, memory, syscall)
+            .fs_or_io_syscall(&process.policy, registers, memory, syscall)
             .or_else(|| raw.time_or_proc_syscall(&process.ptrace, registers, memory, syscall))
             .or_else(|| raw.poll_or_select(thread, registers, memory, syscall))
             .or_else(|| raw.net_syscall(memory, syscall))
@@ -631,6 +661,7 @@ impl SyscallArgs {
 
     fn fs_or_io_syscall(
         self,
+        policy: &Policy,
         registers: &Regs,
         memory: &GuestMemory,
         syscall: Sysno,
@@ -662,30 +693,35 @@ impl SyscallArgs {
                 &[Arg::fd(0), Arg::bytes(1, STAT_BYTES)],
             )),
             #[cfg(target_arch = "x86_64")]
-            Sysno::newfstatat => Some(self.translate_and_forward(
-                memory,
-                syscall,
-                &[Arg::dirfd(0), Arg::cstr(1), Arg::bytes(2, STAT_BYTES)],
-            )),
+            Sysno::newfstatat => Some(self.fstatat_syscall(policy, memory, syscall)),
             #[cfg(target_arch = "aarch64")]
-            Sysno::fstatat => Some(self.translate_and_forward(
-                memory,
-                syscall,
-                &[Arg::dirfd(0), Arg::cstr(1), Arg::bytes(2, STAT_BYTES)],
-            )),
+            Sysno::fstatat => Some(self.fstatat_syscall(policy, memory, syscall)),
             #[cfg(target_arch = "x86_64")]
-            Sysno::stat | Sysno::lstat => Some(Self::stat_syscall(syscall, registers, memory)),
-            Sysno::statx => Some(Self::stat_syscall(syscall, registers, memory)),
+            Sysno::stat | Sysno::lstat => {
+                Some(Self::stat_syscall(policy, syscall, registers, memory))
+            }
+            Sysno::statx => Some(Self::stat_syscall(policy, syscall, registers, memory)),
             Sysno::fstatfs => Some(self.translate_and_forward(
                 memory,
                 syscall,
                 &[Arg::fd(0), Arg::bytes(1, STATFS_BYTES)],
             )),
-            Sysno::statfs => Some(self.translate_and_forward(
-                memory,
-                syscall,
-                &[Arg::cstr(0), Arg::bytes(1, STATFS_BYTES)],
-            )),
+            Sysno::statfs => {
+                let path = match HostCString::read(memory, self.0[0]) {
+                    Ok(path) => path,
+                    Err(errno) => return Some(errno.negated()),
+                };
+                if let Some(raw) = path.as_bytes()
+                    && policy.is_broker_proc_fd(None, raw)
+                {
+                    return Some(Errno::ENOENT.negated());
+                }
+                Some(self.translate_and_forward(
+                    memory,
+                    syscall,
+                    &[Arg::copied_path(0, &path), Arg::bytes(1, STATFS_BYTES)],
+                ))
+            }
             #[cfg(target_arch = "x86_64")]
             Sysno::getdents => Some(self.getdents(memory, syscall)),
             Sysno::getdents64 => Some(self.getdents(memory, syscall)),
@@ -698,7 +734,18 @@ impl SyscallArgs {
                     Arg::bytes(2, CACHESTAT_BYTES),
                 ],
             )),
-            Sysno::chdir => Some(self.translate_and_forward(memory, syscall, &[Arg::cstr(0)])),
+            Sysno::chdir => {
+                let path = match HostCString::read(memory, self.0[0]) {
+                    Ok(path) => path,
+                    Err(errno) => return Some(errno.negated()),
+                };
+                if let Some(raw) = path.as_bytes()
+                    && policy.is_broker_proc_fd(None, raw)
+                {
+                    return Some(Errno::ENOENT.negated());
+                }
+                Some(self.translate_and_forward(memory, syscall, &[Arg::copied_path(0, &path)]))
+            }
             Sysno::getcwd | Sysno::getrandom => {
                 Some(self.translate_and_forward(memory, syscall, &[Arg::bytes(0, self.0[1])]))
             }
@@ -707,6 +754,28 @@ impl SyscallArgs {
             }
             _ => None,
         }
+    }
+
+    fn fstatat_syscall(self, policy: &Policy, memory: &GuestMemory, syscall: Sysno) -> u64 {
+        let path = match HostCString::read(memory, self.0[1]) {
+            Ok(path) => path,
+            Err(errno) => return errno.negated(),
+        };
+        let dirfd = GuestFd::from_reg(self.0[0]).policy_dirfd();
+        if let Some(raw) = path.as_bytes()
+            && policy.is_broker_proc_fd(Some(dirfd), raw)
+        {
+            return Errno::ENOENT.negated();
+        }
+        self.translate_and_forward(
+            memory,
+            syscall,
+            &[
+                Arg::dirfd(0),
+                Arg::copied_path(1, &path),
+                Arg::bytes(2, STAT_BYTES),
+            ],
+        )
     }
 
     fn getdents(self, memory: &GuestMemory, syscall: Sysno) -> u64 {

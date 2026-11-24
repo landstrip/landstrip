@@ -105,6 +105,11 @@ impl Call<'_> {
             Ok(path) => path,
             Err(errno) => return errno.negated(),
         };
+        if let Some(raw) = path.as_bytes()
+            && self.policy.is_broker_proc_fd(None, raw)
+        {
+            return Errno::ENOENT.negated();
+        }
         let request = Request::xattr_path(self.syscall, &path);
         match self.syscall {
             Sysno::listxattr | Sysno::llistxattr => self.check(
@@ -168,6 +173,11 @@ impl Call<'_> {
         } else {
             0
         };
+        if let Some(raw) = path.as_bytes()
+            && self.policy.is_broker_proc_fd(dirfd, raw)
+        {
+            return Errno::ENOENT.negated();
+        }
         let reads = mode & libc::R_OK != 0;
         let writes = mode & libc::W_OK != 0;
         if flags & !KNOWN_FLAGS != 0 || mode & !KNOWN_MODE != 0 || (!reads && !writes) {
@@ -181,12 +191,6 @@ impl Call<'_> {
         let access = if writes { Access::Write } else { Access::Read };
         let trailing_slash = path.as_bytes().is_some_and(|bytes| bytes.ends_with(b"/"));
         let follow = trailing_slash || flags & libc::AT_SYMLINK_NOFOLLOW == 0;
-        if follow
-            && let Some(raw) = path.as_bytes()
-            && self.policy.is_broker_proc_fd(dirfd, raw)
-        {
-            return Errno::ENOENT.negated();
-        }
         let mut request = Request::path(dirfd, &path, access, follow)
             .opens(open_flags)
             .missing(Missing::Kernel);
@@ -202,18 +206,17 @@ impl Call<'_> {
             Ok(path) => path,
             Err(errno) => return errno.negated(),
         };
+        if let Some(raw) = path.as_bytes()
+            && self.policy.is_broker_proc_fd(dirfd, raw)
+        {
+            return Errno::ENOENT.negated();
+        }
         let follow = Request::open_follows(flags, &path, ResolveFlags::empty());
         let mut request =
             Request::path(dirfd, &path, Access::from_open_flags(flags), follow).opens(flags);
         request.flags = Request::open_flag_names(flags);
         if flags & libc::O_CREAT == 0 {
             request = request.missing(Missing::Kernel);
-        }
-        if follow
-            && let Some(raw) = path.as_bytes()
-            && self.policy.is_broker_proc_fd(dirfd, raw)
-        {
-            return Errno::ENOENT.negated();
         }
         if let Some(errno) = self
             .sink
@@ -268,6 +271,11 @@ impl Call<'_> {
         };
         let dirfd = GuestFd::from_reg(arguments[0]).policy_dirfd();
         if !path.is_null() {
+            if let Some(raw) = path.as_bytes()
+                && self.policy.is_broker_proc_fd(Some(dirfd), raw)
+            {
+                return Errno::ENOENT.negated();
+            }
             let follow = Request::open_follows(flags, &path, resolve);
             let mut request =
                 Request::path(Some(dirfd), &path, Access::from_open_flags(flags), follow)
@@ -276,12 +284,6 @@ impl Call<'_> {
             request.flags = Request::open_flag_names(flags);
             if flags & libc::O_CREAT == 0 {
                 request = request.missing(Missing::Kernel);
-            }
-            if follow
-                && let Some(raw) = path.as_bytes()
-                && self.policy.is_broker_proc_fd(Some(dirfd), raw)
-            {
-                return Errno::ENOENT.negated();
             }
             if let Some(errno) = self
                 .sink
@@ -417,22 +419,26 @@ impl Call<'_> {
         let bufsiz = GuestReg(arguments[index + 2]).as_i32();
         if !path.is_null()
             && let Some(raw) = path.as_bytes()
-            && self.policy.is_proc_self_exe(dirfd, raw)
         {
-            if bufsiz <= 0 {
-                return Errno::EINVAL.negated();
+            if self.policy.is_broker_proc_fd(dirfd, raw) {
+                return Errno::ENOENT.negated();
             }
-            let exe = self.policy.exe();
-            let bytes = exe.as_os_str().as_bytes();
-            let copy_len = bytes.len().min(usize::try_from(bufsiz).unwrap_or(0));
-            if self
-                .memory
-                .write(arguments[index + 1], &bytes[..copy_len])
-                .is_err()
-            {
-                return Errno::EFAULT.negated();
+            if self.policy.is_proc_self_exe(dirfd, raw) {
+                if bufsiz <= 0 {
+                    return Errno::EINVAL.negated();
+                }
+                let exe = self.policy.exe();
+                let bytes = exe.as_os_str().as_bytes();
+                let copy_len = bytes.len().min(usize::try_from(bufsiz).unwrap_or(0));
+                if self
+                    .memory
+                    .write(arguments[index + 1], &bytes[..copy_len])
+                    .is_err()
+                {
+                    return Errno::EFAULT.negated();
+                }
+                return u64::try_from(copy_len).unwrap_or(0);
             }
-            return u64::try_from(copy_len).unwrap_or(0);
         }
         let len = u64::try_from(bufsiz.max(0)).unwrap_or(0);
         let specs = if dirfd.is_some() {

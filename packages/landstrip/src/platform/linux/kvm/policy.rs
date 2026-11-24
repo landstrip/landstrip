@@ -480,7 +480,7 @@ impl Policy {
             Resolution::Kernel | Resolution::Unclassified => return Vec::new(),
             Resolution::Unresolvable(unres) => {
                 let mut denial = Denial::unresolvable(access, unres);
-                denial.queryable = !creating;
+                denial.queryable = !creating && !Self::is_broker_proc_self_fd(&denial.path);
                 return vec![denial];
             }
             Resolution::Resolved(resolved) => resolved,
@@ -581,6 +581,9 @@ impl Policy {
             None => path.to_path_buf(),
         };
         let lexical = joined.clean_lexically();
+        if Self::is_broker_proc_self_fd(&lexical) {
+            return Resolution::Unresolvable(lexical);
+        }
         let proc_dirfd = (!path.is_absolute()).then_some(dirfd);
         if follow && self.is_proc_self_exe(proc_dirfd, path.as_os_str().as_bytes()) {
             return Resolution::Resolved(Resolved {
@@ -649,7 +652,7 @@ impl Policy {
         let Some(lexical) = resolve.lexical_path(&root_base, path) else {
             return Resolution::Kernel;
         };
-        if follow && Self::is_broker_proc_self_fd(&lexical) {
+        if Self::is_broker_proc_self_fd(&lexical) {
             return Resolution::Unresolvable(lexical);
         }
         match ProbeOpen::open(raw_dirfd, path, follow, false, resolve) {

@@ -1410,6 +1410,11 @@ impl Process {
         if copied_path.is_null() {
             return Err(Errno::EFAULT);
         }
+        if let Some(raw) = copied_path.as_bytes()
+            && self.policy.is_broker_proc_fd(dirfd, raw)
+        {
+            return Err(Errno::ENOENT);
+        }
         let empty_fd = flags & libc::AT_EMPTY_PATH != 0 && copied_path.is_empty_non_null();
         let trailing_slash = copied_path
             .as_bytes()
