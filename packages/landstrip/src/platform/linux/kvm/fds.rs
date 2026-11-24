@@ -16,7 +16,7 @@ use std::sync::{Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use syscalls::Errno;
 
 const DEFAULT_RESERVE_FLOOR: RawFd = 4096;
-const HOST_NOFILE_CAP: u64 = 524_288;
+const HOST_NOFILE_CAP: u64 = 1_048_576;
 const BROKER_HEADROOM: RawFd = 512;
 const MARGIN: RawFd = 64;
 const LOW_WORDS: usize = 128;
@@ -292,7 +292,7 @@ impl GuestFd {
             return Err(io::Error::last_os_error()).context("read native RLIMIT_NOFILE");
         }
         let host_target = Self::raise_host_soft_limit(native.rlim_cur, native.rlim_max);
-        let host_cap = RawFd::try_from(host_target.min(HOST_NOFILE_CAP)).unwrap_or(i32::MAX);
+        let host_cap = RawFd::try_from(host_target).unwrap_or(i32::MAX);
         let reserve_floor = DEFAULT_RESERVE_FLOOR
             .min(host_cap.saturating_sub(MARGIN))
             .max(2 * MARGIN);
@@ -317,11 +317,11 @@ impl GuestFd {
         let nr_open = fs::read_to_string("/proc/sys/fs/nr_open")
             .ok()
             .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .unwrap_or(1_048_576);
+            .unwrap_or(HOST_NOFILE_CAP);
         let target = if max == libc::RLIM64_INFINITY {
             nr_open.min(HOST_NOFILE_CAP).max(cur)
         } else {
-            max
+            max.min(nr_open).max(cur)
         };
         if target > cur {
             let raised = libc::rlimit64 {
@@ -359,7 +359,7 @@ impl GuestFd {
                 broker_base: saved.broker_base,
             })
             .map_err(|_| anyhow::anyhow!("descriptor configuration already set"))?;
-        GUEST_NOFILE_CUR.store(saved.cur, Ordering::Release);
+        GUEST_NOFILE_CUR.store(saved.cur.min(saved.max), Ordering::Release);
         GUEST_NOFILE_MAX.store(saved.max, Ordering::Release);
         SELECT_CAP.store(saved.select_cap.max(1024), Ordering::Release);
         Ok(())
@@ -638,7 +638,10 @@ impl GuestFd {
 
     pub(crate) fn duplicate_above(fd: RawFd) -> io::Result<BrokerFd> {
         let base = Self::broker_base();
-        let moved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, base) };
+        let mut moved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, base) };
+        if moved < 0 {
+            moved = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, Self::reserve_floor()) };
+        }
         if moved < 0 {
             return Err(io::Error::last_os_error());
         }
