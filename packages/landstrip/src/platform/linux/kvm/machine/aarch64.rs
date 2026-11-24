@@ -488,6 +488,15 @@ impl Machine {
         Register::write_word(vcpu, Register::FPCR, state.fpcr)
     }
 
+    #[allow(clippy::unused_self)]
+    pub(crate) fn reset_fpu(&self, vcpu: &VcpuFd) -> Result<()> {
+        for index in 0..32 {
+            Register::write_vector(vcpu, Register::v(index), 0)?;
+        }
+        Register::write_word(vcpu, Register::FPSR, 0)?;
+        Register::write_word(vcpu, Register::FPCR, 0)
+    }
+
     fn attach(memory: GuestMemory) -> Result<(Self, super::BrokerHandle<VcpuFd>)> {
         let kvm = Self::open_kvm()?;
         let vm =

@@ -1565,6 +1565,7 @@ impl Process {
         }
         #[cfg(target_arch = "aarch64")]
         Machine::set_tls(vcpu, 0)?;
+        self.machine.reset_fpu(vcpu)?;
         if !loaded.executable.as_os_str().is_empty() {
             self.policy.set_exe(&loaded.executable);
         }

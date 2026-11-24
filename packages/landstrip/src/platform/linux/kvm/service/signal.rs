@@ -950,6 +950,7 @@ impl GuestSignals {
             0
         };
         Self::set_thread_mask(active_mask | action.mask | defer_self);
+        machine.reset_fpu(vcpu)?;
         Machine::set_regs(vcpu, &next_regs).context("set handler registers for signal")?;
         Ok(None)
     }

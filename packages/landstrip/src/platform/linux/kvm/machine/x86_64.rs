@@ -423,6 +423,21 @@ impl Machine {
         Self::restore_fpu(vcpu, state)
     }
 
+    pub(crate) fn reset_fpu(&self, vcpu: &VcpuFd) -> Result<()> {
+        let fpu = kvm_fpu {
+            fcw: 0x037f,
+            mxcsr: 0x1f80,
+            ..kvm_fpu::default()
+        };
+        if self.xcr0.is_some() {
+            let xsave = Box::new(kvm_xsave::default());
+            // SAFETY: zeroed `kvm_xsave` (`XSTATE_BV == 0`) places all enabled
+            // XSAVE components in their architectural INIT state.
+            unsafe { vcpu.set_xsave(&xsave) }.context("reset vCPU XSAVE state")?;
+        }
+        vcpu.set_fpu(&fpu).context("reset vCPU FPU state")
+    }
+
     fn restore_fpu(vcpu: &VcpuFd, state: &VcpuState) -> Result<()> {
         if let Some(xsave) = &state.xsave {
             // SAFETY: `xsave` was returned by `KVM_GET_XSAVE` on a vCPU with
