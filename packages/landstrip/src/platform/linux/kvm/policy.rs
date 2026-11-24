@@ -856,8 +856,8 @@ impl Policy {
     }
 
     fn is_broker_proc_self_fd(lexical: &Path) -> bool {
-        Self::proc_self_fd_number(lexical)
-            .and_then(|fd| RawFd::try_from(fd).ok())
+        Self::proc_self_fd_target(lexical, true)
+            .and_then(|(fd, _)| RawFd::try_from(fd).ok())
             .is_some_and(|raw| super::fds::GuestFd::from_raw(raw).is_broker())
     }
 
@@ -865,7 +865,7 @@ impl Policy {
         if fast_only && !lexical.starts_with("/proc") && !lexical.starts_with("/dev") {
             return None;
         }
-        let fd = Self::proc_self_fd_number(lexical)?;
+        let (fd, remainder) = Self::proc_self_fd_target(lexical, false)?;
         if RawFd::try_from(fd)
             .ok()
             .is_some_and(|raw| super::fds::GuestFd::from_raw(raw).is_broker())
@@ -873,40 +873,96 @@ impl Policy {
             return Some(Resolution::Unresolvable(lexical.to_path_buf()));
         }
         Some(match DescriptorTarget::resolve(fd) {
-            DescriptorTarget::Path(label) => Resolution::Resolved(Resolved {
-                label,
-                lexical: lexical.to_path_buf(),
-                present: true,
-            }),
+            DescriptorTarget::Path(label) => {
+                let target = if remainder.as_os_str().is_empty() {
+                    label
+                } else {
+                    let joined = label.join(&remainder);
+                    fs::canonicalize(&joined)
+                        .unwrap_or_else(|_| joined.canonicalize_existing_prefix())
+                };
+                let present = if remainder.as_os_str().is_empty() {
+                    true
+                } else {
+                    Resolved::exists(i64::from(libc::AT_FDCWD), &target, true)
+                };
+                Resolution::Resolved(Resolved {
+                    label: target,
+                    lexical: lexical.to_path_buf(),
+                    present,
+                })
+            }
             DescriptorTarget::Unresolvable(unres) => Resolution::Unresolvable(unres),
             DescriptorTarget::Unclassified | DescriptorTarget::Invalid => Resolution::Kernel,
         })
     }
 
-    fn proc_self_fd_number(path: &Path) -> Option<i64> {
+    fn proc_self_fd_target(path: &Path, include_fdinfo: bool) -> Option<(i64, PathBuf)> {
         const MAX_SYMLINKS: usize = 40;
         let self_root = PathBuf::from(format!("/proc/{}", std::process::id()));
-        let mut current = path.to_path_buf();
+        let mut current = path.clean_lexically();
         for _ in 0..=MAX_SYMLINKS {
-            let parent = current.parent()?;
-            let name = current.file_name()?.to_str()?;
-            if let Ok(canon_parent) = fs::canonicalize(parent)
-                && let Ok(rel) = canon_parent.strip_prefix(&self_root)
-                && (rel == Path::new("fd")
-                    || (rel.starts_with("task")
-                        && rel.file_name() == Some(OsStr::new("fd"))
-                        && rel.components().count() == 3))
-            {
-                return name.parse::<i64>().ok();
+            if let Some(hit) = Self::match_proc_self_fd(&current, &self_root, include_fdinfo) {
+                return Some(hit);
             }
+            if let Ok(rel) = current.strip_prefix("/dev/fd")
+                && let Some(first) = rel.components().next()
+                && let Ok(fd) = first.as_os_str().to_str()?.parse::<i64>()
+            {
+                let mut rest = PathBuf::new();
+                for comp in rel.components().skip(1) {
+                    rest.push(comp.as_os_str());
+                }
+                return Some((fd, rest));
+            }
+            let parent = current.parent()?;
             let Ok(target) = fs::read_link(&current) else {
                 return None;
             };
             current = if target.is_absolute() {
-                target
+                target.clean_lexically()
             } else {
-                parent.join(target)
+                parent.join(target).clean_lexically()
             };
+        }
+        None
+    }
+
+    fn match_proc_self_fd(
+        path: &Path,
+        self_root: &Path,
+        include_fdinfo: bool,
+    ) -> Option<(i64, PathBuf)> {
+        let mut ancestors: Vec<&OsStr> = Vec::new();
+        let mut cursor = path;
+        while let (Some(parent), Some(name)) = (cursor.parent(), cursor.file_name()) {
+            if let Ok(canon_parent) = fs::canonicalize(parent)
+                && let Ok(rel) = canon_parent.strip_prefix(self_root)
+            {
+                let is_fd = rel == Path::new("fd")
+                    || (rel.starts_with("task")
+                        && rel.file_name() == Some(OsStr::new("fd"))
+                        && rel.components().count() == 3);
+                let is_fdinfo = include_fdinfo
+                    && ancestors.is_empty()
+                    && (rel == Path::new("fdinfo")
+                        || (rel.starts_with("task")
+                            && rel.file_name() == Some(OsStr::new("fdinfo"))
+                            && rel.components().count() == 3));
+                if is_fd || is_fdinfo {
+                    let fd = name.to_str()?.parse::<i64>().ok()?;
+                    let mut remainder = PathBuf::new();
+                    for part in ancestors.into_iter().rev() {
+                        remainder.push(part);
+                    }
+                    return Some((fd, remainder));
+                }
+            }
+            ancestors.push(name);
+            cursor = parent;
+            if cursor.as_os_str().is_empty() || cursor == Path::new("/") {
+                break;
+            }
         }
         None
     }
