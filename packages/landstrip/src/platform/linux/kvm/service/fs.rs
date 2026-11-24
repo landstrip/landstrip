@@ -148,9 +148,7 @@ impl Call<'_> {
         let is_legacy = false;
         let path_index = usize::from(!is_legacy);
         let dirfd = (!is_legacy).then(|| GuestFd::from_reg(arguments[0]).policy_dirfd());
-        let Ok(mode) = i32::try_from(arguments[path_index + 1]) else {
-            return Errno::EINVAL.negated();
-        };
+        let mode = GuestReg(arguments[path_index + 1]).as_i32();
         let path = match HostCString::read(self.memory, arguments[path_index]) {
             Ok(path) => path,
             Err(errno) => return errno.negated(),
@@ -161,15 +159,7 @@ impl Call<'_> {
             vec![Arg::dirfd(0), Arg::copied_path(1, &path)]
         };
         let flags = if syscall == Sysno::faccessat2 {
-            let Ok(flags) = i32::try_from(arguments[3]) else {
-                return SyscallArgs::forward_translated(
-                    self.registers,
-                    self.memory,
-                    syscall,
-                    &specs,
-                );
-            };
-            flags
+            GuestReg(arguments[3]).as_i32()
         } else {
             0
         };
