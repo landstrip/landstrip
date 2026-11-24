@@ -18,6 +18,7 @@ use linux_raw_sys::general::{
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use syscalls::{Errno, Sysno};
 
 #[cfg(target_arch = "x86_64")]
@@ -29,11 +30,13 @@ const VALID_MPROTECT_FLAGS: u64 = 0x17;
 const MAPPING_RESERVE: u64 = 0x0100_0000;
 pub(super) const MAPPING_CEILING: u64 = STACK_TOP - MAPPING_RESERVE;
 
+static NEXT_SHM_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MappingKind {
     Anonymous,
     HostBacked,
-    SysvShm { base: u64 },
+    SysvShm { base: u64, id: u64 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,13 +65,14 @@ impl MappingMeta {
     }
 
     const fn relocated(mut self, old_addr: u64, new_addr: u64) -> Self {
-        if let MappingKind::SysvShm { base } = self.kind {
+        if let MappingKind::SysvShm { base, id } = self.kind {
             self.kind = if let Some(offset) = old_addr.checked_sub(base)
                 && let Some(relocated_base) = new_addr.checked_sub(offset)
                 && relocated_base >= RESERVED_END
             {
                 MappingKind::SysvShm {
                     base: relocated_base,
+                    id,
                 }
             } else {
                 MappingKind::HostBacked
@@ -303,18 +307,22 @@ impl AddressSpace {
             .any(|(_, _, meta)| meta.needs_host_restore())
     }
 
-    fn has_shm_base(&self, base: u64) -> bool {
+    fn shm_id_at_base(&self, base: u64) -> Option<u64> {
         self.regions
             .values()
-            .any(|&(_, meta)| meta.kind == MappingKind::SysvShm { base })
+            .find_map(|&(_, meta)| match meta.kind {
+                MappingKind::SysvShm { base: b, id } if b == base => Some(id),
+                _ => None,
+            })
     }
 
-    fn take_shm_segments(&mut self, base: u64) -> Vec<(u64, u64)> {
+    fn take_shm_segments(&mut self, id: u64) -> Vec<(u64, u64)> {
         let starts: Vec<u64> = self
             .regions
             .iter()
             .filter_map(|(&start, &(_, meta))| {
-                (meta.kind == MappingKind::SysvShm { base }).then_some(start)
+                matches!(meta.kind, MappingKind::SysvShm { id: seg_id, .. } if seg_id == id)
+                    .then_some(start)
             })
             .collect();
         let mut segments = Vec::with_capacity(starts.len());
@@ -1139,11 +1147,15 @@ impl Process {
             let _ = memory.restore_anonymous(address, length);
             return Errno::ENOMEM.negated();
         }
+        let attachment_id = NEXT_SHM_ID.fetch_add(1, Ordering::Relaxed);
         space.insert_range(
             address,
             address + length,
             MappingMeta {
-                kind: MappingKind::SysvShm { base: address },
+                kind: MappingKind::SysvShm {
+                    base: address,
+                    id: attachment_id,
+                },
                 prot,
                 shared: true,
                 advised: false,
@@ -1162,13 +1174,13 @@ impl Process {
             .space
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !space.has_shm_base(shmaddr) {
+        let Some(shm_id) = space.shm_id_at_base(shmaddr) else {
             return Errno::EINVAL.negated();
-        }
+        };
         if let Err(errno) = memory.detach_shm(shmaddr) {
             return errno.negated();
         }
-        for (start, end) in space.take_shm_segments(shmaddr) {
+        for (start, end) in space.take_shm_segments(shm_id) {
             let length = end - start;
             let _ = memory.restore_anonymous(start, length);
             let _ = self.machine.protect_pages(start, length, 0);
