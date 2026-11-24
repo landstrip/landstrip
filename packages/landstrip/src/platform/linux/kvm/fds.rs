@@ -67,7 +67,37 @@ impl BrokerBitmap {
     }
 
     fn set_high_base(&self, base: RawFd) {
+        let mut guard = self
+            .overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old_base = self.high_base.load(Ordering::Acquire);
+        if old_base == base {
+            return;
+        }
+        let mut migrated: Vec<RawFd> = guard.iter().copied().collect();
+        guard.clear();
+        self.overflow_len.store(0, Ordering::Release);
+        for (idx, slot) in self.high.iter().enumerate() {
+            let mut bits = slot.swap(0, Ordering::AcqRel);
+            while bits != 0 {
+                let tz = RawFd::try_from(bits.trailing_zeros()).unwrap_or(0);
+                let step = RawFd::try_from(idx * 64).unwrap_or(0);
+                migrated.push(old_base.saturating_add(step).saturating_add(tz));
+                bits &= bits - 1;
+            }
+        }
         self.high_base.store(base, Ordering::Release);
+        for fd in migrated {
+            if fd >= base
+                && fd < base.saturating_add(HIGH_SPAN)
+                && let Ok(offset) = usize::try_from(fd - base)
+            {
+                self.high[offset / 64].fetch_or(1_u64 << (offset % 64), Ordering::AcqRel);
+            } else if guard.insert(fd) {
+                self.overflow_len.fetch_add(1, Ordering::Release);
+            }
+        }
     }
 
     fn insert(&self, fd: RawFd) {
