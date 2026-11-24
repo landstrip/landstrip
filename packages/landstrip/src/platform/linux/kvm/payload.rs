@@ -367,6 +367,16 @@ impl<'a> Shebang<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct MappedSegment {
+    pub(crate) start: u64,
+    pub(crate) file_end: u64,
+    pub(crate) end: u64,
+    pub(crate) file_offset: u64,
+    pub(crate) prot: u32,
+    pub(crate) interpreter: bool,
+}
+
 /// Guest state the initial stack and the vCPU entry point are built from.
 pub(crate) struct Launch {
     /// Address the vCPU starts at, which is the interpreter when there is one.
@@ -377,9 +387,10 @@ pub(crate) struct Launch {
     header_count: u64,
     header_address: u64,
     interpreter_base: u64,
+    pub(crate) interpreter: Option<PathBuf>,
     /// Highest mapped byte, which bounds the payload heap from below.
     pub(crate) end: u64,
-    pub(crate) segments: Vec<(u64, u64, u32)>,
+    pub(crate) segments: Vec<MappedSegment>,
 }
 
 impl Launch {
@@ -502,16 +513,32 @@ impl Payload {
             interpreter.load(memory)?;
         }
         let mut segments = Vec::new();
-        for seg in self.image.segments.iter().chain(
+        for (is_interp, seg) in self.image.segments.iter().map(|seg| (false, seg)).chain(
             self.interpreter
                 .iter()
-                .flat_map(|interpreter| interpreter.segments.iter()),
+                .flat_map(|interpreter| interpreter.segments.iter().map(|seg| (true, seg))),
         ) {
-            let start = seg.address & !(PAGE_BYTES - 1);
+            let page_off = seg.address & (PAGE_BYTES - 1);
+            let start = seg.address - page_off;
+            let file_offset = seg.offset.saturating_sub(page_off);
+            let file_end = if seg.file_size == 0 {
+                start
+            } else {
+                (seg.address + seg.file_size)
+                    .checked_add(PAGE_BYTES - 1)
+                    .map_or(u64::MAX, |aligned| aligned & !(PAGE_BYTES - 1))
+            };
             let end = (seg.address + seg.memory_size)
                 .checked_add(PAGE_BYTES - 1)
                 .map_or(u64::MAX, |aligned| aligned & !(PAGE_BYTES - 1));
-            segments.push((start, end, seg.prot));
+            segments.push(MappedSegment {
+                start,
+                file_end,
+                end,
+                file_offset,
+                prot: seg.prot,
+                interpreter: is_interp,
+            });
         }
         Ok(Launch {
             start: self
@@ -532,6 +559,7 @@ impl Payload {
                         .map_or(0, |segment| segment.address & !(PAGE_BYTES - 1))
                 }
             }),
+            interpreter: self.image.interpreter.clone(),
             end: self
                 .interpreter
                 .as_ref()

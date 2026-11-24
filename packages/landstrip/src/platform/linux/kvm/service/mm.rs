@@ -8,6 +8,7 @@ use super::super::machine::{
     Machine, PAGE_BYTES, RESERVED_END, Regs, STACK_TOP, USER_ADDRESS_BYTES,
 };
 use super::super::memory::GuestMemory;
+use super::super::payload::MappedSegment;
 use super::{GuestReg, Process, SyscallArgs, WORD_SIZE};
 use anyhow::Result;
 #[cfg(target_arch = "x86_64")]
@@ -18,7 +19,7 @@ use linux_raw_sys::general::{
 };
 use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use syscalls::{Errno, Sysno};
 
@@ -34,10 +35,24 @@ const PROT_MASK: u32 = VALID_MPROTECT_FLAGS as u32;
 static NEXT_SHM_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageSource {
+    Executable,
+    Interpreter,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum MappingKind {
     Anonymous,
+    Image {
+        source: ImageSource,
+        base_addr: u64,
+        file_offset: u64,
+    },
     HostBacked,
-    SysvShm { base: u64, id: u64 },
+    SysvShm {
+        base: u64,
+        id: u64,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,22 +77,40 @@ impl MappingMeta {
     }
 
     const fn needs_host_restore(self) -> bool {
-        !matches!(self.kind, MappingKind::Anonymous) || self.advised
+        matches!(
+            self.kind,
+            MappingKind::HostBacked | MappingKind::SysvShm { .. }
+        ) || self.advised
     }
 
     const fn relocated(mut self, old_addr: u64, new_addr: u64) -> Self {
-        if let MappingKind::SysvShm { base, id } = self.kind {
-            self.kind = if let Some(offset) = old_addr.checked_sub(base)
-                && let Some(relocated_base) = new_addr.checked_sub(offset)
-                && relocated_base >= RESERVED_END
-            {
-                MappingKind::SysvShm {
-                    base: relocated_base,
-                    id,
-                }
-            } else {
-                MappingKind::HostBacked
-            };
+        match self.kind {
+            MappingKind::SysvShm { base, id } => {
+                self.kind = if let Some(offset) = old_addr.checked_sub(base)
+                    && let Some(relocated_base) = new_addr.checked_sub(offset)
+                    && relocated_base >= RESERVED_END
+                {
+                    MappingKind::SysvShm {
+                        base: relocated_base,
+                        id,
+                    }
+                } else {
+                    MappingKind::HostBacked
+                };
+            }
+            MappingKind::Image {
+                source,
+                base_addr,
+                file_offset,
+            } => {
+                let adjusted = file_offset.saturating_add(old_addr.saturating_sub(base_addr));
+                self.kind = MappingKind::Image {
+                    source,
+                    base_addr: new_addr,
+                    file_offset: adjusted,
+                };
+            }
+            MappingKind::Anonymous | MappingKind::HostBacked => {}
         }
         self
     }
@@ -107,6 +140,7 @@ impl MappingMeta {
 pub(super) struct AddressSpace {
     heap_floor: u64,
     break_point: u64,
+    interpreter: Option<PathBuf>,
     regions: BTreeMap<u64, (u64, MappingMeta)>,
 }
 
@@ -118,19 +152,73 @@ impl AddressSpace {
         }
     }
 
-    pub(super) fn new(payload_end: u64, segments: &[(u64, u64, u32)]) -> Self {
+    pub(super) fn new(
+        payload_end: u64,
+        segments: &[MappedSegment],
+        interpreter: Option<PathBuf>,
+    ) -> Self {
         let heap_floor = Self::page_align_len(payload_end).unwrap_or(u64::MAX);
         let mut space = Self {
             heap_floor,
             break_point: heap_floor,
+            interpreter,
             regions: BTreeMap::new(),
         };
         let rw = (libc::PROT_READ | libc::PROT_WRITE).cast_unsigned();
-        for &(start, end, prot) in segments {
-            space.insert_segment(start, end, prot);
+        for &seg in segments {
+            let source = if seg.interpreter {
+                ImageSource::Interpreter
+            } else {
+                ImageSource::Executable
+            };
+            let file_end = seg.file_end.min(seg.end);
+            if seg.start < file_end {
+                space.insert_image_segment(seg.start, file_end, seg.prot, source, seg.file_offset);
+            }
+            if file_end < seg.end {
+                space.insert_segment(file_end, seg.end, seg.prot);
+            }
         }
         space.insert_range(MAPPING_CEILING, USER_ADDRESS_BYTES, MappingMeta::anon(rw));
         space
+    }
+
+    fn insert_image_segment(
+        &mut self,
+        start: u64,
+        end: u64,
+        prot: u32,
+        source: ImageSource,
+        file_offset: u64,
+    ) {
+        if start >= end {
+            return;
+        }
+        let meta = MappingMeta {
+            kind: MappingKind::Image {
+                source,
+                base_addr: start,
+                file_offset,
+            },
+            prot,
+            shared: false,
+            advised: false,
+            dont_fork: false,
+        };
+        let overlapped = self.take_overlapping(start, end);
+        let mut cursor = start;
+        for (ov_start, ov_end, ov_meta) in overlapped {
+            if cursor < ov_start {
+                self.insert_range(cursor, ov_start, meta);
+            }
+            let mut merged = meta;
+            merged.prot |= ov_meta.prot;
+            self.insert_range(ov_start, ov_end, merged);
+            cursor = ov_end;
+        }
+        if cursor < end {
+            self.insert_range(cursor, end, meta);
+        }
     }
 
     fn insert_segment(&mut self, start: u64, end: u64, prot: u32) {
@@ -239,18 +327,30 @@ impl AddressSpace {
                         "{start:08x}-{shown_end:08x} {perms} 00000000 00:00 0                          [stack]",
                     );
                 }
+            } else if let MappingKind::Image {
+                source,
+                base_addr,
+                file_offset,
+            } = meta.kind
+            {
+                let off = file_offset.saturating_add(start.saturating_sub(base_addr));
+                let path = match source {
+                    ImageSource::Executable => Some(exe),
+                    ImageSource::Interpreter => self.interpreter.as_deref(),
+                };
+                if let Some(path) = path {
+                    let _ = writeln!(
+                        out,
+                        "{start:08x}-{end:08x} {perms} {off:08x} 00:00 0                          {}",
+                        path.display()
+                    );
+                } else {
+                    let _ = writeln!(out, "{start:08x}-{end:08x} {perms} {off:08x} 00:00 0");
+                }
             } else if start >= self.heap_floor && end <= heap_end {
                 let _ = writeln!(
                     out,
                     "{start:08x}-{end:08x} {perms} 00000000 00:00 0                          [heap]"
-                );
-            } else if end <= self.heap_floor {
-                let _ = writeln!(
-                    out,
-                    "{:08x}-{:08x} {perms} 00000000 00:00 0                          {}",
-                    start,
-                    end,
-                    exe.display()
                 );
             } else {
                 let _ = writeln!(out, "{start:08x}-{end:08x} {perms} 00000000 00:00 0");
@@ -865,9 +965,8 @@ impl Process {
                 Err(_) => {} // Retry at a different guest address below.
             }
         }
-        if meta.kind == MappingKind::Anonymous
+        if !meta.needs_host_restore()
             && !meta.shared
-            && !meta.advised
             && let Some(new_end) = old_addr.checked_add(new_len)
             && new_end <= memory.size()
             && !space.overlaps(old_end, new_end)

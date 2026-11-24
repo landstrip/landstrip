@@ -462,7 +462,7 @@ impl Broker {
             ptrace,
             restart_image,
         } = files;
-        let space = AddressSpace::new(launch.end, &launch.segments);
+        let space = AddressSpace::new(launch.end, &launch.segments, launch.interpreter.clone());
         if space.break_point() >= MAPPING_CEILING {
             bail!("payload does not fit into the guest address space");
         }
@@ -1587,7 +1587,7 @@ impl Process {
         self.signals.reset_on_exec();
         self.membarrier.store(0, Ordering::Release);
         self.machine.reset_page_tables()?;
-        let new_space = AddressSpace::new(launch.end, &launch.segments);
+        let new_space = AddressSpace::new(launch.end, &launch.segments, launch.interpreter.clone());
         new_space.sync_page_tables(&self.machine)?;
         *self
             .space
