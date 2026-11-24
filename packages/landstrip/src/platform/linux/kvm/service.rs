@@ -1515,7 +1515,7 @@ impl Process {
             let current_exe = (follow
                 && self
                     .policy
-                    .is_proc_self_exe(Some(base), path.as_os_str().as_bytes()))
+                    .is_proc_self_exe(Some(base), path.as_os_str().as_bytes(), true))
             .then(|| self.policy.exe());
             let (open_dirfd, open_target) = match &current_exe {
                 Some(exe) => (libc::AT_FDCWD, exe.as_path()),

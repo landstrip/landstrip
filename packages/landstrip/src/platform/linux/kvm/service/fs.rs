@@ -224,10 +224,10 @@ impl Call<'_> {
         {
             return errno.negated();
         }
-        if let Some(fd) = self.open_proc_maps(dirfd, &path, flags) {
+        if let Some(fd) = self.open_proc_maps(dirfd, &path, flags, follow) {
             return fd;
         }
-        if let Some(fd) = self.open_proc_exe(dirfd, &path, flags, follow) {
+        if let Some(fd) = self.open_proc_exe(dirfd, &path, flags, follow, ResolveFlags::empty()) {
             return fd;
         }
         let specs = if dirfd.is_some() {
@@ -291,11 +291,15 @@ impl Call<'_> {
             {
                 return errno.negated();
             }
-            if resolve.is_empty() {
-                if let Some(fd) = self.open_proc_maps(Some(dirfd), &path, flags) {
+            if ResolveFlags::from_bits(how.resolve).is_some()
+                && !(resolve.contains(ResolveFlags::BENEATH)
+                    && resolve.contains(ResolveFlags::IN_ROOT))
+                && !(resolve.contains(ResolveFlags::BENEATH) && path.as_path().is_absolute())
+            {
+                if let Some(fd) = self.open_proc_maps(Some(dirfd), &path, flags, follow) {
                     return fd;
                 }
-                if let Some(fd) = self.open_proc_exe(Some(dirfd), &path, flags, follow) {
+                if let Some(fd) = self.open_proc_exe(Some(dirfd), &path, flags, follow, resolve) {
                     return fd;
                 }
             }
@@ -315,14 +319,17 @@ impl Call<'_> {
     /// Synthesizes `/proc/self/maps` from the guest's virtual address space so
     /// runtimes querying main-thread stack bounds (`pthread_getattr_np`) see
     /// the guest layout rather than the broker's host mappings.
-    fn open_proc_maps(self, dirfd: Option<i64>, path: &HostCString, flags: i32) -> Option<u64> {
+    fn open_proc_maps(
+        self,
+        dirfd: Option<i64>,
+        path: &HostCString,
+        flags: i32,
+        follow: bool,
+    ) -> Option<u64> {
         if flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_PATH) != 0 {
             return None;
         }
         let raw = path.as_bytes()?;
-        if !raw.ends_with(b"/maps") && raw != b"maps" {
-            return None;
-        }
         let candidate = std::path::Path::new(OsStr::from_bytes(raw));
         let full = if candidate.is_absolute() {
             candidate.to_path_buf()
@@ -340,6 +347,12 @@ impl Call<'_> {
                 Some(_) => return None,
             }
         };
+        if !follow
+            && let Ok(meta) = std::fs::symlink_metadata(&full)
+            && meta.file_type().is_symlink()
+        {
+            return None;
+        }
         let canonical = std::fs::canonicalize(full).ok()?;
         let self_root = std::path::PathBuf::from(format!("/proc/{}", std::process::id()));
         let relative = canonical.strip_prefix(&self_root).ok()?;
@@ -392,16 +405,28 @@ impl Call<'_> {
         path: &HostCString,
         flags: i32,
         follow: bool,
+        resolve: ResolveFlags,
     ) -> Option<u64> {
-        if !follow {
+        let raw = path.as_bytes()?;
+        if !self.policy.is_proc_self_exe(dirfd, raw, follow) {
             return None;
         }
-        let raw = path.as_bytes()?;
-        if !self.policy.is_proc_self_exe(dirfd, raw) {
+        if !follow {
+            if flags & libc::O_PATH == 0 || resolve.contains(ResolveFlags::NO_SYMLINKS) {
+                return Some(Errno::ELOOP.negated());
+            }
             return None;
+        }
+        if resolve.intersects(ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS) {
+            return Some(Errno::ELOOP.negated());
+        }
+        if resolve.intersects(ResolveFlags::BENEATH | ResolveFlags::NO_XDEV) {
+            return Some(Errno::EXDEV.negated());
         }
         let exe = self.policy.exe();
-        let cexe = CString::new(exe.as_os_str().as_bytes()).ok()?;
+        let Ok(cexe) = CString::new(exe.as_os_str().as_bytes()) else {
+            return Some(Errno::EACCES.negated());
+        };
         let rc = unsafe { libc::openat(libc::AT_FDCWD, cexe.as_ptr(), flags, 0_u32) };
         let result = if rc < 0 {
             Errno::last_os(Errno::EIO).negated()
@@ -423,7 +448,7 @@ impl Call<'_> {
             if self.policy.is_broker_proc_fd(dirfd, raw) {
                 return Errno::ENOENT.negated();
             }
-            if self.policy.is_proc_self_exe(dirfd, raw) {
+            if self.policy.is_proc_self_exe(dirfd, raw, false) {
                 if bufsiz <= 0 {
                     return Errno::EINVAL.negated();
                 }

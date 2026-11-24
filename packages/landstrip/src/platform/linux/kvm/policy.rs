@@ -585,7 +585,7 @@ impl Policy {
             return Resolution::Unresolvable(lexical);
         }
         let proc_dirfd = (!path.is_absolute()).then_some(dirfd);
-        if follow && self.is_proc_self_exe(proc_dirfd, path.as_os_str().as_bytes()) {
+        if follow && self.is_proc_self_exe(proc_dirfd, path.as_os_str().as_bytes(), true) {
             return Resolution::Resolved(Resolved {
                 label: self.exe(),
                 lexical,
@@ -807,36 +807,62 @@ impl Policy {
         std::env::current_dir().unwrap_or_else(|_| self.cwd.clone())
     }
 
-    pub(crate) fn is_proc_self_exe(&self, dirfd: Option<i64>, raw_path: &[u8]) -> bool {
-        if !raw_path.ends_with(b"/exe") && raw_path != b"exe" {
-            return false;
-        }
+    pub(crate) fn is_proc_self_exe(
+        &self,
+        dirfd: Option<i64>,
+        raw_path: &[u8],
+        follow: bool,
+    ) -> bool {
+        const MAX_SYMLINKS: usize = 40;
         let candidate = Path::new(OsStr::from_bytes(raw_path));
-        let full = if candidate.is_absolute() {
-            candidate.to_path_buf()
+        let mut current = if candidate.is_absolute() {
+            candidate.clean_lexically()
         } else {
             match dirfd {
-                None => self.cwd().join(candidate),
-                Some(fd) if fd == i64::from(libc::AT_FDCWD) => self.cwd().join(candidate),
-                Some(fd)
-                    if i32::try_from(fd).ok().is_some_and(|raw| {
-                        super::fds::GuestFd::from_raw(raw).valid().is_some()
-                    }) =>
-                {
-                    PathBuf::from(format!("/proc/self/fd/{fd}")).join(candidate)
+                None => self.cwd().join(candidate).clean_lexically(),
+                Some(fd) if fd == i64::from(libc::AT_FDCWD) => {
+                    self.cwd().join(candidate).clean_lexically()
                 }
-                Some(_) => return false,
+                Some(fd) => match DescriptorTarget::resolve(fd) {
+                    DescriptorTarget::Path(base) => base.join(candidate).clean_lexically(),
+                    _ => return false,
+                },
             }
         };
-        let Some(parent) = full.parent().and_then(|dir| fs::canonicalize(dir).ok()) else {
-            return false;
-        };
         let self_root = PathBuf::from(format!("/proc/{}", std::process::id()));
-        parent == self_root
-            || parent
-                .strip_prefix(&self_root)
-                .ok()
-                .is_some_and(|rel| rel.starts_with("task") && rel.components().count() == 2)
+        let limit = if follow { MAX_SYMLINKS } else { 0 };
+        for _ in 0..=limit {
+            let Some(parent) = current.parent() else {
+                return false;
+            };
+            let Some(name) = current.file_name() else {
+                return false;
+            };
+            if name == OsStr::new("exe")
+                && let Ok(canon_parent) = fs::canonicalize(parent)
+                && (canon_parent == self_root
+                    || canon_parent
+                        .strip_prefix(&self_root)
+                        .ok()
+                        .is_some_and(|rel| {
+                            rel.starts_with("task") && rel.components().count() == 2
+                        }))
+            {
+                return true;
+            }
+            if !follow {
+                return false;
+            }
+            let Ok(target) = fs::read_link(&current) else {
+                return false;
+            };
+            current = if target.is_absolute() {
+                target.clean_lexically()
+            } else {
+                parent.join(target).clean_lexically()
+            };
+        }
+        false
     }
 
     pub(crate) fn is_proc_self_fd_dir(fd: RawFd) -> bool {
