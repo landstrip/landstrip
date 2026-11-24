@@ -268,6 +268,29 @@ impl SignalQueue {
             slot.state.store(SLOT_FREE, Ordering::Release);
         }
     }
+
+    pub(super) fn discard_signal(&self, signo: u32) {
+        if !self.has_any() {
+            return;
+        }
+        for slot in &self.slots {
+            if slot.state.load(Ordering::Acquire) == SLOT_READY
+                && slot.signo.load(Ordering::Relaxed) == signo
+                && slot
+                    .state
+                    .compare_exchange(
+                        SLOT_READY,
+                        SLOT_CLAIMING,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                self.ready_count.fetch_sub(1, Ordering::Release);
+                slot.state.store(SLOT_FREE, Ordering::Release);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -606,6 +629,16 @@ impl GuestSignals {
         }
         if let Some(action) = new_action {
             actions[index] = action;
+            if let Ok(signo) = u32::try_from(sig)
+                && (action.handler == 1
+                    || (action.handler == 0
+                        && matches!(
+                            sig,
+                            libc::SIGCHLD | libc::SIGURG | libc::SIGWINCH | libc::SIGCONT
+                        )))
+            {
+                SIGNAL_QUEUE.discard_signal(signo);
+            }
             Self::install_host_disposition(sig, action.handler);
         }
         0
