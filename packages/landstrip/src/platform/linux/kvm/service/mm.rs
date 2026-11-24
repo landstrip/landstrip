@@ -440,40 +440,7 @@ impl Process {
         let hprot = Self::host_prot(prot);
         let is_shared = matches!(map_type, MAP_SHARED | MAP_SHARED_VALIDATE);
         if anonymous && !is_shared {
-            let removed = space.take_overlapping(address, address + length);
-            let had_host = removed
-                .iter()
-                .any(|&(_, _, meta)| meta.needs_host_restore());
-            let had_non_rw = removed.iter().any(|&(_, _, meta)| {
-                Self::host_prot(meta.prot) != (libc::PROT_READ | libc::PROT_WRITE)
-            });
-            let cleared = if had_host {
-                memory.restore_anonymous(address, length)
-            } else {
-                if had_non_rw
-                    && memory
-                        .protect_host(address, length, libc::PROT_READ | libc::PROT_WRITE)
-                        .is_err()
-                {
-                    return Errno::ENOMEM.negated();
-                }
-                memory.discard(address, length)
-            };
-            if cleared.is_err() {
-                let _ = self.machine.protect_pages(address, length, 0);
-                return Errno::ENOMEM.negated();
-            }
-            if hprot != (libc::PROT_READ | libc::PROT_WRITE)
-                && let Err(errno) = memory.protect_host(address, length, hprot)
-            {
-                let _ = self.machine.protect_pages(address, length, 0);
-                return errno.negated();
-            }
-            if self.machine.protect_pages(address, length, prot).is_err() {
-                return Errno::ENOMEM.negated();
-            }
-            space.insert_range(address, address + length, MappingMeta::anon(prot));
-            return address;
+            return self.install_anon_mmap(&mut space, memory, address, length, prot, hprot);
         }
         if let Err(errno) =
             Self::install_host_mmap(memory, address, length, prot, flags, fd, offset, anonymous)
@@ -495,6 +462,52 @@ impl Process {
                 dont_fork: false,
             },
         );
+        address
+    }
+
+    fn install_anon_mmap(
+        &self,
+        space: &mut AddressSpace,
+        memory: &GuestMemory,
+        address: u64,
+        length: u64,
+        prot: u32,
+        hprot: i32,
+    ) -> u64 {
+        let removed = space.take_overlapping(address, address + length);
+        let had_host = removed
+            .iter()
+            .any(|&(_, _, meta)| meta.needs_host_restore());
+        let had_non_rw = removed.iter().any(|&(_, _, meta)| {
+            Self::host_prot(meta.prot) != (libc::PROT_READ | libc::PROT_WRITE)
+        });
+        let cleared = if had_host {
+            memory.restore_anonymous(address, length)
+        } else {
+            if had_non_rw
+                && memory
+                    .protect_host(address, length, libc::PROT_READ | libc::PROT_WRITE)
+                    .is_err()
+            {
+                let _ = self.machine.protect_pages(address, length, 0);
+                return Errno::ENOMEM.negated();
+            }
+            memory.discard(address, length)
+        };
+        if cleared.is_err() {
+            let _ = self.machine.protect_pages(address, length, 0);
+            return Errno::ENOMEM.negated();
+        }
+        if hprot != (libc::PROT_READ | libc::PROT_WRITE)
+            && let Err(errno) = memory.protect_host(address, length, hprot)
+        {
+            let _ = self.machine.protect_pages(address, length, 0);
+            return errno.negated();
+        }
+        if self.machine.protect_pages(address, length, prot).is_err() {
+            return Errno::ENOMEM.negated();
+        }
+        space.insert_range(address, address + length, MappingMeta::anon(prot));
         address
     }
 
