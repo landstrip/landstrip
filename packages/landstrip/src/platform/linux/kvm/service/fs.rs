@@ -111,21 +111,65 @@ impl Call<'_> {
         {
             return Errno::ENOENT.negated();
         }
+        let trailing_slash = path.as_bytes().is_some_and(|bytes| bytes.ends_with(b"/"));
+        let follow = trailing_slash
+            || !matches!(
+                self.syscall,
+                Sysno::lsetxattr | Sysno::lgetxattr | Sysno::llistxattr | Sysno::lremovexattr
+            );
+        let pinned = (self.sink.can_query() && follow && !path.as_path().as_os_str().is_empty())
+            .then(|| {
+                let resolved = self
+                    .policy
+                    .resolved(GuestFd::at_fdcwd(), path.as_path(), true)?;
+                Pinned::open_mode(&resolved.label, true)
+            })
+            .flatten();
         let request = Request::xattr_path(self.syscall, &path);
-        match self.syscall {
-            Sysno::listxattr | Sysno::llistxattr => self.check(
-                request,
-                &[Arg::copied_path(0, &path), Arg::bytes(1, args[2])],
+        if let Some(errno) = self
+            .sink
+            .refuse_target(self.policy, self.registers, request)
+        {
+            return errno.negated();
+        }
+        if trailing_slash && pinned.as_ref().is_some_and(|pin| !pin.is_dir()) {
+            return Errno::ENOTDIR.negated();
+        }
+        let pinned_cstr = pinned.as_ref().map(Pinned::path);
+        let (syscall, path_arg) = match &pinned_cstr {
+            Some(cstr) => {
+                let syscall = match self.syscall {
+                    Sysno::lsetxattr => Sysno::setxattr,
+                    Sysno::lgetxattr => Sysno::getxattr,
+                    Sysno::llistxattr => Sysno::listxattr,
+                    Sysno::lremovexattr => Sysno::removexattr,
+                    other => other,
+                };
+                (syscall, Arg::copied_bytes(0, cstr.as_bytes_with_nul()))
+            }
+            None => (self.syscall, Arg::copied_path(0, &path)),
+        };
+        match syscall {
+            Sysno::listxattr | Sysno::llistxattr => SyscallArgs::forward_translated(
+                self.registers,
+                self.memory,
+                syscall,
+                &[path_arg, Arg::bytes(1, args[2])],
             ),
-            Sysno::setxattr | Sysno::lsetxattr | Sysno::getxattr | Sysno::lgetxattr => self.check(
-                request,
-                &[
-                    Arg::copied_path(0, &path),
-                    Arg::cstr(1),
-                    Arg::bytes(2, args[3]),
-                ],
+            Sysno::setxattr | Sysno::lsetxattr | Sysno::getxattr | Sysno::lgetxattr => {
+                SyscallArgs::forward_translated(
+                    self.registers,
+                    self.memory,
+                    syscall,
+                    &[path_arg, Arg::cstr(1), Arg::bytes(2, args[3])],
+                )
+            }
+            _ => SyscallArgs::forward_translated(
+                self.registers,
+                self.memory,
+                syscall,
+                &[path_arg, Arg::cstr(1)],
             ),
-            _ => self.check(request, &[Arg::copied_path(0, &path), Arg::cstr(1)]),
         }
     }
 
@@ -919,14 +963,17 @@ struct Pinned(BrokerFd);
 
 impl Pinned {
     fn open(path: &std::path::Path) -> Option<Self> {
+        Self::open_mode(path, false)
+    }
+
+    fn open_mode(path: &std::path::Path, follow: bool) -> Option<Self> {
         let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut flags = libc::O_PATH | libc::O_CLOEXEC;
+        if !follow {
+            flags |= libc::O_NOFOLLOW;
+        }
         let _fd_lock = GuestFd::read_fd_table();
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        };
+        let fd = unsafe { libc::open(path.as_ptr(), flags) };
         if fd < 0 {
             return None;
         }
