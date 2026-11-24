@@ -1912,9 +1912,11 @@ impl Process {
         descriptor: RawFd,
         arguments: &[u64; 6],
     ) -> u64 {
-        if arguments[4] == 0 {
-            return SyscallArgs::forward_translated(
-                registers,
+        if arguments[4] == 0 || GuestReg(arguments[5]).as_i32() == 0 {
+            let mut raw = *arguments;
+            raw[4] = 0;
+            raw[5] = 0;
+            return SyscallArgs(raw).translate_and_forward(
                 memory,
                 Sysno::sendto,
                 &[Arg::fd(0), Arg::bytes(1, arguments[2])],

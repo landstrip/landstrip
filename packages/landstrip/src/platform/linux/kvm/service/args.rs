@@ -2136,7 +2136,7 @@ impl KernelMsghdr {
         let flags = i32::from_le_bytes(raw[48..52].try_into().unwrap_or([0; 4]));
         let vectors = Self::decode_iovecs(memory, iov, iovlen)?;
         let mut send_name = None;
-        let (host_name, host_namelen) = if name == 0 {
+        let (host_name, host_namelen) = if name == 0 || (is_send && namelen == 0) {
             (std::ptr::null_mut(), 0)
         } else if is_send {
             if usize::try_from(namelen)
