@@ -4,6 +4,7 @@
 //! Guest `RLIMIT_NOFILE` accounting and broker descriptor isolation.
 
 use super::ErrnoExt;
+use super::machine::{RESERVED_END, USER_ADDRESS_BYTES};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -17,6 +18,7 @@ use syscalls::Errno;
 
 const DEFAULT_RESERVE_FLOOR: RawFd = 4096;
 const HOST_NOFILE_CAP: u64 = 1_048_576;
+const GUEST_AS_CEILING: u64 = USER_ADDRESS_BYTES - RESERVED_END;
 const BROKER_HEADROOM: RawFd = 512;
 const MARGIN: RawFd = 64;
 const LOW_WORDS: usize = 128;
@@ -28,6 +30,8 @@ const HIGH_SPAN: RawFd = 1024;
 pub(crate) struct SavedFdLimits {
     pub(crate) cur: u64,
     pub(crate) max: u64,
+    pub(crate) as_cur: u64,
+    pub(crate) as_max: u64,
     pub(crate) reserve_floor: RawFd,
     pub(crate) broker_base: RawFd,
     pub(crate) select_cap: RawFd,
@@ -42,6 +46,8 @@ struct FdConfig {
 static CONFIG: OnceLock<FdConfig> = OnceLock::new();
 static GUEST_NOFILE_CUR: AtomicU64 = AtomicU64::new(1024);
 static GUEST_NOFILE_MAX: AtomicU64 = AtomicU64::new(1024);
+static GUEST_AS_CUR: AtomicU64 = AtomicU64::new(GUEST_AS_CEILING);
+static GUEST_AS_MAX: AtomicU64 = AtomicU64::new(GUEST_AS_CEILING);
 static GUEST_NOFILE_LOCK: Mutex<()> = Mutex::new(());
 static FD_TABLE_LOCK: RwLock<()> = RwLock::new(());
 static SELECT_CAP: AtomicI32 = AtomicI32::new(1024);
@@ -344,6 +350,7 @@ impl GuestFd {
         });
         GUEST_NOFILE_CUR.store(native.rlim_cur, Ordering::Release);
         GUEST_NOFILE_MAX.store(native.rlim_max, Ordering::Release);
+        Self::init_as_limits();
         let max_inherited = inherited.iter().copied().max().unwrap_or(2);
         let initial_cap = max_inherited
             .saturating_add(1)
@@ -351,6 +358,29 @@ impl GuestFd {
             .min(RawFd::try_from(HOST_NOFILE_CAP).unwrap_or(i32::MAX));
         SELECT_CAP.store(initial_cap, Ordering::Release);
         Ok(())
+    }
+
+    fn init_as_limits() {
+        let mut native_as = libc::rlimit64 {
+            rlim_cur: libc::RLIM64_INFINITY,
+            rlim_max: libc::RLIM64_INFINITY,
+        };
+        if unsafe { libc::getrlimit64(libc::RLIMIT_AS, &raw mut native_as) } == 0 {
+            if native_as.rlim_cur < native_as.rlim_max {
+                let raised = libc::rlimit64 {
+                    rlim_cur: native_as.rlim_max,
+                    rlim_max: native_as.rlim_max,
+                };
+                let _ = unsafe { libc::setrlimit64(libc::RLIMIT_AS, &raw const raised) };
+            }
+            let as_max = native_as.rlim_max.min(GUEST_AS_CEILING);
+            let as_cur = native_as.rlim_cur.min(as_max);
+            GUEST_AS_CUR.store(as_cur, Ordering::Release);
+            GUEST_AS_MAX.store(as_max, Ordering::Release);
+        } else {
+            GUEST_AS_CUR.store(GUEST_AS_CEILING, Ordering::Release);
+            GUEST_AS_MAX.store(GUEST_AS_CEILING, Ordering::Release);
+        }
     }
 
     fn raise_host_soft_limit(cur: u64, max: u64) -> u64 {
@@ -377,10 +407,13 @@ impl GuestFd {
 
     pub(crate) fn save_limits() -> SavedFdLimits {
         let (cur, max) = Self::limits();
+        let (as_cur, as_max) = Self::as_limits();
         let cfg = Self::config();
         SavedFdLimits {
             cur,
             max,
+            as_cur,
+            as_max,
             reserve_floor: cfg.reserve_floor,
             broker_base: cfg.broker_base,
             select_cap: SELECT_CAP.load(Ordering::Acquire),
@@ -401,6 +434,9 @@ impl GuestFd {
             .map_err(|_| anyhow::anyhow!("descriptor configuration already set"))?;
         GUEST_NOFILE_CUR.store(saved.cur.min(saved.max), Ordering::Release);
         GUEST_NOFILE_MAX.store(saved.max, Ordering::Release);
+        let as_max = saved.as_max.min(GUEST_AS_CEILING);
+        GUEST_AS_CUR.store(saved.as_cur.min(as_max), Ordering::Release);
+        GUEST_AS_MAX.store(as_max, Ordering::Release);
         SELECT_CAP.store(saved.select_cap.max(1024), Ordering::Release);
         Ok(())
     }
@@ -457,6 +493,36 @@ impl GuestFd {
         }
         GUEST_NOFILE_CUR.store(cur, Ordering::Release);
         GUEST_NOFILE_MAX.store(max, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn as_limits() -> (u64, u64) {
+        let _guard = GUEST_NOFILE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            GUEST_AS_CUR.load(Ordering::Acquire),
+            GUEST_AS_MAX.load(Ordering::Acquire),
+        )
+    }
+
+    pub(crate) fn as_soft_limit() -> u64 {
+        GUEST_AS_CUR.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_as_limits(cur: u64, max: u64) -> std::result::Result<(), Errno> {
+        if cur > max {
+            return Err(Errno::EINVAL);
+        }
+        let _guard = GUEST_NOFILE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current_max = GUEST_AS_MAX.load(Ordering::Acquire);
+        if max > current_max {
+            return Err(Errno::EPERM);
+        }
+        GUEST_AS_CUR.store(cur, Ordering::Release);
+        GUEST_AS_MAX.store(max, Ordering::Release);
         Ok(())
     }
 

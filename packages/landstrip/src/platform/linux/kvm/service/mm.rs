@@ -173,6 +173,35 @@ impl AddressSpace {
             .collect()
     }
 
+    pub(super) fn mapped_bytes(&self) -> u64 {
+        self.regions.iter().fold(0_u64, |acc, (&start, &(end, _))| {
+            acc.saturating_add(end.saturating_sub(start))
+        })
+    }
+
+    fn overlapping_bytes(&self, start: u64, end: u64) -> u64 {
+        if start >= end {
+            return 0;
+        }
+        self.regions
+            .range(..end)
+            .filter(|&(_, &(e, _))| e > start)
+            .map(|(&s, &(e, _))| e.min(end).saturating_sub(s.max(start)))
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    fn allows_as_growth(&self, replaced_start: u64, replaced_end: u64, added_bytes: u64) -> bool {
+        let limit = GuestFd::as_soft_limit();
+        if limit == libc::RLIM64_INFINITY {
+            return true;
+        }
+        let replaced = self.overlapping_bytes(replaced_start, replaced_end);
+        self.mapped_bytes()
+            .saturating_sub(replaced)
+            .checked_add(added_bytes)
+            .is_some_and(|total| total <= limit)
+    }
+
     pub(super) fn sync_page_tables(&self, machine: &Machine) -> Result<()> {
         for (&start, &(end, meta)) in &self.regions {
             if start < end {
@@ -436,6 +465,9 @@ impl Process {
             Ok(addr) => addr,
             Err(errno) => return errno.negated(),
         };
+        if !space.allows_as_growth(address, address + length, length) {
+            return Errno::ENOMEM.negated();
+        }
         let prot = GuestReg(protection).as_u32() & PROT_MASK;
         let hprot = Self::host_prot(prot);
         let is_shared = matches!(map_type, MAP_SHARED | MAP_SHARED_VALIDATE);
@@ -685,6 +717,9 @@ impl Process {
             );
         }
         if dont_unmap {
+            if !space.allows_as_growth(0, 0, new_len) {
+                return Errno::ENOMEM.negated();
+            }
             let Some(dest) = space.find_free_top_down(new_len, RESERVED_END, MAPPING_CEILING)
             else {
                 return Errno::ENOMEM.negated();
@@ -732,6 +767,18 @@ impl Process {
             || !(old_end <= new_addr || new_end <= old_addr)
         {
             return Errno::EINVAL.negated();
+        }
+        let freed = if dont_unmap { 0 } else { old_len };
+        let dst_overlap = space.overlapping_bytes(new_addr, new_end);
+        let limit = GuestFd::as_soft_limit();
+        if limit != libc::RLIM64_INFINITY
+            && space
+                .mapped_bytes()
+                .saturating_sub(freed.saturating_add(dst_overlap))
+                .checked_add(new_len)
+                .is_none_or(|total| total > limit)
+        {
+            return Errno::ENOMEM.negated();
         }
         let extra = if dont_unmap {
             libc::MREMAP_DONTUNMAP
@@ -794,6 +841,9 @@ impl Process {
             }
             let _ = self.machine.protect_pages(tail_start, tail_len, 0);
             return old_addr;
+        }
+        if !space.allows_as_growth(0, 0, new_len - old_len) {
+            return Errno::ENOMEM.negated();
         }
         if meta.needs_host_restore()
             && let Some(new_end) = old_addr.checked_add(new_len)
@@ -1063,7 +1113,9 @@ impl Process {
         };
         let old_end = space.heap_end();
         if new_end > old_end {
-            if space.regions_overlap(old_end, new_end) {
+            if space.regions_overlap(old_end, new_end)
+                || !space.allows_as_growth(0, 0, new_end - old_end)
+            {
                 return space.break_point;
             }
             let ext_len = new_end - old_end;
@@ -1147,6 +1199,9 @@ impl Process {
             }
             addr
         };
+        if !space.allows_as_growth(address, address + length, length) {
+            return Errno::ENOMEM.negated();
+        }
         if let Err(errno) = memory.attach_shm(address, length, shmid, shmflg) {
             return errno.negated();
         }

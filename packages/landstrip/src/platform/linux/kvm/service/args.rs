@@ -595,7 +595,7 @@ impl SyscallArgs {
         let raw = Self::from_regs(registers);
         if let Some(result) = raw
             .fs_or_io_syscall(&process.policy, registers, memory, syscall)
-            .or_else(|| raw.time_or_proc_syscall(&process.ptrace, registers, memory, syscall))
+            .or_else(|| raw.time_or_proc_syscall(process, registers, memory, syscall))
             .or_else(|| raw.poll_or_select(thread, registers, memory, syscall))
             .or_else(|| raw.net_syscall(memory, syscall))
             .or_else(|| raw.ipc_syscall(process.mqueue, memory, syscall))
@@ -857,11 +857,12 @@ impl SyscallArgs {
 
     fn time_or_proc_syscall(
         self,
-        ptrace: &PtraceTable,
+        process: &Process,
         registers: &Regs,
         memory: &GuestMemory,
         syscall: Sysno,
     ) -> Option<u64> {
+        let ptrace = &process.ptrace;
         let specs: &[Arg<'_>] = match syscall {
             Sysno::getrusage => &[Arg::bytes(1, RUSAGE_BYTES)],
             Sysno::times => &[Arg::bytes(0, TMS_BYTES)],
@@ -894,7 +895,7 @@ impl SyscallArgs {
             Sysno::pipe2 => return Some(self.forward_fd_pair(memory, syscall, 0)),
             Sysno::uname => &[Arg::bytes(0, UTSNAME_BYTES)],
             Sysno::sysinfo => &[Arg::bytes(0, SYSINFO_BYTES)],
-            Sysno::prlimit64 => return Some(self.prlimit64(memory)),
+            Sysno::prlimit64 => return Some(self.prlimit64(process, memory)),
             Sysno::getrlimit => return Some(self.getrlimit(memory)),
             Sysno::setrlimit => return Some(self.setrlimit(memory)),
             Sysno::wait4 => return Some(self.wait4_syscall(ptrace, memory)),
@@ -1043,18 +1044,21 @@ impl SyscallArgs {
     }
 
     fn getrlimit(self, memory: &GuestMemory) -> u64 {
-        if i64::from(GuestReg(self.0[0]).as_u32()) != i64::from(libc::RLIMIT_NOFILE) {
-            return self.translate_and_forward(
-                memory,
-                Sysno::getrlimit,
-                &[Arg::bytes(1, RLIMIT64_BYTES)],
-            );
+        let resource = i64::from(GuestReg(self.0[0]).as_u32());
+        if resource == i64::from(libc::RLIMIT_NOFILE) {
+            return Self::write_fd_limit(memory, self.0[1], GuestFd::limits());
         }
-        Self::write_fd_limit(memory, self.0[1], GuestFd::limits())
+        if resource == i64::from(libc::RLIMIT_AS) {
+            return Self::write_fd_limit(memory, self.0[1], GuestFd::as_limits());
+        }
+        self.translate_and_forward(memory, Sysno::getrlimit, &[Arg::bytes(1, RLIMIT64_BYTES)])
     }
 
     fn setrlimit(self, memory: &GuestMemory) -> u64 {
-        if i64::from(GuestReg(self.0[0]).as_u32()) != i64::from(libc::RLIMIT_NOFILE) {
+        let resource = i64::from(GuestReg(self.0[0]).as_u32());
+        let is_nofile = resource == i64::from(libc::RLIMIT_NOFILE);
+        let is_as = resource == i64::from(libc::RLIMIT_AS);
+        if !is_nofile && !is_as {
             return self.translate_and_forward(
                 memory,
                 Sysno::setrlimit,
@@ -1066,7 +1070,12 @@ impl SyscallArgs {
         };
         let cur = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
         let max = u64::from_le_bytes(raw[8..].try_into().unwrap_or([0; 8]));
-        match GuestFd::set_limits(cur, max) {
+        let outcome = if is_nofile {
+            GuestFd::set_limits(cur, max)
+        } else {
+            GuestFd::set_as_limits(cur, max)
+        };
+        match outcome {
             Ok(()) => 0,
             Err(errno) => errno.negated(),
         }
@@ -1083,45 +1092,78 @@ impl SyscallArgs {
         }
     }
 
-    fn prlimit64(self, memory: &GuestMemory) -> u64 {
+    fn prlimit64(self, process: &Process, memory: &GuestMemory) -> u64 {
         let pid = GuestReg(self.0[0]).as_i32();
+        if pid < 0 {
+            return Errno::EINVAL.negated();
+        }
         if pid == 1 {
             return Errno::EPERM.negated();
         }
         let self_pid = i32::try_from(std::process::id()).unwrap_or(0);
-        if i64::from(GuestReg(self.0[1]).as_u32()) == i64::from(libc::RLIMIT_NOFILE)
-            && (pid == 0 || pid == self_pid)
-        {
-            let new_limit = if self.0[2] != 0 {
-                let Ok(raw) = memory.read(self.0[2], RLIMIT64_BYTES) else {
-                    return Errno::EFAULT.negated();
-                };
-                let cur = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
-                let max = u64::from_le_bytes(raw[8..].try_into().unwrap_or([0; 8]));
-                Some((cur, max))
-            } else {
-                None
-            };
-            if self.0[3] != 0 && memory.address(self.0[3], RLIMIT64_BYTES).is_err() {
-                return Errno::EFAULT.negated();
-            }
-            let old = GuestFd::limits();
-            if let Some((cur, max)) = new_limit
-                && let Err(errno) = GuestFd::set_limits(cur, max)
-            {
-                return errno.negated();
-            }
-            return if self.0[3] == 0 {
-                0
-            } else {
-                Self::write_fd_limit(memory, self.0[3], old)
-            };
+        let is_self = pid == 0 || pid == self_pid || process.has_worker_tid(pid);
+        let resource = i64::from(GuestReg(self.0[1]).as_u32());
+        let is_nofile = resource == i64::from(libc::RLIMIT_NOFILE);
+        let is_as = resource == i64::from(libc::RLIMIT_AS);
+        if is_nofile || is_as {
+            return Self::virtual_prlimit(pid, is_self, is_nofile, memory, self.0[2], self.0[3]);
         }
         self.translate_and_forward(
             memory,
             Sysno::prlimit64,
             &[Arg::bytes(2, RLIMIT64_BYTES), Arg::bytes(3, RLIMIT64_BYTES)],
         )
+    }
+
+    fn virtual_prlimit(
+        pid: i32,
+        is_self: bool,
+        is_nofile: bool,
+        memory: &GuestMemory,
+        new_ptr: u64,
+        old_ptr: u64,
+    ) -> u64 {
+        let new_limit = if new_ptr != 0 {
+            let Ok(raw) = memory.read(new_ptr, RLIMIT64_BYTES) else {
+                return Errno::EFAULT.negated();
+            };
+            let cur = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
+            let max = u64::from_le_bytes(raw[8..].try_into().unwrap_or([0; 8]));
+            Some((cur, max))
+        } else {
+            None
+        };
+        if old_ptr != 0 && memory.address(old_ptr, RLIMIT64_BYTES).is_err() {
+            return Errno::EFAULT.negated();
+        }
+        if !is_self {
+            if unsafe { libc::kill(pid, 0) } < 0 {
+                return Errno::last_os(Errno::ESRCH).negated();
+            }
+            if new_limit.is_some() {
+                return Errno::EPERM.negated();
+            }
+        }
+        let old = if is_nofile {
+            GuestFd::limits()
+        } else {
+            GuestFd::as_limits()
+        };
+        if let Some((cur, max)) = new_limit {
+            let res = if is_nofile {
+                GuestFd::set_limits(cur, max)
+            } else {
+                GuestFd::set_as_limits(cur, max)
+            };
+            if let Err(errno) = res {
+                return errno.negated();
+            }
+        }
+        if old_ptr == 0 {
+            0
+        } else {
+            Self::write_fd_limit(memory, old_ptr, old)
+        }
     }
 
     fn wait4_target(upid: i32) -> Option<(u32, u32)> {

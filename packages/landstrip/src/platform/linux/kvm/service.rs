@@ -1020,6 +1020,18 @@ impl Broker {
 }
 
 impl Process {
+    pub(super) fn has_worker_tid(&self, tid: i32) -> bool {
+        let Ok(tid_u64) = u64::try_from(tid) else {
+            return false;
+        };
+        self.threads
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .workers
+            .contains(&tid_u64)
+    }
+
     fn complete_vfork(&self) {
         if let Some(sync) = self
             .vfork_sync
