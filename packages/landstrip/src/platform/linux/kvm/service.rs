@@ -1913,6 +1913,7 @@ impl ForkSnapshot {
     ) -> Result<()> {
         let flags = registers.arguments()[0];
         SIGNAL_QUEUE.clear_all();
+        RobustMirror::clear_thread_local();
         let shared_memory = process.machine.memory.shared();
         let omitted = self.space.dont_fork_ranges();
         for &(start, end) in &omitted {

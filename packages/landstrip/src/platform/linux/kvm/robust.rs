@@ -122,6 +122,15 @@ impl RobustMirror {
         });
     }
 
+    pub(super) fn clear_thread_local() {
+        NATIVE.with(|native| {
+            // SAFETY: the forked child is single-threaded here and owns its TLS slot.
+            unsafe {
+                native.get().write(NativeHead::default());
+            }
+        });
+    }
+
     pub(super) fn prepare_exec(memory: &GuestMemory) -> Result<()> {
         NATIVE.with(|native| {
             let head = native.get();
