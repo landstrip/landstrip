@@ -20,8 +20,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::ffi::OsString;
-use std::io::Write;
-use std::os::fd::{AsFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 #[derive(Deserialize, Serialize)]
@@ -127,7 +126,12 @@ impl State {
             .transpose()?;
         let result = state.run(error.as_ref());
         if let (Some(error_pipe), Err(error)) = (error.as_ref(), result.as_ref()) {
-            let _ = write!(error_pipe.get(), "{error:#}");
+            let formatted = format!("{error:#}");
+            let _ = nix::sys::socket::send(
+                error_pipe.as_raw_fd(),
+                formatted.as_bytes(),
+                nix::sys::socket::MsgFlags::MSG_NOSIGNAL,
+            );
         }
         result
     }

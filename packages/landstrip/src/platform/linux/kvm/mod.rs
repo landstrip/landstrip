@@ -45,7 +45,7 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -235,7 +235,15 @@ impl Sandbox {
                 )
             });
         if let Err(error) = &outcome {
-            let _ = write!(writer.get(), "{error:#}");
+            let formatted = format!("{error:#}");
+            unsafe {
+                let _ = libc::send(
+                    writer.as_raw_fd(),
+                    formatted.as_ptr().cast(),
+                    formatted.len(),
+                    libc::MSG_NOSIGNAL,
+                );
+            }
         }
         outcome
     }

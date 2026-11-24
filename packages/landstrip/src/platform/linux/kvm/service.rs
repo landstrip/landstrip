@@ -49,7 +49,7 @@ use linux_raw_sys::general::{
 use linux_raw_sys::ioctl::{FICLONE, FICLONERANGE};
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
@@ -949,7 +949,15 @@ impl Process {
         if let Some(pipe) = &self.error_pipe
             && let Ok(stream) = pipe.lock()
         {
-            let _ = write!(stream.get(), "{error:#}");
+            let formatted = format!("{error:#}");
+            unsafe {
+                let _ = libc::send(
+                    stream.as_raw_fd(),
+                    formatted.as_ptr().cast(),
+                    formatted.len(),
+                    libc::MSG_NOSIGNAL,
+                );
+            }
         }
         unsafe { libc::_exit(127) }
     }
