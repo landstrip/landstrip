@@ -43,8 +43,10 @@ use crate::trap_fd::TrapFd;
 use anyhow::{Context, Result, bail};
 use kvm_ioctls::VcpuFd;
 use linux_raw_sys::general::{
-    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_VFORK,
-    CLONE_VM, file_clone_range, membarrier_cmd, membarrier_cmd_flag,
+    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_FILES, CLONE_FS, CLONE_NEWCGROUP, CLONE_NEWIPC,
+    CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS,
+    CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
+    file_clone_range, membarrier_cmd, membarrier_cmd_flag,
 };
 use linux_raw_sys::ioctl::{FICLONE, FICLONERANGE};
 use std::collections::{BTreeSet, HashSet};
@@ -657,13 +659,15 @@ impl Broker {
             Sysno::fork | Sysno::vfork => {
                 Self::fork_process(process, vcpu, thread, registers, syscall)?;
             }
-            Sysno::clone => {
-                if Self::clone_creates_thread(registers) {
+            Sysno::clone => match Self::validate_clone_flags(registers.arguments()[0]) {
+                Err(errno) => registers.set_result(errno.negated()),
+                Ok(true) => {
                     registers.set_result(Self::spawn_thread(process, vcpu.get(), registers)?);
-                } else {
+                }
+                Ok(false) => {
                     Self::fork_process(process, vcpu, thread, registers, Sysno::clone)?;
                 }
-            }
+            },
             #[cfg(target_arch = "x86_64")]
             Sysno::arch_prctl => registers.set_result(Process::arch_prctl(
                 vcpu.get(),
@@ -675,9 +679,37 @@ impl Broker {
         Ok(None)
     }
 
-    fn clone_creates_thread(registers: &Regs) -> bool {
-        let flags = registers.arguments()[0];
-        flags & u64::from(CLONE_VM) != 0 && flags & u64::from(CLONE_VFORK) == 0
+    fn validate_clone_flags(flags: u64) -> std::result::Result<bool, Errno> {
+        let ns_flags = u64::from(
+            CLONE_NEWNS
+                | CLONE_NEWUTS
+                | CLONE_NEWIPC
+                | CLONE_NEWUSER
+                | CLONE_NEWPID
+                | CLONE_NEWNET
+                | CLONE_NEWCGROUP
+                | CLONE_NEWTIME,
+        );
+        if flags & ns_flags != 0 {
+            return Err(Errno::EPERM);
+        }
+        let is_thread = flags & u64::from(CLONE_THREAD) != 0;
+        let has_sighand = flags & u64::from(CLONE_SIGHAND) != 0;
+        let has_vm = flags & u64::from(CLONE_VM) != 0;
+        let is_vfork = flags & u64::from(CLONE_VFORK) != 0;
+        if (is_thread && !has_sighand) || (has_sighand && !has_vm) {
+            return Err(Errno::EINVAL);
+        }
+        if is_thread {
+            if is_vfork {
+                return Err(Errno::EINVAL);
+            }
+            return Ok(true);
+        }
+        if has_sighand || flags & u64::from(CLONE_FILES | CLONE_FS) != 0 || (has_vm && !is_vfork) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(false)
     }
 
     fn spawn_thread(process: &Arc<Process>, vcpu: &VcpuFd, registers: &Regs) -> Result<u64> {
@@ -694,18 +726,19 @@ impl Broker {
         {
             return Ok(Errno::EFAULT.negated());
         }
+        let tls = match Self::clone_tls(registers) {
+            Ok(tls) => tls,
+            Err(errno) => return Ok(errno.negated()),
+        };
         let state = process.machine.state(vcpu)?;
         let child_regs = registers.child(registers.arguments()[1]);
         let child_vcpu = match process.machine.pop_idle_vcpu() {
             Some(recycled) => recycled,
             None => process.machine.allocate_vcpu()?,
         };
-        process.machine.configure_vcpu(
-            child_vcpu.get(),
-            &state,
-            Self::clone_tls(registers),
-            &child_regs,
-        )?;
+        process
+            .machine
+            .configure_vcpu(child_vcpu.get(), &state, tls, &child_regs)?;
 
         let mut threads = process
             .threads
@@ -760,16 +793,21 @@ impl Broker {
         syscall: Sysno,
     ) -> Result<()> {
         let flags = registers.arguments()[0];
-        if syscall == Sysno::clone
-            && flags & u64::from(CLONE_PARENT_SETTID) != 0
-            && process
-                .machine
-                .memory
-                .address(registers.arguments()[2], 4)
-                .is_err()
-        {
-            registers.set_result(Errno::EFAULT.negated());
-            return Ok(());
+        if syscall == Sysno::clone {
+            if let Err(errno) = Self::clone_tls(registers) {
+                registers.set_result(errno.negated());
+                return Ok(());
+            }
+            if flags & u64::from(CLONE_PARENT_SETTID) != 0
+                && process
+                    .machine
+                    .memory
+                    .address(registers.arguments()[2], 4)
+                    .is_err()
+            {
+                registers.set_result(Errno::EFAULT.negated());
+                return Ok(());
+            }
         }
         let snapshot = process.fork_snapshot(vcpu.get())?;
         let child = unsafe { libc::fork() };
@@ -793,9 +831,27 @@ impl Broker {
     }
 
     /// Thread pointer a `clone` with `CLONE_SETTLS` installs in the child.
-    fn clone_tls(registers: &Regs) -> Option<u64> {
+    #[cfg_attr(
+        target_arch = "aarch64",
+        allow(
+            clippy::unnecessary_wraps,
+            reason = "uniform with x86-64, which validates canonical TLS addresses"
+        )
+    )]
+    fn clone_tls(registers: &Regs) -> std::result::Result<Option<u64>, Errno> {
         let arguments = registers.arguments();
-        (arguments[0] & u64::from(CLONE_SETTLS) != 0).then_some(arguments[CLONE_TLS_ARGUMENT])
+        if arguments[0] & u64::from(CLONE_SETTLS) == 0 {
+            return Ok(None);
+        }
+        let tls = arguments[CLONE_TLS_ARGUMENT];
+        #[cfg(target_arch = "x86_64")]
+        {
+            const TASK_SIZE_MAX: u64 = (1 << 47) - PAGE_BYTES;
+            if tls >= TASK_SIZE_MAX {
+                return Err(Errno::EPERM);
+            }
+        }
+        Ok(Some(tls))
     }
 }
 
@@ -1927,7 +1983,7 @@ impl ForkSnapshot {
         process.machine.memory.disown();
 
         let tls = if syscall == Sysno::clone {
-            Broker::clone_tls(registers)
+            Broker::clone_tls(registers).ok().flatten()
         } else {
             None
         };
