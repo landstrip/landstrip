@@ -917,6 +917,22 @@ impl Denials {
         self.report(&trap);
     }
 
+    pub(super) fn is_cached_allow(&self, access: Access, path: &std::path::Path) -> bool {
+        let operation = match access {
+            Access::Read => TrapOperation::Read,
+            Access::Write => TrapOperation::Write,
+        };
+        let subject = QuerySubject::filesystem(operation, path);
+        self.query
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .decisions
+            .0
+            .get(&subject)
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// Refuses the access `request` names, unless the policy grants it.
     pub(super) fn refuse_target(
         &self,

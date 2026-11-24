@@ -209,6 +209,27 @@ impl Call<'_> {
         self.check(request, &specs)
     }
 
+    fn verify_opened_fd(self, result: u64, flags: i32) -> u64 {
+        let guarded = GuestFd::guard_created(result);
+        let signed = GuestReg(guarded).as_c_long();
+        if signed < 0 {
+            return guarded;
+        }
+        let Ok(raw_fd) = i32::try_from(signed) else {
+            return Errno::EMFILE.negated();
+        };
+        for denial in self
+            .policy
+            .descriptor_open_denials(i64::from(raw_fd), flags)
+        {
+            if !denial.queryable || !self.sink.is_cached_allow(denial.access, &denial.path) {
+                unsafe { libc::close(raw_fd) };
+                return Errno::EACCES.negated();
+            }
+        }
+        guarded
+    }
+
     fn open(self, dirfd: Option<i64>, index: usize, flags: i32) -> u64 {
         let arguments = SyscallArgs::raw(self.registers);
         let path = match HostCString::read(self.memory, arguments[index]) {
@@ -244,12 +265,9 @@ impl Call<'_> {
         } else {
             vec![Arg::copied_path(index, &path)]
         };
-        GuestFd::guard_created(SyscallArgs::forward_translated(
-            self.registers,
-            self.memory,
-            self.syscall,
-            &specs,
-        ))
+        let raw_res =
+            SyscallArgs::forward_translated(self.registers, self.memory, self.syscall, &specs);
+        self.verify_opened_fd(raw_res, flags)
     }
 
     fn openat2(self) -> u64 {
@@ -313,7 +331,7 @@ impl Call<'_> {
                 }
             }
         }
-        GuestFd::guard_created(SyscallArgs::forward_translated(
+        let raw_res = SyscallArgs::forward_translated(
             self.registers,
             self.memory,
             Sysno::openat2,
@@ -322,7 +340,8 @@ impl Call<'_> {
                 Arg::copied_path(1, &path),
                 Arg::copied_bytes(2, &raw_bytes),
             ],
-        ))
+        );
+        self.verify_opened_fd(raw_res, flags)
     }
 
     /// Synthesizes `/proc/self/maps` from the guest's virtual address space so
@@ -459,7 +478,7 @@ impl Call<'_> {
         } else {
             u64::from(rc.cast_unsigned())
         };
-        Some(GuestFd::guard_created(result))
+        Some(self.verify_opened_fd(result, flags))
     }
 
     fn readlink_syscall(self, dirfd: Option<i64>, index: usize, arguments: &[u64; 6]) -> u64 {
