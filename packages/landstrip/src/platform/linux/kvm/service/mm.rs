@@ -657,7 +657,7 @@ impl Process {
             else {
                 return Errno::ENOMEM.negated();
             };
-            if let Err(errno) = memory.remap_host(
+            if let Err((errno, _, unmapped_dest)) = memory.remap_host(
                 old_addr,
                 old_len,
                 dest,
@@ -665,6 +665,10 @@ impl Process {
                 libc::MREMAP_DONTUNMAP,
                 true,
             ) {
+                if unmapped_dest {
+                    space.remove_range(dest, dest + new_len);
+                    let _ = self.machine.protect_pages(dest, new_len, 0);
+                }
                 return errno.negated();
             }
             let _ = self.machine.protect_pages(dest, new_len, meta.prot);
@@ -702,9 +706,18 @@ impl Process {
         } else {
             0
         };
-        if let Err(errno) =
+        if let Err((errno, shrunk_tail, unmapped_dest)) =
             memory.remap_host(old_addr, old_len, new_addr, new_len, extra, dont_unmap)
         {
+            if shrunk_tail {
+                let tail_start = old_addr + new_len;
+                space.remove_range(tail_start, old_end);
+                let _ = self.machine.protect_pages(tail_start, old_len - new_len, 0);
+            }
+            if unmapped_dest {
+                space.remove_range(new_addr, new_end);
+                let _ = self.machine.protect_pages(new_addr, new_len, 0);
+            }
             return errno.negated();
         }
         if !dont_unmap {
@@ -804,7 +817,18 @@ impl Process {
         let Some(dest) = space.find_free_top_down(new_len, RESERVED_END, MAPPING_CEILING) else {
             return Errno::ENOMEM.negated();
         };
-        if let Err(errno) = memory.remap_host(old_addr, old_len, dest, new_len, 0, false) {
+        if let Err((errno, shrunk_tail, unmapped_dest)) =
+            memory.remap_host(old_addr, old_len, dest, new_len, 0, false)
+        {
+            if shrunk_tail {
+                let tail_start = old_addr + new_len;
+                space.remove_range(tail_start, old_end);
+                let _ = self.machine.protect_pages(tail_start, old_len - new_len, 0);
+            }
+            if unmapped_dest {
+                space.remove_range(dest, dest + new_len);
+                let _ = self.machine.protect_pages(dest, new_len, 0);
+            }
             return errno.negated();
         }
         let _ = self.machine.protect_pages(old_addr, old_len, 0);

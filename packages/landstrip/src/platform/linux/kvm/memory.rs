@@ -292,6 +292,29 @@ impl GuestMemory {
         Ok(())
     }
 
+    fn refill_unmapped_hole(&self, offset: u64, length: u64) -> bool {
+        let Ok(range) = self.range(offset, length) else {
+            return false;
+        };
+        if range.is_empty() {
+            return false;
+        }
+        let mapped = unsafe {
+            libc::mmap(
+                self.pointer.add(range.start).cast(),
+                range.len(),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE
+                    | libc::MAP_ANONYMOUS
+                    | libc::MAP_NORESERVE
+                    | libc::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+        };
+        mapped != libc::MAP_FAILED
+    }
+
     pub(crate) fn remap_host(
         &self,
         old_offset: u64,
@@ -300,13 +323,14 @@ impl GuestMemory {
         new_length: u64,
         extra_flags: i32,
         keep_source: bool,
-    ) -> std::result::Result<(), Errno> {
+    ) -> std::result::Result<(), (Errno, bool, bool)> {
         let old_range = self
             .range(old_offset, old_length)
-            .map_err(|_| Errno::EFAULT)?;
+            .map_err(|_| (Errno::EFAULT, false, false))?;
         let new_range = self
             .range(new_offset, new_length)
-            .map_err(|_| Errno::ENOMEM)?;
+            .map_err(|_| (Errno::ENOMEM, false, false))?;
+        self.custom_mappings.store(true, Ordering::Release);
         let moved = unsafe {
             libc::mremap(
                 self.pointer.add(old_range.start).cast(),
@@ -317,7 +341,12 @@ impl GuestMemory {
             )
         };
         if moved == libc::MAP_FAILED {
-            return Err(Errno::last_os(Errno::ENOMEM));
+            let errno = Errno::last_os(Errno::ENOMEM);
+            let shrunk_tail = !keep_source
+                && new_length < old_length
+                && self.refill_unmapped_hole(old_offset + new_length, old_length - new_length);
+            let unmapped_dest = self.refill_unmapped_hole(new_offset, new_length);
+            return Err((errno, shrunk_tail, unmapped_dest));
         }
         if !keep_source {
             let _ = self.restore_anonymous(old_offset, old_length);
