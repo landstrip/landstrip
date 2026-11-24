@@ -962,6 +962,52 @@ impl SyscallArgs {
         )
     }
 
+    fn wait4_target(upid: i32) -> Option<(u32, u32)> {
+        if upid == -1 {
+            Some((libc::P_ALL, 0))
+        } else if upid > 0 {
+            Some((libc::P_PID, upid.cast_unsigned()))
+        } else if upid == 0 {
+            let pgid = unsafe { libc::getpgid(0) };
+            (pgid > 0).then_some((libc::P_PGID, pgid.cast_unsigned()))
+        } else {
+            upid.checked_neg()
+                .map(|pgid| (libc::P_PGID, pgid.cast_unsigned()))
+        }
+    }
+
+    fn peek_traced_stop(
+        ptrace: &PtraceTable,
+        parent: i32,
+        idtype: u32,
+        id: u32,
+        extra_opts: i32,
+    ) -> Option<i32> {
+        let mut info = [0_u8; 128];
+        let opts = libc::WEXITED | libc::WSTOPPED | libc::WNOWAIT | extra_opts;
+        let rc = Self::invoke(
+            Sysno::waitid,
+            &[
+                u64::from(idtype),
+                u64::from(id),
+                info.as_mut_ptr().expose_provenance() as u64,
+                i64::from(opts).cast_unsigned(),
+                0,
+                0,
+            ],
+        );
+        if rc != 0 {
+            return None;
+        }
+        let si_signo = i32::from_ne_bytes(info[0..4].try_into().unwrap_or([0; 4]));
+        let si_code = i32::from_ne_bytes(info[8..12].try_into().unwrap_or([0; 4]));
+        let si_pid = i32::from_ne_bytes(info[16..20].try_into().unwrap_or([0; 4]));
+        (si_signo == libc::SIGCHLD
+            && matches!(si_code, libc::CLD_STOPPED | libc::CLD_TRAPPED)
+            && ptrace.is_traced_by(si_pid, parent))
+        .then_some(si_pid)
+    }
+
     fn wait4_syscall(mut self, ptrace: &PtraceTable, memory: &GuestMemory) -> u64 {
         const VALID_OPTIONS: i32 = libc::WNOHANG
             | libc::WUNTRACED
@@ -969,6 +1015,7 @@ impl SyscallArgs {
             | libc::__WALL
             | libc::__WCLONE
             | libc::__WNOTHREAD;
+        let upid = GuestReg(self.0[0]).as_i32();
         let orig_options = GuestReg(self.0[2]).as_i32();
         let status_ptr = self.0[1];
         if orig_options & !VALID_OPTIONS != 0
@@ -982,39 +1029,45 @@ impl SyscallArgs {
         }
         let parent = unsafe { libc::getpid() };
         let host_rusage = memory.translated_address(self.0[3], RUSAGE_BYTES);
-        loop {
-            let mut host_status = 0_i32;
-            self.0[1] = (&raw mut host_status).expose_provenance() as u64;
-            // Always listen for stops so a child that calls `PTRACE_TRACEME`
-            // after its parent has already entered `wait4` still wakes it.
-            self.0[2] = i64::from(orig_options | libc::WUNTRACED).cast_unsigned();
-            self.0[3] = host_rusage;
-            let rc = self.forward(Sysno::wait4);
-            let child = GuestReg(rc).as_i32();
-            if child <= 0 {
-                return rc;
-            }
-            if libc::WIFSTOPPED(host_status)
-                && orig_options & libc::WUNTRACED == 0
-                && !ptrace.is_traced_by(child, parent)
-            {
-                if orig_options & libc::WNOHANG != 0 {
-                    return 0;
+        let mut effective_pid = self.0[0];
+        let mut effective_opts = orig_options;
+        if orig_options & libc::WUNTRACED == 0 {
+            let can_peek = orig_options & libc::WNOHANG == 0 || ptrace.has_tracees_for(parent);
+            if can_peek && let Some((idtype, id)) = Self::wait4_target(upid) {
+                let extra = orig_options
+                    & (libc::WNOHANG
+                        | libc::WCONTINUED
+                        | libc::__WALL
+                        | libc::__WCLONE
+                        | libc::__WNOTHREAD);
+                if let Some(traced_pid) = Self::peek_traced_stop(ptrace, parent, idtype, id, extra)
+                {
+                    effective_pid = i64::from(traced_pid).cast_unsigned();
+                    effective_opts = orig_options | libc::WUNTRACED;
                 }
-                continue;
             }
-            if libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status) {
-                ptrace.forget_tracee(child);
-            }
-            if status_ptr != 0
-                && memory
-                    .write(status_ptr, &host_status.to_ne_bytes())
-                    .is_err()
-            {
-                return Errno::EFAULT.negated();
-            }
+        }
+        let mut host_status = 0_i32;
+        self.0[0] = effective_pid;
+        self.0[1] = (&raw mut host_status).expose_provenance() as u64;
+        self.0[2] = i64::from(effective_opts).cast_unsigned();
+        self.0[3] = host_rusage;
+        let rc = self.forward(Sysno::wait4);
+        let child = GuestReg(rc).as_i32();
+        if child <= 0 {
             return rc;
         }
+        if libc::WIFEXITED(host_status) || libc::WIFSIGNALED(host_status) {
+            ptrace.forget_tracee(child);
+        }
+        if status_ptr != 0
+            && memory
+                .write(status_ptr, &host_status.to_ne_bytes())
+                .is_err()
+        {
+            return Errno::EFAULT.negated();
+        }
+        rc
     }
 
     fn waitid_syscall(mut self, ptrace: &PtraceTable, memory: &GuestMemory) -> u64 {
@@ -1029,45 +1082,34 @@ impl SyscallArgs {
         let idtype = GuestReg(self.0[0]).as_u32();
         let infop = self.0[2];
         let orig_options = GuestReg(self.0[3]).as_i32();
+        let parent = unsafe { libc::getpid() };
         let add_stopped = orig_options & !VALID_OPTIONS == 0
             && orig_options & libc::WEXITED != 0
             && orig_options & libc::WSTOPPED == 0
-            && orig_options & libc::WNOWAIT == 0;
-        let parent = unsafe { libc::getpid() };
-        loop {
-            if add_stopped {
+            && orig_options & libc::WNOWAIT == 0
+            && (orig_options & libc::WNOHANG == 0 || ptrace.has_tracees_for(parent));
+        if add_stopped && idtype != libc::P_PIDFD {
+            let id = GuestReg(self.0[1]).as_u32();
+            if Self::peek_traced_stop(ptrace, parent, idtype, id, orig_options).is_some() {
                 self.0[3] = i64::from(orig_options | libc::WSTOPPED).cast_unsigned();
             }
-            let pointers = [Arg::bytes(2, SIGINFO_BYTES), Arg::bytes(4, RUSAGE_BYTES)];
-            let result = if idtype == libc::P_PIDFD {
-                self.translate_and_forward(
-                    memory,
-                    Sysno::waitid,
-                    &[Arg::fd(1), pointers[0], pointers[1]],
-                )
-            } else {
-                self.translate_and_forward(memory, Sysno::waitid, &pointers)
-            };
-            if result != 0 || infop == 0 {
-                return result;
-            }
-            let Ok(info) = memory.read(infop, 24) else {
-                return result;
-            };
-            let si_signo = i32::from_ne_bytes(info[0..4].try_into().unwrap_or([0; 4]));
+        }
+        let pointers = [Arg::bytes(2, SIGINFO_BYTES), Arg::bytes(4, RUSAGE_BYTES)];
+        let result = if idtype == libc::P_PIDFD {
+            self.translate_and_forward(
+                memory,
+                Sysno::waitid,
+                &[Arg::fd(1), pointers[0], pointers[1]],
+            )
+        } else {
+            self.translate_and_forward(memory, Sysno::waitid, &pointers)
+        };
+        if result != 0 || infop == 0 {
+            return result;
+        }
+        if let Ok(info) = memory.read(infop, 24) {
             let si_code = i32::from_ne_bytes(info[8..12].try_into().unwrap_or([0; 4]));
             let si_pid = i32::from_ne_bytes(info[16..20].try_into().unwrap_or([0; 4]));
-            if add_stopped
-                && si_signo == libc::SIGCHLD
-                && matches!(si_code, libc::CLD_STOPPED | libc::CLD_TRAPPED)
-                && !ptrace.is_traced_by(si_pid, parent)
-            {
-                let _ = memory.write_zeros(infop, SIGINFO_BYTES);
-                if orig_options & libc::WNOHANG != 0 {
-                    return 0;
-                }
-                continue;
-            }
             if orig_options & libc::WNOWAIT == 0
                 && si_pid > 1
                 && matches!(
@@ -1077,8 +1119,8 @@ impl SyscallArgs {
             {
                 ptrace.forget_tracee(si_pid);
             }
-            return 0;
         }
+        0
     }
 
     fn setgroups(self, memory: &GuestMemory) -> u64 {

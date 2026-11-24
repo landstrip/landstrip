@@ -114,6 +114,16 @@ impl PtraceTable {
             .any(|slot| slot.load(Ordering::Acquire) == target)
     }
 
+    pub(super) fn has_tracees_for(&self, parent: i32) -> bool {
+        if parent <= 1 {
+            return false;
+        }
+        self.slots().iter().any(|slot| {
+            let entry = slot.load(Ordering::Acquire);
+            entry != 0 && Self::unpack(entry).0 == parent
+        })
+    }
+
     pub(super) fn forget_tracee(&self, child: i32) {
         if child <= 1 {
             return;
