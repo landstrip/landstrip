@@ -512,16 +512,37 @@ impl SyscallArgs {
                     &[Arg::fd(0), Arg::bytes(2, FLOCK_BYTES)],
                 )
             }
-            F_SETOWN_EX | F_GETOWN_EX | F_GET_RW_HINT | F_SET_RW_HINT | F_GET_FILE_RW_HINT
+            F_SETOWN_EX => {
+                let Ok(raw) = memory.read(registers.arguments()[2], WORD_SIZE) else {
+                    return Errno::EFAULT.negated();
+                };
+                let owner_pid = i32::from_ne_bytes(raw[4..8].try_into().unwrap_or([0; 4]));
+                if owner_pid == 1 || owner_pid == -1 {
+                    return Errno::EPERM.negated();
+                }
+                Self::forward_translated(
+                    registers,
+                    memory,
+                    Sysno::fcntl,
+                    &[Arg::fd(0), Arg::bytes(2, WORD_SIZE)],
+                )
+            }
+            F_GETOWN_EX | F_GET_RW_HINT | F_SET_RW_HINT | F_GET_FILE_RW_HINT
             | F_SET_FILE_RW_HINT => Self::forward_translated(
                 registers,
                 memory,
                 Sysno::fcntl,
                 &[Arg::fd(0), Arg::bytes(2, WORD_SIZE)],
             ),
-            F_GETFD | F_SETFD | F_GETFL | F_SETFL | F_SETOWN | F_GETOWN | F_SETSIG | F_GETSIG
-            | F_SETLEASE | F_GETLEASE | F_NOTIFY | F_SETPIPE_SZ | F_GETPIPE_SZ | F_ADD_SEALS
-            | F_GET_SEALS => {
+            F_SETOWN => {
+                let target = GuestReg(registers.arguments()[2]).as_i32();
+                if target == 1 || target == -1 {
+                    return Errno::EPERM.negated();
+                }
+                Self::forward_translated(registers, memory, Sysno::fcntl, &[Arg::fd(0)])
+            }
+            F_GETFD | F_SETFD | F_GETFL | F_SETFL | F_GETOWN | F_SETSIG | F_GETSIG | F_SETLEASE
+            | F_GETLEASE | F_NOTIFY | F_SETPIPE_SZ | F_GETPIPE_SZ | F_ADD_SEALS | F_GET_SEALS => {
                 Self::forward_translated(registers, memory, Sysno::fcntl, &[Arg::fd(0)])
             }
             _ => {
