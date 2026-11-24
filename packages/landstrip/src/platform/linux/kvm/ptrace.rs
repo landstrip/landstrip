@@ -177,11 +177,17 @@ impl PtraceTable {
                 if request == PTRACE_DETACH {
                     self.forget_tracee(pid);
                 }
-                if sig != 0 && unsafe { libc::kill(pid, sig) } < 0 {
-                    return Errno::last_os(Errno::ESRCH).negated();
-                }
-                if unsafe { libc::kill(pid, libc::SIGCONT) } < 0 {
-                    return Errno::last_os(Errno::ESRCH).negated();
+                if sig == libc::SIGSTOP {
+                    if unsafe { libc::kill(pid, libc::SIGSTOP) } < 0 {
+                        return Errno::last_os(Errno::ESRCH).negated();
+                    }
+                } else {
+                    if unsafe { libc::kill(pid, libc::SIGCONT) } < 0 {
+                        return Errno::last_os(Errno::ESRCH).negated();
+                    }
+                    if sig != 0 && unsafe { libc::kill(pid, sig) } < 0 {
+                        return Errno::last_os(Errno::ESRCH).negated();
+                    }
                 }
                 0
             }
