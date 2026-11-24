@@ -27,6 +27,8 @@ const MAP_32BIT_CEILING: u64 = 0x8000_0000;
 const VALID_MPROTECT_FLAGS: u64 = 0x7;
 #[cfg(target_arch = "aarch64")]
 const VALID_MPROTECT_FLAGS: u64 = 0x17;
+#[allow(clippy::cast_possible_truncation)]
+const PROT_MASK: u32 = VALID_MPROTECT_FLAGS as u32;
 const MAPPING_RESERVE: u64 = 0x0100_0000;
 pub(super) const MAPPING_CEILING: u64 = STACK_TOP - MAPPING_RESERVE;
 
@@ -53,7 +55,7 @@ impl MappingMeta {
     const fn anon(prot: u32) -> Self {
         Self {
             kind: MappingKind::Anonymous,
-            prot,
+            prot: prot & PROT_MASK,
             shared: false,
             advised: false,
             dont_fork: false,
@@ -434,7 +436,7 @@ impl Process {
             Ok(addr) => addr,
             Err(errno) => return errno.negated(),
         };
-        let prot = GuestReg(protection).as_u32();
+        let prot = GuestReg(protection).as_u32() & PROT_MASK;
         let hprot = Self::host_prot(prot);
         let is_shared = matches!(map_type, MAP_SHARED | MAP_SHARED_VALIDATE);
         if anonymous && !is_shared {
