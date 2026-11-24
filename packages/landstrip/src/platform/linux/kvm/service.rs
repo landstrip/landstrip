@@ -799,6 +799,18 @@ impl Broker {
 }
 
 impl Process {
+    fn release_forked_fds(&self) {
+        self.machine.release_forked_fds();
+        self.denials.release_forked_fds();
+        self.dbus_proxies.release_forked_fds();
+        self.cancellation.release_forked_fds();
+        if let Some(pipe) = &self.error_pipe
+            && let Ok(stream) = pipe.try_lock()
+        {
+            stream.close_for_forked_parent();
+        }
+    }
+
     fn finish_native_exec(&self, thread: &ThreadState) -> Result<Option<PreparedExec>> {
         let tid = ThreadState::current_tid();
         let (lock, condvar) = &self.threads;
@@ -1945,6 +1957,7 @@ impl ForkSnapshot {
         if Arc::strong_count(&old_process) == 1 {
             drop(old_process);
         } else {
+            old_process.release_forked_fds();
             std::mem::forget(old_process);
         }
         *vcpu = child_vcpu;

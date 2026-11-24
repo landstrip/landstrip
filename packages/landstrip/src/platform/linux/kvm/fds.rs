@@ -258,6 +258,16 @@ impl<T: AsRawFd> BrokerHandle<T> {
         debug_assert_eq!(mapped.as_raw_fd(), raw);
         BrokerHandle(ManuallyDrop::new(mapped))
     }
+
+    /// Closes and unregisters a broker handle owned by a forgotten parent
+    /// `Process` inside a forked child.
+    pub(crate) fn close_for_forked_parent(&self) {
+        let raw = self.0.as_raw_fd();
+        if raw >= 0 {
+            unsafe { libc::close(raw) };
+            GuestFd::unregister_broker(raw);
+        }
+    }
 }
 
 impl BrokerFd {

@@ -92,6 +92,15 @@ impl DbusProxies {
         }
     }
 
+    pub(crate) fn release_forked_fds(&self) {
+        if let Ok(instances) = self.instances.try_lock() {
+            for proxy in instances.values() {
+                proxy.socket.close_for_forked_parent();
+                proxy.keepalive.close_for_forked_parent();
+            }
+        }
+    }
+
     pub(super) fn exec_state(
         &self,
         inherited: &mut super::handoff::Inherited,

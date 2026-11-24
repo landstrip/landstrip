@@ -133,4 +133,15 @@ impl Machine {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(vcpu);
     }
+
+    /// Closes broker VM and pooled vCPU descriptors inherited from a
+    /// multithreaded parent when its `Arc<Process>` cannot be dropped safely.
+    pub(super) fn release_forked_fds(&self) {
+        self.vm.close_for_forked_parent();
+        if let Ok(idle) = self.pool.idle.try_lock() {
+            for vcpu in idle.iter() {
+                vcpu.close_for_forked_parent();
+            }
+        }
+    }
 }

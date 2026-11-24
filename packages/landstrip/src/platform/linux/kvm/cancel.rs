@@ -157,6 +157,14 @@ impl Client {
         ))
     }
 
+    pub(super) fn release_forked_fds(&self) {
+        self.request.close_for_forked_parent();
+        if let Ok(response) = self.response.try_lock() {
+            response.close_for_forked_parent();
+        }
+        self.reply.close_for_forked_parent();
+    }
+
     pub(super) fn child_clone(&self) -> Result<Self> {
         let request =
             GuestFd::duplicate_above(self.request.as_raw_fd())?.map_same_fd(UnixDatagram::from);

@@ -286,6 +286,13 @@ impl Denials {
         self.trap.is_some() && self.query_snapshot().queryable
     }
 
+    pub(super) fn release_forked_fds(&self) {
+        if let Some(trap) = &self.trap {
+            trap.close_for_forked_parent();
+        }
+        self.channel.release_forked_fds();
+    }
+
     fn emit_unique(&self, record: &str) {
         let inserted = {
             let mut seen = self
@@ -584,6 +591,11 @@ impl Channel {
             writer: GuestFd::relocate_above(OwnedFd::from(writer))
                 .context("relocate denial channel writer")?,
         })
+    }
+
+    fn release_forked_fds(&self) {
+        self.reader.close_for_forked_parent();
+        self.writer.close_for_forked_parent();
     }
 
     pub(super) fn keep(

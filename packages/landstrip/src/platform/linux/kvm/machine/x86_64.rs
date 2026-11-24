@@ -343,7 +343,7 @@ impl Regs {
 
 pub(crate) struct Machine {
     pub(crate) memory: GuestMemory,
-    vm: super::BrokerHandle<VmFd>,
+    pub(super) vm: super::BrokerHandle<VmFd>,
     cpuid: CpuId,
     xcr0: Option<u64>,
     nxe: bool,

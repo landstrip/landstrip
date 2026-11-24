@@ -145,6 +145,20 @@ impl TrapFd {
         })
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn close_for_forked_parent(&self) {
+        let raw = self.as_raw_fd();
+        if raw >= 0 {
+            unsafe { libc::close(raw) };
+            if self.broker_registered {
+                crate::platform::linux::kvm::fds::GuestFd::unregister_broker(raw);
+            }
+        }
+    }
+
     pub(crate) fn connect(path: &Path) -> io::Result<Self> {
         UnixStream::connect(path).map(|stream| Self::from(OwnedFd::from(stream)))
     }

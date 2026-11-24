@@ -416,7 +416,7 @@ impl Regs {
 
 pub(crate) struct Machine {
     pub(crate) memory: GuestMemory,
-    vm: super::BrokerHandle<VmFd>,
+    pub(super) vm: super::BrokerHandle<VmFd>,
     target: kvm_vcpu_init,
     pub(super) pool: VcpuPool,
 }
