@@ -305,6 +305,11 @@ impl Regs {
     #[allow(clippy::unused_self)]
     pub(crate) const fn normalize_interrupted(&mut self) {}
 
+    #[allow(clippy::unused_self)]
+    pub(crate) const fn has_valid_return_ip(&self) -> bool {
+        true
+    }
+
     /// Registers of a `clone` or `fork` child, which returns zero from the
     /// system call on `stack`, or on the parent's stack when it is zero.
     pub(crate) const fn child(&self, stack: u64) -> Self {

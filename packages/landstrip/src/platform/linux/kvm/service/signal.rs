@@ -730,29 +730,38 @@ impl GuestSignals {
         vcpu: &VcpuFd,
         thread: &mut ThreadState,
         registers: &mut Regs,
-    ) -> Result<()> {
-        let Some(mut saved) = thread.signal_frames.pop() else {
-            registers.set_result(Errno::EINVAL.negated());
-            return Ok(());
+    ) -> Result<Option<GuestFault>> {
+        let sigsegv = GuestFault {
+            signal: libc::SIGSEGV,
+            code: libc::SI_KERNEL,
+            address: 0,
+            is_page_fault: false,
         };
+        let Some(mut saved) = thread.signal_frames.pop() else {
+            return Ok(Some(sigsegv));
+        };
+        let Ok(uc_raw) = memory.read(saved.ucontext_addr, UCONTEXT_BYTES) else {
+            return Ok(Some(sigsegv));
+        };
+        saved.regs.apply_ucontext(&uc_raw);
+        if !saved.regs.has_valid_return_ip() {
+            return Ok(Some(sigsegv));
+        }
         let mut mask = saved.old_mask;
         let mut alt = (
             saved.old_altstack.sp,
             saved.old_altstack.flags,
             saved.old_altstack.size,
         );
-        if let Ok(uc_raw) = memory.read(saved.ucontext_addr, UCONTEXT_BYTES) {
-            saved.regs.apply_ucontext(&uc_raw);
-            if let Some((uc_mask, uc_alt)) = Regs::read_ucontext_meta(&uc_raw) {
-                mask = uc_mask;
-                alt = uc_alt;
-            }
+        if let Some((uc_mask, uc_alt)) = Regs::read_ucontext_meta(&uc_raw) {
+            mask = uc_mask;
+            alt = uc_alt;
         }
         Self::set_thread_mask(mask);
         thread.restore_altstack(saved.regs.stack_pointer(), alt.0, alt.1, alt.2);
         Machine::restore(vcpu, &saved.state).context("restore vCPU state on sigreturn")?;
         *registers = saved.regs;
-        Ok(())
+        Ok(None)
     }
 
     pub(super) fn thread_mask() -> u64 {

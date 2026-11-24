@@ -182,6 +182,15 @@ impl Regs {
         }
     }
 
+    pub(crate) const fn is_canonical_addr(addr: u64) -> bool {
+        let shift = (addr.cast_signed()) >> 47;
+        shift == 0 || shift == -1
+    }
+
+    pub(crate) const fn has_valid_return_ip(&self) -> bool {
+        Self::is_canonical_addr(self.raw.rip) && Self::is_canonical_addr(self.raw.rsp)
+    }
+
     /// Registers of a `clone` or `fork` child, which returns zero from the
     /// system call on `stack`, or on the parent's stack when it is zero.
     pub(crate) const fn child(&self, stack: u64) -> Self {
@@ -718,6 +727,20 @@ impl Machine {
             Ok(VcpuExit::IoOut(TRAP_PORT, _)) => Ok(ExitReason::Syscall),
             Ok(VcpuExit::IoOut(FAULT_PORT, _)) => self.fault(vcpu).map(ExitReason::Fault),
             Ok(VcpuExit::IoOut(port, _)) => bail!("guest wrote to unexpected port {port:#x}"),
+            Ok(VcpuExit::FailEntry(..) | VcpuExit::InternalError | VcpuExit::Shutdown) => {
+                if let Ok(regs) = self.regs(vcpu)
+                    && !regs.in_kernel_stub
+                    && !regs.has_valid_return_ip()
+                {
+                    return Ok(ExitReason::Fault(GuestFault {
+                        signal: libc::SIGSEGV,
+                        code: libc::SI_KERNEL,
+                        address: 0,
+                        is_page_fault: false,
+                    }));
+                }
+                bail!("unsupported guest exit")
+            }
             Ok(_) => bail!("unsupported guest exit"),
             Err(error) if error.errno() == libc::EINTR => Ok(ExitReason::Interrupted),
             Err(error) if error.errno() == libc::EFAULT => Ok(ExitReason::Fault(GuestFault {

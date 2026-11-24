@@ -776,7 +776,14 @@ impl Broker {
                 return Ok(Some(ExitKind::Group(status)));
             }
             Sysno::rt_sigreturn => {
-                GuestSignals::rt_sigreturn(&process.machine.memory, vcpu.get(), thread, registers)?;
+                if let Some(fault) = GuestSignals::rt_sigreturn(
+                    &process.machine.memory,
+                    vcpu.get(),
+                    thread,
+                    registers,
+                )? {
+                    return process.deliver_fault(vcpu.get(), thread, fault);
+                }
             }
             Sysno::execve | Sysno::execveat => {
                 process.exec(vcpu.get(), syscall, registers, thread)?;
