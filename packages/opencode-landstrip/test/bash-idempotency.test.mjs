@@ -850,3 +850,88 @@ test('headless trap server answers queries without treating deferred query stanz
     },
   );
 });
+
+test(
+  'linux.backend container passes --backend container and handles seccomp traps',
+  linuxOnly,
+  async (t) => {
+    await withPlugin(
+      {
+        enabled: true,
+        linux: { backend: 'container' },
+        filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: ['secret.txt'], denyWrite: [] },
+        network: { allowNetwork: true, allowedDomains: ['*'], deniedDomains: [] },
+      },
+      async ({ handlers, tempDir }) => {
+        const errors = [];
+        const blockedPath = join(await realpath(tempDir), 'secret.txt');
+        const queryStanza = serializeTrapStanza({
+          kind: 'filesystem',
+          code: 'FILESYSTEM_DENIED',
+          state: 'query',
+          query_id: '11',
+          operation: 'read',
+          path: blockedPath,
+          syscall: 'openat',
+          errno: 'EACCES',
+          reason: 'deny_match',
+          mechanism: 'seccomp',
+          pid: 412,
+        });
+        const infoStanza = serializeTrapStanza({
+          kind: 'filesystem',
+          code: 'FILESYSTEM_DENIED',
+          state: 'info',
+          operation: 'read',
+          path: blockedPath,
+          syscall: 'openat',
+          errno: 'EACCES',
+          reason: 'deny_match',
+          mechanism: 'seccomp',
+          pid: 412,
+        });
+        const event = {
+          id: 'container-backend-seccomp',
+          sessionID: 'test-session',
+          tool: 'shell',
+          input: { command: 'cat secret.txt' },
+        };
+
+        await handlers.tool['execute.before'](event);
+        t.mock.method(console, 'error', (message) => errors.push(message));
+        assert.deepEqual(parseShell(event.input.command).slice(5, 10), [
+          'run',
+          '--trap',
+          '3',
+          '--backend',
+          'container',
+        ]);
+        const trapPort = Number(/\/dev\/tcp\/127\.0\.0\.1\/(\d+)/.exec(event.input.command)[1]);
+        const reply = await new Promise((resolve, reject) => {
+          let received = '';
+          const client = connect(trapPort, '127.0.0.1', () => {
+            client.write(queryStanza);
+          });
+          client.setEncoding('utf8');
+          client.on('data', (chunk) => {
+            received += chunk;
+            if (received.includes('\n\n')) {
+              client.end(infoStanza);
+            }
+          });
+          client.once('close', () => resolve(received));
+          client.once('error', reject);
+        });
+        assert.equal(reply, 'query_id=11\naction=deny\n\n');
+        await handlers.tool['execute.after']({
+          ...event,
+          status: 'completed',
+          result: { output: '' },
+        });
+        assert.deepEqual(errors, [
+          `opencode-landstrip: landstrip: filesystem read denied (${blockedPath}) [seccomp]`,
+        ]);
+      },
+    );
+  },
+);

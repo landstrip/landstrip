@@ -40,6 +40,9 @@ test('parseSandboxConfig parses valid config and partial config', () => {
       denyWrite: ['/workspace/src'],
       denyWriteAlways: ['/workspace/.git'],
     },
+    linux: {
+      backend: 'container',
+    },
     macos: {
       allowTrustd: true,
       allowMachLookup: ['com.example.service'],
@@ -86,6 +89,10 @@ test('parseSandboxConfig rejects unknown fields', () => {
     /unknown sandbox field filesystem\.unknown/,
   );
   assert.throws(
+    () => parseSandboxConfig({ linux: { unknown: true } }),
+    /unknown sandbox field linux\.unknown/,
+  );
+  assert.throws(
     () => parseSandboxConfig({ macos: { unknown: true } }),
     /unknown sandbox field macos\.unknown/,
   );
@@ -114,6 +121,10 @@ test('parseSandboxConfig rejects invalid types and enums', () => {
     /shell\.readAccess must be host or policy/,
   );
   assert.throws(
+    () => parseSandboxConfig({ linux: { backend: 'invalid' } }),
+    /linux\.backend must be auto, container, or machine/,
+  );
+  assert.throws(
     () => parseSandboxConfig({ windows: { appContainerMode: 'invalid' } }),
     /windows\.appContainerMode must be lpac or standard/,
   );
@@ -139,6 +150,9 @@ test('deepMergeSandboxConfig deep merges partial config into base config', () =>
       denyWrite: ['/base/denyWrite'],
       denyWriteAlways: ['/base/denyWriteAlways'],
     },
+    linux: {
+      backend: 'auto',
+    },
     macos: {
       allowTrustd: false,
       allowMachLookup: ['com.example.one'],
@@ -162,6 +176,9 @@ test('deepMergeSandboxConfig deep merges partial config into base config', () =>
       allowWrite: ['/base/overrideWrite'],
       denyWriteAlways: ['/base/overrideDenyWriteAlways'],
     },
+    linux: {
+      backend: 'container',
+    },
     macos: {
       allowTrustd: true,
       allowMachLookup: ['com.example.two'],
@@ -184,6 +201,7 @@ test('deepMergeSandboxConfig deep merges partial config into base config', () =>
     '/base/overrideDenyWriteAlways',
   ]); // merged
   assert.deepEqual(merged.filesystem.denyRead, ['/base/denyRead']); // preserved
+  assert.equal(merged.linux?.backend, 'container'); // overridden
   assert.deepEqual(merged.macos, {
     allowTrustd: true,
     allowMachLookup: ['com.example.one', 'com.example.two'],

@@ -268,6 +268,34 @@ test('stanza wire format round-trips escaped values, omitted fields, and replies
 
   assert.equal(controlResponseStanza('42', 'allow'), 'query_id=42\naction=allow\n\n');
   assert.throws(() => controlResponseStanza('0', 'allow'), TypeError);
+
+  const seccompQuery = serializeTrapStanza({
+    kind: 'filesystem',
+    code: 'FILESYSTEM_DENIED',
+    state: 'query',
+    query_id: '7',
+    operation: 'read',
+    path: '/etc/hosts',
+    syscall: 'openat',
+    errno: 'EACCES',
+    reason: 'allow_miss',
+    mechanism: 'seccomp',
+    pid: 99,
+  });
+  assert.equal(parseTrapStanza(seccompQuery)?.mechanism, 'seccomp');
+
+  const landlockFailure = serializeTrapStanza({
+    kind: 'internal',
+    code: 'SANDBOX_SETUP_FAILED',
+    mechanism: 'landlock',
+    message: 'landlock ABI unsupported',
+  });
+  assert.deepEqual(parseTrapStanza(landlockFailure), {
+    kind: 'internal',
+    code: 'SANDBOX_SETUP_FAILED',
+    mechanism: 'landlock',
+    message: 'landlock ABI unsupported',
+  });
 });
 
 test('createDarwinLogTag and querySeatbeltDenials correlate macOS Seatbelt log output', async () => {

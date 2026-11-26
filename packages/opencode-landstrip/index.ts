@@ -17,7 +17,7 @@ import {
   startFilterProxy,
 } from '@landstrip/landstrip-api/proxy';
 
-import type { LandstripTrap } from '@landstrip/landstrip-api';
+import type { LandstripLinuxBackend, LandstripTrap } from '@landstrip/landstrip-api';
 import {
   type SandboxConfig,
   allowsAllDomains,
@@ -298,8 +298,13 @@ function buildWrappedCommand(
   command: string,
   trapPort: number | null,
   sessionID?: string,
+  linuxBackend?: LandstripLinuxBackend,
 ): string {
-  const baseArgs = ['run', '-p', policyPath, '--', ...shellArgs(shell, command)];
+  const backendArgs =
+    process.platform === 'linux' && linuxBackend !== undefined && linuxBackend !== 'auto'
+      ? ['--backend', linuxBackend]
+      : [];
+  const baseArgs = ['run', ...backendArgs, '-p', policyPath, '--', ...shellArgs(shell, command)];
   const plain = quoteShell([landstripBinaryPath(), ...baseArgs]);
   if (trapPort === null) return plain;
 
@@ -312,6 +317,7 @@ function buildWrappedCommand(
     'run',
     '--trap',
     '3',
+    ...backendArgs,
     '-p',
     policyPath,
     '--',
@@ -660,6 +666,7 @@ const plugin: Plugin.Plugin = {
         originalCommand,
         trapPort,
         tuiTrapPort === null ? undefined : interactiveSessionID,
+        config.linux?.backend,
       );
 
       activeBash.set(callID, {

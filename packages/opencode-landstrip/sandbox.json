@@ -22,5 +22,8 @@
       "~/.config/opencode/sandbox.json"
     ],
     "denyWriteAlways": []
+  },
+  "linux": {
+    "backend": "auto"
   }
 }

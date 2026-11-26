@@ -26,6 +26,9 @@ the selected global or project file.
 
 Defaults allow project writes, deny sensitive-file writes, and block networking.
 Unusable sandboxing fails closed; `enabled: false` permits unsandboxed Bash.
+On Linux, `linux.backend` selects `"auto"` (default; uses `"machine"` when
+`/dev/kvm` is accessible and falls back to `"container"`), `"container"`, or
+`"machine"`.
 
 See [landstrip(1)](../landstrip/man/man1/landstrip.1) for hard-denial rules,
 native traps, and platform limits.
