@@ -2,6 +2,8 @@
 
 /** The kernel layer an event is attributed to. */
 export type LandstripMechanism =
+  | 'landlock'
+  | 'seccomp'
   | 'kvm'
   | 'namespace'
   | 'seatbelt'
@@ -34,7 +36,7 @@ export interface LandstripFilesystemTrap {
   errno: string;
   flags?: string[];
   reason: LandstripTrapReason;
-  mechanism: 'kvm';
+  mechanism: 'kvm' | 'seccomp';
   pid: number;
   exe?: string;
   cwd?: string;
@@ -52,7 +54,7 @@ export interface LandstripNetworkTrap {
   target: string;
   syscall: string;
   errno: string;
-  mechanism: 'kvm';
+  mechanism: 'kvm' | 'seccomp';
   pid: number;
   exe?: string;
   cwd?: string;
@@ -232,6 +234,11 @@ export interface SandboxNetworkConfig {
   deniedDomains: string[];
 }
 
+export type LandstripLinuxBackend = 'auto' | 'container' | 'machine';
+
+export interface SandboxLinuxConfig {
+  backend: LandstripLinuxBackend;
+}
 export interface SandboxDarwinConfig {
   /** Optional Seatbelt log correlation tag; same restrictions as LandstripDarwinPolicy.logTag. */
   logTag?: string;
@@ -253,6 +260,7 @@ export interface SandboxConfig {
   shell?: SandboxShellConfig;
   network: SandboxNetworkConfig;
   filesystem: SandboxFilesystemConfig;
+  linux?: SandboxLinuxConfig;
   macos?: SandboxDarwinConfig;
   windows?: SandboxWindowsConfig;
 }
@@ -260,6 +268,7 @@ export interface SandboxConfig {
 export type SandboxFilesystemConfigFile = Partial<SandboxFilesystemConfig>;
 export type SandboxShellConfigFile = Partial<SandboxShellConfig>;
 export type SandboxNetworkConfigFile = Partial<SandboxNetworkConfig>;
+export type SandboxLinuxConfigFile = Partial<SandboxLinuxConfig>;
 export type SandboxDarwinConfigFile = Partial<SandboxDarwinConfig>;
 export type SandboxWindowsConfigFile = Partial<SandboxWindowsConfig>;
 
@@ -268,6 +277,7 @@ export interface SandboxConfigFile {
   shell?: SandboxShellConfigFile;
   network?: SandboxNetworkConfigFile;
   filesystem?: SandboxFilesystemConfigFile;
+  linux?: SandboxLinuxConfigFile;
   macos?: SandboxDarwinConfigFile;
   windows?: SandboxWindowsConfigFile;
 }

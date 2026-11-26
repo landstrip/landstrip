@@ -142,6 +142,8 @@ function allowsAllDomains(allowedDomains) {
 }
 
 const LANDSTRIP_MECHANISMS = new Set([
+  'landlock',
+  'seccomp',
   'kvm',
   'namespace',
   'seatbelt',
@@ -236,14 +238,14 @@ const TrapStanza = {
     const pid = TrapStanza.parsePid(value.pid);
     if (pid === null) return null;
     if (typeof value.syscall !== 'string' || typeof value.errno !== 'string') return null;
-    if (value.mechanism !== 'kvm') return null;
+    if (value.mechanism !== 'kvm' && value.mechanism !== 'seccomp') return null;
     if (value.exe !== undefined && typeof value.exe !== 'string') return null;
     if (value.cwd !== undefined && typeof value.cwd !== 'string') return null;
     if (value.state === 'query') {
       if (!TrapStanza.isValidQueryId(value.query_id)) return null;
-      return { state: 'query', query_id: value.query_id, pid };
+      return { state: 'query', query_id: value.query_id, pid, mechanism: value.mechanism };
     }
-    return { state: 'info', query_id: undefined, pid };
+    return { state: 'info', query_id: undefined, pid, mechanism: value.mechanism };
   },
 
   parseLine(line) {
@@ -404,7 +406,7 @@ function decodeLandstripTrap(value) {
         syscall: value.syscall,
         errno: value.errno,
         reason: value.reason,
-        mechanism: 'kvm',
+        mechanism: base.mechanism,
         pid: base.pid,
       };
       if (base.query_id !== undefined) result.query_id = base.query_id;
@@ -437,7 +439,7 @@ function decodeLandstripTrap(value) {
         target: value.target,
         syscall: value.syscall,
         errno: value.errno,
-        mechanism: 'kvm',
+        mechanism: base.mechanism,
         pid: base.pid,
       };
       if (base.query_id !== undefined) result.query_id = base.query_id;
@@ -905,6 +907,7 @@ function parseSandboxConfig(value) {
     'shell',
     'network',
     'filesystem',
+    'linux',
     'macos',
     'windows',
   ]);
@@ -1006,6 +1009,22 @@ function parseSandboxConfig(value) {
     }
   }
 
+  if (value.linux !== undefined) {
+    requireSandboxObject(value.linux, 'linux');
+    rejectUnknownSandboxFields(value.linux, ['backend'], 'linux.');
+    if (
+      value.linux.backend !== undefined &&
+      value.linux.backend !== 'auto' &&
+      value.linux.backend !== 'container' &&
+      value.linux.backend !== 'machine'
+    ) {
+      throw new Error('linux.backend must be auto, container, or machine');
+    }
+    config.linux = {};
+    if (value.linux.backend !== undefined) {
+      config.linux.backend = value.linux.backend;
+    }
+  }
   if (value.macos !== undefined) {
     requireSandboxObject(value.macos, 'macos');
     rejectUnknownSandboxFields(
@@ -1074,6 +1093,7 @@ function deepMergeSandboxConfig(base, overrides) {
   const shell = overrides.shell;
   const network = overrides.network;
   const filesystem = overrides.filesystem;
+  const linux = overrides.linux;
   const macos = overrides.macos;
   const windows = overrides.windows;
 
@@ -1103,6 +1123,11 @@ function deepMergeSandboxConfig(base, overrides) {
     };
   }
 
+  if (base.linux !== undefined || linux !== undefined) {
+    result.linux = {
+      backend: linux?.backend ?? base.linux?.backend ?? 'auto',
+    };
+  }
   if (base.macos !== undefined || macos !== undefined) {
     result.macos = {
       allowTrustd: macos?.allowTrustd ?? base.macos?.allowTrustd ?? false,

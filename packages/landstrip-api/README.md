@@ -69,6 +69,14 @@ or DEL (0x7f). `null` is invalid. `buildLandstripPolicy` and `parseSandboxConfig
 validate and forward it; `deepMergeSandboxConfig` uses the override tag when
 provided, otherwise preserving the base tag.
 
+## Linux backend selection
+
+`SandboxLinuxConfig` accepts optional `backend?: 'auto' | 'container' | 'machine'`
+(default `'auto'`) under the JSON key `linux`. `parseSandboxConfig` validates it
+and `deepMergeSandboxConfig` preserves override precedence; Linux callers pass
+`--backend <backend>` to `landstrip run` instead of embedding `linux` in
+`policy.json`.
+
 ## Trap transport and reporting
 
 On Unix, `--trap FD|PATH` accepts either an inherited open FD ≥3 or an absolute
