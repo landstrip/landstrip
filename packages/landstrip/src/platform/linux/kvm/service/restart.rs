@@ -153,7 +153,7 @@ impl State {
         let error_pipe = error
             .map(|stream| Process::clone_stream_above(stream.get()))
             .transpose()?;
-        let (machine, vcpu) = {
+        let (machine, mut vcpu) = {
             let _range = Range::occupy_unused()?;
             Machine::create(GuestMemory::new(RAM_SIZE)?)?
         };
@@ -165,7 +165,7 @@ impl State {
             &loaded.arguments,
             &self.environment,
         )?;
-        Machine::set_regs(vcpu.get(), &Regs::start(launch.start, stack))?;
+        machine.set_regs(vcpu.get_mut(), &Regs::start(launch.start, stack))?;
         nix::sys::prctl::set_name(&loaded.comm).context("set resumed payload name")?;
         let mut broker = Broker::new(
             (machine, vcpu),

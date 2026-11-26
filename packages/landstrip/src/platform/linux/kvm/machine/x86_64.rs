@@ -20,7 +20,7 @@ use kvm_bindings::{
     CpuId, KVM_MAX_CPUID_ENTRIES, Msrs, kvm_fpu, kvm_msr_entry, kvm_regs, kvm_segment, kvm_sregs,
     kvm_userspace_memory_region, kvm_xcrs, kvm_xsave,
 };
-use kvm_ioctls::{VcpuExit, VcpuFd, VmFd};
+use kvm_ioctls::{Cap, SyncReg, VcpuExit, VcpuFd, VmFd};
 use std::mem::offset_of;
 
 const PML4: u64 = 0x1000;
@@ -371,6 +371,7 @@ pub(crate) struct Machine {
     xcr0: Option<u64>,
     nxe: bool,
     fsgsbase: bool,
+    sync_regs: bool,
     pub(super) pool: VcpuPool,
 }
 
@@ -390,18 +391,18 @@ impl Machine {
         tls: Option<u64>,
     ) -> Result<(Self, super::BrokerHandle<VcpuFd>)> {
         let _range = super::super::fds::Range::occupy_unused()?;
-        let (machine, vcpu) = Self::attach(memory)?;
-        let mut sregs = vcpu.get().get_sregs().context("read vCPU state")?;
+        let (machine, mut vcpu) = Self::attach(memory)?;
+        let mut sregs = machine.raw_sregs(vcpu.get())?;
         sregs.fs = trapped.sregs.fs;
         sregs.gs = trapped.sregs.gs;
         sregs.cr2 = trapped.sregs.cr2;
         if let Some(base) = tls {
             sregs.fs.base = base;
         }
-        vcpu.get()
-            .set_sregs(&sregs)
+        machine
+            .write_sregs(vcpu.get_mut(), &sregs)
             .context("set vCPU state of the forked child")?;
-        Self::restore_fpu(vcpu.get(), trapped)?;
+        Self::restore_fpu(vcpu.get_mut(), trapped)?;
         Ok((machine, vcpu))
     }
 
@@ -414,7 +415,7 @@ impl Machine {
             None
         };
         Ok(VcpuState {
-            sregs: vcpu.get_sregs().context("read vCPU state")?,
+            sregs: self.raw_sregs(vcpu)?,
             fpu: vcpu.get_fpu().context("read vCPU FPU state")?,
             xsave,
         })
@@ -422,11 +423,12 @@ impl Machine {
 
     /// Restores floating-point state when a signal handler returns, keeping
     /// the guest's current TLS segment bases intact.
-    pub(crate) fn restore_signal(vcpu: &VcpuFd, state: &VcpuState) -> Result<()> {
+    #[allow(clippy::unused_self)]
+    pub(crate) fn restore_signal(&self, vcpu: &mut VcpuFd, state: &VcpuState) -> Result<()> {
         Self::restore_fpu(vcpu, state)
     }
 
-    pub(crate) fn reset_fpu(&self, vcpu: &VcpuFd) -> Result<()> {
+    pub(crate) fn reset_fpu(&self, vcpu: &mut VcpuFd) -> Result<()> {
         let fpu = kvm_fpu {
             fcw: 0x037f,
             mxcsr: 0x1f80,
@@ -441,7 +443,7 @@ impl Machine {
         vcpu.set_fpu(&fpu).context("reset vCPU FPU state")
     }
 
-    fn restore_fpu(vcpu: &VcpuFd, state: &VcpuState) -> Result<()> {
+    fn restore_fpu(vcpu: &mut VcpuFd, state: &VcpuState) -> Result<()> {
         if let Some(xsave) = &state.xsave {
             // SAFETY: `xsave` was returned by `KVM_GET_XSAVE` on a vCPU with
             // the same `XCR0` configuration.
@@ -464,21 +466,28 @@ impl Machine {
         };
         unsafe { vm.get().set_user_memory_region(region) }.context("register guest memory")?;
 
-        let vcpu = super::BrokerHandle::register(vm.get().create_vcpu(0).context("create a vCPU")?);
+        let sync_regs = kvm.check_extension(Cap::SyncRegs);
+        let mut vcpu =
+            super::BrokerHandle::register(vm.get().create_vcpu(0).context("create a vCPU")?);
         let mut cpuid = kvm
             .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
             .context("read supported CPUID")?;
         let (xcr0, nxe, fsgsbase) = Self::sanitize_cpuid(&mut cpuid);
-        vcpu.get().set_cpuid2(&cpuid).context("set vCPU CPUID")?;
-        vcpu.get()
+        vcpu.get_mut()
+            .set_cpuid2(&cpuid)
+            .context("set vCPU CPUID")?;
+        vcpu.get_mut()
             .set_sregs(&Self::long_mode_sregs(xcr0.is_some(), nxe, fsgsbase, 0))
             .context("set vCPU state")?;
         if let Some(mask) = xcr0 {
-            Self::set_xcr0(vcpu.get(), mask)?;
+            Self::set_xcr0(vcpu.get_mut(), mask)?;
         }
-        vcpu.get()
+        vcpu.get_mut()
             .set_msrs(&Self::msrs()?)
             .context("set vCPU MSRs")?;
+        if sync_regs {
+            Self::seed_sync_regs(vcpu.get_mut())?;
+        }
 
         Ok((
             Self {
@@ -488,6 +497,7 @@ impl Machine {
                 xcr0,
                 nxe,
                 fsgsbase,
+                sync_regs,
                 pool: VcpuPool::new(),
             },
             vcpu,
@@ -497,7 +507,7 @@ impl Machine {
     /// Allocates a fresh vCPU above the payload descriptor ceiling.
     pub(crate) fn allocate_vcpu(&self) -> Result<super::BrokerHandle<VcpuFd>> {
         let id = self.pool.next_id();
-        let vcpu = {
+        let mut vcpu = {
             let _range = super::super::fds::Range::occupy_unused()?;
             super::BrokerHandle::register(
                 self.vm
@@ -506,10 +516,10 @@ impl Machine {
                     .context("create thread vCPU")?,
             )
         };
-        vcpu.get()
+        vcpu.get_mut()
             .set_cpuid2(&self.cpuid)
             .context("set thread vCPU CPUID")?;
-        vcpu.get()
+        vcpu.get_mut()
             .set_sregs(&Self::long_mode_sregs(
                 self.xcr0.is_some(),
                 self.nxe,
@@ -517,6 +527,9 @@ impl Machine {
                 id,
             ))
             .context("set initial thread vCPU state")?;
+        if self.sync_regs {
+            Self::seed_sync_regs(vcpu.get_mut())?;
+        }
         Ok(vcpu)
     }
 
@@ -525,12 +538,12 @@ impl Machine {
     /// when present.
     pub(crate) fn configure_vcpu(
         &self,
-        vcpu: &VcpuFd,
+        vcpu: &mut VcpuFd,
         state: &VcpuState,
         tls: Option<u64>,
         registers: &Regs,
     ) -> Result<()> {
-        let prev_tr = vcpu.get_sregs().map_or(TSS_POOL, |s| s.tr.base);
+        let prev_tr = self.raw_sregs(vcpu).map_or(TSS_POOL, |s| s.tr.base);
         let slot = if prev_tr >= TSS_POOL {
             (prev_tr - TSS_POOL) / TSS_SLOT_BYTES
         } else {
@@ -546,14 +559,24 @@ impl Machine {
         vcpu.set_msrs(&Self::msrs()?)
             .context("set thread vCPU MSRs")?;
         Self::restore_fpu(vcpu, state)?;
-        Self::set_regs(vcpu, registers)
+        if self.sync_regs {
+            Self::seed_sync_regs(vcpu)?;
+        }
+        self.set_regs(vcpu, registers)
     }
 
     /// Reads the general-purpose registers of `vcpu`.
     pub(crate) fn regs(&self, vcpu: &VcpuFd) -> Result<Regs> {
-        let mut raw = vcpu.get_regs().context("read vCPU registers")?;
-        let sregs = vcpu.get_sregs().context("read vCPU segments")?;
-        if sregs.cs.selector == KERNEL_CS
+        let (mut raw, cs_selector) = if self.sync_regs {
+            let synced = vcpu.sync_regs();
+            (synced.regs, synced.sregs.cs.selector)
+        } else {
+            (
+                vcpu.get_regs().context("read vCPU registers")?,
+                vcpu.get_sregs().context("read vCPU segments")?.cs.selector,
+            )
+        };
+        if cs_selector == KERNEL_CS
             && (HANDLERS..HANDLERS + EXCEPTION_VECTORS * HANDLER_SIZE).contains(&raw.rip)
         {
             self.unwind_interrupted_handler(&mut raw)?;
@@ -562,7 +585,7 @@ impl Machine {
                 in_kernel_stub: false,
             });
         }
-        let in_kernel_stub = sregs.cs.selector == KERNEL_CS && Self::in_stub(raw.rip);
+        let in_kernel_stub = cs_selector == KERNEL_CS && Self::in_stub(raw.rip);
         Ok(Regs {
             raw,
             in_kernel_stub,
@@ -600,7 +623,18 @@ impl Machine {
 
     /// Writes the general-purpose registers of `vcpu`, leaving ring 0 when
     /// they no longer point into the stub.
-    pub(crate) fn set_regs(vcpu: &VcpuFd, registers: &Regs) -> Result<()> {
+    pub(crate) fn set_regs(&self, vcpu: &mut VcpuFd, registers: &Regs) -> Result<()> {
+        if self.sync_regs {
+            if !registers.in_kernel_stub && vcpu.sync_regs().sregs.cs.selector != USER_CS {
+                let sregs = &mut vcpu.sync_regs_mut().sregs;
+                sregs.cs = Self::segment(USER_CS, SEGMENT_TYPE_CODE, 3, true);
+                sregs.ss = Self::segment(USER_DS, SEGMENT_TYPE_DATA, 3, false);
+                vcpu.set_sync_dirty_reg(SyncReg::SystemRegister);
+            }
+            vcpu.sync_regs_mut().regs = registers.raw;
+            vcpu.set_sync_dirty_reg(SyncReg::Register);
+            return Ok(());
+        }
         if !registers.in_kernel_stub {
             let mut sregs = vcpu.get_sregs().context("read vCPU segments")?;
             if sregs.cs.selector != USER_CS {
@@ -613,13 +647,30 @@ impl Machine {
             .context("write vCPU registers")
     }
 
+    pub(crate) fn update_regs(
+        &self,
+        vcpu: &mut VcpuFd,
+        _origin: &Regs,
+        registers: &Regs,
+    ) -> Result<()> {
+        self.set_regs(vcpu, registers)
+    }
+
     /// Reads the guest's FS or GS base without touching the host thread state.
-    pub(crate) fn segment_base(vcpu: &VcpuFd, gs: bool) -> Result<u64> {
-        let sregs = vcpu.get_sregs().context("read vCPU segments")?;
+    pub(crate) fn segment_base(&self, vcpu: &VcpuFd, gs: bool) -> Result<u64> {
+        let sregs = self.raw_sregs(vcpu)?;
         Ok(if gs { sregs.gs.base } else { sregs.fs.base })
     }
 
-    pub(crate) fn set_segment_base(vcpu: &VcpuFd, gs: bool, base: u64) -> Result<()> {
+    pub(crate) fn set_segment_base(&self, vcpu: &mut VcpuFd, gs: bool, base: u64) -> Result<()> {
+        if self.sync_regs {
+            let sregs = &mut vcpu.sync_regs_mut().sregs;
+            let segment = if gs { &mut sregs.gs } else { &mut sregs.fs };
+            segment.selector = 0;
+            segment.base = base;
+            vcpu.set_sync_dirty_reg(SyncReg::SystemRegister);
+            return Ok(());
+        }
         let mut sregs = vcpu.get_sregs().context("read vCPU segments")?;
         let segment = if gs { &mut sregs.gs } else { &mut sregs.fs };
         segment.selector = 0;
@@ -636,14 +687,57 @@ impl Machine {
         self.pool.tlb_epoch()
     }
 
-    pub(crate) fn sync_tlb(&self, vcpu: &VcpuFd, local_epoch: &mut u64) -> Result<()> {
+    pub(crate) fn sync_tlb(&self, vcpu: &mut VcpuFd, local_epoch: &mut u64) -> Result<()> {
         let current = self.pool.tlb_epoch();
         if *local_epoch != current {
-            let sregs = vcpu.get_sregs().context("read vCPU segments for TLB")?;
-            vcpu.set_sregs(&sregs).context("flush vCPU TLB")?;
+            if self.sync_regs {
+                vcpu.set_sync_dirty_reg(SyncReg::SystemRegister);
+            } else {
+                let sregs = vcpu.get_sregs().context("read vCPU segments for TLB")?;
+                vcpu.set_sregs(&sregs).context("flush vCPU TLB")?;
+            }
             *local_epoch = current;
         }
         Ok(())
+    }
+
+    fn seed_sync_regs(vcpu: &mut VcpuFd) -> Result<()> {
+        let regs = vcpu.get_regs().context("read vCPU registers")?;
+        let sregs = vcpu.get_sregs().context("read vCPU segments")?;
+        let synced = vcpu.sync_regs_mut();
+        synced.regs = regs;
+        synced.sregs = sregs;
+        vcpu.set_sync_valid_reg(SyncReg::Register);
+        vcpu.set_sync_valid_reg(SyncReg::SystemRegister);
+        vcpu.clear_sync_dirty_reg(SyncReg::Register);
+        vcpu.clear_sync_dirty_reg(SyncReg::SystemRegister);
+        Ok(())
+    }
+
+    fn raw_regs(&self, vcpu: &VcpuFd) -> Result<kvm_regs> {
+        if self.sync_regs {
+            Ok(vcpu.sync_regs().regs)
+        } else {
+            vcpu.get_regs().context("read vCPU registers")
+        }
+    }
+
+    fn raw_sregs(&self, vcpu: &VcpuFd) -> Result<kvm_sregs> {
+        if self.sync_regs {
+            Ok(vcpu.sync_regs().sregs)
+        } else {
+            vcpu.get_sregs().context("read vCPU segments")
+        }
+    }
+
+    fn write_sregs(&self, vcpu: &mut VcpuFd, sregs: &kvm_sregs) -> Result<()> {
+        if self.sync_regs {
+            vcpu.sync_regs_mut().sregs = *sregs;
+            vcpu.set_sync_dirty_reg(SyncReg::SystemRegister);
+            Ok(())
+        } else {
+            vcpu.set_sregs(sregs).context("write vCPU segments")
+        }
     }
 
     pub(crate) fn reset_page_tables(&self) -> Result<()> {
@@ -800,9 +894,9 @@ impl Machine {
         }
     }
 
-    fn fault(&self, vcpu: &VcpuFd) -> Result<GuestFault> {
-        let mut registers = vcpu.get_regs().context("read vCPU registers")?;
-        let sregs = vcpu.get_sregs().context("read vCPU segments")?;
+    fn fault(&self, vcpu: &mut VcpuFd) -> Result<GuestFault> {
+        let mut registers = self.raw_regs(vcpu)?;
+        let cr2 = self.raw_sregs(vcpu)?.cr2;
         let vector = registers.rax;
         let has_err = ERROR_CODE_VECTORS.contains(&vector);
         let word_count = 6 + u64::from(has_err);
@@ -825,23 +919,20 @@ impl Machine {
         let rflags = words.get(base + 2).copied().unwrap_or(RFLAGS_RESERVED);
         let user_rsp = words.get(base + 3).copied().unwrap_or(0);
         if cs.trailing_zeros() >= 2 {
-            bail!(
-                "supervisor fault {vector} at rip {rip:#x} (cr2 {:#x})",
-                sregs.cr2
-            );
+            bail!("supervisor fault {vector} at rip {rip:#x} (cr2 {cr2:#x})");
         }
         registers.rax = saved_rax;
         registers.rip = rip;
         registers.rflags = rflags;
         registers.rsp = user_rsp;
-        Self::set_regs(
+        self.set_regs(
             vcpu,
             &Regs {
                 raw: registers,
                 in_kernel_stub: false,
             },
         )?;
-        Ok(Self::classify_fault(vector, error_code, rip, sregs.cr2))
+        Ok(Self::classify_fault(vector, error_code, rip, cr2))
     }
 
     const fn classify_fault(vector: u64, error_code: u64, rip: u64, cr2: u64) -> GuestFault {
@@ -1101,7 +1192,7 @@ impl Machine {
         (xcr0, nxe, fsgsbase)
     }
 
-    fn set_xcr0(vcpu: &VcpuFd, mask: u64) -> Result<()> {
+    fn set_xcr0(vcpu: &mut VcpuFd, mask: u64) -> Result<()> {
         let mut xcrs = kvm_xcrs {
             nr_xcrs: 1,
             ..kvm_xcrs::default()

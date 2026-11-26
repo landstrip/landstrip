@@ -376,7 +376,7 @@ pub(super) struct SavedFrame {
 impl Process {
     pub(super) fn deliver_fault(
         &self,
-        vcpu: &VcpuFd,
+        vcpu: &mut VcpuFd,
         thread: &mut ThreadState,
         fault: GuestFault,
     ) -> Result<Option<ExitKind>> {
@@ -780,8 +780,8 @@ impl GuestSignals {
     }
 
     pub(super) fn rt_sigreturn(
-        memory: &GuestMemory,
-        vcpu: &VcpuFd,
+        machine: &Machine,
+        vcpu: &mut VcpuFd,
         thread: &mut ThreadState,
         registers: &mut Regs,
     ) -> Result<Option<GuestFault>> {
@@ -794,7 +794,7 @@ impl GuestSignals {
         let Some(mut saved) = thread.signal_frames.pop() else {
             return Ok(Some(sigsegv));
         };
-        let Ok(uc_raw) = memory.read(saved.ucontext_addr, UCONTEXT_BYTES) else {
+        let Ok(uc_raw) = machine.memory.read(saved.ucontext_addr, UCONTEXT_BYTES) else {
             return Ok(Some(sigsegv));
         };
         saved.regs.apply_ucontext(&uc_raw);
@@ -813,7 +813,9 @@ impl GuestSignals {
         }
         Self::set_thread_mask(mask);
         thread.restore_altstack(saved.regs.stack_pointer(), alt.0, alt.1, alt.2);
-        Machine::restore_signal(vcpu, &saved.state).context("restore vCPU state on sigreturn")?;
+        machine
+            .restore_signal(vcpu, &saved.state)
+            .context("restore vCPU state on sigreturn")?;
         *registers = saved.regs;
         Ok(None)
     }
@@ -852,7 +854,7 @@ impl GuestSignals {
     pub(super) fn deliver_pending(
         &self,
         machine: &Machine,
-        vcpu: &VcpuFd,
+        vcpu: &mut VcpuFd,
         thread: &mut ThreadState,
         origin: Option<&Regs>,
     ) -> Result<Option<ExitKind>> {
@@ -909,7 +911,7 @@ impl GuestSignals {
     #[allow(clippy::too_many_arguments)]
     fn deliver_frame(
         machine: &Machine,
-        vcpu: &VcpuFd,
+        vcpu: &mut VcpuFd,
         thread: &mut ThreadState,
         active_mask: u64,
         saved_mask: u64,
@@ -1005,7 +1007,9 @@ impl GuestSignals {
         };
         Self::set_thread_mask(active_mask | action.mask | defer_self);
         machine.reset_fpu(vcpu)?;
-        Machine::set_regs(vcpu, &next_regs).context("set handler registers for signal")?;
+        machine
+            .set_regs(vcpu, &next_regs)
+            .context("set handler registers for signal")?;
         Ok(None)
     }
 }

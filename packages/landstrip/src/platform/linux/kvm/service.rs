@@ -681,20 +681,22 @@ impl Broker {
                 if ThreadState::current_tid() != leader {
                     return Ok(ExitKind::Retired);
                 }
-                process.finish_exec(vcpu.get(), thread)?;
+                process.finish_exec(vcpu.get_mut(), thread)?;
                 continue;
             }
             if SIGNAL_QUEUE.has_any()
-                && let Some(exit) =
-                    process
-                        .signals
-                        .deliver_pending(&process.machine, vcpu.get(), thread, None)?
+                && let Some(exit) = process.signals.deliver_pending(
+                    &process.machine,
+                    vcpu.get_mut(),
+                    thread,
+                    None,
+                )?
             {
                 return Ok(exit);
             }
             process
                 .machine
-                .sync_tlb(vcpu.get(), &mut thread.tlb_epoch)?;
+                .sync_tlb(vcpu.get_mut(), &mut thread.tlb_epoch)?;
             match process.machine.run(vcpu.get_mut())? {
                 ExitReason::Syscall => {
                     let mut registers = process.machine.regs(vcpu.get())?;
@@ -705,11 +707,13 @@ impl Broker {
                     if process.denials.is_cancelled() {
                         continue;
                     }
-                    Machine::set_regs(vcpu.get(), &registers)?;
+                    process
+                        .machine
+                        .update_regs(vcpu.get_mut(), &origin, &registers)?;
                     if (SIGNAL_QUEUE.has_any() || thread.temp_signal_mask.is_some())
                         && let Some(exit) = process.signals.deliver_pending(
                             &process.machine,
-                            vcpu.get(),
+                            vcpu.get_mut(),
                             thread,
                             Some(&origin),
                         )?
@@ -721,7 +725,7 @@ impl Broker {
                 ExitReason::Interrupted => {
                     if let Some(exit) = process.signals.deliver_pending(
                         &process.machine,
-                        vcpu.get(),
+                        vcpu.get_mut(),
                         thread,
                         None,
                     )? {
@@ -729,7 +733,7 @@ impl Broker {
                     }
                 }
                 ExitReason::Fault(fault) => {
-                    if let Some(exit) = process.deliver_fault(vcpu.get(), thread, fault)? {
+                    if let Some(exit) = process.deliver_fault(vcpu.get_mut(), thread, fault)? {
                         return Ok(exit);
                     }
                 }
@@ -779,17 +783,14 @@ impl Broker {
                 return Ok(Some(ExitKind::Group(status)));
             }
             Sysno::rt_sigreturn => {
-                if let Some(fault) = GuestSignals::rt_sigreturn(
-                    &process.machine.memory,
-                    vcpu.get(),
-                    thread,
-                    registers,
-                )? {
-                    return process.deliver_fault(vcpu.get(), thread, fault);
+                if let Some(fault) =
+                    GuestSignals::rt_sigreturn(&process.machine, vcpu.get_mut(), thread, registers)?
+                {
+                    return process.deliver_fault(vcpu.get_mut(), thread, fault);
                 }
             }
             Sysno::execve | Sysno::execveat => {
-                process.exec(vcpu.get(), syscall, registers, thread)?;
+                process.exec(vcpu.get_mut(), syscall, registers, thread)?;
             }
             #[cfg(target_arch = "x86_64")]
             Sysno::fork | Sysno::vfork => {
@@ -805,11 +806,9 @@ impl Broker {
                 }
             },
             #[cfg(target_arch = "x86_64")]
-            Sysno::arch_prctl => registers.set_result(Process::arch_prctl(
-                vcpu.get(),
-                registers,
-                &process.machine.memory,
-            )?),
+            Sysno::arch_prctl => {
+                registers.set_result(process.arch_prctl(vcpu.get_mut(), registers)?);
+            }
             _ => registers.set_result(process.serve(thread, syscall, registers)),
         }
         Ok(None)
@@ -868,13 +867,13 @@ impl Broker {
         };
         let state = process.machine.state(vcpu)?;
         let child_regs = registers.child(registers.arguments()[1]);
-        let child_vcpu = match process.machine.pop_idle_vcpu() {
+        let mut child_vcpu = match process.machine.pop_idle_vcpu() {
             Some(recycled) => recycled,
             None => process.machine.allocate_vcpu()?,
         };
         process
             .machine
-            .configure_vcpu(child_vcpu.get(), &state, tls, &child_regs)?;
+            .configure_vcpu(child_vcpu.get_mut(), &state, tls, &child_regs)?;
 
         let mut threads = process
             .threads
@@ -1108,7 +1107,7 @@ impl Process {
                 .context("missing native exec capsule")?,
         ))
     }
-    fn finish_exec(&self, vcpu: &VcpuFd, thread: &mut ThreadState) -> Result<()> {
+    fn finish_exec(&self, vcpu: &mut VcpuFd, thread: &mut ThreadState) -> Result<()> {
         let tid = ThreadState::current_tid();
         let caller = self
             .threads
@@ -1160,7 +1159,7 @@ impl Process {
             &pending.loaded,
             &pending.environment,
         )?;
-        Machine::set_regs(vcpu, &registers)?;
+        self.machine.set_regs(vcpu, &registers)?;
         for signal in private_signals {
             unsafe {
                 syscalls::syscall!(
@@ -1349,7 +1348,7 @@ impl Process {
 
     fn exec(
         &self,
-        vcpu: &VcpuFd,
+        vcpu: &mut VcpuFd,
         syscall: Sysno,
         registers: &mut Regs,
         thread: &mut ThreadState,
@@ -1363,7 +1362,7 @@ impl Process {
 
     fn replace(
         &self,
-        vcpu: &VcpuFd,
+        vcpu: &mut VcpuFd,
         syscall: Sysno,
         registers: &mut Regs,
         thread: &mut ThreadState,
@@ -1584,7 +1583,7 @@ impl Process {
 
     fn commit_exec(
         &self,
-        vcpu: &VcpuFd,
+        vcpu: &mut VcpuFd,
         registers: &mut Regs,
         thread: &mut ThreadState,
         invoked: &OsStr,
@@ -1600,11 +1599,11 @@ impl Process {
         GuestFd::close_cloexec();
         #[cfg(target_arch = "x86_64")]
         {
-            Machine::set_segment_base(vcpu, false, 0)?;
-            Machine::set_segment_base(vcpu, true, 0)?;
+            self.machine.set_segment_base(vcpu, false, 0)?;
+            self.machine.set_segment_base(vcpu, true, 0)?;
         }
         #[cfg(target_arch = "aarch64")]
-        Machine::set_tls(vcpu, 0)?;
+        self.machine.set_tls(vcpu, 0)?;
         self.machine.reset_fpu(vcpu)?;
         if !loaded.executable.as_os_str().is_empty() {
             self.policy.set_exe(&loaded.executable);
@@ -1624,6 +1623,7 @@ impl Process {
         thread.temp_signal_mask = None;
         thread.signal_frames.clear();
         *registers = Regs::start(launch.start, stack);
+        self.machine.set_regs(vcpu, registers)?;
         nix::sys::prctl::set_name(&loaded.comm).context("set payload exec name")?;
         Ok(Replacement::Done)
     }
@@ -2270,7 +2270,7 @@ impl Process {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn arch_prctl(vcpu: &VcpuFd, registers: &Regs, memory: &GuestMemory) -> Result<u64> {
+    fn arch_prctl(&self, vcpu: &mut VcpuFd, registers: &Regs) -> Result<u64> {
         const ARCH_SET_GS: u32 = 0x1001;
         const ARCH_SET_FS: u32 = 0x1002;
         const ARCH_GET_FS: u32 = 0x1003;
@@ -2284,12 +2284,13 @@ impl Process {
                 if address >= TASK_SIZE_MAX {
                     return Ok(Errno::EPERM.negated());
                 }
-                Machine::set_segment_base(vcpu, code == ARCH_SET_GS, address)?;
+                self.machine
+                    .set_segment_base(vcpu, code == ARCH_SET_GS, address)?;
                 Ok(0)
             }
             ARCH_GET_FS | ARCH_GET_GS => {
-                let base = Machine::segment_base(vcpu, code == ARCH_GET_GS)?;
-                Ok(if memory.write_u64(address, base).is_ok() {
+                let base = self.machine.segment_base(vcpu, code == ARCH_GET_GS)?;
+                Ok(if self.machine.memory.write_u64(address, base).is_ok() {
                     0
                 } else {
                     Errno::EFAULT.negated()
@@ -2394,6 +2395,7 @@ impl ForkSnapshot {
             }
         }
         *registers = registers.child(stack);
+        process.machine.set_regs(vcpu.get_mut(), registers)?;
         Ok(())
     }
 }

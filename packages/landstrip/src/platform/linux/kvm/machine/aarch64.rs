@@ -206,7 +206,7 @@ impl Register {
         Ok(u64::from_ne_bytes(value))
     }
 
-    fn write(vcpu: &VcpuFd, id: u64, value: u64) -> Result<()> {
+    fn write(vcpu: &mut VcpuFd, id: u64, value: u64) -> Result<()> {
         vcpu.set_one_reg(id, &value.to_ne_bytes())
             .with_context(|| format!("write vCPU register {id:#x}"))?;
         Ok(())
@@ -219,7 +219,7 @@ impl Register {
         Ok(u32::from_ne_bytes(value))
     }
 
-    fn write_word(vcpu: &VcpuFd, id: u64, value: u32) -> Result<()> {
+    fn write_word(vcpu: &mut VcpuFd, id: u64, value: u32) -> Result<()> {
         vcpu.set_one_reg(id, &value.to_ne_bytes())
             .with_context(|| format!("write vCPU register {id:#x}"))?;
         Ok(())
@@ -232,7 +232,7 @@ impl Register {
         Ok(u128::from_ne_bytes(value))
     }
 
-    fn write_vector(vcpu: &VcpuFd, id: u64, value: u128) -> Result<()> {
+    fn write_vector(vcpu: &mut VcpuFd, id: u64, value: u128) -> Result<()> {
         vcpu.set_one_reg(id, &value.to_ne_bytes())
             .with_context(|| format!("write vCPU register {id:#x}"))?;
         Ok(())
@@ -445,10 +445,10 @@ impl Machine {
         tls: Option<u64>,
     ) -> Result<(Self, super::BrokerHandle<VcpuFd>)> {
         let _range = super::super::fds::Range::occupy_unused()?;
-        let (machine, vcpu) = Self::attach(memory)?;
-        Self::restore(vcpu.get(), trapped)?;
+        let (machine, mut vcpu) = Self::attach(memory)?;
+        machine.restore(vcpu.get_mut(), trapped)?;
         if let Some(pointer) = tls {
-            Register::write(vcpu.get(), Register::TPIDR_EL0, pointer)?;
+            Register::write(vcpu.get_mut(), Register::TPIDR_EL0, pointer)?;
         }
         Ok((machine, vcpu))
     }
@@ -473,14 +473,15 @@ impl Machine {
     }
 
     /// Restores full state (including TLS) for a spawned/forked child.
-    pub(crate) fn restore(vcpu: &VcpuFd, state: &VcpuState) -> Result<()> {
-        Self::restore_signal(vcpu, state)?;
+    pub(crate) fn restore(&self, vcpu: &mut VcpuFd, state: &VcpuState) -> Result<()> {
+        self.restore_signal(vcpu, state)?;
         Register::write(vcpu, Register::TPIDR_EL0, state.tls)
     }
 
     /// Restores floating-point state when a signal handler returns, keeping
     /// the guest's current `TPIDR_EL0` intact.
-    pub(crate) fn restore_signal(vcpu: &VcpuFd, state: &VcpuState) -> Result<()> {
+    #[allow(clippy::unused_self)]
+    pub(crate) fn restore_signal(&self, vcpu: &mut VcpuFd, state: &VcpuState) -> Result<()> {
         for (index, value) in state.vectors.iter().enumerate() {
             Register::write_vector(vcpu, Register::v(index), *value)?;
         }
@@ -489,7 +490,7 @@ impl Machine {
     }
 
     #[allow(clippy::unused_self)]
-    pub(crate) fn reset_fpu(&self, vcpu: &VcpuFd) -> Result<()> {
+    pub(crate) fn reset_fpu(&self, vcpu: &mut VcpuFd) -> Result<()> {
         for index in 0..32 {
             Register::write_vector(vcpu, Register::v(index), 0)?;
         }
@@ -513,19 +514,20 @@ impl Machine {
         vm.get()
             .get_preferred_target(&mut target)
             .context("read the preferred vCPU target")?;
-        let vcpu = super::BrokerHandle::register(vm.get().create_vcpu(0).context("create a vCPU")?);
+        let mut vcpu =
+            super::BrokerHandle::register(vm.get().create_vcpu(0).context("create a vCPU")?);
         let machine = Self {
             memory,
             vm,
             target,
             pool: VcpuPool::new(),
         };
-        machine.reset_vcpu(vcpu.get())?;
+        machine.reset_vcpu(vcpu.get_mut())?;
         Ok((machine, vcpu))
     }
 
     /// Resets `vcpu` and points its EL1 at the layout.
-    fn reset_vcpu(&self, vcpu: &VcpuFd) -> Result<()> {
+    fn reset_vcpu(&self, vcpu: &mut VcpuFd) -> Result<()> {
         vcpu.vcpu_init(&self.target)
             .context("initialize the vCPU")?;
         for (id, value) in [
@@ -559,17 +561,17 @@ impl Machine {
     /// when present.
     pub(crate) fn configure_vcpu(
         &self,
-        vcpu: &VcpuFd,
+        vcpu: &mut VcpuFd,
         state: &VcpuState,
         tls: Option<u64>,
         registers: &Regs,
     ) -> Result<()> {
         self.reset_vcpu(vcpu)?;
-        Self::restore(vcpu, state)?;
+        self.restore(vcpu, state)?;
         if let Some(pointer) = tls {
             Register::write(vcpu, Register::TPIDR_EL0, pointer)?;
         }
-        Self::set_regs(vcpu, registers)
+        self.set_regs(vcpu, registers)
     }
 
     /// Reads the payload registers of `vcpu`.
@@ -606,7 +608,8 @@ impl Machine {
     }
 
     /// Writes the payload registers of `vcpu`, which resumes them with `eret`.
-    pub(crate) fn set_regs(vcpu: &VcpuFd, registers: &Regs) -> Result<()> {
+    #[allow(clippy::unused_self)]
+    pub(crate) fn set_regs(&self, vcpu: &mut VcpuFd, registers: &Regs) -> Result<()> {
         for (index, value) in registers.x.iter().enumerate() {
             Register::write(vcpu, Register::x(index), *value)?;
         }
@@ -623,7 +626,33 @@ impl Machine {
         Ok(())
     }
 
-    pub(crate) fn set_tls(vcpu: &VcpuFd, pointer: u64) -> Result<()> {
+    #[allow(clippy::unused_self)]
+    pub(crate) fn update_regs(
+        &self,
+        vcpu: &mut VcpuFd,
+        origin: &Regs,
+        registers: &Regs,
+    ) -> Result<()> {
+        for (index, (&old, &new)) in origin.x.iter().zip(&registers.x).enumerate() {
+            if old != new {
+                Register::write(vcpu, Register::x(index), new)?;
+            }
+        }
+        if origin.sp != registers.sp {
+            Register::write(vcpu, Register::SP_EL0, registers.sp)?;
+        }
+        if origin.pc != registers.pc {
+            Register::write(vcpu, Register::ELR_EL1, registers.pc)?;
+        }
+        let mode = u64::from(PSR_MODE_MASK | PSR_MODE32_BIT);
+        if (origin.pstate & !mode) != (registers.pstate & !mode) {
+            Register::write(vcpu, Register::SPSR_EL1, registers.pstate & !mode)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    pub(crate) fn set_tls(&self, vcpu: &mut VcpuFd, pointer: u64) -> Result<()> {
         Register::write(vcpu, Register::TPIDR_EL0, pointer)
     }
 
@@ -664,7 +693,7 @@ impl Machine {
         self.pool.tlb_epoch()
     }
 
-    pub(crate) fn sync_tlb(&self, vcpu: &VcpuFd, local_epoch: &mut u64) -> Result<()> {
+    pub(crate) fn sync_tlb(&self, vcpu: &mut VcpuFd, local_epoch: &mut u64) -> Result<()> {
         let current = self.pool.tlb_epoch();
         if *local_epoch != current {
             let pstate = Register::read(vcpu, Register::PSTATE)?;
@@ -675,7 +704,7 @@ impl Machine {
                         && (pc - VECTORS) % VECTOR_BYTES == INSTRUCTION_BYTES));
             if !at_eret {
                 let regs = self.regs(vcpu)?;
-                Self::set_regs(vcpu, &regs)?;
+                self.set_regs(vcpu, &regs)?;
             }
             Register::write(vcpu, Register::PC, LAUNCH_FLUSH)?;
             *local_epoch = current;

@@ -267,7 +267,7 @@ impl Sandbox {
             .transpose()?;
         let ptrace = ptrace::PtraceTable::new()?;
         let channel = service::Channel::new()?;
-        let (machine, vcpu, mqueue) = {
+        let (machine, mut vcpu, mqueue) = {
             let _range = fds::Range::reserve(inherited)?;
             let mqueue = service::MqueueNamespace::probe();
             let memory = GuestMemory::new(RAM_SIZE)?;
@@ -281,7 +281,7 @@ impl Sandbox {
             &loaded.arguments,
             &payload::Launch::inherited_environment(),
         )?;
-        machine::Machine::set_regs(vcpu.get(), &machine::Regs::start(launch.start, stack))?;
+        machine.set_regs(vcpu.get_mut(), &machine::Regs::start(launch.start, stack))?;
         nix::sys::prctl::set_name(&loaded.comm).context("set payload exec name")?;
         let broker = service::Broker::new(
             (machine, vcpu),
