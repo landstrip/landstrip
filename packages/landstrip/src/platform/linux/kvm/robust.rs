@@ -142,8 +142,10 @@ impl RobustMirror {
                 return Ok(());
             }
             let read = |host: u64| {
-                let bytes = memory.read(host.checked_sub(snapshot.base)?, 8).ok()?;
-                Some(u64::from_ne_bytes(bytes.try_into().ok()?))
+                memory
+                    .read_array::<8>(host.checked_sub(snapshot.base)?)
+                    .ok()
+                    .map(u64::from_ne_bytes)
             };
             for (target, value) in snapshot.exit_writes(address, read) {
                 let target =
@@ -323,8 +325,7 @@ impl RobustMirror {
             return;
         };
         let entry_at = |address: u64| {
-            let word = memory.read(address, 8).ok()?;
-            let entry = u64::from_le_bytes(word.try_into().ok()?);
+            let entry = memory.read_u64(address).ok()?;
             Some((entry & !1, entry & 1 != 0))
         };
         if head == 0 {
@@ -333,12 +334,7 @@ impl RobustMirror {
         let Some((mut entry, mut pi)) = entry_at(head) else {
             return;
         };
-        let Some(offset) = memory
-            .read(head.wrapping_add(8), 8)
-            .ok()
-            .and_then(|word| word.try_into().ok())
-            .map(u64::from_le_bytes)
-        else {
+        let Ok(offset) = memory.read_u64(head.wrapping_add(8)) else {
             return;
         };
         let Some((pending, pending_pi)) = entry_at(head.wrapping_add(16)) else {

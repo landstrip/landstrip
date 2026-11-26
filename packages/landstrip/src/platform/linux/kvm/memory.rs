@@ -35,8 +35,7 @@ impl HostCString {
         if offset == 0 {
             return Ok(Self(None));
         }
-        let mut bytes = memory.read_cstring(offset, PATH_MAX_BYTES)?;
-        bytes.push(0);
+        let bytes = memory.scan_cstring(offset, PATH_MAX_BYTES, true)?;
         Ok(Self(CString::from_vec_with_nul(bytes).ok()))
     }
 
@@ -77,6 +76,7 @@ impl HostCString {
 pub(crate) struct GuestMemory {
     pointer: *mut u8,
     size: usize,
+    pid: libc::pid_t,
     owned: AtomicBool,
     custom_mappings: AtomicBool,
 }
@@ -100,6 +100,7 @@ impl GuestMemory {
         Ok(Self {
             pointer,
             size,
+            pid: unsafe { libc::getpid() },
             owned: AtomicBool::new(true),
             custom_mappings: AtomicBool::new(false),
         })
@@ -114,6 +115,7 @@ impl GuestMemory {
         Self {
             pointer: self.pointer,
             size: self.size,
+            pid: unsafe { libc::getpid() },
             owned: AtomicBool::new(true),
             custom_mappings: AtomicBool::new(self.custom_mappings.load(Ordering::Acquire)),
         }
@@ -412,16 +414,10 @@ impl GuestMemory {
         self.supervisor_range(offset, length)
     }
 
-    fn copy_out(&self, range: Range<usize>) -> Vec<u8> {
-        let mut buffer = vec![0u8; range.len()];
+    fn copy_into(&self, start: usize, dest: &mut [u8]) {
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.pointer.add(range.start),
-                buffer.as_mut_ptr(),
-                range.len(),
-            );
+            std::ptr::copy_nonoverlapping(self.pointer.add(start), dest.as_mut_ptr(), dest.len());
         }
-        buffer
     }
 
     fn copy_in(&self, range: Range<usize>, bytes: &[u8]) {
@@ -434,26 +430,26 @@ impl GuestMemory {
         }
     }
 
-    fn try_copy_out(&self, range: Range<usize>) -> Result<Vec<u8>> {
-        if !self.custom_mappings.load(Ordering::Acquire) || range.is_empty() {
-            return Ok(self.copy_out(range));
+    fn try_copy_into(&self, range: Range<usize>, dest: &mut [u8]) -> Result<()> {
+        if !self.custom_mappings.load(Ordering::Acquire) || dest.is_empty() {
+            self.copy_into(range.start, dest);
+            return Ok(());
         }
-        let mut buffer = vec![0u8; range.len()];
         let local = libc::iovec {
-            iov_base: buffer.as_mut_ptr().cast(),
-            iov_len: buffer.len(),
+            iov_base: dest.as_mut_ptr().cast(),
+            iov_len: dest.len(),
         };
         let remote = libc::iovec {
             iov_base: unsafe { self.pointer.add(range.start) }.cast(),
-            iov_len: range.len(),
+            iov_len: dest.len(),
         };
         let copied = unsafe {
-            libc::process_vm_readv(libc::getpid(), &raw const local, 1, &raw const remote, 1, 0)
+            libc::process_vm_readv(self.pid, &raw const local, 1, &raw const remote, 1, 0)
         };
-        if copied < 0 || usize::try_from(copied).ok() != Some(range.len()) {
+        if copied < 0 || usize::try_from(copied).ok() != Some(dest.len()) {
             bail!("guest buffer read faulted");
         }
-        Ok(buffer)
+        Ok(())
     }
 
     fn try_copy_in(&self, range: Range<usize>, bytes: &[u8]) -> Result<()> {
@@ -470,7 +466,7 @@ impl GuestMemory {
             iov_len: bytes.len(),
         };
         let copied = unsafe {
-            libc::process_vm_writev(libc::getpid(), &raw const local, 1, &raw const remote, 1, 0)
+            libc::process_vm_writev(self.pid, &raw const local, 1, &raw const remote, 1, 0)
         };
         if copied < 0 || usize::try_from(copied).ok() != Some(bytes.len()) {
             bail!("guest buffer write faulted");
@@ -503,17 +499,46 @@ impl GuestMemory {
         self.address(offset, length).unwrap_or(1)
     }
 
-    pub(crate) fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
-        self.try_copy_out(self.range(offset, length)?)
+    pub(crate) fn read_into(&self, offset: u64, dest: &mut [u8]) -> Result<()> {
+        let length = u64::try_from(dest.len()).context("guest buffer length")?;
+        let range = self.range(offset, length)?;
+        self.try_copy_into(range, dest)
     }
 
+    pub(crate) fn read_array<const N: usize>(&self, offset: u64) -> Result<[u8; N]> {
+        let mut out = [0u8; N];
+        self.read_into(offset, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn read_u32(&self, offset: u64) -> Result<u32> {
+        self.read_array::<4>(offset).map(u32::from_le_bytes)
+    }
+
+    pub(crate) fn read_u64(&self, offset: u64) -> Result<u64> {
+        self.read_array::<8>(offset).map(u64::from_le_bytes)
+    }
+
+    pub(crate) fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+        let range = self.range(offset, length)?;
+        let mut buffer = vec![0u8; range.len()];
+        self.try_copy_into(range, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn read_supervisor(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
-        Ok(self.copy_out(self.supervisor_range(offset, length)?))
+        let range = self.supervisor_range(offset, length)?;
+        let mut buffer = vec![0u8; range.len()];
+        self.copy_into(range.start, &mut buffer);
+        Ok(buffer)
     }
 
     pub(crate) fn read_supervisor_u64(&self, offset: u64) -> Result<u64> {
-        let bytes = self.read_supervisor(offset, 8)?;
-        Ok(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])))
+        let range = self.supervisor_range(offset, 8)?;
+        let mut bytes = [0u8; 8];
+        self.copy_into(range.start, &mut bytes);
+        Ok(u64::from_le_bytes(bytes))
     }
 
     pub(crate) fn write(&self, offset: u64, bytes: &[u8]) -> Result<()> {
@@ -616,8 +641,9 @@ impl GuestMemory {
             bail!("guest word {offset:#x} is not 4-byte aligned");
         }
         if self.custom_mappings.load(Ordering::Acquire) {
-            let found = self.try_copy_out(range.clone())?;
-            let found = u32::from_le_bytes(found.try_into().unwrap_or_default());
+            let mut raw = [0u8; 4];
+            self.try_copy_into(range.clone(), &mut raw)?;
+            let found = u32::from_le_bytes(raw);
             if found == current {
                 self.try_copy_in(range, &new.to_le_bytes())?;
             }
@@ -643,7 +669,12 @@ impl GuestMemory {
         })
     }
 
-    fn read_cstring(&self, offset: u64, limit: usize) -> std::result::Result<Vec<u8>, Errno> {
+    fn scan_cstring(
+        &self,
+        offset: u64,
+        limit: usize,
+        include_nul: bool,
+    ) -> std::result::Result<Vec<u8>, Errno> {
         if offset < super::machine::RESERVED_END || offset >= self.size() {
             return Err(Errno::EFAULT);
         }
@@ -654,30 +685,30 @@ impl GuestMemory {
             return Err(Errno::EFAULT);
         };
         let max = available.min(limit);
+        let end = start + max;
+        let mut cursor = start;
+        let mut page = [0u8; 4096];
         let mut bytes = Vec::new();
-        if self.custom_mappings.load(Ordering::Acquire) {
-            let end = start + max;
-            let mut cursor = start;
-            while cursor < end {
-                let page_end = ((cursor + 4096) & !4095).min(end);
-                let chunk = self
-                    .try_copy_out(cursor..page_end)
-                    .map_err(|_| Errno::EFAULT)?;
-                if let Some(pos) = chunk.iter().position(|&b| b == 0) {
-                    bytes.extend_from_slice(&chunk[..pos]);
-                    return Ok(bytes);
+        let extra = usize::from(include_nul);
+        while cursor < end {
+            let page_end = ((cursor + 4096) & !4095).min(end);
+            let step = page_end - cursor;
+            let chunk = &mut page[..step];
+            self.try_copy_into(cursor..page_end, chunk)
+                .map_err(|_| Errno::EFAULT)?;
+            if let Some(pos) = chunk.iter().position(|&b| b == 0) {
+                let keep = pos + extra;
+                if bytes.is_empty() {
+                    let mut out = Vec::with_capacity(keep);
+                    out.extend_from_slice(&chunk[..keep]);
+                    return Ok(out);
                 }
-                bytes.extend_from_slice(&chunk);
-                cursor = page_end;
+                bytes.reserve_exact(keep);
+                bytes.extend_from_slice(&chunk[..keep]);
+                return Ok(bytes);
             }
-        } else {
-            for index in 0..max {
-                let byte = unsafe { std::ptr::read_volatile(self.pointer.add(start + index)) };
-                if byte == 0 {
-                    return Ok(bytes);
-                }
-                bytes.push(byte);
-            }
+            bytes.extend_from_slice(chunk);
+            cursor = page_end;
         }
         if available < limit {
             Err(Errno::EFAULT)
@@ -698,32 +729,22 @@ impl GuestMemory {
         };
         let mut comm = [0u8; 16];
         let max = available.min(15);
-        if self.custom_mappings.load(Ordering::Acquire) {
-            let end = start + max;
-            let mut cursor = start;
-            let mut written = 0;
-            while cursor < end {
-                let page_end = ((cursor + 4096) & !4095).min(end);
-                let chunk = self
-                    .try_copy_out(cursor..page_end)
-                    .map_err(|_| Errno::EFAULT)?;
-                for &byte in &chunk {
-                    comm[written] = byte;
-                    written += 1;
-                    if byte == 0 {
-                        return Ok(comm);
-                    }
-                }
-                cursor = page_end;
+        let end = start + max;
+        let mut cursor = start;
+        let mut written = 0;
+        while cursor < end {
+            let page_end = ((cursor + 4096) & !4095).min(end);
+            let step = page_end - cursor;
+            let mut chunk = [0u8; 16];
+            self.try_copy_into(cursor..page_end, &mut chunk[..step])
+                .map_err(|_| Errno::EFAULT)?;
+            if let Some(pos) = chunk[..step].iter().position(|&b| b == 0) {
+                comm[written..written + pos].copy_from_slice(&chunk[..pos]);
+                return Ok(comm);
             }
-        } else {
-            for (index, slot) in comm.iter_mut().take(max).enumerate() {
-                let byte = unsafe { std::ptr::read_volatile(self.pointer.add(start + index)) };
-                *slot = byte;
-                if byte == 0 {
-                    return Ok(comm);
-                }
-            }
+            comm[written..written + step].copy_from_slice(&chunk[..step]);
+            written += step;
+            cursor = page_end;
         }
         if available >= 15 {
             Ok(comm)
@@ -752,20 +773,21 @@ impl GuestMemory {
             else {
                 return Err(Errno::EFAULT);
             };
-            let Ok(bytes) = self.read(slot, 8) else {
+            let Ok(at) = self.read_u64(slot) else {
                 return Err(Errno::EFAULT);
             };
-            let at = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
             if at == 0 {
                 return Ok(values);
             }
-            let item = self.read_cstring(at, max_item_len).map_err(|errno| {
-                if errno == Errno::ENAMETOOLONG {
-                    Errno::E2BIG
-                } else {
-                    errno
-                }
-            })?;
+            let item = self
+                .scan_cstring(at, max_item_len, false)
+                .map_err(|errno| {
+                    if errno == Errno::ENAMETOOLONG {
+                        Errno::E2BIG
+                    } else {
+                        errno
+                    }
+                })?;
             total = total.saturating_add(item.len() + 1);
             if total > max_total_bytes {
                 return Err(Errno::E2BIG);

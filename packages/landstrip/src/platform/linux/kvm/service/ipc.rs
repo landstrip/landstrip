@@ -14,7 +14,7 @@ use syscalls::{Errno, Sysno};
 const SEMID64_BYTES: usize = 104;
 #[cfg(target_arch = "aarch64")]
 const SEMID64_BYTES: usize = 88;
-const SIGEVENT_BYTES: u64 = size_of::<libc::sigevent>() as u64;
+const SIGEVENT_LEN: usize = size_of::<libc::sigevent>();
 const NOTIFY_COOKIE_LEN: usize = 32;
 
 #[derive(Clone, Copy)]
@@ -190,7 +190,7 @@ impl SyscallArgs {
         let mut event = if self.0[1] == 0 {
             None
         } else {
-            let Ok(mut raw) = memory.read(self.0[1], SIGEVENT_BYTES) else {
+            let Ok(mut raw) = memory.read_array::<SIGEVENT_LEN>(self.0[1]) else {
                 return Errno::EFAULT.negated();
             };
             let notify = i32::from_ne_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
@@ -200,10 +200,9 @@ impl SyscallArgs {
                     return Errno::EBADF.negated();
                 }
                 let cookie_ptr = u64::from_ne_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
-                let Ok(bytes) = memory.read(cookie_ptr, NOTIFY_COOKIE_LEN as u64) else {
+                if memory.read_into(cookie_ptr, &mut cookie).is_err() {
                     return Errno::EFAULT.negated();
-                };
-                cookie.copy_from_slice(&bytes);
+                }
                 let host_cookie = cookie.as_ptr().expose_provenance() as u64;
                 raw[0..8].copy_from_slice(&host_cookie.to_ne_bytes());
             }

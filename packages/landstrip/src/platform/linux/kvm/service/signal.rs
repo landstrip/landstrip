@@ -7,8 +7,7 @@ use super::super::machine::{
 };
 use super::super::memory::GuestMemory;
 use super::{
-    Arg, ExitKind, GuestReg, Process, SIGINFO_BYTES, SyscallArgs, SysnoExt, TIMESPEC_BYTES,
-    ThreadState, WORD_SIZE,
+    Arg, ExitKind, GuestReg, Process, SIGINFO_BYTES, SyscallArgs, SysnoExt, ThreadState, WORD_SIZE,
 };
 use anyhow::{Context, Result};
 use kvm_ioctls::VcpuFd;
@@ -20,7 +19,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use syscalls::{Errno, Sysno};
 
-const STACK_T_BYTES: u64 = std::mem::size_of::<libc::stack_t>() as u64;
+const STACK_T_LEN: usize = std::mem::size_of::<libc::stack_t>();
 #[cfg(target_arch = "x86_64")]
 const GUEST_MINSIGSTKSZ: u64 = 2048;
 #[cfg(target_arch = "aarch64")]
@@ -30,8 +29,9 @@ const SLOT_FREE: u8 = 0;
 const SLOT_WRITING: u8 = 1;
 const SLOT_READY: u8 = 2;
 const SLOT_CLAIMING: u8 = 3;
-const SIGACTION_BYTES: u64 = 32;
-const UCONTEXT_BYTES: u64 = std::mem::size_of::<libc::ucontext_t>() as u64;
+const SIGACTION_LEN: usize = 32;
+const UCONTEXT_LEN: usize = std::mem::size_of::<libc::ucontext_t>();
+const UCONTEXT_BYTES: u64 = UCONTEXT_LEN as u64;
 
 pub(super) struct PendingSignal {
     pub(super) number: i32,
@@ -451,7 +451,7 @@ impl Process {
             old_raw[16..24].copy_from_slice(&thread.altstack.size.to_le_bytes());
         }
         if new_ss_addr != 0 {
-            let Ok(raw) = memory.read(new_ss_addr, STACK_T_BYTES) else {
+            let Ok(raw) = memory.read_array::<STACK_T_LEN>(new_ss_addr) else {
                 return Errno::EFAULT.negated();
             };
             let new_sp = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
@@ -605,7 +605,7 @@ impl GuestSignals {
         }
         let index = usize::try_from(sig - 1).unwrap_or(0);
         let new_action = if registers.arguments()[1] != 0 {
-            let Ok(raw) = memory.read(registers.arguments()[1], SIGACTION_BYTES) else {
+            let Ok(raw) = memory.read_array::<SIGACTION_LEN>(registers.arguments()[1]) else {
                 return Errno::EFAULT.negated();
             };
             Some(GuestSigAction {
@@ -671,10 +671,9 @@ impl GuestSignals {
         if args[1] != WORD_SIZE {
             return Errno::EINVAL.negated();
         }
-        let Ok(raw) = memory.read(args[0], WORD_SIZE) else {
+        let Ok(host_mask) = memory.read_u64(args[0]) else {
             return Errno::EFAULT.negated();
         };
-        let host_mask = u64::from_le_bytes(raw.try_into().unwrap_or([0; 8]));
         thread.run_with_temp_mask(memory, args[0], args[1], || {
             SyscallArgs::invoke(
                 Sysno::rt_sigsuspend,
@@ -723,7 +722,7 @@ impl GuestSignals {
         if sigsetsize != WORD_SIZE {
             return Errno::EINVAL.negated();
         }
-        let Ok(raw_mask) = memory.read(uthese, WORD_SIZE) else {
+        let Ok(raw_mask) = memory.read_u64(uthese) else {
             return Errno::EFAULT.negated();
         };
         let mut ts = libc::timespec {
@@ -731,7 +730,8 @@ impl GuestSignals {
             tv_nsec: 0,
         };
         let ts_ptr = if uts != 0 {
-            let Ok(raw_ts) = memory.read(uts, TIMESPEC_BYTES) else {
+            let Ok(raw_ts) = memory.read_array::<{ std::mem::size_of::<libc::timespec>() }>(uts)
+            else {
                 return Errno::EFAULT.negated();
             };
             ts.tv_sec = i64::from_le_bytes(raw_ts[0..8].try_into().unwrap_or([0; 8]));
@@ -747,7 +747,7 @@ impl GuestSignals {
             return Errno::EFAULT.negated();
         }
         let uncatchable = (1u64 << (libc::SIGKILL - 1)) | (1u64 << (libc::SIGSTOP - 1));
-        let these_mask = u64::from_le_bytes(raw_mask.try_into().unwrap_or([0; 8])) & !uncatchable;
+        let these_mask = raw_mask & !uncatchable;
         if let Some((signo, info)) =
             SIGNAL_QUEUE.pop_deliverable(ThreadState::current_tid(), these_mask)
         {
@@ -794,7 +794,10 @@ impl GuestSignals {
         let Some(mut saved) = thread.signal_frames.pop() else {
             return Ok(Some(sigsegv));
         };
-        let Ok(uc_raw) = machine.memory.read(saved.ucontext_addr, UCONTEXT_BYTES) else {
+        let Ok(uc_raw) = machine
+            .memory
+            .read_array::<UCONTEXT_LEN>(saved.ucontext_addr)
+        else {
             return Ok(Some(sigsegv));
         };
         saved.regs.apply_ucontext(&uc_raw);
@@ -970,7 +973,7 @@ impl GuestSignals {
         let ucontext_addr = frame + SIGINFO_BYTES;
         let sig_no = bit_index + 1;
 
-        let mut uc_raw = vec![0u8; usize::try_from(UCONTEXT_BYTES).unwrap_or(0)];
+        let mut uc_raw = [0u8; UCONTEXT_LEN];
         prior_regs.write_ucontext(&mut uc_raw, uc_stack, saved_mask, fault_addr, ucontext_addr);
 
         let mut next_regs = prior_regs;

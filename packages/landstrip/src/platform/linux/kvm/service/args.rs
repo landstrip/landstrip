@@ -361,21 +361,24 @@ impl SyscallArgs {
         count: u64,
         call: impl FnOnce(u64) -> u64,
     ) -> u64 {
+        const WAITV_LEN: usize = std::mem::size_of::<futex_waitv>();
         if vector == 0 || count == 0 || count > u64::from(FUTEX_WAITV_MAX) {
             // The kernel rejects these before reading the array.
             return call(u64::from(vector != 0));
         }
-        let mut copied = Vec::new();
+        let mut copied = [0_u8; FUTEX_WAITV_MAX as usize * WAITV_LEN];
+        let mut filled = 0;
         for index in 0..count {
             let Some(mut element) = vector
                 .checked_add(index * FUTEX_WAITV_BYTES)
-                .and_then(|address| memory.read(address, FUTEX_WAITV_BYTES).ok())
+                .and_then(|address| memory.read_array::<WAITV_LEN>(address).ok())
             else {
-                return Self::with_faulting_suffix(&copied, call);
+                return Self::with_faulting_suffix(&copied[..filled], call);
             };
             let word = u64::from_le_bytes(element[8..16].try_into().unwrap_or([0; 8]));
             element[8..16].copy_from_slice(&Self::futex_word(memory, word).to_le_bytes());
-            copied.extend_from_slice(&element);
+            copied[filled..filled + WAITV_LEN].copy_from_slice(&element);
+            filled += WAITV_LEN;
         }
         call(copied.as_ptr().expose_provenance() as u64)
     }
@@ -519,7 +522,9 @@ impl SyscallArgs {
             return Errno::EPERM.negated();
         }
         let info_idx = if is_tg { 3 } else { 2 };
-        let Ok(mut info_buf) = memory.read(args[info_idx], SIGINFO_BYTES) else {
+        let Ok(mut info_buf) =
+            memory.read_array::<{ std::mem::size_of::<libc::siginfo_t>() }>(args[info_idx])
+        else {
             return Errno::EFAULT.negated();
         };
         args[info_idx] = info_buf.as_mut_ptr().expose_provenance() as u64;
@@ -557,7 +562,7 @@ impl SyscallArgs {
                 )
             }
             F_SETOWN_EX => {
-                let Ok(raw) = memory.read(registers.arguments()[2], WORD_SIZE) else {
+                let Ok(raw) = memory.read_array::<8>(registers.arguments()[2]) else {
                     return Errno::EFAULT.negated();
                 };
                 let owner_pid = i32::from_ne_bytes(raw[4..8].try_into().unwrap_or([0; 4]));
@@ -931,7 +936,7 @@ impl SyscallArgs {
             Sysno::signalfd4 => return Some(self.signalfd(memory, syscall)),
             Sysno::capget | Sysno::capset => {
                 let data_len =
-                    memory.read(self.0[0], WORD_SIZE).ok().map_or(
+                    memory.read_array::<8>(self.0[0]).ok().map_or(
                         0,
                         |hdr| match u32::from_le_bytes(hdr[..4].try_into().unwrap_or([0; 4])) {
                             _LINUX_CAPABILITY_VERSION_1 => 12,
@@ -962,11 +967,9 @@ impl SyscallArgs {
         if pid == 1 {
             return Errno::EPERM.negated();
         }
-        let Ok(header) = memory.read(guest, 4) else {
+        let Ok(mut size) = memory.read_array::<4>(guest) else {
             return Errno::EFAULT.negated();
         };
-        let mut size = [0; 4];
-        size.copy_from_slice(&header);
         let length = match u32::from_ne_bytes(size) {
             0 => ATTR_V0_BYTES,
             value => value,
@@ -975,15 +978,17 @@ impl SyscallArgs {
         if page_size <= 0 {
             return Errno::EIO.negated();
         }
-        let mut attr = if length < ATTR_V0_BYTES || i64::from(length) > page_size {
-            header
+        let mut full_attr;
+        let attr: &mut [u8] = if length < ATTR_V0_BYTES || i64::from(length) > page_size {
+            &mut size
         } else {
-            let Ok(mut buffer) = memory.read(guest, u64::from(length)) else {
+            let Ok(buffer) = memory.read(guest, u64::from(length)) else {
                 return Errno::EFAULT.negated();
             };
+            full_attr = buffer;
             // Pin the length checked above even if the guest changes its copy.
-            buffer[..4].copy_from_slice(&size);
-            buffer
+            full_attr[..4].copy_from_slice(&size);
+            &mut full_attr
         };
         self.0[1] = attr.as_mut_ptr().expose_provenance() as u64;
         let result = self.forward(Sysno::sched_setattr);
@@ -996,10 +1001,10 @@ impl SyscallArgs {
     }
 
     fn clock_adjustment(mut self, memory: &GuestMemory, syscall: Sysno) -> u64 {
-        const TIMEX_BYTES: u64 = size_of::<libc::timex>() as u64;
+        const TIMEX_LEN: usize = size_of::<libc::timex>();
         let index = usize::from(syscall == Sysno::clock_adjtime);
         let guest = self.0[index];
-        let Ok(mut timex) = memory.read(guest, TIMEX_BYTES) else {
+        let Ok(mut timex) = memory.read_array::<TIMEX_LEN>(guest) else {
             return Errno::EFAULT.negated();
         };
         // Use the same private copy for validation and the syscall so another
@@ -1084,7 +1089,8 @@ impl SyscallArgs {
                 &[Arg::bytes(1, RLIMIT64_BYTES)],
             );
         }
-        let Ok(raw) = memory.read(self.0[1], RLIMIT64_BYTES) else {
+        let Ok(raw) = memory.read_array::<{ std::mem::size_of::<libc::rlimit64>() }>(self.0[1])
+        else {
             return Errno::EFAULT.negated();
         };
         let cur = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
@@ -1143,7 +1149,8 @@ impl SyscallArgs {
         old_ptr: u64,
     ) -> u64 {
         let new_limit = if new_ptr != 0 {
-            let Ok(raw) = memory.read(new_ptr, RLIMIT64_BYTES) else {
+            let Ok(raw) = memory.read_array::<{ std::mem::size_of::<libc::rlimit64>() }>(new_ptr)
+            else {
                 return Errno::EFAULT.negated();
             };
             let cur = u64::from_le_bytes(raw[..8].try_into().unwrap_or([0; 8]));
@@ -1330,7 +1337,7 @@ impl SyscallArgs {
         if result != 0 || infop == 0 {
             return result;
         }
-        if let Ok(info) = memory.read(infop, 24) {
+        if let Ok(info) = memory.read_array::<24>(infop) {
             let si_code = i32::from_ne_bytes(info[8..12].try_into().unwrap_or([0; 4]));
             let si_pid = i32::from_ne_bytes(info[16..20].try_into().unwrap_or([0; 4]));
             if orig_options & libc::WNOWAIT == 0
@@ -1362,17 +1369,28 @@ impl SyscallArgs {
     }
 
     fn clock_settime(self, memory: &GuestMemory) -> u64 {
-        if memory.read(self.0[1], TIMESPEC_BYTES).is_err() {
+        if memory
+            .read_array::<{ std::mem::size_of::<libc::timespec>() }>(self.0[1])
+            .is_err()
+        {
             return Errno::EFAULT.negated();
         }
         Errno::EPERM.negated()
     }
 
     fn settimeofday(self, memory: &GuestMemory) -> u64 {
-        if self.0[0] != 0 && memory.read(self.0[0], TIMEVAL_BYTES).is_err() {
+        if self.0[0] != 0
+            && memory
+                .read_array::<{ std::mem::size_of::<libc::timeval>() }>(self.0[0])
+                .is_err()
+        {
             return Errno::EFAULT.negated();
         }
-        if self.0[1] != 0 && memory.read(self.0[1], TIMEZONE_BYTES).is_err() {
+        if self.0[1] != 0
+            && memory
+                .read_array::<{ std::mem::size_of::<libc::timezone>() }>(self.0[1])
+                .is_err()
+        {
             return Errno::EFAULT.negated();
         }
         Errno::EPERM.negated()
@@ -1532,13 +1550,23 @@ impl SyscallArgs {
         }
         let guest_fds = self.0[0];
         let bytes = u64::from(nfds).saturating_mul(POLLFD_BYTES);
-        let mut host_buf = if nfds == 0 {
-            Vec::new()
+        let byte_len = usize::try_from(bytes).unwrap_or(usize::MAX);
+        let mut inline_fds = [0_u8; 64 * 8];
+        let mut heap_fds;
+        let host_buf: &mut [u8] = if nfds == 0 {
+            &mut []
+        } else if byte_len <= inline_fds.len() {
+            let slice = &mut inline_fds[..byte_len];
+            if memory.read_into(guest_fds, slice).is_err() {
+                return Errno::EFAULT.negated();
+            }
+            slice
         } else {
             let Ok(buf) = memory.read(guest_fds, bytes) else {
                 return Errno::EFAULT.negated();
             };
-            buf
+            heap_fds = buf;
+            &mut heap_fds
         };
         let mut invalid = Vec::new();
         for (idx, chunk) in host_buf.chunks_exact_mut(8).enumerate() {
@@ -1553,7 +1581,9 @@ impl SyscallArgs {
         if syscall == Sysno::ppoll {
             if !invalid.is_empty()
                 && self.0[2] != 0
-                && memory.read(self.0[2], TIMESPEC_BYTES).is_err()
+                && memory
+                    .read_array::<{ std::mem::size_of::<libc::timespec>() }>(self.0[2])
+                    .is_err()
             {
                 return Errno::EFAULT.negated();
             }
@@ -1663,7 +1693,7 @@ impl SyscallArgs {
         let host_pack: [u64; 2];
         let mut temp_ss = (0u64, 0u64);
         if syscall == Sysno::pselect6 && translated.raw[5] != 0 {
-            if let Ok(raw) = memory.read(translated.raw[5], 2 * WORD_SIZE) {
+            if let Ok(raw) = memory.read_array::<16>(translated.raw[5]) {
                 let ss = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
                 let ss_len = u64::from_le_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
                 temp_ss = (ss, ss_len);
@@ -1738,12 +1768,12 @@ impl SyscallArgs {
             translated.raw[len_idx] = 0;
             return translated.forward(syscall);
         }
-        let Ok(raw_len) = memory.read(guest_len_ptr, 4) else {
+        let Ok(raw_len) = memory.read_u32(guest_len_ptr) else {
             translated.raw[buf_idx] = 1;
             translated.raw[len_idx] = 1;
             return translated.forward(syscall);
         };
-        let mut host_len = i32::from_le_bytes(raw_len.try_into().unwrap_or([0; 4]));
+        let mut host_len = raw_len.cast_signed();
         translated.raw[buf_idx] = if let Ok(cap) = u64::try_from(host_len) {
             memory.address(guest_buf, cap).unwrap_or(1)
         } else {
@@ -2163,7 +2193,10 @@ impl KernelMsghdr {
                 }
                 break;
             };
-            if memory.read(entry, MMSGHDR_BYTES).is_err() {
+            if memory
+                .read_array::<{ std::mem::size_of::<KernelMmsghdr>() }>(entry)
+                .is_err()
+            {
                 if index == 0 {
                     return Err(Errno::EFAULT);
                 }
@@ -2211,7 +2244,7 @@ impl KernelMsghdr {
             else {
                 return Err(Errno::EFAULT);
             };
-            let Ok(vector) = memory.read(offset, 2 * WORD_SIZE) else {
+            let Ok(vector) = memory.read_array::<16>(offset) else {
                 return Err(Errno::EFAULT);
             };
             let base = u64::from_le_bytes(vector[..8].try_into().unwrap_or([0; 8]));
@@ -2389,7 +2422,7 @@ impl KernelMsghdr {
         address: u64,
         is_send: bool,
     ) -> std::result::Result<DecodedMsg, Errno> {
-        let Ok(raw) = memory.read(address, MSGHDR_BYTES) else {
+        let Ok(raw) = memory.read_array::<{ std::mem::size_of::<KernelMsghdr>() }>(address) else {
             return Err(Errno::EFAULT);
         };
         let name = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));

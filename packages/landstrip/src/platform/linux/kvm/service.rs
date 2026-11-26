@@ -61,7 +61,8 @@ use syscalls::{Errno, Sysno};
 
 const TIMEVAL_BYTES: u64 = std::mem::size_of::<libc::timeval>() as u64;
 const ITIMERSPEC_BYTES: u64 = std::mem::size_of::<libc::itimerspec>() as u64;
-const FILE_CLONE_RANGE_BYTES: u64 = std::mem::size_of::<file_clone_range>() as u64;
+const FILE_CLONE_RANGE_LEN: usize = std::mem::size_of::<file_clone_range>();
+const SOCKADDR_STORAGE_LEN: usize = std::mem::size_of::<libc::sockaddr_storage>();
 const WORD_SIZE: u64 = 8;
 const AT_EMPTY_PATH: u64 = libc::AT_EMPTY_PATH as u64;
 #[cfg(target_arch = "x86_64")]
@@ -169,11 +170,11 @@ impl ThreadState {
         if ss_ptr == 0 || ss_len != WORD_SIZE {
             return call();
         }
-        let Ok(raw) = memory.read(ss_ptr, WORD_SIZE) else {
+        let Ok(raw_mask) = memory.read_u64(ss_ptr) else {
             return call();
         };
         let uncatchable = (1u64 << (libc::SIGKILL - 1)) | (1u64 << (libc::SIGSTOP - 1));
-        let temp_mask = u64::from_le_bytes(raw.try_into().unwrap_or([0; 8])) & !uncatchable;
+        let temp_mask = raw_mask & !uncatchable;
         let orig_mask = GuestSignals::thread_mask();
         if SIGNAL_QUEUE.pending_mask(Self::current_tid()) & !temp_mask != 0 {
             self.temp_signal_mask = Some((temp_mask, orig_mask));
@@ -335,6 +336,7 @@ impl VforkSync {
         let host_base = process.machine.memory.base();
         let ranges = process.space_snapshot().writable_private_ranges();
         let mut entries = vec![0_u8; 4096 * 8];
+        let mut page_buf = [0_u8; 4096];
         for (start, end) in ranges {
             let mut cursor = start & !(PAGE_BYTES - 1);
             while cursor < end {
@@ -353,10 +355,15 @@ impl VforkSync {
                     let anon_exclusive = word & (1_u64 << 56) != 0;
                     if present_or_swapped && anon_exclusive {
                         let guest_page = cursor + (idx as u64) * PAGE_BYTES;
-                        if let Ok(bytes) = process.machine.memory.read(guest_page, PAGE_BYTES) {
+                        if process
+                            .machine
+                            .memory
+                            .read_into(guest_page, &mut page_buf)
+                            .is_ok()
+                        {
                             let hdr = guest_page.to_le_bytes();
                             if !Self::send_all(self.tx.as_raw_fd(), &hdr)
-                                || !Self::send_all(self.tx.as_raw_fd(), &bytes)
+                                || !Self::send_all(self.tx.as_raw_fd(), &page_buf)
                             {
                                 return;
                             }
@@ -1296,7 +1303,7 @@ impl Process {
         let event = if args[1] == 0 {
             None
         } else {
-            let Ok(bytes) = memory.read(args[1], std::mem::size_of::<libc::sigevent>() as u64)
+            let Ok(bytes) = memory.read_array::<{ std::mem::size_of::<libc::sigevent>() }>(args[1])
             else {
                 return Errno::EFAULT.negated();
             };
@@ -1727,7 +1734,7 @@ impl Process {
                 ],
             );
         }
-        let Ok(mut range_buf) = memory.read(args[2], FILE_CLONE_RANGE_BYTES) else {
+        let Ok(mut range_buf) = memory.read_array::<FILE_CLONE_RANGE_LEN>(args[2]) else {
             return Errno::EFAULT.negated();
         };
         let src_fd = i64::from_le_bytes(range_buf[..8].try_into().unwrap_or([0; 8]));
@@ -1789,14 +1796,16 @@ impl Process {
         let Ok(length) = usize::try_from(GuestReg(arguments[2]).as_i32()) else {
             return Some(Errno::EINVAL.negated());
         };
-        if length > std::mem::size_of::<libc::sockaddr_storage>() {
+        if length > SOCKADDR_STORAGE_LEN {
             return Some(Errno::EINVAL.negated());
         }
-        let Ok(address) = memory.read(arguments[1], length as u64) else {
+        let mut addr_buf = [0_u8; SOCKADDR_STORAGE_LEN];
+        let address = &mut addr_buf[..length];
+        if memory.read_into(arguments[1], address).is_err() {
             return Some(Errno::EFAULT.negated());
-        };
+        }
         let mut cwd_guard = Some(self.policy.read_cwd());
-        let verdict = network::Verdict::mediate(&self.policy, descriptor, operation, &address);
+        let verdict = network::Verdict::mediate(&self.policy, descriptor, operation, address);
         if matches!(operation, NetworkOperation::Connect) {
             drop(cwd_guard.take());
         }
@@ -1823,7 +1832,7 @@ impl Process {
         };
         Some(
             self.forward_socket_endpoint(
-                syscall, registers, memory, descriptor, &address, pinned_fd,
+                syscall, registers, memory, descriptor, address, pinned_fd,
             ),
         )
     }
@@ -1991,13 +2000,15 @@ impl Process {
         let Ok(length) = usize::try_from(GuestReg(arguments[5]).as_i32()) else {
             return Errno::EINVAL.negated();
         };
-        if length > std::mem::size_of::<libc::sockaddr_storage>() {
+        if length > SOCKADDR_STORAGE_LEN {
             return Errno::EINVAL.negated();
         }
-        let Ok(dest) = memory.read(arguments[4], length as u64) else {
+        let mut dest_buf = [0_u8; SOCKADDR_STORAGE_LEN];
+        let dest = &mut dest_buf[..length];
+        if memory.read_into(arguments[4], dest).is_err() {
             return Errno::EFAULT.negated();
-        };
-        let pinned = match self.mediate_datagram_bytes(descriptor, &dest) {
+        }
+        let pinned = match self.mediate_datagram_bytes(descriptor, dest) {
             Ok(pinned) => pinned,
             Err(status) => return status,
         };
@@ -2029,7 +2040,7 @@ impl Process {
             &[
                 Arg::fd(0),
                 Arg::bytes(1, arguments[2]),
-                Arg::copied_bytes(4, &dest),
+                Arg::copied_bytes(4, dest),
             ],
         )
     }

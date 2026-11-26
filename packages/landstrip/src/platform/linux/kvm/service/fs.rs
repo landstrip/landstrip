@@ -410,9 +410,14 @@ impl Call<'_> {
         if size > PAGE_BYTES {
             return Errno::E2BIG.negated();
         }
-        let Ok(raw_bytes) = self.memory.read(arguments[2], size) else {
-            return Errno::EFAULT.negated();
+        let Ok(size_len) = usize::try_from(size) else {
+            return Errno::E2BIG.negated();
         };
+        let mut raw_buf = [0_u8; 4096];
+        let raw_bytes = &mut raw_buf[..size_len];
+        if self.memory.read_into(arguments[2], raw_bytes).is_err() {
+            return Errno::EFAULT.negated();
+        }
         if raw_bytes[HOW_BYTES..].iter().any(|&byte| byte != 0) {
             return Errno::E2BIG.negated();
         }
@@ -483,7 +488,7 @@ impl Call<'_> {
             &[
                 pinned_dfd.as_arg(0),
                 Arg::copied_path(1, &path),
-                Arg::copied_bytes(2, &raw_bytes),
+                Arg::copied_bytes(2, raw_bytes),
             ],
         );
         self.verify_opened_fd(raw_res, flags)
