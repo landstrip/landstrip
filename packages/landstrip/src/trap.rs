@@ -295,7 +295,7 @@ impl FromStr for Reply {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct FilesystemDenial {
     pub(crate) operation: TrapOperation,
     pub(crate) path: PathBuf,
@@ -311,7 +311,7 @@ pub(crate) struct FilesystemDenial {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 impl FilesystemDenial {
-    pub(crate) fn to_trap(&self, query_id: Option<u64>) -> Trap {
+    pub(crate) fn to_trap(&self, query_id: Option<u64>, mechanism: Mechanism) -> Trap {
         let path = self.path.to_string_lossy().into_owned();
         let requested = self.requested_path.to_string_lossy();
         let requested_path = (requested.as_ref() != path).then(|| requested.into_owned());
@@ -325,12 +325,12 @@ impl FilesystemDenial {
             errno: "EACCES",
             flags: self.flags.clone(),
             reason: self.reason,
-            mechanism: Mechanism::Kvm,
+            mechanism,
             process: self.process.clone(),
         }))
     }
 
-    pub(crate) fn into_trap(self, query_id: Option<u64>) -> Trap {
+    pub(crate) fn into_trap(self, query_id: Option<u64>, mechanism: Mechanism) -> Trap {
         let path = self.path.to_string_lossy().into_owned();
         let requested = self.requested_path.to_string_lossy();
         let requested_path = (requested.as_ref() != path).then(|| requested.into_owned());
@@ -344,7 +344,7 @@ impl FilesystemDenial {
             errno: "EACCES",
             flags: self.flags,
             reason: self.reason,
-            mechanism: Mechanism::Kvm,
+            mechanism,
             process: self.process,
         }))
     }
@@ -418,6 +418,7 @@ impl Trap {
         target: String,
         process: ProcessContext,
         query_id: Option<u64>,
+        mechanism: Mechanism,
     ) -> Self {
         let syscall = operation.into();
         Self::Network(Box::new(NetworkTrap {
@@ -427,7 +428,7 @@ impl Trap {
             target,
             syscall,
             errno: "EACCES",
-            mechanism: Mechanism::Kvm,
+            mechanism,
             process,
         }))
     }

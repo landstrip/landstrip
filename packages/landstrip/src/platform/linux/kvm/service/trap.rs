@@ -8,6 +8,7 @@ use super::super::machine::Regs;
 use super::super::memory::HostCString;
 use super::super::policy::{self, Access, DirBase, Missing, Policy, ResolveFlags};
 use super::{AT_EMPTY_PATH, SyscallArgs, WORD_SIZE};
+use crate::error::Mechanism;
 use crate::policy::DenialReason;
 use crate::trap::{FilesystemDenial, NetworkOperation, Reply, ReplyAction, Trap, TrapOperation};
 use crate::trap_fd::TrapFd;
@@ -336,7 +337,7 @@ impl Denials {
             return QueryOutcome::Denied;
         }
         let query_id = state.allocate_query_id();
-        let trap = denial.to_trap(Some(query_id));
+        let trap = denial.to_trap(Some(query_id), Mechanism::Kvm);
         self.ask(trap_fd, &mut state, subject, query_id, &trap)
     }
 
@@ -372,6 +373,7 @@ impl Denials {
             target.to_owned(),
             policy.process_context(),
             Some(query_id),
+            Mechanism::Kvm,
         );
         self.ask(trap_fd, &mut state, subject, query_id, &trap)
     }
@@ -892,7 +894,7 @@ impl Denials {
                 QueryOutcome::Denied => {}
             }
         }
-        let trap = record.into_trap(None);
+        let trap = record.into_trap(None, Mechanism::Kvm);
         let deferred = matches!(denial.access, Access::Read)
             && matches!(denial.reason, DenialReason::AllowMiss);
         if deferred {
@@ -910,7 +912,13 @@ impl Denials {
         operation: NetworkOperation,
         target: String,
     ) {
-        let trap = Trap::network(operation, target, policy.process_context(), None);
+        let trap = Trap::network(
+            operation,
+            target,
+            policy.process_context(),
+            None,
+            Mechanism::Kvm,
+        );
         self.report(&trap);
     }
 
