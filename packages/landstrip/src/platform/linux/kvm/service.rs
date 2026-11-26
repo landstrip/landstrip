@@ -2359,7 +2359,7 @@ impl ForkSnapshot {
         let child_process = Arc::new(Process {
             machine,
             denials,
-            policy: self.policy,
+            policy: self.policy.into_child(),
             dbus_proxies: self.dbus_proxies,
             signals: self.signals,
             timers: Mutex::new(HashSet::new()),

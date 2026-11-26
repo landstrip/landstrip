@@ -15,7 +15,7 @@ use linux_raw_sys::general::{
     FUTEX_CMD_MASK, FUTEX_LOCK_PI, FUTEX_LOCK_PI2, FUTEX_WAIT, FUTEX_WAIT_BITSET,
     FUTEX_WAIT_REQUEUE_PI, open_how,
 };
-use std::ffi::{CString, OsStr};
+use std::ffi::CString;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use syscalls::{Errno, Sysno};
@@ -508,43 +508,7 @@ impl Call<'_> {
             return None;
         }
         let raw = path.as_bytes()?;
-        let candidate = std::path::Path::new(OsStr::from_bytes(raw));
-        let full = if candidate.is_absolute() {
-            candidate.to_path_buf()
-        } else {
-            match dir {
-                DirBase::Cwd => self.policy.cwd().join(candidate),
-                DirBase::Guest(fd) if fd == i64::from(libc::AT_FDCWD) => {
-                    self.policy.cwd().join(candidate)
-                }
-                DirBase::Guest(fd)
-                    if i32::try_from(fd)
-                        .ok()
-                        .is_some_and(|raw| GuestFd::from_raw(raw).valid().is_some()) =>
-                {
-                    std::path::PathBuf::from(format!("/proc/self/fd/{fd}")).join(candidate)
-                }
-                DirBase::Pinned(fd) => {
-                    std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
-                        .join(candidate)
-                }
-                DirBase::Guest(_) | DirBase::Invalid => return None,
-            }
-        };
-        if !follow
-            && let Ok(meta) = std::fs::symlink_metadata(&full)
-            && meta.file_type().is_symlink()
-        {
-            return None;
-        }
-        let canonical = std::fs::canonicalize(full).ok()?;
-        let self_root = std::path::PathBuf::from(format!("/proc/{}", std::process::id()));
-        let relative = canonical.strip_prefix(&self_root).ok()?;
-        let is_self_maps = relative == std::path::Path::new("maps")
-            || (relative.starts_with("task")
-                && relative.file_name() == Some(OsStr::new("maps"))
-                && relative.components().count() == 3);
-        if !is_self_maps {
+        if !self.policy.is_proc_self_maps_at(dir, raw, follow) {
             return None;
         }
 

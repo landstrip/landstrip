@@ -25,11 +25,12 @@ use nix::sys::stat::{fstat, fstatat};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
+use std::io::Write;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -361,6 +362,8 @@ pub(crate) struct Policy {
     rules: AccessPolicy,
     cwd: PathBuf,
     cwd_lock: RwLock<()>,
+    pid: u32,
+    self_root: PathBuf,
     exe: RwLock<PathBuf>,
     abstract_sockets: RwLock<HashSet<Vec<u8>>>,
 }
@@ -375,10 +378,13 @@ pub(super) struct ExecPolicy {
 
 impl ExecPolicy {
     pub(super) fn restore(self) -> Result<Policy> {
+        let pid = std::process::id();
         Ok(Policy {
             rules: self.rules.restore()?,
             cwd: self.cwd.into(),
             cwd_lock: RwLock::new(()),
+            pid,
+            self_root: PathBuf::from(format!("/proc/{pid}")),
             exe: RwLock::new(self.exe.into()),
             abstract_sockets: RwLock::new(self.abstract_sockets),
         })
@@ -410,10 +416,13 @@ impl Denial {
 
 impl Policy {
     pub(crate) fn new(policy: &AccessPolicy, cwd: &Path, exe: &Path) -> Self {
+        let pid = std::process::id();
         Self {
             rules: policy.clone(),
             cwd: cwd.to_path_buf(),
             cwd_lock: RwLock::new(()),
+            pid,
+            self_root: PathBuf::from(format!("/proc/{pid}")),
             exe: RwLock::new(exe.to_path_buf()),
             abstract_sockets: RwLock::new(HashSet::new()),
         }
@@ -424,6 +433,8 @@ impl Policy {
             rules: self.rules.clone(),
             cwd: self.cwd.clone(),
             cwd_lock: RwLock::new(()),
+            pid: self.pid,
+            self_root: self.self_root.clone(),
             exe: RwLock::new(self.exe()),
             abstract_sockets: RwLock::new(
                 self.abstract_sockets
@@ -432,6 +443,14 @@ impl Policy {
             ),
         }
     }
+
+    pub(crate) fn into_child(mut self) -> Self {
+        let pid = std::process::id();
+        self.pid = pid;
+        self.self_root = PathBuf::from(format!("/proc/{pid}"));
+        self
+    }
+
     pub(crate) fn read_cwd(&self) -> RwLockReadGuard<'_, ()> {
         self.cwd_lock
             .read()
@@ -521,7 +540,7 @@ impl Policy {
             Resolution::Kernel | Resolution::Unclassified => return Vec::new(),
             Resolution::Unresolvable(unres) => {
                 let mut denial = Denial::unresolvable(access, unres);
-                denial.queryable = !creating && !Self::is_broker_proc_self_fd(&denial.path);
+                denial.queryable = !creating && !self.is_broker_proc_self_fd(&denial.path);
                 return vec![denial];
             }
             Resolution::Resolved(resolved) => resolved,
@@ -640,32 +659,23 @@ impl Policy {
             None => path.to_path_buf(),
         };
         let lexical = joined.clean_lexically();
-        if Self::is_broker_proc_self_fd(&lexical) {
-            return Resolution::Unresolvable(lexical);
-        }
-        let proc_dir = if path.is_absolute() {
-            DirBase::Cwd
-        } else {
-            dir
-        };
-        if follow && self.is_proc_self_exe_at(proc_dir, path.as_os_str().as_bytes(), true) {
-            return Resolution::Resolved(Resolved {
-                label: self.exe(),
-                lexical,
-                present: true,
-            });
+        match self.classify_special(&lexical, follow) {
+            SpecialPath::BrokerFd => return Resolution::Unresolvable(lexical),
+            SpecialPath::SelfExe => {
+                return Resolution::Resolved(Resolved {
+                    label: self.exe(),
+                    lexical,
+                    present: true,
+                });
+            }
+            SpecialPath::GuestFd { fd, remainder } => {
+                return Self::resolve_guest_fd_target(&lexical, fd, &remainder);
+            }
+            SpecialPath::Ordinary => {}
         }
         if follow {
-            if let Some(resolution) = Self::resolve_proc_self_fd(&lexical, true) {
-                return resolution;
-            }
-            let canonical = fs::canonicalize(&lexical);
-            if canonical.is_err()
-                && let Some(resolution) = Self::resolve_proc_self_fd(&lexical, false)
-            {
-                return resolution;
-            }
-            let label = canonical.unwrap_or_else(|_| lexical.canonicalize_existing_prefix());
+            let label = fs::canonicalize(&lexical)
+                .unwrap_or_else(|_| lexical.canonicalize_existing_prefix());
             let present = Resolved::exists_at(dir, path, true);
             return Resolution::Resolved(Resolved {
                 label,
@@ -728,7 +738,7 @@ impl Policy {
         let Some(lexical) = resolve.lexical_path(&root_base, path) else {
             return Resolution::Kernel;
         };
-        if Self::is_broker_proc_self_fd(&lexical) {
+        if self.is_broker_proc_self_fd(&lexical) {
             return Resolution::Unresolvable(lexical);
         }
         match ProbeOpen::open(raw_dirfd, path, follow, false, resolve) {
@@ -937,6 +947,44 @@ impl Policy {
         }
     }
 
+    fn proc_dev() -> Option<libc::dev_t> {
+        static DEV: OnceLock<Option<libc::dev_t>> = OnceLock::new();
+        *DEV.get_or_init(|| {
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::stat(c"/proc/self".as_ptr(), stat.as_mut_ptr()) } < 0 {
+                return None;
+            }
+            Some(unsafe { stat.assume_init() }.st_dev)
+        })
+    }
+
+    fn is_proc_path(path: &Path) -> bool {
+        let Some(dev) = Self::proc_dev() else {
+            return true;
+        };
+        let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        unsafe {
+            libc::stat(cpath.as_ptr(), stat.as_mut_ptr()) == 0 && stat.assume_init().st_dev == dev
+        }
+    }
+
+    fn is_self_proc_dir(&self, dir: &Path) -> bool {
+        if !Self::is_proc_path(dir) {
+            return false;
+        }
+        let Ok(canon) = fs::canonicalize(dir) else {
+            return false;
+        };
+        canon == self.self_root
+            || canon
+                .strip_prefix(&self.self_root)
+                .ok()
+                .is_some_and(|rel| rel.starts_with("task") && rel.components().count() == 2)
+    }
+
     pub(crate) fn is_proc_self_exe_at(
         &self,
         dir: DirBase<'_>,
@@ -945,10 +993,15 @@ impl Policy {
     ) -> bool {
         const MAX_SYMLINKS: usize = 40;
         let candidate = Path::new(OsStr::from_bytes(raw_path));
+        if !follow
+            && let Some(std::path::Component::Normal(name)) = candidate.components().next_back()
+            && name != OsStr::new("exe")
+        {
+            return false;
+        }
         let Some(mut current) = self.join_base(dir, candidate) else {
             return false;
         };
-        let self_root = PathBuf::from(format!("/proc/{}", std::process::id()));
         let limit = if follow { MAX_SYMLINKS } else { 0 };
         for _ in 0..=limit {
             let Some(parent) = current.parent() else {
@@ -957,16 +1010,7 @@ impl Policy {
             let Some(name) = current.file_name() else {
                 return false;
             };
-            if name == OsStr::new("exe")
-                && let Ok(canon_parent) = fs::canonicalize(parent)
-                && (canon_parent == self_root
-                    || canon_parent
-                        .strip_prefix(&self_root)
-                        .ok()
-                        .is_some_and(|rel| {
-                            rel.starts_with("task") && rel.components().count() == 2
-                        }))
-            {
+            if name == OsStr::new("exe") && self.is_self_proc_dir(parent) {
                 return true;
             }
             if !follow {
@@ -983,6 +1027,62 @@ impl Policy {
         }
         false
     }
+
+    pub(crate) fn is_proc_self_maps_at(
+        &self,
+        dir: DirBase<'_>,
+        raw_path: &[u8],
+        follow: bool,
+    ) -> bool {
+        let Ok(cpath) = CString::new(raw_path) else {
+            return false;
+        };
+        let candidate = Path::new(OsStr::from_bytes(raw_path));
+        let raw_dirfd = if candidate.is_absolute() {
+            libc::AT_FDCWD
+        } else {
+            match dir {
+                DirBase::Cwd => libc::AT_FDCWD,
+                DirBase::Guest(fd) if fd == i64::from(libc::AT_FDCWD) => libc::AT_FDCWD,
+                DirBase::Guest(fd) => match RawFd::try_from(fd) {
+                    Ok(raw) if super::fds::GuestFd::from_raw(raw).valid().is_some() => raw,
+                    _ => return false,
+                },
+                DirBase::Pinned(fd) => fd.as_raw_fd(),
+                DirBase::Invalid => return false,
+            }
+        };
+        let stat_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstatat(raw_dirfd, cpath.as_ptr(), stat.as_mut_ptr(), stat_flags) } < 0 {
+            return false;
+        }
+        let stat = unsafe { stat.assume_init() };
+        if !follow && (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+            return false;
+        }
+        if Self::proc_dev().is_some_and(|dev| stat.st_dev != dev) {
+            return false;
+        }
+        let full = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else if raw_dirfd == libc::AT_FDCWD {
+            self.cwd().join(candidate)
+        } else {
+            PathBuf::from(format!("/proc/self/fd/{raw_dirfd}")).join(candidate)
+        };
+        let Ok(canonical) = fs::canonicalize(full) else {
+            return false;
+        };
+        let Ok(relative) = canonical.strip_prefix(&self.self_root) else {
+            return false;
+        };
+        relative == Path::new("maps")
+            || (relative.starts_with("task")
+                && relative.file_name() == Some(OsStr::new("maps"))
+                && relative.components().count() == 3)
+    }
+
     pub(crate) fn has_forbidden_proc_target_at(
         &self,
         dir: DirBase<'_>,
@@ -1068,7 +1168,10 @@ impl Policy {
         if (stat.st_mode & libc::S_IFMT) != libc::S_IFDIR {
             return false;
         }
-        let Ok(target) = fs::read_link(format!("/proc/self/fd/{fd}")) else {
+        if Self::proc_dev().is_some_and(|dev| stat.st_dev != dev) {
+            return false;
+        }
+        let Ok(target) = FdLabel::read_proc_fd_link(fd) else {
             return false;
         };
         let self_root = PathBuf::from(format!("/proc/{}", std::process::id()));
@@ -1094,32 +1197,20 @@ impl Policy {
         let Some(full) = self.join_base(dir, candidate) else {
             return false;
         };
-        Self::is_broker_proc_self_fd(&full)
+        self.is_broker_proc_self_fd(&full)
     }
 
-    fn is_broker_proc_self_fd(lexical: &Path) -> bool {
-        Self::proc_self_fd_target(lexical, true)
-            .and_then(|(fd, _)| RawFd::try_from(fd).ok())
-            .is_some_and(|raw| super::fds::GuestFd::from_raw(raw).is_broker())
+    fn is_broker_proc_self_fd(&self, lexical: &Path) -> bool {
+        matches!(self.classify_special(lexical, false), SpecialPath::BrokerFd)
     }
 
-    fn resolve_proc_self_fd(lexical: &Path, fast_only: bool) -> Option<Resolution> {
-        if fast_only && !lexical.starts_with("/proc") && !lexical.starts_with("/dev") {
-            return None;
-        }
-        let (fd, remainder) = Self::proc_self_fd_target(lexical, false)?;
-        if RawFd::try_from(fd)
-            .ok()
-            .is_some_and(|raw| super::fds::GuestFd::from_raw(raw).is_broker())
-        {
-            return Some(Resolution::Unresolvable(lexical.to_path_buf()));
-        }
-        Some(match DescriptorTarget::resolve(fd) {
+    fn resolve_guest_fd_target(lexical: &Path, fd: i64, remainder: &Path) -> Resolution {
+        match DescriptorTarget::resolve(fd) {
             DescriptorTarget::Path(label) => {
                 let target = if remainder.as_os_str().is_empty() {
                     label
                 } else {
-                    let joined = label.join(&remainder);
+                    let joined = label.join(remainder);
                     fs::canonicalize(&joined)
                         .unwrap_or_else(|_| joined.canonicalize_existing_prefix())
                 };
@@ -1136,50 +1227,80 @@ impl Policy {
             }
             DescriptorTarget::Unresolvable(unres) => Resolution::Unresolvable(unres),
             DescriptorTarget::Unclassified | DescriptorTarget::Invalid => Resolution::Kernel,
-        })
+        }
     }
 
-    fn proc_self_fd_target(path: &Path, include_fdinfo: bool) -> Option<(i64, PathBuf)> {
+    fn classify_special(&self, lexical: &Path, follow: bool) -> SpecialPath {
         const MAX_SYMLINKS: usize = 40;
-        let self_root = PathBuf::from(format!("/proc/{}", std::process::id()));
-        let mut current = path.clean_lexically();
+        let mut current: Cow<'_, Path> = Cow::Borrowed(lexical);
         for _ in 0..=MAX_SYMLINKS {
-            if let Some(hit) = Self::match_proc_self_fd(&current, &self_root, include_fdinfo) {
-                return Some(hit);
+            if let Some((fd, remainder, is_fdinfo)) = self.match_proc_self_fd(&current, true) {
+                if RawFd::try_from(fd)
+                    .ok()
+                    .is_some_and(|raw| super::fds::GuestFd::from_raw(raw).is_broker())
+                {
+                    return SpecialPath::BrokerFd;
+                }
+                if follow && !is_fdinfo {
+                    return SpecialPath::GuestFd { fd, remainder };
+                }
+                return SpecialPath::Ordinary;
             }
             if let Ok(rel) = current.strip_prefix("/dev/fd")
                 && let Some(first) = rel.components().next()
-                && let Ok(fd) = first.as_os_str().to_str()?.parse::<i64>()
+                && let Some(fd) = first
+                    .as_os_str()
+                    .to_str()
+                    .and_then(|s| s.parse::<i64>().ok())
             {
-                let mut rest = PathBuf::new();
-                for comp in rel.components().skip(1) {
-                    rest.push(comp.as_os_str());
+                if RawFd::try_from(fd)
+                    .ok()
+                    .is_some_and(|raw| super::fds::GuestFd::from_raw(raw).is_broker())
+                {
+                    return SpecialPath::BrokerFd;
                 }
-                return Some((fd, rest));
+                if follow {
+                    let mut remainder = PathBuf::new();
+                    for comp in rel.components().skip(1) {
+                        remainder.push(comp.as_os_str());
+                    }
+                    return SpecialPath::GuestFd { fd, remainder };
+                }
+                return SpecialPath::Ordinary;
             }
-            let parent = current.parent()?;
-            let Ok(target) = fs::read_link(&current) else {
-                return None;
+            let Some(parent) = current.parent() else {
+                return SpecialPath::Ordinary;
             };
-            current = if target.is_absolute() {
+            if follow
+                && current.file_name() == Some(OsStr::new("exe"))
+                && self.is_self_proc_dir(parent)
+            {
+                return SpecialPath::SelfExe;
+            }
+            let Ok(target) = fs::read_link(&*current) else {
+                return SpecialPath::Ordinary;
+            };
+            current = Cow::Owned(if target.is_absolute() {
                 target.clean_lexically()
             } else {
                 parent.join(target).clean_lexically()
-            };
+            });
         }
-        None
+        SpecialPath::Ordinary
     }
 
     fn match_proc_self_fd(
+        &self,
         path: &Path,
-        self_root: &Path,
         include_fdinfo: bool,
-    ) -> Option<(i64, PathBuf)> {
+    ) -> Option<(i64, PathBuf, bool)> {
         let mut ancestors: Vec<&OsStr> = Vec::new();
         let mut cursor = path;
         while let (Some(parent), Some(name)) = (cursor.parent(), cursor.file_name()) {
-            if let Ok(canon_parent) = fs::canonicalize(parent)
-                && let Ok(rel) = canon_parent.strip_prefix(self_root)
+            if let Some(fd) = name.to_str().and_then(|s| s.parse::<i64>().ok())
+                && Self::is_proc_path(parent)
+                && let Ok(canon_parent) = fs::canonicalize(parent)
+                && let Ok(rel) = canon_parent.strip_prefix(&self.self_root)
             {
                 let is_fd = rel == Path::new("fd")
                     || (rel.starts_with("task")
@@ -1187,17 +1308,16 @@ impl Policy {
                         && rel.components().count() == 3);
                 let is_fdinfo = include_fdinfo
                     && ancestors.is_empty()
-                    && (rel == Path::new("fdinfo")
+                    && (rel == Path::new("fdinfo") && rel.components().count() == 1
                         || (rel.starts_with("task")
                             && rel.file_name() == Some(OsStr::new("fdinfo"))
                             && rel.components().count() == 3));
                 if is_fd || is_fdinfo {
-                    let fd = name.to_str()?.parse::<i64>().ok()?;
                     let mut remainder = PathBuf::new();
                     for part in ancestors.into_iter().rev() {
                         remainder.push(part);
                     }
-                    return Some((fd, remainder));
+                    return Some((fd, remainder, is_fdinfo));
                 }
             }
             ancestors.push(name);
@@ -1211,7 +1331,7 @@ impl Policy {
 
     pub(crate) fn process_context(&self) -> ProcessContext {
         ProcessContext {
-            pid: std::process::id(),
+            pid: self.pid,
             exe: Some(self.exe().to_string_lossy().into_owned()),
             cwd: Some(self.cwd().to_string_lossy().into_owned()),
         }
@@ -1395,6 +1515,13 @@ enum FdLabel {
     },
 }
 
+enum SpecialPath {
+    Ordinary,
+    BrokerFd,
+    GuestFd { fd: i64, remainder: PathBuf },
+    SelfExe,
+}
+
 impl FdLabel {
     fn memfd_dev() -> Option<libc::dev_t> {
         static DEV: OnceLock<Option<libc::dev_t>> = OnceLock::new();
@@ -1408,9 +1535,36 @@ impl FdLabel {
         })
     }
 
+    fn read_proc_fd_link(fd: RawFd) -> Result<PathBuf, ()> {
+        let mut path_buf = [0_u8; 32];
+        let written = {
+            let mut cursor = &mut path_buf[..31];
+            let before = cursor.len();
+            write!(cursor, "/proc/self/fd/{fd}").map_err(|_| ())?;
+            before - cursor.len()
+        };
+        path_buf[written] = 0;
+        let mut target = [0_u8; 4096];
+        let rc = unsafe {
+            libc::readlink(
+                path_buf.as_ptr().cast(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        if rc < 0 {
+            return Err(());
+        }
+        let len = usize::try_from(rc).map_err(|_| ())?;
+        if len == target.len() {
+            let cpath = CStr::from_bytes_with_nul(&path_buf[..=written]).map_err(|_| ())?;
+            return fs::read_link(OsStr::from_bytes(cpath.to_bytes())).map_err(|_| ());
+        }
+        Ok(PathBuf::from(OsString::from_vec(target[..len].to_vec())))
+    }
+
     fn resolve(fd: BorrowedFd<'_>) -> Result<Self, ()> {
-        let proc_path = Path::new("/proc/self/fd").join(fd.as_raw_fd().to_string());
-        let label = fs::read_link(proc_path).map_err(|_| ())?;
+        let label = Self::read_proc_fd_link(fd.as_raw_fd())?;
         if !label.is_absolute() {
             return Ok(Self::Anonymous);
         }
