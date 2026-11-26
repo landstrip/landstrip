@@ -42,9 +42,11 @@ import {
   binaryPath,
   type LandstripControlResponse,
   type LandstripPolicy,
+  type LandstripLinuxBackend,
   type SandboxConfig as BaseSandboxConfig,
   type SandboxConfigFile,
   type SandboxFilesystemConfig,
+  type SandboxLinuxConfig,
   type SandboxNetworkConfig,
   type SandboxShellConfig,
   type SandboxWindowsConfig,
@@ -101,6 +103,7 @@ import {
 
 export interface SandboxConfig extends BaseSandboxConfig {
   shell: SandboxShellConfig;
+  linux: SandboxLinuxConfig;
   windows: SandboxWindowsConfig;
 }
 import {
@@ -223,6 +226,32 @@ export function formatSandboxPromptGuidelines(
   }
 
   return [writeLine, readLine, networkLine];
+}
+
+export function buildLandstripRunArgs(
+  policyPath: string,
+  command: string,
+  args: readonly string[],
+  options: {
+    linuxBackend?: LandstripLinuxBackend;
+    inheritFd?: number;
+    trapFd?: number;
+    platform?: NodeJS.Platform;
+  } = {},
+): string[] {
+  const platform = options.platform ?? process.platform;
+  const runArgs = ['run', '-p', policyPath];
+  if (
+    platform === 'linux' &&
+    options.linuxBackend !== undefined &&
+    options.linuxBackend !== 'auto'
+  ) {
+    runArgs.push('--backend', options.linuxBackend);
+  }
+  if (options.inheritFd !== undefined) runArgs.push('--inherit', String(options.inheritFd));
+  if (options.trapFd !== undefined) runArgs.push('--trap', String(options.trapFd));
+  runArgs.push('--', command, ...args);
+  return runArgs;
 }
 
 export { parseSeatbeltDenials };
@@ -2106,7 +2135,6 @@ function createLandstripIntegrationWithPrompts(
       if (disposed) throw new Error('Prepared process has been disposed');
       if (spawned) throw new Error('Prepared process can only be spawned once');
       spawned = true;
-      const landstripArgs = ['run', '-p', workerPolicy.path];
       const authPipe =
         Array.isArray(spawnOptions.stdio) && spawnOptions.stdio[WORKER_AUTH_FD] === 'pipe';
       if (authPipe && process.platform === 'win32') {
@@ -2116,10 +2144,17 @@ function createLandstripIntegrationWithPrompts(
       if (workerChildEnd || authPipe) stdio.push(workerChildEnd ?? 'ignore');
       if (authPipe) {
         stdio.push('pipe');
-        landstripArgs.push('--inherit', String(WORKER_AUTH_FD));
       }
-      if (workerChildEnd) landstripArgs.push('--trap', '3');
-      landstripArgs.push('--', options.command, ...options.args);
+      const landstripArgs = buildLandstripRunArgs(
+        workerPolicy.path,
+        options.command,
+        options.args,
+        {
+          linuxBackend: config.linux.backend,
+          ...(authPipe ? { inheritFd: WORKER_AUTH_FD } : {}),
+          ...(workerChildEnd ? { trapFd: 3 } : {}),
+        },
+      );
       const child = spawn(binaryPath(), landstripArgs, {
         ...spawnOptions,
         cwd: options.cwd,
@@ -2354,9 +2389,15 @@ function createLandstripIntegrationWithPrompts(
             cwd,
           );
           policy = writePolicyFile(cwd, proxy?.port ?? null, 'shell', processAllowances, ctx);
-          landstripArgs = ['run', '-p', policy.path];
-          if (process.platform !== 'win32') landstripArgs.push('--trap', '3');
-          landstripArgs.push('--', invocation.executable, ...invocation.args);
+          landstripArgs = buildLandstripRunArgs(
+            policy.path,
+            invocation.executable,
+            invocation.args,
+            {
+              linuxBackend: config.linux.backend,
+              ...(process.platform !== 'win32' ? { trapFd: 3 } : {}),
+            },
+          );
         } catch (error) {
           await teardownResources();
           throw error;

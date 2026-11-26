@@ -26,6 +26,9 @@
     ],
     "denyWriteAlways": []
   },
+  "linux": {
+    "backend": "auto"
+  },
   "windows": {
     "appContainerMode": "standard",
     "allowLoopback": false

@@ -30,6 +30,9 @@ approvals are written to the global or project file. For policy-only shell reads
 Shell reads default to `"host"`; workers always use policy reads. See
 [landstrip(1)](../landstrip/man/man1/landstrip.1) for native policy, traps,
 and platform limits, including Windows read grants and hard-denial restrictions.
+On Linux, `linux.backend` selects `"auto"` (default; uses `"machine"` when
+`/dev/kvm` is accessible and falls back to `"container"`), `"container"`, or
+`"machine"`.
 
 Worker boundaries:
 
