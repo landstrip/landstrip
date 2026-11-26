@@ -27,7 +27,7 @@ use self::trap::{Denials, Empty, PendingDenials, QueryOutcome, QueryState, Reque
 use super::ErrnoExt;
 use super::cancel::{Client, Request as CancelRequest};
 use super::dbus::DbusProxies;
-use super::fds::{BrokerHandle, GuestFd};
+use super::fds::{BrokerFd, BrokerHandle, GuestFd};
 use super::handoff::RestartImage;
 use super::machine::{ExitReason, Machine, PAGE_BYTES, RESERVED_END, Regs, VcpuState};
 use super::memory::{GuestMemory, HostCString};
@@ -1795,27 +1795,32 @@ impl Process {
         let Ok(address) = memory.read(arguments[1], length as u64) else {
             return Some(Errno::EFAULT.negated());
         };
-        let pinned_fd =
-            match network::Verdict::mediate(&self.policy, descriptor, operation, &address) {
-                network::Verdict::Allow { pinned } => pinned,
-                network::Verdict::SessionBus {
-                    upstream,
-                    target,
-                    allowed,
-                } => {
-                    return Some(self.connect_session_bus(descriptor, &upstream, target, allowed));
+        let mut cwd_guard = Some(self.policy.read_cwd());
+        let verdict = network::Verdict::mediate(&self.policy, descriptor, operation, &address);
+        if matches!(operation, NetworkOperation::Connect) {
+            drop(cwd_guard.take());
+        }
+        let pinned_fd = match verdict {
+            network::Verdict::Allow { pinned } => pinned,
+            network::Verdict::SessionBus {
+                upstream,
+                target,
+                allowed,
+            } => {
+                drop(cwd_guard);
+                return Some(self.connect_session_bus(descriptor, &upstream, target, allowed));
+            }
+            network::Verdict::Refuse {
+                errno,
+                denial,
+                pinned,
+            } => {
+                if let Some(status) = self.refuse_network(errno, denial) {
+                    return Some(status);
                 }
-                network::Verdict::Refuse {
-                    errno,
-                    denial,
-                    pinned,
-                } => {
-                    if let Some(status) = self.refuse_network(errno, denial) {
-                        return Some(status);
-                    }
-                    pinned
-                }
-            };
+                pinned
+            }
+        };
         Some(
             self.forward_socket_endpoint(
                 syscall, registers, memory, descriptor, &address, pinned_fd,
@@ -1936,24 +1941,28 @@ impl Process {
                     Ok(msg) => msg,
                     Err(errno) => return errno.negated(),
                 };
-                if let Some(dest) = decoded.send_name().filter(|bytes| !bytes.is_empty())
-                    && let Some(status) = self.mediate_datagram_bytes(descriptor, dest)
-                {
-                    return status;
+                if let Some(dest) = decoded.send_name().filter(|bytes| !bytes.is_empty()) {
+                    match self.mediate_datagram_bytes(descriptor, dest) {
+                        Ok(Some(pinned)) => decoded.set_pinned_dest(pinned),
+                        Ok(None) => {}
+                        Err(status) => return status,
+                    }
                 }
                 decoded.send_single(descriptor, arguments[2])
             }
             Sysno::sendmmsg => {
-                let decoded =
+                let mut decoded =
                     match KernelMsghdr::decode_batch(memory, arguments[1], arguments[2], true) {
                         Ok(batch) => batch,
                         Err(errno) => return errno.negated(),
                     };
-                for msg in &decoded {
-                    if let Some(dest) = msg.send_name().filter(|bytes| !bytes.is_empty())
-                        && let Some(status) = self.mediate_datagram_bytes(descriptor, dest)
-                    {
-                        return status;
+                for msg in &mut decoded {
+                    if let Some(dest) = msg.send_name().filter(|bytes| !bytes.is_empty()) {
+                        match self.mediate_datagram_bytes(descriptor, dest) {
+                            Ok(Some(pinned)) => msg.set_pinned_dest(pinned),
+                            Ok(None) => {}
+                            Err(status) => return status,
+                        }
                     }
                 }
                 KernelMsghdr::send_multi(descriptor, arguments[1], arguments[3], memory, decoded)
@@ -1988,8 +1997,30 @@ impl Process {
         let Ok(dest) = memory.read(arguments[4], length as u64) else {
             return Errno::EFAULT.negated();
         };
-        if let Some(status) = self.mediate_datagram_bytes(descriptor, &dest) {
-            return status;
+        let pinned = match self.mediate_datagram_bytes(descriptor, &dest) {
+            Ok(pinned) => pinned,
+            Err(status) => return status,
+        };
+        if let Some(pinned) = pinned {
+            let proc_path = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+            if let Ok(sock_addr) = socket2::SockAddr::unix(proc_path)
+                && let Ok(addr_len) = usize::try_from(sock_addr.len())
+            {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(sock_addr.as_ptr().cast::<u8>(), addr_len)
+                };
+                let mut raw = *arguments;
+                raw[5] = u64::from(sock_addr.len());
+                return SyscallArgs(raw).translate_and_forward(
+                    memory,
+                    Sysno::sendto,
+                    &[
+                        Arg::fd(0),
+                        Arg::bytes(1, arguments[2]),
+                        Arg::copied_bytes(4, bytes),
+                    ],
+                );
+            }
         }
         SyscallArgs::forward_translated(
             registers,
@@ -2003,11 +2034,26 @@ impl Process {
         )
     }
 
-    fn mediate_datagram_bytes(&self, descriptor: RawFd, bytes: &[u8]) -> Option<u64> {
-        match network::Verdict::mediate_datagram(&self.policy, descriptor, bytes) {
-            network::Verdict::Allow { .. } => None,
-            network::Verdict::SessionBus { .. } => Some(Errno::EACCES.negated()),
-            network::Verdict::Refuse { errno, denial, .. } => self.refuse_network(errno, denial),
+    fn mediate_datagram_bytes(
+        &self,
+        descriptor: RawFd,
+        bytes: &[u8],
+    ) -> std::result::Result<Option<BrokerFd>, u64> {
+        let verdict = {
+            let _cwd = self.policy.read_cwd();
+            network::Verdict::mediate_datagram(&self.policy, descriptor, bytes)
+        };
+        match verdict {
+            network::Verdict::Allow { pinned } => Ok(pinned),
+            network::Verdict::SessionBus { .. } => Err(Errno::EACCES.negated()),
+            network::Verdict::Refuse {
+                errno,
+                denial,
+                pinned,
+            } => match self.refuse_network(errno, denial) {
+                Some(status) => Err(status),
+                None => Ok(pinned),
+            },
         }
     }
 

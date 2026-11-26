@@ -3,7 +3,7 @@
 
 use super::super::ErrnoExt;
 use super::super::cancel::Client;
-use super::super::fds::GuestFd;
+use super::super::fds::{BrokerFd, GuestFd};
 use super::super::machine::Regs;
 use super::super::memory::{GuestMemory, HostCString};
 use super::super::policy::{DirBase, Policy};
@@ -2087,6 +2087,7 @@ pub(super) struct DecodedMsg {
     hdr: KernelMsghdr,
     vectors: Vec<libc::iovec>,
     send_name: Option<Vec<u8>>,
+    pinned_dest: Option<BrokerFd>,
     control_buf: ControlBuffer,
     guest_control: u64,
 }
@@ -2096,6 +2097,17 @@ impl DecodedMsg {
         self.send_name.as_deref()
     }
 
+    pub(super) fn set_pinned_dest(&mut self, pinned: BrokerFd) {
+        let proc_path = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+        if let Ok(sock_addr) = socket2::SockAddr::unix(proc_path)
+            && let Ok(len) = usize::try_from(sock_addr.len())
+        {
+            let bytes = unsafe { std::slice::from_raw_parts(sock_addr.as_ptr().cast::<u8>(), len) };
+            self.send_name = Some(bytes.to_vec());
+            self.hdr.namelen = sock_addr.len();
+            self.pinned_dest = Some(pinned);
+        }
+    }
     fn bind_buffers(&mut self) {
         self.hdr.iov = self.vectors.as_mut_ptr();
         if let Some(name) = &mut self.send_name {
@@ -2454,6 +2466,7 @@ impl KernelMsghdr {
             },
             vectors,
             send_name,
+            pinned_dest: None,
             control_buf,
             guest_control: control,
         })
