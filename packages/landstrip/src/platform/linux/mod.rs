@@ -25,7 +25,7 @@ pub(crate) enum Backend {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ResolvedBackend {
+pub(crate) enum ResolvedBackend {
     Container,
     Machine,
 }
@@ -40,7 +40,7 @@ impl fmt::Display for Backend {
 }
 
 impl Backend {
-    fn resolve(self) -> ResolvedBackend {
+    pub(crate) fn resolve(self) -> ResolvedBackend {
         match self {
             Self::Auto => {
                 if kvm::Sandbox::is_available() {

@@ -37,7 +37,9 @@ mod windows;
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub(crate) use linux::{Backend as LinuxBackend, resume_if_requested};
+pub(crate) use linux::{
+    Backend as LinuxBackend, ResolvedBackend as ResolvedLinuxBackend, resume_if_requested,
+};
 
 use crate::outcome::DoctorReport;
 #[cfg(any(

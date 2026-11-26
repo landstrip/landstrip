@@ -31,6 +31,11 @@ use self::probe::Probe;
 #[cfg(target_os = "linux")]
 use self::process::ProcessStep;
 use crate::outcome::CommandOutcome;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use crate::platform::LinuxBackend;
 use clap::ValueEnum;
 use clap::builder::PossibleValue;
 use proptest::test_runner::{Config, RngSeed};
@@ -65,16 +70,21 @@ impl Scenario {
         }
     }
 
-    fn run(self, config: &Config, progress: &dyn Fn(Progress)) -> Result<(), Failure> {
+    fn run(
+        self,
+        config: &Config,
+        ctx: &SandboxContext,
+        progress: &dyn Fn(Progress),
+    ) -> Result<(), Failure> {
         match self {
-            Self::CliAndFds => Machine::<CliAndFdsStep>::run(config, 6..10, progress),
-            Self::FsPolicy => Machine::<FsPolicyStep>::run(config, 10..18, progress),
+            Self::CliAndFds => Machine::<CliAndFdsStep>::run(config, 6..10, ctx, progress),
+            Self::FsPolicy => Machine::<FsPolicyStep>::run(config, 10..18, ctx, progress),
             #[cfg(unix)]
-            Self::Network => Machine::<NetworkStep>::run(config, 4..8, progress),
+            Self::Network => Machine::<NetworkStep>::run(config, 4..8, ctx, progress),
             #[cfg(target_os = "linux")]
-            Self::Process => Machine::<ProcessStep>::run(config, 5..9, progress),
+            Self::Process => Machine::<ProcessStep>::run(config, 5..9, ctx, progress),
             #[cfg(target_os = "linux")]
-            Self::Compat => Machine::<CompatStep>::run(config, 1..2, progress),
+            Self::Compat => Machine::<CompatStep>::run(config, 1..2, ctx, progress),
         }
     }
 }
@@ -90,6 +100,12 @@ impl fmt::Display for Scenario {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct SelftestArgs {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[command(flatten)]
+    pub(crate) backend: crate::cli::BackendArgs,
     /// Seed for case generation; every run prints the seed it used.
     #[arg(long, value_name = "SEED")]
     seed: Option<u64>,
@@ -104,7 +120,24 @@ pub(crate) struct SelftestArgs {
 }
 
 impl SelftestArgs {
-    pub(crate) fn run(&self) -> io::Result<CommandOutcome> {
+    pub(crate) fn run(
+        &self,
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        backend: LinuxBackend,
+    ) -> io::Result<CommandOutcome> {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let ctx = SandboxContext::with_backend(backend);
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        let ctx = SandboxContext::default();
         let seed = self
             .seed
             .unwrap_or_else(|| RandomState::new().hash_one(Instant::now()));
@@ -138,7 +171,7 @@ impl SelftestArgs {
                 };
                 let _ = write!(io::stderr(), "\r\x1b[K{scenario:<12} {line} {elapsed:.1}s");
             };
-            let result = scenario.run(&config, &progress);
+            let result = scenario.run(&config, &ctx, &progress);
             if interactive {
                 write!(io::stderr(), "\r\x1b[K")?;
             }
@@ -151,7 +184,24 @@ impl SelftestArgs {
             if let Err(failure) = result {
                 passed = false;
                 write!(out, "{failure}")?;
-                writeln!(out, "  replay: landstrip selftest --seed {seed} {scenario}")?;
+                #[cfg(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ))]
+                let backend_arg = if backend == LinuxBackend::Auto {
+                    String::new()
+                } else {
+                    format!("--backend {backend} ")
+                };
+                #[cfg(not(all(
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )))]
+                let backend_arg = "";
+                writeln!(
+                    out,
+                    "  replay: landstrip selftest {backend_arg}--seed {seed} {scenario}"
+                )?;
             }
         }
         let _ = state::robust_remove(&SandboxContext::scratch_root());

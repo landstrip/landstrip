@@ -300,7 +300,18 @@ pub struct SandboxState {
 
 impl Default for SandboxState {
     fn default() -> Self {
-        let ctx = SandboxContext::default();
+        Self::new(SandboxContext::default())
+    }
+}
+
+impl Drop for SandboxState {
+    fn drop(&mut self) {
+        let _ = robust_remove(&self.root);
+    }
+}
+
+impl SandboxState {
+    pub fn new(ctx: SandboxContext) -> Self {
         let id = STATE_SEQ.fetch_add(1, Ordering::Relaxed);
         let raw_root = ctx.scratch_root.join(format!("s{id}"));
         let _ = robust_remove(&raw_root);
@@ -316,15 +327,6 @@ impl Default for SandboxState {
         state.seed_initial_tree();
         state
     }
-}
-
-impl Drop for SandboxState {
-    fn drop(&mut self) {
-        let _ = robust_remove(&self.root);
-    }
-}
-
-impl SandboxState {
     pub fn alloc_inode(&mut self) -> u64 {
         let ino = self.next_inode;
         self.next_inode += 1;

@@ -1,7 +1,17 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use super::WorkerArgs;
 use super::probe::Probe;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use crate::platform::LinuxBackend;
 use proptest::test_runner::TestCaseError;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -36,6 +46,11 @@ pub enum ResponderMode {
 pub struct SandboxContext {
     pub exe: PathBuf,
     pub scratch_root: PathBuf,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub backend: LinuxBackend,
 }
 
 impl Default for SandboxContext {
@@ -46,7 +61,15 @@ impl Default for SandboxContext {
         let exe = PathBuf::from("/proc/self/exe");
         #[cfg(not(target_os = "linux"))]
         let exe = std::env::current_exe().unwrap_or_default();
-        Self { exe, scratch_root }
+        Self {
+            exe,
+            scratch_root,
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            backend: LinuxBackend::Auto,
+        }
     }
 }
 
@@ -198,6 +221,16 @@ impl<'a> RunSpec<'a> {
 }
 
 impl SandboxContext {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(super) fn with_backend(backend: LinuxBackend) -> Self {
+        Self {
+            backend,
+            ..Self::default()
+        }
+    }
     pub fn scratch_root() -> PathBuf {
         std::env::temp_dir().join(format!("ls-{}", std::process::id()))
     }
@@ -213,6 +246,13 @@ impl SandboxContext {
         env_overrides: &[(&str, &str)],
     ) -> RunResult {
         let mut cmd = Command::new(&self.exe);
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if self.backend != LinuxBackend::Auto && subcmd.first() != Some(&WorkerArgs::SUBCOMMAND) {
+            cmd.args(["--backend", &self.backend.to_string()]);
+        }
         cmd.args(subcmd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -232,6 +272,13 @@ impl SandboxContext {
         let _ = std::fs::create_dir_all(&stage);
         let mut cmd = Command::new(&self.exe);
         cmd.arg("run");
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        if self.backend != LinuxBackend::Auto {
+            cmd.args(["--backend", &self.backend.to_string()]);
+        }
         for &(key, val) in spec.env_overrides {
             cmd.env(key, val);
         }

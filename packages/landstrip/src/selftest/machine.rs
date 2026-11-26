@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
+use super::context::SandboxContext;
 use super::state::SandboxState;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseResult, TestError, TestRunner};
@@ -77,6 +78,7 @@ impl<T: Transition> Machine<T> {
     pub fn run(
         config: &Config,
         steps: Range<usize>,
+        ctx: &SandboxContext,
         progress: &dyn Fn(Progress),
     ) -> Result<(), Failure> {
         let failed = Cell::new(false);
@@ -91,7 +93,7 @@ impl<T: Transition> Machine<T> {
                     } else {
                         Progress::Case(calls.get())
                     });
-                    let result = Self::apply(&transitions, seen.as_deref());
+                    let result = Self::apply(&transitions, ctx, seen.as_deref());
                     if result.is_err() && !failed.replace(true) {
                         calls.set(0);
                     }
@@ -107,8 +109,12 @@ impl<T: Transition> Machine<T> {
             })
     }
 
-    fn apply(transitions: &[T], seen: Option<&AtomicUsize>) -> TestCaseResult {
-        let mut state = SandboxState::default();
+    fn apply(
+        transitions: &[T],
+        ctx: &SandboxContext,
+        seen: Option<&AtomicUsize>,
+    ) -> TestCaseResult {
+        let mut state = SandboxState::new(ctx.clone());
         state.verify_invariants()?;
         for transition in transitions {
             if let Some(seen) = seen {

@@ -9,6 +9,8 @@ use super::context::{RunResult, RunSpec};
 use super::machine::{Require, Step};
 use super::probe::{Probe, ProbeReply, SysCheck, SysProbe};
 use super::state::SandboxState;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::platform::ResolvedLinuxBackend;
 use proptest::prelude::*;
 use proptest::test_runner::{TestCaseError, TestCaseResult};
 use serde_json::{Value, json};
@@ -60,6 +62,12 @@ impl Step for HostParityCmd {
             let sandbox = sandbox.get(name).map_or("is not reported", String::as_str);
             let agrees = match Self::ANSWERS.iter().find(|(answered, _)| answered == name) {
                 Some((_, answer)) => sandbox == *answer,
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                None if name == "rseq"
+                    && state.ctx.backend.resolve() == ResolvedLinuxBackend::Machine =>
+                {
+                    sandbox == "ENOSYS"
+                }
                 None => Self::kind(sandbox) == Self::kind(host),
             };
             if !agrees {
@@ -84,8 +92,8 @@ impl HostParityCmd {
     /// What the sandbox answers whatever the host does. The `EPERM` ones
     /// reach files, the network, kernel subsystems, or host process state
     /// without a brokered path or address, or leave the namespaces and
-    /// protections the sandbox runs in. `clone3` and `rseq` are refused so
-    /// that the C library falls back cleanly.
+    /// protections the sandbox runs in. `clone3` (and `rseq` on the `machine`
+    /// backend) are refused so that the C library falls back cleanly.
     const ANSWERS: &[(&str, &str)] = &[
         ("io_uring_setup", "EPERM"),
         ("io_uring_enter", "EPERM"),
@@ -150,7 +158,6 @@ impl HostParityCmd {
         ("lsm_set_self_attr", "EPERM"),
         ("lsm_list_modules", "EPERM"),
         ("clone3", "ENOSYS"),
-        ("rseq", "ENOSYS"),
     ];
     const SWEEP_LIMIT: Duration = Duration::from_mins(2);
 

@@ -3,6 +3,11 @@
 
 mod args;
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) use self::args::BackendArgs;
 use self::args::{Command, Invocation, ParseOutcome, PolicyRequest, RunCommand};
 use crate::error::Error;
 use crate::outcome::{CommandOutcome, PolicyValidationReport};
@@ -123,6 +128,15 @@ fn dispatch(invocation: &mut Invocation) -> Result<CommandOutcome> {
             let report = platform::doctor()?;
             Ok(CommandOutcome::json(report.ok, report)?)
         }
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        Command::Selftest(args) => Ok(args.run(backend)?),
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         Command::Selftest(args) => Ok(args.run()?),
         Command::SelftestWorker(args) => Ok(args.run()),
         #[cfg(target_os = "windows")]

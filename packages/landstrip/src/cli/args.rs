@@ -98,10 +98,10 @@ pub(super) struct PolicyRequest {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[derive(Clone, Copy, Debug, Default, Args)]
-struct BackendArgs {
+pub(crate) struct BackendArgs {
     /// Select the Linux sandbox backend.
     #[arg(long, value_enum, value_name = "BACKEND")]
-    backend: Option<LinuxBackend>,
+    pub(crate) backend: Option<LinuxBackend>,
 }
 
 #[derive(Debug, Args)]
@@ -188,7 +188,8 @@ impl CliCommand {
             Self::Run(args) => args.backend.backend,
             Self::Check(args) => args.backend.backend,
             Self::Doctor(args) => args.backend.backend,
-            Self::Resolve(_) | Self::Selftest(_) | Self::SelftestWorker(_) => None,
+            Self::Selftest(args) => args.backend.backend,
+            Self::Resolve(_) | Self::SelftestWorker(_) => None,
         }
     }
 }
