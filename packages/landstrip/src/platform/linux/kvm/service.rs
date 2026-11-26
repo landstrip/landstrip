@@ -33,7 +33,7 @@ use super::machine::{ExitReason, Machine, PAGE_BYTES, RESERVED_END, Regs, VcpuSt
 use super::memory::{GuestMemory, HostCString};
 use super::network;
 use super::payload;
-use super::policy::{Access, Missing, Policy};
+use super::policy::{Access, DirBase, Missing, Policy};
 use super::ptrace::PtraceTable;
 use super::robust::{HEAD_BYTES as ROBUST_HEAD_BYTES, RobustMirror};
 use crate::trap::NetworkOperation;
@@ -1418,7 +1418,6 @@ impl Process {
         let arguments = SyscallArgs::raw(registers);
         let is_at = syscall == Sysno::execveat;
         let index = usize::from(is_at);
-        let dirfd = is_at.then(|| GuestFd::from_reg(arguments[0]).policy_dirfd());
         let flags = if is_at {
             let raw_flags = GuestReg(arguments[4]).as_i32();
             if raw_flags & !(libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW) != 0 {
@@ -1432,26 +1431,56 @@ impl Process {
         if copied_path.is_null() {
             return Err(Errno::EFAULT);
         }
+        let empty_fd = flags & libc::AT_EMPTY_PATH != 0 && copied_path.is_empty_non_null();
+        let path = copied_path.as_path();
+        let _cwd = self.policy.read_cwd();
+        let guest_dfd = is_at.then(|| GuestFd::from_reg(arguments[0]));
+        let uses_dfd = guest_dfd.is_some_and(|dfd| dfd.policy_dirfd() != GuestFd::at_fdcwd())
+            && (empty_fd || !path.is_absolute());
+        let mut dfd_invalid = false;
+        let pinned_dfd = if uses_dfd {
+            match guest_dfd
+                .unwrap_or_else(|| GuestFd::from_raw(-1))
+                .pin_with_cloexec()
+            {
+                Ok(pinned) => Some(pinned),
+                Err(Errno::EBADF) => {
+                    dfd_invalid = true;
+                    None
+                }
+                Err(errno) => return Err(errno),
+            }
+        } else {
+            None
+        };
+        let dir = if let Some((fd, _, _)) = &pinned_dfd {
+            DirBase::Pinned(fd.as_fd())
+        } else if dfd_invalid {
+            DirBase::Invalid
+        } else {
+            DirBase::Cwd
+        };
         if let Some(raw) = copied_path.as_bytes()
-            && self.policy.is_broker_proc_fd(dirfd, raw)
+            && self.policy.is_broker_proc_fd_at(dir, raw)
         {
             return Err(Errno::ENOENT);
         }
-        let empty_fd = flags & libc::AT_EMPTY_PATH != 0 && copied_path.is_empty_non_null();
         let trailing_slash = copied_path
             .as_bytes()
             .is_some_and(|bytes| bytes.ends_with(b"/"));
         let follow = trailing_slash || flags & libc::AT_SYMLINK_NOFOLLOW == 0;
-        let mut request = Request::read(dirfd, &copied_path, follow);
+        let mut request = Request::read(dir, &copied_path, follow);
         if is_at {
             request = request.empty(Empty::Flagged { index: 4 });
         }
         if let Some(errno) = self.denials.refuse_target(&self.policy, registers, request) {
             return Err(errno);
         }
-        let path = copied_path.as_path();
         if !empty_fd && path.as_os_str().is_empty() {
             return Err(Errno::ENOENT);
+        }
+        if dfd_invalid {
+            return Err(Errno::EBADF);
         }
         let argv = memory.read_cstring_vec(
             arguments[index + 1],
@@ -1467,7 +1496,9 @@ impl Process {
         )?;
         let (invoked, loaded) = self.load_exec_image(
             syscall,
-            dirfd.unwrap_or_else(GuestFd::at_fdcwd),
+            pinned_dfd
+                .as_ref()
+                .map(|(fd, raw, cloexec)| (fd.as_fd(), *raw, *cloexec)),
             empty_fd,
             follow,
             path,
@@ -1479,7 +1510,7 @@ impl Process {
     fn load_exec_image(
         &self,
         syscall: Sysno,
-        base: i64,
+        pinned_dfd: Option<(std::os::fd::BorrowedFd<'_>, RawFd, bool)>,
         empty_fd: bool,
         follow: bool,
         path: &Path,
@@ -1487,57 +1518,51 @@ impl Process {
     ) -> std::result::Result<(OsString, payload::LoadedProgram), Errno> {
         let authorize = |target: &Path| {
             self.policy
-                .denial(
-                    GuestFd::at_fdcwd(),
-                    target,
-                    Access::Read,
-                    true,
-                    Missing::Kernel,
-                )
+                .denial_at(DirBase::Cwd, target, Access::Read, true, Missing::Kernel)
                 .and_then(|denial| {
                     self.denials
                         .refuse(&self.policy, syscall, denial, Vec::new())
                 })
         };
         let (invoked, loaded_result) = if empty_fd {
-            if base == GuestFd::at_fdcwd() {
-                let invoked = OsString::from(".");
-                let res = payload::LoadRequest::guest_path(
-                    libc::AT_FDCWD,
-                    Path::new("."),
-                    &invoked,
-                    argv,
-                )
-                .load(authorize);
-                (invoked, res)
-            } else {
-                let guest_fd = GuestFd::from_reg(base.cast_unsigned());
-                let raw = guest_fd.valid().ok_or(Errno::EBADF)?;
-                let dup = GuestFd::duplicate_above(raw).map_err(|_| Errno::EBADF)?;
-                let invoked = OsString::from(format!("/dev/fd/{raw}"));
-                let res = payload::LoadRequest::guest_fd(dup.as_fd(), &invoked, argv)
-                    .mark_inaccessible(guest_fd.has_cloexec())
+            match pinned_dfd {
+                None => {
+                    let invoked = OsString::from(".");
+                    let res = payload::LoadRequest::guest_path(
+                        libc::AT_FDCWD,
+                        Path::new("."),
+                        &invoked,
+                        argv,
+                    )
                     .load(authorize);
-                (invoked, res)
+                    (invoked, res)
+                }
+                Some((fd, raw, cloexec)) => {
+                    let invoked = OsString::from(format!("/dev/fd/{raw}"));
+                    let res = payload::LoadRequest::guest_fd(fd, &invoked, argv)
+                        .mark_inaccessible(cloexec)
+                        .load(authorize);
+                    (invoked, res)
+                }
             }
         } else {
-            let (raw_dirfd, invoked, inaccessible) =
-                if path.is_absolute() || base == GuestFd::at_fdcwd() {
-                    (libc::AT_FDCWD, path.as_os_str().to_os_string(), false)
-                } else {
-                    let guest_fd = GuestFd::from_reg(base.cast_unsigned());
-                    let raw = guest_fd.valid().ok_or(Errno::EBADF)?;
-                    if !guest_fd.is_open() {
-                        return Err(Errno::EBADF);
-                    }
+            let (raw_dirfd, dir_base, invoked, inaccessible) = match pinned_dfd {
+                None => (
+                    libc::AT_FDCWD,
+                    DirBase::Cwd,
+                    path.as_os_str().to_os_string(),
+                    false,
+                ),
+                Some((fd, raw, cloexec)) => {
                     let mut prefix = OsString::from(format!("/dev/fd/{raw}/"));
                     prefix.push(path.as_os_str());
-                    (raw, prefix, guest_fd.has_cloexec())
-                };
+                    (fd.as_raw_fd(), DirBase::Pinned(fd), prefix, cloexec)
+                }
+            };
             let current_exe = (follow
                 && self
                     .policy
-                    .is_proc_self_exe(Some(base), path.as_os_str().as_bytes(), true))
+                    .is_proc_self_exe_at(dir_base, path.as_os_str().as_bytes(), true))
             .then(|| self.policy.exe());
             let (open_dirfd, open_target) = match &current_exe {
                 Some(exe) => (libc::AT_FDCWD, exe.as_path()),
@@ -1674,27 +1699,28 @@ impl Process {
 
     fn ficlone_ioctl(&self, registers: &Regs, memory: &GuestMemory, cmd: u32) -> u64 {
         let args = SyscallArgs::raw(registers);
-        let dest = GuestFd::from_reg(args[0]);
-        let Some(dest_raw) = dest.valid().filter(|_| dest.is_open()) else {
-            return Errno::EBADF.negated();
+        let dest = match GuestFd::from_reg(args[0]).pin() {
+            Ok(fd) => fd,
+            Err(errno) => return errno.negated(),
         };
         if cmd == FICLONE {
-            let src = GuestFd::from_reg(args[2]);
-            let Some(src_raw) = src.valid().filter(|_| src.is_open()) else {
-                return Errno::EBADF.negated();
+            let src = match GuestFd::from_reg(args[2]).pin() {
+                Ok(fd) => fd,
+                Err(errno) => return errno.negated(),
             };
-            if let Some(errno) =
-                self.denials
-                    .refuse_target(&self.policy, registers, Request::write_descriptor(0))
-            {
+            if let Some(errno) = self.denials.refuse_target(
+                &self.policy,
+                registers,
+                Request::write_descriptor(dest.as_fd()),
+            ) {
                 return errno.negated();
             }
             return SyscallArgs::invoke(
                 Sysno::ioctl,
                 &[
-                    u64::from(dest_raw.cast_unsigned()),
+                    u64::from(dest.as_raw_fd().cast_unsigned()),
                     u64::from(cmd),
-                    u64::from(src_raw.cast_unsigned()),
+                    u64::from(src.as_raw_fd().cast_unsigned()),
                     0,
                     0,
                     0,
@@ -1708,19 +1734,22 @@ impl Process {
         let Ok(src_raw) = RawFd::try_from(src_fd) else {
             return Errno::EBADF.negated();
         };
-        if !GuestFd::from_raw(src_raw).is_open() {
-            return Errno::EBADF.negated();
-        }
-        if let Some(errno) =
-            self.denials
-                .refuse_target(&self.policy, registers, Request::write_descriptor(0))
-        {
+        let src = match GuestFd::from_raw(src_raw).pin() {
+            Ok(fd) => fd,
+            Err(errno) => return errno.negated(),
+        };
+        range_buf[..8].copy_from_slice(&i64::from(src.as_raw_fd()).to_le_bytes());
+        if let Some(errno) = self.denials.refuse_target(
+            &self.policy,
+            registers,
+            Request::write_descriptor(dest.as_fd()),
+        ) {
             return errno.negated();
         }
         SyscallArgs::invoke(
             Sysno::ioctl,
             &[
-                u64::from(dest_raw.cast_unsigned()),
+                u64::from(dest.as_raw_fd().cast_unsigned()),
                 u64::from(cmd),
                 range_buf.as_mut_ptr().expose_provenance() as u64,
                 0,

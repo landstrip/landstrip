@@ -6,7 +6,7 @@ use super::super::cancel::Client;
 use super::super::fds::GuestFd;
 use super::super::machine::Regs;
 use super::super::memory::{GuestMemory, HostCString};
-use super::super::policy::Policy;
+use super::super::policy::{DirBase, Policy};
 use super::super::ptrace::PtraceTable;
 use super::{
     ARG_BYTES_LIMIT, GuestReg, ITIMERSPEC_BYTES, Process, SIGINFO_BYTES, TIMESPEC_BYTES,
@@ -32,7 +32,7 @@ use linux_raw_sys::ioctl::{
 use linux_raw_sys::mempolicy::MPOL_F_ADDR;
 use linux_raw_sys::prctl::{PR_GET_NAME, PR_SET_NAME};
 use std::ffi::CString;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use syscalls::{Errno, Sysno};
 
 const STAT_BYTES: u64 = std::mem::size_of::<libc::stat>() as u64;
@@ -63,6 +63,8 @@ const TASK_COMM_LEN: u64 = 16;
 pub(super) enum Arg<'a> {
     Fd(usize),
     DirFd(usize),
+    BorrowedFd(usize, BorrowedFd<'a>),
+    InvalidFd(usize),
     CString(usize),
     CopiedPath(usize, &'a HostCString),
     CopiedBytes(usize, &'a [u8]),
@@ -76,6 +78,14 @@ impl<'a> Arg<'a> {
 
     pub(super) const fn dirfd(index: usize) -> Self {
         Self::DirFd(index)
+    }
+
+    pub(super) const fn borrowed_fd(index: usize, fd: BorrowedFd<'a>) -> Self {
+        Self::BorrowedFd(index, fd)
+    }
+
+    pub(super) const fn invalid_fd(index: usize) -> Self {
+        Self::InvalidFd(index)
     }
 
     pub(super) const fn cstr(ptr: usize) -> Self {
@@ -134,7 +144,9 @@ impl SyscallArgs {
         let mut owned = Vec::with_capacity(specs.len());
         for spec in specs {
             let index = match *spec {
-                Arg::Fd(idx) | Arg::DirFd(idx) => idx,
+                Arg::Fd(idx) | Arg::DirFd(idx) | Arg::BorrowedFd(idx, _) | Arg::InvalidFd(idx) => {
+                    idx
+                }
                 Arg::CString(ptr)
                 | Arg::CopiedPath(ptr, _)
                 | Arg::CopiedBytes(ptr, _)
@@ -149,6 +161,8 @@ impl SyscallArgs {
             *slot = match *spec {
                 Arg::Fd(_) => GuestFd::from_reg(*slot).syscall_fd(),
                 Arg::DirFd(_) => GuestFd::from_reg(*slot).syscall_dirfd(),
+                Arg::BorrowedFd(_, fd) => u64::from(fd.as_raw_fd().cast_unsigned()),
+                Arg::InvalidFd(_) => u64::MAX,
                 Arg::CString(_) => {
                     let copied = HostCString::read(memory, *slot)?;
                     if let Some(cstr) = copied.into_inner() {
@@ -606,7 +620,11 @@ impl SyscallArgs {
             Sysno::kill | Sysno::tkill | Sysno::tgkill => {
                 Some(Self::signal_syscall(syscall, registers))
             }
-            Sysno::lseek | Sysno::shutdown | Sysno::fchdir => {
+            Sysno::lseek | Sysno::shutdown => {
+                Some(raw.translate_and_forward(memory, syscall, &[Arg::fd(0)]))
+            }
+            Sysno::fchdir => {
+                let _cwd = process.policy.write_cwd();
                 Some(raw.translate_and_forward(memory, syscall, &[Arg::fd(0)]))
             }
             #[cfg(target_arch = "x86_64")]
@@ -736,12 +754,13 @@ impl SyscallArgs {
                     Ok(path) => path,
                     Err(errno) => return Some(errno.negated()),
                 };
+                let _cwd = policy.write_cwd();
                 if let Some(raw) = path.as_bytes() {
-                    if policy.is_broker_proc_fd(None, raw) {
+                    if policy.is_broker_proc_fd_at(DirBase::Cwd, raw) {
                         return Some(Errno::ENOENT.negated());
                     }
                     if !raw.is_empty()
-                        && policy.has_forbidden_proc_target(None, path.as_path(), true)
+                        && policy.has_forbidden_proc_target_at(DirBase::Cwd, path.as_path(), true)
                     {
                         return Some(Errno::EACCES.negated());
                     }

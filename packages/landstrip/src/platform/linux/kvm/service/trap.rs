@@ -6,7 +6,7 @@ use super::super::cancel::Client;
 use super::super::fds::{BrokerFd, GuestFd};
 use super::super::machine::Regs;
 use super::super::memory::HostCString;
-use super::super::policy::{self, Access, Missing, Policy, ResolveFlags};
+use super::super::policy::{self, Access, DirBase, Missing, Policy, ResolveFlags};
 use super::{AT_EMPTY_PATH, SyscallArgs, WORD_SIZE};
 use crate::policy::DenialReason;
 use crate::trap::{FilesystemDenial, NetworkOperation, Reply, ReplyAction, Trap, TrapOperation};
@@ -705,17 +705,15 @@ impl Empty {
 /// The object a mediated syscall reaches.
 #[derive(Clone, Copy)]
 pub(super) enum Target<'a> {
-    /// A path argument, resolved through the optional directory descriptor.
     Path {
-        dirfd: Option<i64>,
+        dir: DirBase<'a>,
         path: &'a HostCString,
         follow: bool,
         resolve: ResolveFlags,
         empty: Empty,
         missing: Missing,
     },
-    /// An already open descriptor argument.
-    Descriptor { index: usize },
+    Descriptor(BorrowedFd<'a>),
 }
 
 /// One access a syscall needs granted.
@@ -729,24 +727,23 @@ pub(super) struct Request<'a> {
 }
 
 impl<'a> Request<'a> {
-    pub(super) const fn read(dirfd: Option<i64>, path: &'a HostCString, follow: bool) -> Self {
-        Self::path(dirfd, path, Access::Read, follow).missing(Missing::Kernel)
+    pub(super) const fn read(dir: DirBase<'a>, path: &'a HostCString, follow: bool) -> Self {
+        Self::path(dir, path, Access::Read, follow).missing(Missing::Kernel)
     }
 
-    /// A mutated open descriptor at `index`.
-    pub(super) const fn write_descriptor(index: usize) -> Self {
-        Self::with(Target::Descriptor { index }, Access::Write)
+    pub(super) const fn write_descriptor(fd: BorrowedFd<'a>) -> Self {
+        Self::with(Target::Descriptor(fd), Access::Write)
     }
 
     pub(super) const fn path(
-        dirfd: Option<i64>,
+        dir: DirBase<'a>,
         path: &'a HostCString,
         access: Access,
         follow: bool,
     ) -> Self {
         Self::with(
             Target::Path {
-                dirfd,
+                dir,
                 path,
                 follow,
                 resolve: ResolveFlags::empty(),
@@ -828,7 +825,7 @@ impl<'a> Request<'a> {
         names
     }
 
-    fn xattr_access(syscall: Sysno) -> Access {
+    pub(super) fn xattr_access(syscall: Sysno) -> Access {
         if matches!(
             syscall,
             Sysno::getxattr
@@ -852,15 +849,15 @@ impl<'a> Request<'a> {
                 syscall,
                 Sysno::lsetxattr | Sysno::lgetxattr | Sysno::llistxattr | Sysno::lremovexattr
             );
-        let request = Self::path(None, path, access, follow);
+        let request = Self::path(DirBase::Cwd, path, access, follow);
         match access {
             Access::Read => request.missing(Missing::Kernel),
             Access::Write => request,
         }
     }
 
-    pub(super) fn xattr_fd(syscall: Sysno, index: usize) -> Self {
-        Self::with(Target::Descriptor { index }, Self::xattr_access(syscall))
+    pub(super) fn xattr_fd(syscall: Sysno, fd: BorrowedFd<'a>) -> Self {
+        Self::with(Target::Descriptor(fd), Self::xattr_access(syscall))
     }
 }
 
@@ -943,7 +940,7 @@ impl Denials {
         let argument = SyscallArgs::raw(registers);
         let denials = match request.target {
             Target::Path {
-                dirfd,
+                dir,
                 path,
                 follow,
                 resolve,
@@ -951,11 +948,10 @@ impl Denials {
                 missing,
             } => {
                 if empty.names_descriptor(&argument, path) {
-                    let fd = dirfd.unwrap_or_else(GuestFd::at_fdcwd);
                     match request.open {
-                        Some(flags) => policy.descriptor_open_denials(fd, flags),
+                        Some(flags) => policy.descriptor_open_denials_at(dir, flags),
                         None => policy
-                            .descriptor_denial(fd, request.access)
+                            .descriptor_denial_at(dir, request.access)
                             .into_iter()
                             .collect(),
                     }
@@ -964,23 +960,19 @@ impl Denials {
                     if path_ref.as_os_str().is_empty() {
                         return None;
                     }
-                    let dirfd = dirfd.unwrap_or_else(GuestFd::at_fdcwd);
                     match request.open {
                         Some(flags) => {
-                            policy.open_denials(dirfd, path_ref, flags, follow, resolve, missing)
+                            policy.open_denials_at(dir, path_ref, flags, follow, resolve, missing)
                         }
                         None => policy
-                            .denial(dirfd, path_ref, request.access, follow, missing)
+                            .denial_at(dir, path_ref, request.access, follow, missing)
                             .into_iter()
                             .collect(),
                     }
                 }
             }
-            Target::Descriptor { index } => policy
-                .descriptor_denial(
-                    GuestFd::from_reg(argument[index]).policy_dirfd(),
-                    request.access,
-                )
+            Target::Descriptor(fd) => policy
+                .borrowed_descriptor_denial(fd, request.access)
                 .into_iter()
                 .collect(),
         };

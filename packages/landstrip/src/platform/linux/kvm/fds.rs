@@ -588,13 +588,6 @@ impl GuestFd {
             .is_some_and(|fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
     }
 
-    pub(crate) fn has_cloexec(self) -> bool {
-        self.valid().is_some_and(|fd| {
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            flags >= 0 && flags & libc::FD_CLOEXEC != 0
-        })
-    }
-
     pub(crate) fn close_cloexec() {
         let mut candidates = Vec::new();
         if let Ok(entries) = fs::read_dir("/proc/self/fd") {
@@ -766,6 +759,22 @@ impl GuestFd {
             return Ok(BrokerFd::register(fd));
         }
         Self::duplicate_above(fd.as_raw_fd())
+    }
+
+    pub(crate) fn pin(self) -> std::result::Result<BrokerFd, Errno> {
+        self.pin_with_cloexec().map(|(fd, _, _)| fd)
+    }
+
+    pub(crate) fn pin_with_cloexec(self) -> std::result::Result<(BrokerFd, RawFd, bool), Errno> {
+        let _fd_lock = Self::read_fd_table();
+        let raw = self.valid().ok_or(Errno::EBADF)?;
+        let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(Errno::EBADF);
+        }
+        let dup =
+            Self::duplicate_above(raw).map_err(|error| Errno::from_io(&error, Errno::EBADF))?;
+        Ok((dup, raw, flags & libc::FD_CLOEXEC != 0))
     }
 }
 

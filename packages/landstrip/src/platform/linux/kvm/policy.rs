@@ -25,14 +25,13 @@ use nix::sys::stat::{fstat, fstatat};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::ffi::OsString;
-use std::ffi::{CString, OsStr};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Error the guest sees when the policy refuses an access.
 pub(crate) const DENIED: syscalls::Errno = syscalls::Errno::EACCES;
@@ -340,9 +339,28 @@ impl ProbeOpen {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum DirBase<'a> {
+    Cwd,
+    Guest(i64),
+    Pinned(BorrowedFd<'a>),
+    Invalid,
+}
+
+impl DirBase<'_> {
+    pub(crate) fn from_opt(dirfd: Option<i64>) -> Self {
+        match dirfd {
+            None => Self::Cwd,
+            Some(fd) if fd == i64::from(libc::AT_FDCWD) => Self::Cwd,
+            Some(fd) => Self::Guest(fd),
+        }
+    }
+}
+
 pub(crate) struct Policy {
     rules: AccessPolicy,
     cwd: PathBuf,
+    cwd_lock: RwLock<()>,
     exe: RwLock<PathBuf>,
     abstract_sockets: RwLock<HashSet<Vec<u8>>>,
 }
@@ -360,6 +378,7 @@ impl ExecPolicy {
         Ok(Policy {
             rules: self.rules.restore()?,
             cwd: self.cwd.into(),
+            cwd_lock: RwLock::new(()),
             exe: RwLock::new(self.exe.into()),
             abstract_sockets: RwLock::new(self.abstract_sockets),
         })
@@ -394,6 +413,7 @@ impl Policy {
         Self {
             rules: policy.clone(),
             cwd: cwd.to_path_buf(),
+            cwd_lock: RwLock::new(()),
             exe: RwLock::new(exe.to_path_buf()),
             abstract_sockets: RwLock::new(HashSet::new()),
         }
@@ -403,6 +423,7 @@ impl Policy {
         Self {
             rules: self.rules.clone(),
             cwd: self.cwd.clone(),
+            cwd_lock: RwLock::new(()),
             exe: RwLock::new(self.exe()),
             abstract_sockets: RwLock::new(
                 self.abstract_sockets
@@ -410,6 +431,17 @@ impl Policy {
                     .map_or_else(|poisoned| poisoned.into_inner().clone(), |set| set.clone()),
             ),
         }
+    }
+    pub(crate) fn read_cwd(&self) -> RwLockReadGuard<'_, ()> {
+        self.cwd_lock
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn write_cwd(&self) -> RwLockWriteGuard<'_, ()> {
+        self.cwd_lock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(super) fn exec_state(&self) -> ExecPolicy {
@@ -425,17 +457,15 @@ impl Policy {
         }
     }
 
-    /// Describes a refused access, or `None` when the policy grants it or the
-    /// kernel is to answer the syscall itself.
-    pub(crate) fn denial(
+    pub(crate) fn denial_at(
         &self,
-        dirfd: i64,
+        dir: DirBase<'_>,
         path: &Path,
         access: Access,
         follow: bool,
         missing: Missing,
     ) -> Option<Denial> {
-        let resolved = match self.resolve_path(dirfd, path, follow, ResolveFlags::empty()) {
+        let resolved = match self.resolve_at(dir, path, follow, ResolveFlags::empty()) {
             Resolution::Kernel | Resolution::Unclassified => return None,
             Resolution::Unresolvable(unres) => return Some(Denial::unresolvable(access, unres)),
             Resolution::Resolved(resolved) => resolved,
@@ -465,9 +495,9 @@ impl Policy {
         })
     }
 
-    pub(crate) fn open_denials(
+    pub(crate) fn open_denials_at(
         &self,
-        dirfd: i64,
+        dir: DirBase<'_>,
         path: &Path,
         flags: i32,
         follow: bool,
@@ -478,11 +508,11 @@ impl Policy {
         let access = Access::from_open_flags(flags);
         let creating = follow && flags & libc::O_CREAT != 0;
         let resolution = if creating && !resolve.is_empty() {
-            self.resolve_scoped(dirfd, path, follow, resolve, true)
+            self.resolve_scoped_at(dir, path, follow, resolve, true)
         } else {
-            match self.resolve_path(dirfd, path, follow, resolve) {
+            match self.resolve_at(dir, path, follow, resolve) {
                 Resolution::Resolved(resolved) if creating && !resolved.present => {
-                    self.resolve_scoped(dirfd, path, follow, resolve, true)
+                    self.resolve_scoped_at(dir, path, follow, resolve, true)
                 }
                 resolution => resolution,
             }
@@ -550,8 +580,6 @@ impl Policy {
         denials
     }
 
-    /// Whether a rule refuses `access` to the resolved path whatever the
-    /// payload does.
     fn hard(&self, access: Access, resolved: &Resolved) -> bool {
         match access {
             Access::Read => self
@@ -565,37 +593,46 @@ impl Policy {
         }
     }
 
-    /// Resolves a guest path, or `None` when the directory descriptor it is
-    /// relative to names nothing the broker can read.
     pub(crate) fn resolved(&self, dirfd: i64, path: &Path, follow: bool) -> Option<Resolved> {
-        match self.resolve_path(dirfd, path, follow, ResolveFlags::empty()) {
+        match self.resolve_at(DirBase::Guest(dirfd), path, follow, ResolveFlags::empty()) {
             Resolution::Resolved(resolved) => Some(resolved),
             Resolution::Kernel | Resolution::Unclassified | Resolution::Unresolvable(_) => None,
         }
     }
 
-    pub(crate) fn resolve_path(
+    pub(crate) fn resolve_at(
         &self,
-        dirfd: i64,
+        dir: DirBase<'_>,
         path: &Path,
         follow: bool,
         resolve: ResolveFlags,
     ) -> Resolution {
         if !resolve.is_empty() {
-            return self.resolve_scoped(dirfd, path, follow, resolve, false);
+            return self.resolve_scoped_at(dir, path, follow, resolve, false);
         }
         let base = if path.is_absolute() {
             None
-        } else if dirfd == i64::from(libc::AT_FDCWD) {
-            Some(self.cwd())
         } else {
-            match DescriptorTarget::resolve(dirfd) {
-                DescriptorTarget::Path(base) => Some(base),
-                DescriptorTarget::Unresolvable(unres) => return Resolution::Unresolvable(unres),
-                DescriptorTarget::Unclassified => return Resolution::Unclassified,
-                DescriptorTarget::Invalid => {
-                    return Resolution::Kernel;
-                }
+            match dir {
+                DirBase::Cwd => Some(self.cwd()),
+                DirBase::Guest(fd) if fd == i64::from(libc::AT_FDCWD) => Some(self.cwd()),
+                DirBase::Guest(fd) => match DescriptorTarget::resolve(fd) {
+                    DescriptorTarget::Path(base) => Some(base),
+                    DescriptorTarget::Unresolvable(unres) => {
+                        return Resolution::Unresolvable(unres);
+                    }
+                    DescriptorTarget::Unclassified => return Resolution::Unclassified,
+                    DescriptorTarget::Invalid => return Resolution::Kernel,
+                },
+                DirBase::Pinned(fd) => match DescriptorTarget::resolve_borrowed(fd) {
+                    DescriptorTarget::Path(base) => Some(base),
+                    DescriptorTarget::Unresolvable(unres) => {
+                        return Resolution::Unresolvable(unres);
+                    }
+                    DescriptorTarget::Unclassified => return Resolution::Unclassified,
+                    DescriptorTarget::Invalid => return Resolution::Kernel,
+                },
+                DirBase::Invalid => return Resolution::Kernel,
             }
         };
         let joined = match base {
@@ -606,8 +643,12 @@ impl Policy {
         if Self::is_broker_proc_self_fd(&lexical) {
             return Resolution::Unresolvable(lexical);
         }
-        let proc_dirfd = (!path.is_absolute()).then_some(dirfd);
-        if follow && self.is_proc_self_exe(proc_dirfd, path.as_os_str().as_bytes(), true) {
+        let proc_dir = if path.is_absolute() {
+            DirBase::Cwd
+        } else {
+            dir
+        };
+        if follow && self.is_proc_self_exe_at(proc_dir, path.as_os_str().as_bytes(), true) {
             return Resolution::Resolved(Resolved {
                 label: self.exe(),
                 lexical,
@@ -625,7 +666,7 @@ impl Policy {
                 return resolution;
             }
             let label = canonical.unwrap_or_else(|_| lexical.canonicalize_existing_prefix());
-            let present = Resolved::exists(dirfd, path, true);
+            let present = Resolved::exists_at(dir, path, true);
             return Resolution::Resolved(Resolved {
                 label,
                 lexical,
@@ -633,7 +674,7 @@ impl Policy {
             });
         }
         let label = Resolved::without_follow(&lexical);
-        let present = Resolved::exists(dirfd, path, false);
+        let present = Resolved::exists_at(dir, path, false);
         Resolution::Resolved(Resolved {
             label,
             lexical,
@@ -641,9 +682,9 @@ impl Policy {
         })
     }
 
-    fn resolve_scoped(
+    fn resolve_scoped_at(
         &self,
-        dirfd: i64,
+        dir: DirBase<'_>,
         path: &Path,
         follow: bool,
         resolve: ResolveFlags,
@@ -654,21 +695,34 @@ impl Policy {
         }
         let (raw_dirfd, root_base) = if !resolve.is_scoped() && path.is_absolute() {
             (libc::AT_FDCWD, PathBuf::from("/"))
-        } else if dirfd == i64::from(libc::AT_FDCWD) {
-            (libc::AT_FDCWD, self.cwd())
         } else {
-            match DescriptorTarget::resolve(dirfd) {
-                DescriptorTarget::Path(base) => {
-                    let Ok(raw) = RawFd::try_from(dirfd) else {
-                        return Resolution::Kernel;
-                    };
-                    (raw, base)
+            match dir {
+                DirBase::Cwd => (libc::AT_FDCWD, self.cwd()),
+                DirBase::Guest(fd) if fd == i64::from(libc::AT_FDCWD) => {
+                    (libc::AT_FDCWD, self.cwd())
                 }
-                DescriptorTarget::Unresolvable(unres) => return Resolution::Unresolvable(unres),
-                DescriptorTarget::Unclassified => return Resolution::Unclassified,
-                DescriptorTarget::Invalid => {
-                    return Resolution::Kernel;
-                }
+                DirBase::Guest(fd) => match DescriptorTarget::resolve(fd) {
+                    DescriptorTarget::Path(base) => {
+                        let Ok(raw) = RawFd::try_from(fd) else {
+                            return Resolution::Kernel;
+                        };
+                        (raw, base)
+                    }
+                    DescriptorTarget::Unresolvable(unres) => {
+                        return Resolution::Unresolvable(unres);
+                    }
+                    DescriptorTarget::Unclassified => return Resolution::Unclassified,
+                    DescriptorTarget::Invalid => return Resolution::Kernel,
+                },
+                DirBase::Pinned(fd) => match DescriptorTarget::resolve_borrowed(fd) {
+                    DescriptorTarget::Path(base) => (fd.as_raw_fd(), base),
+                    DescriptorTarget::Unresolvable(unres) => {
+                        return Resolution::Unresolvable(unres);
+                    }
+                    DescriptorTarget::Unclassified => return Resolution::Unclassified,
+                    DescriptorTarget::Invalid => return Resolution::Kernel,
+                },
+                DirBase::Invalid => return Resolution::Kernel,
             }
         };
         let Some(lexical) = resolve.lexical_path(&root_base, path) else {
@@ -707,18 +761,23 @@ impl Policy {
         }
     }
 
-    /// The rules the broker enforces.
     pub(crate) fn rules(&self) -> &AccessPolicy {
         &self.rules
     }
 
-    /// Resolves an open descriptor targeted by `AT_EMPTY_PATH` or `NULL`
-    /// timestamp syscalls (`utimensat`/`futimesat`).
-    pub(crate) fn resolve_descriptor(&self, fd: i64) -> Resolution {
-        if fd == i64::from(libc::AT_FDCWD) {
-            return self.resolve_path(fd, Path::new("."), true, ResolveFlags::empty());
-        }
-        match DescriptorTarget::resolve(fd) {
+    pub(crate) fn resolve_descriptor_at(&self, dir: DirBase<'_>) -> Resolution {
+        let target = match dir {
+            DirBase::Cwd => {
+                return self.resolve_at(DirBase::Cwd, Path::new("."), true, ResolveFlags::empty());
+            }
+            DirBase::Guest(fd) if fd == i64::from(libc::AT_FDCWD) => {
+                return self.resolve_at(DirBase::Cwd, Path::new("."), true, ResolveFlags::empty());
+            }
+            DirBase::Guest(fd) => DescriptorTarget::resolve(fd),
+            DirBase::Pinned(fd) => DescriptorTarget::resolve_borrowed(fd),
+            DirBase::Invalid => return Resolution::Kernel,
+        };
+        match target {
             DescriptorTarget::Path(label) if label.is_absolute() => {
                 Resolution::Resolved(Resolved {
                     lexical: label.clone(),
@@ -732,19 +791,22 @@ impl Policy {
         }
     }
 
-    /// Describes a refused access through an already open descriptor.
-    pub(crate) fn descriptor_denial(&self, fd: i64, access: Access) -> Option<Denial> {
-        if fd == i64::from(libc::AT_FDCWD) {
-            return self.denial(fd, Path::new("."), access, true, Missing::Rules);
-        }
-        match DescriptorTarget::resolve(fd) {
-            DescriptorTarget::Path(path) if path.is_absolute() => self.denial(
-                i64::from(libc::AT_FDCWD),
-                &path,
-                access,
-                true,
-                Missing::Rules,
-            ),
+    pub(crate) fn descriptor_denial_at(&self, dir: DirBase<'_>, access: Access) -> Option<Denial> {
+        let target = match dir {
+            DirBase::Cwd => {
+                return self.denial_at(DirBase::Cwd, Path::new("."), access, true, Missing::Rules);
+            }
+            DirBase::Guest(fd) if fd == i64::from(libc::AT_FDCWD) => {
+                return self.denial_at(DirBase::Cwd, Path::new("."), access, true, Missing::Rules);
+            }
+            DirBase::Guest(fd) => DescriptorTarget::resolve(fd),
+            DirBase::Pinned(fd) => DescriptorTarget::resolve_borrowed(fd),
+            DirBase::Invalid => return None,
+        };
+        match target {
+            DescriptorTarget::Path(path) if path.is_absolute() => {
+                self.denial_at(DirBase::Cwd, &path, access, true, Missing::Rules)
+            }
             DescriptorTarget::Invalid
             | DescriptorTarget::Unclassified
             | DescriptorTarget::Path(_) => None,
@@ -758,23 +820,48 @@ impl Policy {
         }
     }
 
-    /// Describes refused `open`-style (`R_OK` and/or `W_OK`) checks through an
-    /// already open descriptor (`faccessat2` with `AT_EMPTY_PATH` or post-open check).
+    pub(crate) fn borrowed_descriptor_denial(
+        &self,
+        fd: BorrowedFd<'_>,
+        access: Access,
+    ) -> Option<Denial> {
+        self.descriptor_denial_at(DirBase::Pinned(fd), access)
+    }
+
     pub(crate) fn descriptor_open_denials(&self, fd: i64, flags: i32) -> Vec<Denial> {
+        self.descriptor_open_denials_at(DirBase::Guest(fd), flags)
+    }
+
+    pub(crate) fn descriptor_open_denials_at(&self, dir: DirBase<'_>, flags: i32) -> Vec<Denial> {
         let access = Access::from_open_flags(flags);
-        if fd == i64::from(libc::AT_FDCWD) {
-            return self.open_denials(
-                fd,
-                Path::new("."),
-                flags,
-                true,
-                ResolveFlags::empty(),
-                Missing::Rules,
-            );
-        }
-        match DescriptorTarget::resolve(fd) {
-            DescriptorTarget::Path(path) if path.is_absolute() => self.open_denials(
-                i64::from(libc::AT_FDCWD),
+        let target = match dir {
+            DirBase::Cwd => {
+                return self.open_denials_at(
+                    DirBase::Cwd,
+                    Path::new("."),
+                    flags,
+                    true,
+                    ResolveFlags::empty(),
+                    Missing::Rules,
+                );
+            }
+            DirBase::Guest(fd) if fd == i64::from(libc::AT_FDCWD) => {
+                return self.open_denials_at(
+                    DirBase::Cwd,
+                    Path::new("."),
+                    flags,
+                    true,
+                    ResolveFlags::empty(),
+                    Missing::Rules,
+                );
+            }
+            DirBase::Guest(fd) => DescriptorTarget::resolve(fd),
+            DirBase::Pinned(fd) => DescriptorTarget::resolve_borrowed(fd),
+            DirBase::Invalid => return Vec::new(),
+        };
+        match target {
+            DescriptorTarget::Path(path) if path.is_absolute() => self.open_denials_at(
+                DirBase::Cwd,
                 &path,
                 flags,
                 true,
@@ -829,27 +916,37 @@ impl Policy {
         std::env::current_dir().unwrap_or_else(|_| self.cwd.clone())
     }
 
-    pub(crate) fn is_proc_self_exe(
+    fn join_base(&self, dir: DirBase<'_>, candidate: &Path) -> Option<PathBuf> {
+        if candidate.is_absolute() {
+            return Some(candidate.clean_lexically());
+        }
+        match dir {
+            DirBase::Cwd => Some(self.cwd().join(candidate).clean_lexically()),
+            DirBase::Guest(fd) if fd == i64::from(libc::AT_FDCWD) => {
+                Some(self.cwd().join(candidate).clean_lexically())
+            }
+            DirBase::Guest(fd) => match DescriptorTarget::resolve(fd) {
+                DescriptorTarget::Path(base) => Some(base.join(candidate).clean_lexically()),
+                _ => None,
+            },
+            DirBase::Pinned(fd) => match DescriptorTarget::resolve_borrowed(fd) {
+                DescriptorTarget::Path(base) => Some(base.join(candidate).clean_lexically()),
+                _ => None,
+            },
+            DirBase::Invalid => None,
+        }
+    }
+
+    pub(crate) fn is_proc_self_exe_at(
         &self,
-        dirfd: Option<i64>,
+        dir: DirBase<'_>,
         raw_path: &[u8],
         follow: bool,
     ) -> bool {
         const MAX_SYMLINKS: usize = 40;
         let candidate = Path::new(OsStr::from_bytes(raw_path));
-        let mut current = if candidate.is_absolute() {
-            candidate.clean_lexically()
-        } else {
-            match dirfd {
-                None => self.cwd().join(candidate).clean_lexically(),
-                Some(fd) if fd == i64::from(libc::AT_FDCWD) => {
-                    self.cwd().join(candidate).clean_lexically()
-                }
-                Some(fd) => match DescriptorTarget::resolve(fd) {
-                    DescriptorTarget::Path(base) => base.join(candidate).clean_lexically(),
-                    _ => return false,
-                },
-            }
+        let Some(mut current) = self.join_base(dir, candidate) else {
+            return false;
         };
         let self_root = PathBuf::from(format!("/proc/{}", std::process::id()));
         let limit = if follow { MAX_SYMLINKS } else { 0 };
@@ -886,15 +983,13 @@ impl Policy {
         }
         false
     }
-
-    pub(crate) fn has_forbidden_proc_target(
+    pub(crate) fn has_forbidden_proc_target_at(
         &self,
-        dirfd: Option<i64>,
+        dir: DirBase<'_>,
         path: &Path,
         follow: bool,
     ) -> bool {
-        let base = dirfd.unwrap_or_else(super::fds::GuestFd::at_fdcwd);
-        match self.resolve_path(base, path, follow, ResolveFlags::empty()) {
+        match self.resolve_at(dir, path, follow, ResolveFlags::empty()) {
             Resolution::Resolved(resolved) => {
                 Self::is_forbidden_proc_or_internal(&resolved.label)
                     || Self::is_forbidden_proc_or_internal(&resolved.lexical)
@@ -991,20 +1086,13 @@ impl Policy {
     }
 
     pub(crate) fn is_broker_proc_fd(&self, dirfd: Option<i64>, raw_path: &[u8]) -> bool {
+        self.is_broker_proc_fd_at(DirBase::from_opt(dirfd), raw_path)
+    }
+
+    pub(crate) fn is_broker_proc_fd_at(&self, dir: DirBase<'_>, raw_path: &[u8]) -> bool {
         let candidate = Path::new(OsStr::from_bytes(raw_path));
-        let full = if candidate.is_absolute() {
-            candidate.clean_lexically()
-        } else {
-            match dirfd {
-                None => self.cwd().join(candidate).clean_lexically(),
-                Some(fd) if fd == i64::from(libc::AT_FDCWD) => {
-                    self.cwd().join(candidate).clean_lexically()
-                }
-                Some(fd) => match DescriptorTarget::resolve(fd) {
-                    DescriptorTarget::Path(base) => base.join(candidate).clean_lexically(),
-                    _ => return false,
-                },
-            }
+        let Some(full) = self.join_base(dir, candidate) else {
+            return false;
         };
         Self::is_broker_proc_self_fd(&full)
     }
@@ -1038,7 +1126,7 @@ impl Policy {
                 let present = if remainder.as_os_str().is_empty() {
                     true
                 } else {
-                    Resolved::exists(i64::from(libc::AT_FDCWD), &target, true)
+                    Resolved::exists_at(DirBase::Cwd, &target, true)
                 };
                 Resolution::Resolved(Resolved {
                     label: target,
@@ -1236,15 +1324,20 @@ impl Mutation {
 }
 
 impl Resolved {
-    fn exists(dirfd: i64, path: &Path, follow: bool) -> bool {
+    fn exists_at(dir: DirBase<'_>, path: &Path, follow: bool) -> bool {
         let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
             return false;
         };
         let flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
-        let dirfd = i32::try_from(dirfd)
-            .ok()
-            .filter(|&fd| !super::fds::GuestFd::from_raw(fd).is_broker())
-            .unwrap_or(-1);
+        let dirfd = match dir {
+            DirBase::Cwd => libc::AT_FDCWD,
+            DirBase::Pinned(fd) => fd.as_raw_fd(),
+            DirBase::Guest(fd) => i32::try_from(fd)
+                .ok()
+                .filter(|&fd| !super::fds::GuestFd::from_raw(fd).is_broker())
+                .unwrap_or(-1),
+            DirBase::Invalid => -1,
+        };
         let mut stat = MaybeUninit::<libc::stat>::uninit();
         unsafe { libc::fstatat(dirfd, path.as_ptr(), stat.as_mut_ptr(), flags) == 0 }
     }
@@ -1275,8 +1368,11 @@ impl DescriptorTarget {
         {
             return Self::Invalid;
         }
-        let borrowed = unsafe { BorrowedFd::borrow_raw(raw) };
-        let Ok(label) = FdLabel::resolve(borrowed) else {
+        Self::resolve_borrowed(unsafe { BorrowedFd::borrow_raw(raw) })
+    }
+
+    fn resolve_borrowed(fd: BorrowedFd<'_>) -> Self {
+        let Ok(label) = FdLabel::resolve(fd) else {
             return Self::Invalid;
         };
         match label {

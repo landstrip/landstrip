@@ -6,7 +6,7 @@ use super::super::fds::{BrokerFd, GuestFd};
 use super::super::machine::{PAGE_BYTES, Regs};
 use super::super::memory::{GuestMemory, HostCString};
 use super::super::policy::{
-    self, Access, Missing, Mutation, Policy, Resolution, ResolveFlags, Resolved,
+    self, Access, DirBase, Missing, Mutation, Policy, Resolution, ResolveFlags, Resolved,
 };
 #[cfg(target_arch = "x86_64")]
 use super::TIMEVAL_BYTES;
@@ -16,7 +16,7 @@ use linux_raw_sys::general::{
     FUTEX_WAIT_REQUEUE_PI, open_how,
 };
 use std::ffi::{CString, OsStr};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use syscalls::{Errno, Sysno};
 
@@ -45,25 +45,17 @@ impl Call<'_> {
         let arguments = SyscallArgs::raw(self.registers);
         let status = match self.syscall {
             #[cfg(target_arch = "x86_64")]
-            Sysno::open => self.open(None, 0, GuestReg(arguments[1]).as_i32()),
+            Sysno::open => self.open(false, 0, GuestReg(arguments[1]).as_i32()),
             #[cfg(target_arch = "x86_64")]
-            Sysno::creat => self.open(None, 0, libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC),
-            Sysno::openat => self.open(
-                Some(GuestFd::from_reg(arguments[0]).policy_dirfd()),
-                1,
-                GuestReg(arguments[2]).as_i32(),
-            ),
+            Sysno::creat => self.open(false, 0, libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC),
+            Sysno::openat => self.open(true, 1, GuestReg(arguments[2]).as_i32()),
             Sysno::openat2 => self.openat2(),
             #[cfg(target_arch = "x86_64")]
             Sysno::access => self.access_syscall(&arguments),
             Sysno::faccessat | Sysno::faccessat2 => self.access_syscall(&arguments),
             #[cfg(target_arch = "x86_64")]
-            Sysno::readlink => self.readlink_syscall(None, 0, &arguments),
-            Sysno::readlinkat => self.readlink_syscall(
-                Some(GuestFd::from_reg(arguments[0]).policy_dirfd()),
-                1,
-                &arguments,
-            ),
+            Sysno::readlink => self.readlink_syscall(false, 0, &arguments),
+            Sysno::readlinkat => self.readlink_syscall(true, 1, &arguments),
             Sysno::inotify_add_watch => self.inotify_add_watch_syscall(&arguments),
             _ => return None,
         };
@@ -75,18 +67,17 @@ impl Call<'_> {
         let args = SyscallArgs::raw(self.registers);
         let status = match syscall {
             Sysno::ftruncate | Sysno::fchmod | Sysno::fchown | Sysno::fallocate => {
-                self.check(Request::write_descriptor(0), &[Arg::fd(0)])
+                self.check_descriptor(Access::Write, &[])
             }
-            Sysno::flistxattr => self.check(
-                Request::xattr_fd(syscall, 0),
-                &[Arg::fd(0), Arg::bytes(1, args[2])],
-            ),
-            Sysno::fsetxattr | Sysno::fgetxattr => self.check(
-                Request::xattr_fd(syscall, 0),
-                &[Arg::fd(0), Arg::cstr(1), Arg::bytes(2, args[3])],
+            Sysno::flistxattr => {
+                self.check_descriptor(Request::xattr_access(syscall), &[Arg::bytes(1, args[2])])
+            }
+            Sysno::fsetxattr | Sysno::fgetxattr => self.check_descriptor(
+                Request::xattr_access(syscall),
+                &[Arg::cstr(1), Arg::bytes(2, args[3])],
             ),
             Sysno::fremovexattr => {
-                self.check(Request::xattr_fd(syscall, 0), &[Arg::fd(0), Arg::cstr(1)])
+                self.check_descriptor(Request::xattr_access(syscall), &[Arg::cstr(1)])
             }
             Sysno::listxattr
             | Sysno::llistxattr
@@ -109,8 +100,9 @@ impl Call<'_> {
             Ok(path) => path,
             Err(errno) => return errno.negated(),
         };
+        let _cwd = self.policy.read_cwd();
         if let Some(raw) = path.as_bytes()
-            && self.policy.is_broker_proc_fd(None, raw)
+            && self.policy.is_broker_proc_fd_at(DirBase::Cwd, raw)
         {
             return Errno::ENOENT.negated();
         }
@@ -184,15 +176,16 @@ impl Call<'_> {
             Ok(path) => path,
             Err(errno) => return errno.negated(),
         };
+        let _cwd = self.policy.read_cwd();
         if let Some(raw) = path.as_bytes()
-            && self.policy.is_broker_proc_fd(None, raw)
+            && self.policy.is_broker_proc_fd_at(DirBase::Cwd, raw)
         {
             return Errno::ENOENT.negated();
         }
         let mask = GuestReg(arguments[2]).as_u32();
         let trailing_slash = path.as_bytes().is_some_and(|bytes| bytes.ends_with(b"/"));
         let follow = trailing_slash || mask & libc::IN_DONT_FOLLOW == 0;
-        let request = Request::read(None, &path, follow);
+        let request = Request::read(DirBase::Cwd, &path, follow);
         self.check(request, &[Arg::fd(0), Arg::copied_path(1, &path)])
     }
 
@@ -206,6 +199,35 @@ impl Call<'_> {
         SyscallArgs::forward_translated(self.registers, self.memory, self.syscall, specs)
     }
 
+    fn check_descriptor(self, access: Access, extra: &[Arg<'_>]) -> u64 {
+        let args = SyscallArgs::raw(self.registers);
+        let pinned = match GuestFd::from_reg(args[0]).pin() {
+            Ok(fd) => Some(fd),
+            Err(Errno::EBADF) => None,
+            Err(errno) => return errno.negated(),
+        };
+        let fd_arg = match &pinned {
+            Some(fd) => Arg::borrowed_fd(0, fd.as_fd()),
+            None => Arg::invalid_fd(0),
+        };
+        let mut specs = Vec::with_capacity(1 + extra.len());
+        specs.push(fd_arg);
+        specs.extend_from_slice(extra);
+        if let Some(fd) = &pinned {
+            let request = match access {
+                Access::Write => Request::write_descriptor(fd.as_fd()),
+                Access::Read => Request::xattr_fd(self.syscall, fd.as_fd()),
+            };
+            if let Some(errno) = self
+                .sink
+                .refuse_target(self.policy, self.registers, request)
+            {
+                return errno.negated();
+            }
+        }
+        SyscallArgs::forward_translated(self.registers, self.memory, self.syscall, &specs)
+    }
+
     fn access_syscall(self, arguments: &[u64; 6]) -> u64 {
         const KNOWN_FLAGS: i32 = libc::AT_EACCESS | libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
         const KNOWN_MODE: i32 = libc::R_OK | libc::W_OK | libc::X_OK;
@@ -215,16 +237,25 @@ impl Call<'_> {
         #[cfg(target_arch = "aarch64")]
         let is_legacy = false;
         let path_index = usize::from(!is_legacy);
-        let dirfd = (!is_legacy).then(|| GuestFd::from_reg(arguments[0]).policy_dirfd());
         let mode = GuestReg(arguments[path_index + 1]).as_i32();
         let path = match HostCString::read(self.memory, arguments[path_index]) {
             Ok(path) => path,
             Err(errno) => return errno.negated(),
         };
+        let _cwd = self.policy.read_cwd();
+        let active = !is_legacy && !path.is_null() && !path.as_path().is_absolute();
+        let pinned_dfd = match PinnedDir::guest(
+            (!is_legacy).then(|| GuestFd::from_reg(arguments[0])),
+            active,
+        ) {
+            Ok(pinned) => pinned,
+            Err(errno) => return errno.negated(),
+        };
+        let dir = pinned_dfd.as_base();
         let specs: Vec<Arg<'_>> = if is_legacy {
             vec![Arg::copied_path(0, &path)]
         } else {
-            vec![Arg::dirfd(0), Arg::copied_path(1, &path)]
+            vec![pinned_dfd.as_arg(0), Arg::copied_path(1, &path)]
         };
         let flags = if syscall == Sysno::faccessat2 {
             GuestReg(arguments[3]).as_i32()
@@ -232,7 +263,7 @@ impl Call<'_> {
             0
         };
         if let Some(raw) = path.as_bytes()
-            && self.policy.is_broker_proc_fd(dirfd, raw)
+            && self.policy.is_broker_proc_fd_at(dir, raw)
         {
             return Errno::ENOENT.negated();
         }
@@ -243,7 +274,7 @@ impl Call<'_> {
             && !path.as_path().as_os_str().is_empty()
             && self
                 .policy
-                .has_forbidden_proc_target(dirfd, path.as_path(), follow)
+                .has_forbidden_proc_target_at(dir, path.as_path(), follow)
         {
             return Errno::EACCES.negated();
         }
@@ -258,7 +289,7 @@ impl Call<'_> {
             _ => libc::O_RDONLY,
         };
         let access = if writes { Access::Write } else { Access::Read };
-        let mut request = Request::path(dirfd, &path, access, follow)
+        let mut request = Request::path(dir, &path, access, follow)
             .opens(open_flags)
             .missing(Missing::Kernel);
         if syscall == Sysno::faccessat2 {
@@ -288,20 +319,35 @@ impl Call<'_> {
         guarded
     }
 
-    fn open(self, dirfd: Option<i64>, index: usize, flags: i32) -> u64 {
+    fn open(self, has_dirfd: bool, index: usize, flags: i32) -> u64 {
         let arguments = SyscallArgs::raw(self.registers);
         let path = match HostCString::read(self.memory, arguments[index]) {
             Ok(path) => path,
             Err(errno) => return errno.negated(),
         };
+        let is_abs = path.as_path().is_absolute();
+        let non_empty = !path.is_null() && !path.as_path().as_os_str().is_empty();
+        let _proc_cwd = (is_abs
+            && path.as_path().starts_with("/proc")
+            && flags & (libc::O_CREAT | libc::O_TRUNC) != 0)
+            .then(|| self.policy.read_cwd());
+        let pinned_dfd = match PinnedDir::for_open(
+            self.policy,
+            has_dirfd.then(|| GuestFd::from_reg(arguments[0])),
+            non_empty && !is_abs,
+        ) {
+            Ok(pinned) => pinned,
+            Err(errno) => return errno.negated(),
+        };
+        let dir = pinned_dfd.as_base();
         if let Some(raw) = path.as_bytes()
-            && self.policy.is_broker_proc_fd(dirfd, raw)
+            && self.policy.is_broker_proc_fd_at(dir, raw)
         {
             return Errno::ENOENT.negated();
         }
         let follow = Request::open_follows(flags, &path, ResolveFlags::empty());
         let mut request =
-            Request::path(dirfd, &path, Access::from_open_flags(flags), follow).opens(flags);
+            Request::path(dir, &path, Access::from_open_flags(flags), follow).opens(flags);
         request.flags = Request::open_flag_names(flags);
         if flags & libc::O_CREAT == 0 {
             request = request.missing(Missing::Kernel);
@@ -312,19 +358,45 @@ impl Call<'_> {
         {
             return errno.negated();
         }
-        if let Some(fd) = self.open_proc_maps(dirfd, &path, flags, follow) {
+        if let Some(fd) = self.open_proc_maps(dir, &path, flags, follow) {
             return fd;
         }
-        if let Some(fd) = self.open_proc_exe(dirfd, &path, flags, follow, ResolveFlags::empty()) {
+        if let Some(fd) = self.open_proc_exe(dir, &path, flags, follow, ResolveFlags::empty()) {
             return fd;
         }
-        let specs = if dirfd.is_some() {
-            vec![Arg::dirfd(0), Arg::copied_path(index, &path)]
+        let raw_res = if !has_dirfd && let PinnedDir::Pinned(fd) = &pinned_dfd {
+            #[cfg(target_arch = "x86_64")]
+            let mode = if self.syscall == Sysno::creat {
+                arguments[1]
+            } else {
+                arguments[2]
+            };
+            #[cfg(target_arch = "aarch64")]
+            let mode = arguments[2];
+            SyscallArgs([
+                u64::from(fd.as_raw_fd().cast_unsigned()),
+                path.host_ptr(),
+                i64::from(flags).cast_unsigned(),
+                mode,
+                0,
+                0,
+            ])
+            .forward_raw(Sysno::openat)
+        } else if has_dirfd {
+            SyscallArgs::forward_translated(
+                self.registers,
+                self.memory,
+                self.syscall,
+                &[pinned_dfd.as_arg(0), Arg::copied_path(index, &path)],
+            )
         } else {
-            vec![Arg::copied_path(index, &path)]
+            SyscallArgs::forward_translated(
+                self.registers,
+                self.memory,
+                self.syscall,
+                &[Arg::copied_path(index, &path)],
+            )
         };
-        let raw_res =
-            SyscallArgs::forward_translated(self.registers, self.memory, self.syscall, &specs);
         self.verify_opened_fd(raw_res, flags)
     }
 
@@ -354,18 +426,33 @@ impl Call<'_> {
             Ok(path) => path,
             Err(errno) => return errno.negated(),
         };
-        let dirfd = GuestFd::from_reg(arguments[0]).policy_dirfd();
+        let is_abs = path.as_path().is_absolute();
+        let non_empty = !path.is_null() && !path.as_path().as_os_str().is_empty();
+        let scoped = resolve.intersects(ResolveFlags::BENEATH.union(ResolveFlags::IN_ROOT));
+        let _proc_cwd = (is_abs
+            && !scoped
+            && path.as_path().starts_with("/proc")
+            && flags & (libc::O_CREAT | libc::O_TRUNC) != 0)
+            .then(|| self.policy.read_cwd());
+        let pinned_dfd = match PinnedDir::for_open(
+            self.policy,
+            Some(GuestFd::from_reg(arguments[0])),
+            non_empty && (!is_abs || scoped),
+        ) {
+            Ok(pinned) => pinned,
+            Err(errno) => return errno.negated(),
+        };
+        let dir = pinned_dfd.as_base();
         if !path.is_null() {
             if let Some(raw) = path.as_bytes()
-                && self.policy.is_broker_proc_fd(Some(dirfd), raw)
+                && self.policy.is_broker_proc_fd_at(dir, raw)
             {
                 return Errno::ENOENT.negated();
             }
             let follow = Request::open_follows(flags, &path, resolve);
-            let mut request =
-                Request::path(Some(dirfd), &path, Access::from_open_flags(flags), follow)
-                    .opens(flags)
-                    .resolves(resolve);
+            let mut request = Request::path(dir, &path, Access::from_open_flags(flags), follow)
+                .opens(flags)
+                .resolves(resolve);
             request.flags = Request::open_flag_names(flags);
             if flags & libc::O_CREAT == 0 {
                 request = request.missing(Missing::Kernel);
@@ -381,10 +468,10 @@ impl Call<'_> {
                     && resolve.contains(ResolveFlags::IN_ROOT))
                 && !(resolve.contains(ResolveFlags::BENEATH) && path.as_path().is_absolute())
             {
-                if let Some(fd) = self.open_proc_maps(Some(dirfd), &path, flags, follow) {
+                if let Some(fd) = self.open_proc_maps(dir, &path, flags, follow) {
                     return fd;
                 }
-                if let Some(fd) = self.open_proc_exe(Some(dirfd), &path, flags, follow, resolve) {
+                if let Some(fd) = self.open_proc_exe(dir, &path, flags, follow, resolve) {
                     return fd;
                 }
             }
@@ -394,7 +481,7 @@ impl Call<'_> {
             self.memory,
             Sysno::openat2,
             &[
-                Arg::dirfd(0),
+                pinned_dfd.as_arg(0),
                 Arg::copied_path(1, &path),
                 Arg::copied_bytes(2, &raw_bytes),
             ],
@@ -407,7 +494,7 @@ impl Call<'_> {
     /// the guest layout rather than the broker's host mappings.
     fn open_proc_maps(
         self,
-        dirfd: Option<i64>,
+        dir: DirBase<'_>,
         path: &HostCString,
         flags: i32,
         follow: bool,
@@ -420,17 +507,23 @@ impl Call<'_> {
         let full = if candidate.is_absolute() {
             candidate.to_path_buf()
         } else {
-            match dirfd {
-                None => self.policy.cwd().join(candidate),
-                Some(fd) if fd == i64::from(libc::AT_FDCWD) => self.policy.cwd().join(candidate),
-                Some(fd)
+            match dir {
+                DirBase::Cwd => self.policy.cwd().join(candidate),
+                DirBase::Guest(fd) if fd == i64::from(libc::AT_FDCWD) => {
+                    self.policy.cwd().join(candidate)
+                }
+                DirBase::Guest(fd)
                     if i32::try_from(fd)
                         .ok()
                         .is_some_and(|raw| GuestFd::from_raw(raw).valid().is_some()) =>
                 {
                     std::path::PathBuf::from(format!("/proc/self/fd/{fd}")).join(candidate)
                 }
-                Some(_) => return None,
+                DirBase::Pinned(fd) => {
+                    std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+                        .join(candidate)
+                }
+                DirBase::Guest(_) | DirBase::Invalid => return None,
             }
         };
         if !follow
@@ -504,14 +597,14 @@ impl Call<'_> {
 
     fn open_proc_exe(
         self,
-        dirfd: Option<i64>,
+        dir: DirBase<'_>,
         path: &HostCString,
         flags: i32,
         follow: bool,
         resolve: ResolveFlags,
     ) -> Option<u64> {
         let raw = path.as_bytes()?;
-        if !self.policy.is_proc_self_exe(dirfd, raw, follow) {
+        if !self.policy.is_proc_self_exe_at(dir, raw, follow) {
             return None;
         }
         if !follow {
@@ -539,19 +632,27 @@ impl Call<'_> {
         Some(self.verify_opened_fd(result, flags))
     }
 
-    fn readlink_syscall(self, dirfd: Option<i64>, index: usize, arguments: &[u64; 6]) -> u64 {
+    fn readlink_syscall(self, has_dirfd: bool, index: usize, arguments: &[u64; 6]) -> u64 {
         let path = match HostCString::read(self.memory, arguments[index]) {
             Ok(path) => path,
             Err(errno) => return errno.negated(),
         };
+        let _cwd = self.policy.read_cwd();
+        let active = has_dirfd && !path.is_null() && !path.as_path().is_absolute();
+        let pinned_dfd =
+            match PinnedDir::guest(has_dirfd.then(|| GuestFd::from_reg(arguments[0])), active) {
+                Ok(pinned) => pinned,
+                Err(errno) => return errno.negated(),
+            };
+        let dir = pinned_dfd.as_base();
         let bufsiz = GuestReg(arguments[index + 2]).as_i32();
         if !path.is_null()
             && let Some(raw) = path.as_bytes()
         {
-            if self.policy.is_broker_proc_fd(dirfd, raw) {
+            if self.policy.is_broker_proc_fd_at(dir, raw) {
                 return Errno::ENOENT.negated();
             }
-            if self.policy.is_proc_self_exe(dirfd, raw, false) {
+            if self.policy.is_proc_self_exe_at(dir, raw, false) {
                 if bufsiz <= 0 {
                     return Errno::EINVAL.negated();
                 }
@@ -570,15 +671,15 @@ impl Call<'_> {
             if !raw.is_empty()
                 && self
                     .policy
-                    .has_forbidden_proc_target(dirfd, path.as_path(), false)
+                    .has_forbidden_proc_target_at(dir, path.as_path(), false)
             {
                 return Errno::EACCES.negated();
             }
         }
         let len = u64::try_from(bufsiz.max(0)).unwrap_or(0);
-        let specs = if dirfd.is_some() {
+        let specs = if has_dirfd {
             vec![
-                Arg::dirfd(0),
+                pinned_dfd.as_arg(0),
                 Arg::copied_path(index, &path),
                 Arg::bytes(index + 1, len),
             ]
@@ -852,109 +953,126 @@ impl Call<'_> {
     }
 
     fn mutation_status(self, mutation: Mutation, specs: &[PathSpec]) -> u64 {
+        self.try_mutation_status(mutation, specs)
+            .unwrap_or_else(ErrnoExt::negated)
+    }
+
+    fn try_mutation_status(
+        self,
+        mutation: Mutation,
+        specs: &[PathSpec],
+    ) -> std::result::Result<u64, Errno> {
         let syscall = self.syscall;
         let arguments = SyscallArgs::raw(self.registers);
-        let mut copied: Vec<HostCString> = Vec::with_capacity(specs.len());
-        for spec in specs {
-            match HostCString::read(self.memory, arguments[spec.path]) {
-                Ok(path) => copied.push(path),
-                Err(errno) => return errno.negated(),
-            }
-        }
-        let ptrs = Self::copied_path_args(specs, &copied, syscall);
+        let copied = specs
+            .iter()
+            .map(|spec| HostCString::read(self.memory, arguments[spec.path]))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let _cwd = self.policy.read_cwd();
+        let pinned_dfds = PinnedDir::guest_vec(specs, &copied, &arguments)?;
+        let ptrs = Self::copied_path_args(specs, &copied, &pinned_dfds, syscall);
         let mut paths: Vec<Resolved> = Vec::with_capacity(specs.len());
         let mut descriptor_target = false;
         for (spec_index, (spec, path)) in specs.iter().zip(&copied).enumerate() {
-            let dirfd = spec
+            let raw_dirfd = spec
                 .dirfd
                 .map(|index| GuestFd::from_reg(arguments[index]).policy_dirfd());
-            let base = dirfd.unwrap_or_else(GuestFd::at_fdcwd);
+            let dir = pinned_dfds
+                .get(spec_index)
+                .map_or(DirBase::Cwd, PinnedDir::as_base);
             let resolution = if path.as_path().as_os_str().is_empty() {
-                if !Self::spec_names_descriptor(syscall, spec_index, dirfd, path, &arguments) {
-                    return SyscallArgs::forward_translated(
+                if !Self::spec_names_descriptor(syscall, spec_index, raw_dirfd, path, &arguments) {
+                    return Ok(SyscallArgs::forward_translated(
                         self.registers,
                         self.memory,
                         syscall,
                         &ptrs,
-                    );
+                    ));
                 }
                 descriptor_target = true;
-                self.policy.resolve_descriptor(base)
+                self.policy.resolve_descriptor_at(dir)
             } else {
-                self.policy.resolve_path(
-                    base,
+                self.policy.resolve_at(
+                    dir,
                     path.as_path(),
                     spec.follow.follows(&arguments),
                     ResolveFlags::empty(),
                 )
             };
-            let resolved = match resolution {
+            match resolution {
                 Resolution::Kernel => {
-                    return SyscallArgs::forward_translated(
+                    return Ok(SyscallArgs::forward_translated(
                         self.registers,
                         self.memory,
                         syscall,
                         &ptrs,
-                    );
+                    ));
                 }
-                Resolution::Unclassified => continue,
+                Resolution::Unclassified => {}
                 Resolution::Unresolvable(unres) => {
                     let denial = policy::Denial::unresolvable(Access::Write, unres);
                     if let Some(errno) = self.sink.refuse(self.policy, syscall, denial, Vec::new())
                     {
-                        return errno.negated();
+                        return Err(errno);
                     }
-                    continue;
                 }
-                Resolution::Resolved(resolved) => resolved,
-            };
-            paths.push(resolved);
+                Resolution::Resolved(resolved) => paths.push(resolved),
+            }
         }
         let reached = match mutation {
             Mutation::Mkdir => !paths.iter().any(|path| path.present),
             Mutation::Removal => paths.iter().any(|path| path.present),
             Mutation::Reparent | Mutation::Metadata => true,
         };
-        let pinned = (self.sink.can_query() && !descriptor_target).then(|| {
-            let path = paths.first()?;
-            PathSpec::pins(specs, &arguments).then(|| Pinned::open(&path.label))?
-        });
-        let pinned = pinned.flatten();
+        let pinned = (self.sink.can_query() && !descriptor_target)
+            .then(|| {
+                let path = paths.first()?;
+                PathSpec::pins(specs, &arguments).then(|| Pinned::open(&path.label))?
+            })
+            .flatten();
         if let Some(denial) = mutation.denial(self.policy, &paths).filter(|_| reached) {
-            match self.sink.refuse(self.policy, syscall, denial, Vec::new()) {
-                Some(errno) => return errno.negated(),
-                None => {
-                    if let Some(pinned) = pinned {
-                        let trailing_slash = copied
-                            .first()
-                            .and_then(HostCString::as_bytes)
-                            .is_some_and(|bytes| bytes.ends_with(b"/"));
-                        if trailing_slash && !pinned.is_dir() {
-                            return Errno::ENOTDIR.negated();
-                        }
-                        return SyscallArgs::with_translated(
-                            self.registers,
-                            self.memory,
-                            &ptrs,
-                            |raw| pinned.mutate(syscall, raw),
-                        );
-                    }
+            if let Some(errno) = self.sink.refuse(self.policy, syscall, denial, Vec::new()) {
+                return Err(errno);
+            }
+            if let Some(pinned) = pinned {
+                if copied
+                    .first()
+                    .and_then(HostCString::as_bytes)
+                    .is_some_and(|bytes| bytes.ends_with(b"/"))
+                    && !pinned.is_dir()
+                {
+                    return Err(Errno::ENOTDIR);
                 }
+                return Ok(SyscallArgs::with_translated(
+                    self.registers,
+                    self.memory,
+                    &ptrs,
+                    |raw| pinned.mutate(syscall, raw),
+                ));
             }
         }
-        SyscallArgs::forward_translated(self.registers, self.memory, syscall, &ptrs)
+        Ok(SyscallArgs::forward_translated(
+            self.registers,
+            self.memory,
+            syscall,
+            &ptrs,
+        ))
     }
 
     fn copied_path_args<'b>(
         specs: &[PathSpec],
         copied: &'b [HostCString],
+        pinned_dfds: &'b [PinnedDir],
         syscall: Sysno,
     ) -> Vec<Arg<'b>> {
         let extra = Self::extra_args(syscall);
         let mut args = Vec::with_capacity(specs.len() * 2 + extra.len());
-        for (spec, path) in specs.iter().zip(copied) {
+        for (idx, (spec, path)) in specs.iter().zip(copied).enumerate() {
             if let Some(dirfd) = spec.dirfd {
-                args.push(Arg::dirfd(dirfd));
+                let dfd_arg = pinned_dfds
+                    .get(idx)
+                    .map_or_else(|| Arg::dirfd(dirfd), |pinned| pinned.as_arg(dirfd));
+                args.push(dfd_arg);
             }
             args.push(Arg::copied_path(spec.path, path));
         }
@@ -990,6 +1108,81 @@ impl Call<'_> {
 /// The entry a metadata change reaches, held open across a responder's answer.
 struct Pinned(BrokerFd);
 
+enum PinnedDir {
+    Cwd,
+    Pinned(BrokerFd),
+    Invalid,
+}
+
+impl PinnedDir {
+    fn guest(guest_dfd: Option<GuestFd>, active: bool) -> std::result::Result<Self, Errno> {
+        if !active {
+            return Ok(Self::Cwd);
+        }
+        let Some(dfd) = guest_dfd.filter(|dfd| dfd.policy_dirfd() != GuestFd::at_fdcwd()) else {
+            return Ok(Self::Cwd);
+        };
+        match dfd.pin() {
+            Ok(fd) => Ok(Self::Pinned(fd)),
+            Err(Errno::EBADF) => Ok(Self::Invalid),
+            Err(errno) => Err(errno),
+        }
+    }
+
+    fn guest_vec(
+        specs: &[PathSpec],
+        copied: &[HostCString],
+        arguments: &[u64; 6],
+    ) -> std::result::Result<Vec<Self>, Errno> {
+        specs
+            .iter()
+            .zip(copied)
+            .map(|(spec, path)| {
+                let active =
+                    spec.dirfd.is_some() && (path.is_null() || !path.as_path().is_absolute());
+                Self::guest(
+                    spec.dirfd.map(|idx| GuestFd::from_reg(arguments[idx])),
+                    active,
+                )
+            })
+            .collect()
+    }
+
+    fn for_open(
+        policy: &Policy,
+        guest_dfd: Option<GuestFd>,
+        active: bool,
+    ) -> std::result::Result<Self, Errno> {
+        if !active {
+            return Ok(Self::Cwd);
+        }
+        if let Some(dfd) = guest_dfd.filter(|dfd| dfd.policy_dirfd() != GuestFd::at_fdcwd()) {
+            return match dfd.pin() {
+                Ok(fd) => Ok(Self::Pinned(fd)),
+                Err(Errno::EBADF) => Ok(Self::Invalid),
+                Err(errno) => Err(errno),
+            };
+        }
+        Pinned::open_cwd(policy).map(Self::Pinned)
+    }
+
+    fn as_base(&self) -> DirBase<'_> {
+        match self {
+            Self::Cwd => DirBase::Cwd,
+            Self::Pinned(fd) => DirBase::Pinned(fd.as_fd()),
+            Self::Invalid => DirBase::Invalid,
+        }
+    }
+
+    fn as_arg(&self, slot: usize) -> Arg<'_> {
+        match self {
+            Self::Cwd => Arg::dirfd(slot),
+            Self::Pinned(fd) => Arg::borrowed_fd(slot, fd.as_fd()),
+            Self::Invalid => Arg::invalid_fd(slot),
+        }
+    }
+}
+
 impl Pinned {
     fn open(path: &std::path::Path) -> Option<Self> {
         Self::open_mode(path, false)
@@ -1008,6 +1201,23 @@ impl Pinned {
         }
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
         GuestFd::relocate_above(owned).ok().map(Self)
+    }
+
+    fn open_cwd(policy: &Policy) -> std::result::Result<BrokerFd, Errno> {
+        let _cwd = policy.read_cwd();
+        let _fd_lock = GuestFd::read_fd_table();
+        let fd = unsafe {
+            libc::openat(
+                libc::AT_FDCWD,
+                c".".as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(Errno::last_os(Errno::ENOENT));
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        GuestFd::relocate_above(owned).map_err(|error| Errno::from_io(&error, Errno::EMFILE))
     }
 
     fn path(&self) -> CString {
