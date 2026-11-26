@@ -7,6 +7,7 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl -debug
+.Op Fl -backend Ar auto|container|machine
 .Cm run
 .Op Fl p Ar file
 .Op Fl -policy-format Ar format
@@ -18,6 +19,7 @@
 .Op Ar args ...
 .Nm
 .Op Fl -debug
+.Op Fl -backend Ar auto|container|machine
 .Ar command
 .Op Ar options
 .Sh DESCRIPTION
@@ -71,6 +73,20 @@ Remove restricted-user isolation and return to AppContainer.
 .Bl -tag -width Ds
 .It Fl -debug
 Enable debug logging.
+.It Fl -backend Ar auto|container|machine
+Linux only.
+Select the sandbox backend:
+.Va auto
+(default; uses
+.Va machine
+when
+.Pa /dev/kvm
+is accessible and falls back to
+.Va container ) ,
+.Va container
+(Landlock and seccomp-notify), or
+.Va machine
+(KVM).
 .It Fl V , Fl -version
 Print the version.
 .It Fl h , Fl -help
@@ -290,14 +306,18 @@ restricted to this host's sockets.
 Commands run in new user, PID, and mount namespaces with a private procfs and
 a PID-1 reaper that forwards termination signals and reaps all descendants
 on exit.
-On x86-64 and AArch64, each process runs unprivileged in a kernel-less KVM
-guest of the host architecture
+On x86-64 and AArch64, the
+.Va machine
+backend runs each process unprivileged in a kernel-less KVM guest of the host
+architecture
 .Pq requires read-write access to Pa /dev/kvm ,
-with guest threads sharing memory across multiple vCPUs.
-The host KVM broker mediates filesystem and network system calls, reports
-denials and interactive
+with guest threads sharing memory across multiple vCPUs, while the
+.Va container
+backend enforces policy in-kernel with Landlock and a seccomp-notify broker.
+Both backends mediate filesystem and network system calls, report denials and
+interactive
 .Fl -trap
-queries, and blocks service-manager sockets and io_uring.
+queries, and block service-manager sockets and io_uring.
 .It macOS
 Seatbelt fixes the profile at startup.
 .Va macos.allowTrustd ,

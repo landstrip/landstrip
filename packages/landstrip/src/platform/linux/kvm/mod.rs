@@ -95,6 +95,9 @@ impl Sandbox {
         })())
     }
 
+    pub(super) fn is_available() -> bool {
+        machine::Machine::is_available()
+    }
     pub(super) fn probe() -> Result<()> {
         machine::Machine::probe()
     }

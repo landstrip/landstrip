@@ -37,7 +37,7 @@ mod windows;
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub(crate) use linux::resume_if_requested;
+pub(crate) use linux::{Backend as LinuxBackend, resume_if_requested};
 
 use crate::outcome::DoctorReport;
 #[cfg(any(
@@ -73,11 +73,6 @@ pub(crate) enum WindowsCommand {
     target_os = "windows"
 )))]
 pub(crate) use fallback::execute;
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-pub(crate) use linux::execute;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::execute;
 #[cfg(target_os = "windows")]
@@ -114,14 +109,24 @@ pub(crate) fn validate(_policy: &crate::policy::AccessPolicy) -> crate::error::R
     Err(crate::error::Error::PlatformUnsupported)
 }
 
-pub(crate) fn check(policy: &crate::policy::AccessPolicy) -> crate::error::Result<()> {
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) fn check(
+    policy: &crate::policy::AccessPolicy,
+    backend: LinuxBackend,
+) -> crate::error::Result<()> {
     validate(policy)?;
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    linux::check_host()?;
-    Ok(())
+    backend.check_host()
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+pub(crate) fn check(policy: &crate::policy::AccessPolicy) -> crate::error::Result<()> {
+    validate(policy)
 }
 
 #[cfg(all(
@@ -129,8 +134,8 @@ pub(crate) fn check(policy: &crate::policy::AccessPolicy) -> crate::error::Resul
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[allow(clippy::unnecessary_wraps, reason = "uniform platform doctor API")]
-pub(crate) fn doctor() -> anyhow::Result<DoctorReport> {
-    Ok(doctor_report(SandboxPlatform::Linux, linux::doctor()))
+pub(crate) fn doctor(backend: LinuxBackend) -> anyhow::Result<DoctorReport> {
+    Ok(doctor_report(SandboxPlatform::Linux, backend.doctor()))
 }
 
 #[cfg(target_os = "macos")]

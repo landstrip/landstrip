@@ -4,6 +4,11 @@
 use crate::config::{PolicyFormat, Settings};
 #[allow(unused_imports)]
 use crate::error::{Error, Mechanism};
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+use crate::platform::LinuxBackend;
 #[cfg(target_os = "windows")]
 use crate::platform::{RESTRICTED_USER_RUNNER, WindowsCommand};
 use crate::policy::AccessPolicy;
@@ -27,6 +32,11 @@ const PROGRAM_NAME: &str = "landstrip";
 #[derive(Debug)]
 pub(super) struct Invocation {
     pub(super) debug: bool,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(super) backend: LinuxBackend,
     pub(super) command: Command,
 }
 
@@ -83,6 +93,40 @@ pub(super) struct PolicyRequest {
     pub(super) tool: Option<OsString>,
 }
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[derive(Clone, Copy, Debug, Default, Args)]
+struct BackendArgs {
+    /// Select the Linux sandbox backend.
+    #[arg(long, value_enum, value_name = "BACKEND")]
+    backend: Option<LinuxBackend>,
+}
+
+#[derive(Debug, Args)]
+struct CheckArgs {
+    #[command(flatten)]
+    request: PolicyRequest,
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[command(flatten)]
+    backend: BackendArgs,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[command(flatten)]
+    backend: BackendArgs,
+}
+
 #[derive(Debug, Args)]
 pub(super) struct PolicyInput {
     /// Policy file; repeat to merge; use `-` for standard input.
@@ -105,6 +149,12 @@ struct Cli {
     #[arg(long, global = true)]
     debug: bool,
 
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[command(flatten)]
+    backend: BackendArgs,
     #[command(subcommand)]
     command: CliCommand,
 }
@@ -114,11 +164,11 @@ enum CliCommand {
     /// Run a command inside the sandbox.
     Run(RunArgs),
     /// Check policy parsing, merging, resolution, and platform support.
-    Check(PolicyRequest),
+    Check(CheckArgs),
     /// Print the final normalized policy as JSON.
     Resolve(PolicyRequest),
     /// Verify sandbox health and report supported/available capabilities.
-    Doctor,
+    Doctor(DoctorArgs),
     /// Run the randomized model-based self-test against this executable.
     Selftest(SelftestArgs),
     #[command(name = WorkerArgs::SUBCOMMAND, hide = true)]
@@ -128,10 +178,32 @@ enum CliCommand {
     Windows(WindowsArgs),
 }
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+impl CliCommand {
+    fn backend(&self) -> Option<LinuxBackend> {
+        match self {
+            Self::Run(args) => args.backend.backend,
+            Self::Check(args) => args.backend.backend,
+            Self::Doctor(args) => args.backend.backend,
+            Self::Resolve(_) | Self::Selftest(_) | Self::SelftestWorker(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct RunArgs {
     #[command(flatten)]
     policy: PolicyInput,
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[command(flatten)]
+    backend: BackendArgs,
 
     /// Working directory for execution and relative path resolution.
     #[arg(
@@ -264,8 +336,20 @@ impl ParseOutcome {
             }
         };
 
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let subcommand_backend = cli.command.backend();
         Ok(Self::Invocation(Invocation {
             debug: cli.debug,
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            backend: subcommand_backend
+                .or(cli.backend.backend)
+                .unwrap_or_default(),
             command: Command::try_from(cli.command)?,
         }))
     }
@@ -277,9 +361,9 @@ impl TryFrom<CliCommand> for Command {
     fn try_from(command: CliCommand) -> Result<Self, Self::Error> {
         Ok(match command {
             CliCommand::Run(args) => Self::Run(args.try_into()?),
-            CliCommand::Check(request) => Self::Check(request),
+            CliCommand::Check(args) => Self::Check(args.request),
             CliCommand::Resolve(request) => Self::Resolve(request),
-            CliCommand::Doctor => Self::Doctor,
+            CliCommand::Doctor(_) => Self::Doctor,
             CliCommand::Selftest(args) => Self::Selftest(args),
             CliCommand::SelftestWorker(args) => Self::SelftestWorker(args),
             #[cfg(target_os = "windows")]

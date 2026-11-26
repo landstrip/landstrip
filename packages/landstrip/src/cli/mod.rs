@@ -83,11 +83,43 @@ fn trap_descriptor(_invocation: &Invocation) -> Option<&()> {
 }
 
 fn dispatch(invocation: &mut Invocation) -> Result<CommandOutcome> {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let backend = invocation.backend;
     match &mut invocation.command {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        Command::Run(command) => run(command, backend),
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         Command::Run(command) => run(command),
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        Command::Check(request) => check_policy(request, backend),
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         Command::Check(request) => check_policy(request),
         Command::Resolve(request) => resolve_policy(request),
         Command::Doctor => {
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            let report = platform::doctor(backend)?;
+            #[cfg(not(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )))]
             let report = platform::doctor()?;
             Ok(CommandOutcome::json(report.ok, report)?)
         }
@@ -103,12 +135,41 @@ fn dispatch(invocation: &mut Invocation) -> Result<CommandOutcome> {
     }
 }
 
-fn run(command: &mut RunCommand) -> Result<CommandOutcome> {
+fn run(
+    command: &mut RunCommand,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    backend: platform::LinuxBackend,
+) -> Result<CommandOutcome> {
     let policy = command
         .policy
         .resolve(&command.cwd, Some(command.tool.as_os_str()))?;
     platform::validate(&policy)?;
-    #[cfg(unix)]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let result = backend.execute(
+        &policy,
+        &command.cwd,
+        &command.tool,
+        &command.tool_args,
+        command.trap_fd.as_mut(),
+        &command
+            .inherited_fds
+            .iter()
+            .map(std::os::fd::AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>(),
+    );
+    #[cfg(all(
+        unix,
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))
+    ))]
     let result = platform::execute(
         &policy,
         &command.cwd,
@@ -127,7 +188,26 @@ fn run(command: &mut RunCommand) -> Result<CommandOutcome> {
     result.map(CommandOutcome::Exit)
 }
 
-fn check_policy(request: &PolicyRequest) -> Result<CommandOutcome> {
+fn check_policy(
+    request: &PolicyRequest,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    backend: platform::LinuxBackend,
+) -> Result<CommandOutcome> {
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let result = request
+        .policy
+        .resolve(&request.cwd, request.tool.as_deref())
+        .and_then(|policy| platform::check(&policy, backend));
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     let result = request
         .policy
         .resolve(&request.cwd, request.tool.as_deref())

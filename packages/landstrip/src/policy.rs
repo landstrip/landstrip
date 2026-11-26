@@ -414,6 +414,28 @@ impl NetworkAccess {
             }
         )
     }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn restricts_bind_ip(&self) -> bool {
+        matches!(
+            self,
+            Self::Restricted {
+                bind: IpBindAccess::Deny,
+                ..
+            }
+        )
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn restricts_connect_tcp(&self) -> bool {
+        matches!(self, Self::Restricted { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]

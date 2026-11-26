@@ -101,6 +101,9 @@ impl VcpuPool {
 }
 
 impl Machine {
+    pub(super) fn is_available() -> bool {
+        Self::open_kvm().is_ok()
+    }
     pub(super) fn probe() -> Result<()> {
         Self::open_kvm()?
             .create_vm()

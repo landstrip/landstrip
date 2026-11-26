@@ -26,6 +26,22 @@ pub(crate) enum Mechanism {
         )),
         allow(dead_code)
     )]
+    Landlock,
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
+    Seccomp,
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     Namespace,
     #[cfg_attr(
         not(all(
@@ -126,7 +142,16 @@ pub(crate) enum Error {
         mechanism: Mechanism,
         source: Cause,
     },
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "windows"
+        )),
+        allow(dead_code)
+    )]
     SuperviseFailed {
         source: Cause,
     },
@@ -149,7 +174,16 @@ pub(crate) enum Error {
     HostJobIncompatible {
         source: Cause,
     },
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "windows"
+        )),
+        allow(dead_code)
+    )]
     IntegerTooLarge,
     #[cfg_attr(
         any(
@@ -184,11 +218,39 @@ impl Error {
         Self::sandbox_setup(Mechanism::Seatbelt, source)
     }
 
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn landlock(source: impl Into<Cause>) -> Self {
+        Self::sandbox_setup(Mechanism::Landlock, source)
+    }
+
+    #[cfg_attr(
+        not(any(
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
+            target_os = "windows"
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn supervise(source: impl Into<Cause>) -> Self {
         Self::SuperviseFailed {
             source: source.into(),
         }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn supervise_errno(errno: nix::errno::Errno) -> Self {
+        Self::supervise(io::Error::from_raw_os_error(errno as i32))
     }
     #[cfg_attr(
         not(any(
@@ -277,7 +339,7 @@ impl Error {
                 }
             }
             Self::SandboxSetupFailed {
-                mechanism: Mechanism::Windowsuser,
+                mechanism: Mechanism::Landlock | Mechanism::Seccomp | Mechanism::Windowsuser,
                 ..
             } => Some(self.message()),
             Self::PlatformUnsupported => Some("the current platform is unsupported".to_owned()),
