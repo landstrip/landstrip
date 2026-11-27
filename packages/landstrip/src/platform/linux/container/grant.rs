@@ -502,7 +502,7 @@ impl MutationGrant {
                         )
                     },
                     MetadataTarget::Pinned(fd) | MetadataTarget::Descriptor(fd) => {
-                        let path = ProcFd::new(fd.as_fd()).c_path()?;
+                        let path = ProcFd::new(fd.as_fd()).proc_path();
                         unsafe {
                             libc::linkat(
                                 libc::AT_FDCWD,
@@ -568,7 +568,7 @@ impl MetadataTarget {
                 }
             }
             Self::Pinned(fd) => {
-                let path = ProcFd::new(fd.as_fd()).c_path()?;
+                let path = ProcFd::new(fd.as_fd()).proc_path();
                 unsafe {
                     libc::setxattr(
                         path.as_ptr(),
@@ -600,7 +600,7 @@ impl MetadataTarget {
                 unsafe { libc::lremovexattr(path.as_ptr(), name.as_ptr()) }
             }
             Self::Pinned(fd) => {
-                let path = ProcFd::new(fd.as_fd()).c_path()?;
+                let path = ProcFd::new(fd.as_fd()).proc_path();
                 unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) }
             }
             Self::Descriptor(fd) => unsafe { libc::fremovexattr(fd.as_raw_fd(), name.as_ptr()) },
@@ -656,7 +656,7 @@ impl MetadataOp {
                     })?;
                 }
                 MetadataTarget::Pinned(fd) => {
-                    let path = ProcFd::new(fd.as_fd()).c_path()?;
+                    let path = ProcFd::new(fd.as_fd()).proc_path();
                     Errno::result(unsafe { libc::chmod(path.as_ptr(), *mode) })?;
                 }
                 MetadataTarget::Descriptor(fd) => {
@@ -687,7 +687,7 @@ impl MetadataOp {
                         )
                     },
                     MetadataTarget::Pinned(fd) => {
-                        let path = ProcFd::new(fd.as_fd()).c_path()?;
+                        let path = ProcFd::new(fd.as_fd()).proc_path();
                         unsafe { libc::chown(path.as_ptr(), *uid, *gid) }
                     }
                     MetadataTarget::Descriptor(fd) => unsafe {
@@ -714,7 +714,7 @@ impl MetadataOp {
                         )
                     },
                     MetadataTarget::Pinned(fd) => {
-                        let path = ProcFd::new(fd.as_fd()).c_path()?;
+                        let path = ProcFd::new(fd.as_fd()).proc_path();
                         unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times, 0) }
                     }
                     MetadataTarget::Descriptor(fd) => unsafe {

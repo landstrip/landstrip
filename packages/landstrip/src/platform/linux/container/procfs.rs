@@ -5,12 +5,66 @@ use super::error::{BrokerError, SysResult};
 use nix::errno::Errno;
 use nix::fcntl::AtFlags;
 use nix::sys::stat::{fstat, fstatat};
+use nix::unistd::Pid;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
+use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
+
+#[derive(Clone, Copy)]
+pub(super) struct ProcPath {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl ProcPath {
+    pub(super) fn self_fd(fd: RawFd) -> Self {
+        let mut buf = [0_u8; 64];
+        let mut cursor = &mut buf[..63];
+        let _ = write!(cursor, "/proc/self/fd/{fd}");
+        let len = 63 - cursor.len();
+        Self { buf, len }
+    }
+
+    pub(super) fn pid_entry(pid: Pid, entry: &str) -> Self {
+        let mut buf = [0_u8; 64];
+        let mut cursor = &mut buf[..63];
+        let _ = write!(cursor, "/proc/{pid}/{entry}");
+        let len = 63 - cursor.len();
+        Self { buf, len }
+    }
+
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    pub(super) fn as_path(&self) -> &Path {
+        Path::new(OsStr::from_bytes(self.as_bytes()))
+    }
+
+    pub(super) fn as_ptr(&self) -> *const libc::c_char {
+        self.buf.as_ptr().cast()
+    }
+
+    pub(super) fn c_str(&self) -> SysResult<&CStr> {
+        CStr::from_bytes_with_nul(&self.buf[..=self.len]).map_err(|_| BrokerError::InvalidAddress)
+    }
+}
+
+impl AsRef<Path> for ProcPath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+impl AsRef<OsStr> for ProcPath {
+    fn as_ref(&self) -> &OsStr {
+        OsStr::from_bytes(self.as_bytes())
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct ProcFd<'a>(BorrowedFd<'a>);
@@ -20,31 +74,34 @@ impl<'a> ProcFd<'a> {
         Self(fd)
     }
 
-    pub(super) fn open_path(path: &Path, flags: i32) -> SysResult<OwnedFd> {
-        let cpath = CString::new(path.as_os_str().as_bytes())?;
-        let fd = unsafe { libc::open(cpath.as_ptr(), flags) };
+    pub(super) fn open_c_path(path: &CStr, flags: i32) -> SysResult<OwnedFd> {
+        let fd = unsafe { libc::open(path.as_ptr(), flags) };
         let fd = Errno::result(fd)?;
         let fd = RawFd::try_from(fd).map_err(|_| BrokerError::syscall(libc::EMFILE))?;
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    pub(super) fn proc_path(self) -> PathBuf {
-        Path::new("/proc/self/fd").join(self.0.as_raw_fd().to_string())
+    pub(super) fn open_path(path: &Path, flags: i32) -> SysResult<OwnedFd> {
+        let cpath = CString::new(path.as_os_str().as_bytes())?;
+        Self::open_c_path(&cpath, flags)
     }
 
-    pub(super) fn c_path(self) -> SysResult<CString> {
-        Ok(CString::new(self.proc_path().into_os_string().into_vec())?)
+    pub(super) fn proc_path(self) -> ProcPath {
+        ProcPath::self_fd(self.0.as_raw_fd())
     }
 
     pub(super) fn child_c_path(self, name: &CStr) -> SysResult<CString> {
-        let mut path = self.proc_path().into_os_string().into_vec();
+        let proc = self.proc_path();
+        let name_bytes = name.to_bytes();
+        let mut path = Vec::with_capacity(proc.as_bytes().len() + 1 + name_bytes.len());
+        path.extend_from_slice(proc.as_bytes());
         path.push(b'/');
-        path.extend_from_slice(name.to_bytes());
+        path.extend_from_slice(name_bytes);
         Ok(CString::new(path)?)
     }
 
     pub(super) fn reopen(self, flags: i32) -> SysResult<OwnedFd> {
-        Self::open_path(&self.proc_path(), flags)
+        Self::open_c_path(self.proc_path().c_str()?, flags)
     }
 
     pub(super) fn dup_above_stdio(self) -> SysResult<OwnedFd> {
@@ -54,7 +111,15 @@ impl<'a> ProcFd<'a> {
     }
 
     pub(super) fn read_link(self) -> SysResult<PathBuf> {
-        fs::read_link(self.proc_path()).map_err(BrokerError::from)
+        let proc = self.proc_path();
+        let mut buf = [0_u8; libc::PATH_MAX as usize];
+        let len = unsafe { libc::readlink(proc.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        let len = Errno::result(len)?;
+        let len = usize::try_from(len)?;
+        if len == buf.len() {
+            return Err(BrokerError::NameTooLong);
+        }
+        Ok(PathBuf::from(OsStr::from_bytes(&buf[..len])))
     }
 
     pub(super) fn validate_nofollow(self, flags: i32) -> SysResult<()> {

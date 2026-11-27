@@ -103,7 +103,10 @@ impl DbusProxy {
         let [_, _, raw_sync] = retained;
         let mut upstream_arg = OsString::from("unix:path=");
         upstream_arg.push(ProcFd::new(child_fds.upstream.as_fd()).proc_path());
-        let bus_path = ProcFd::new(child_fds.dir.as_fd()).proc_path().join("bus");
+        let bus_path = ProcFd::new(child_fds.dir.as_fd())
+            .proc_path()
+            .as_path()
+            .join("bus");
         let broker_pid = unsafe { libc::getpid() };
 
         let mut command = Command::new(binary);

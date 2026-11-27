@@ -378,7 +378,7 @@ impl UnixSocketOp<'_> {
         match self {
             Self::Connect { .. } => {
                 let object = anchor.target.as_ref().ok_or(BrokerError::InvalidAddress)?;
-                socket.rewrite_unix_path(&ProcFd::new(object.as_fd()).proc_path())?;
+                socket.rewrite_unix_path(ProcFd::new(object.as_fd()).proc_path().as_path())?;
             }
             Self::Bind => {
                 let broker_path = anchor.path()?;

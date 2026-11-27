@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Jarkko Sakkinen
 
 use super::error::{BrokerError, SysResult};
-use super::procfs::{Anchor, OpenHow, ProcFd};
+use super::procfs::{Anchor, OpenHow, ProcFd, ProcPath};
 use crate::paths::PathExt;
 use crate::trap::ProcessContext;
 use nix::errno::Errno;
@@ -31,8 +31,8 @@ impl TargetProcess {
         Self::new(Pid::from_raw(pid.cast_signed()))
     }
 
-    pub(super) fn proc_path(&self, entry: &str) -> PathBuf {
-        Path::new("/proc").join(self.pid.to_string()).join(entry)
+    pub(super) fn proc_path(&self, entry: &str) -> ProcPath {
+        ProcPath::pid_entry(self.pid, entry)
     }
 
     pub(super) fn context(&self) -> ProcessContext {
@@ -247,7 +247,7 @@ impl TargetProcess {
     }
 
     pub(super) fn open_proc(&self, entry: &str, flags: i32) -> SysResult<OwnedFd> {
-        ProcFd::open_path(&self.proc_path(entry), flags)
+        ProcFd::open_c_path(self.proc_path(entry).c_str()?, flags)
     }
 
     pub(super) fn filesystem(&self) -> SysResult<TargetFilesystem<'_>> {
@@ -639,12 +639,16 @@ impl TargetFilesystem<'_> {
                     let rc = unsafe { libc::fstatfs(parent.as_raw_fd(), &raw mut filesystem) };
                     Errno::result(rc)?;
                     let procfs = filesystem.f_type == 0x9fa0;
-                    let target = if procfs && (component == b"self" || component == b"thread-self")
+                    let alias_buf: Vec<u8>;
+                    let mut link_buf = [0_u8; libc::PATH_MAX as usize];
+                    let target: &[u8] = if procfs
+                        && (component == b"self" || component == b"thread-self")
                     {
                         if !Self::same_object(parent, self.proc_root()?.as_fd())? {
                             return Err(BrokerError::syscall(libc::ELOOP));
                         }
-                        self.proc_alias(&component)?
+                        alias_buf = self.proc_alias(&component)?;
+                        &alias_buf
                     } else {
                         if procfs {
                             if resolve & (0x02 | BENEATH | IN_ROOT) != 0 {
@@ -687,27 +691,25 @@ impl TargetFilesystem<'_> {
                                 });
                             }
                         }
-                        let mut bytes = vec![0; libc::PATH_MAX as usize];
                         let length = unsafe {
                             libc::readlinkat(
                                 fd.as_raw_fd(),
                                 c"".as_ptr(),
-                                bytes.as_mut_ptr().cast(),
-                                bytes.len(),
+                                link_buf.as_mut_ptr().cast(),
+                                link_buf.len(),
                             )
                         };
                         let length = Errno::result(length)?;
                         let length = usize::try_from(length)?;
-                        if length == bytes.len() {
+                        if length == link_buf.len() {
                             return Err(BrokerError::syscall(libc::ENAMETOOLONG));
                         }
-                        bytes.truncate(length);
-                        bytes
+                        &link_buf[..length]
                     };
                     if target.starts_with(b"/") {
                         dirs.reset_to_floor(self, resolve & BENEATH != 0)?;
                     }
-                    let mut expanded = Self::path_components(&target);
+                    let mut expanded = Self::path_components(target);
                     if target.ends_with(b"/") && pending.is_empty() {
                         expanded.push_back(b".".to_vec());
                     }
