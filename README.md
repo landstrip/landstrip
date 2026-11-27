@@ -45,6 +45,7 @@ TypeScript APIs, install
 | Directory                                                    | Contents        | License           |
 | ------------------------------------------------------------ | --------------- | ----------------- |
 | [`packages/landstrip`](packages/landstrip)                   | binary          | LGPL-2.1-or-later |
+| [`packages/landstrip-cli`](packages/landstrip-cli)           | CLI             | Apache-2.0        |
 | [`packages/landstrip-api`](packages/landstrip-api)           | Node.js API     | Apache-2.0        |
 | [`packages/opencode-landstrip`](packages/opencode-landstrip) | OpenCode plugin | Apache-2.0        |
 | [`packages/pi-landstrip`](packages/pi-landstrip)             | Pi extension    | Apache-2.0        |
