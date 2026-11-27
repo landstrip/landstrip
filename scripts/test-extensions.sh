@@ -110,6 +110,10 @@ for package_dir in "${extension_dirs[@]}"; do
   "$NPM" --prefix "$package_dir" run ci:test
 done
 
+"${extension_dirs[0]}/node_modules/.bin/oxfmt" --check \
+  -c "${extension_dirs[0]}/.oxfmtrc.json" \
+  README.md packages/*/README.md packages/landstrip-api/lib/*.d.ts
+
 if ((restricted_user_setup)); then
   "packages/landstrip/target/debug/$binary" windows uninstall
   restricted_user_setup=0
