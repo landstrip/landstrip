@@ -19,7 +19,10 @@ export interface ProxyHeaderInjectionRule {
    * `CONNECT` tunnel are rejected with `403 Forbidden`.
    */
   replaceTokens?: Readonly<Record<string, string>> | undefined;
-  /** Upgrade matching plain `http://<host>` proxy requests to upstream `https://`. */
+  /**
+   * Upgrade matching plain `http://<host>` proxy requests to upstream
+   * `https://`.
+   */
   upgradeHttps?: boolean | undefined;
   /** Optional HTTP method allowlist for this rule (case-insensitive). */
   allowedMethods?: readonly string[] | undefined;
@@ -29,11 +32,14 @@ export interface ProxyHeaderInjectionRule {
 
 export interface ProxyUpstreamGateway {
   /**
-   * Upstream base URL (`http://...` or `https://...`), e.g. `'https://api.openai.com/v1'`.
-   * Requests to `http://127.0.0.1:<proxyPort>/<prefix>/...` map to `<target>/...`.
+   * Upstream base URL (`http://...` or `https://...`), e.g.
+   * `'https://api.openai.com/v1'`. Requests to
+   * `http://127.0.0.1:<proxyPort>/<prefix>/...` map to `<target>/...`.
    */
   target: string;
-  /** Headers set or overwritten on requests routed through this gateway prefix. */
+  /**
+   * Headers set or overwritten on requests routed through this gateway prefix.
+   */
   headers?: Readonly<Record<string, string>> | undefined;
   /**
    * Placeholder-to-secret substitutions scoped to this gateway route.
@@ -41,7 +47,9 @@ export interface ProxyUpstreamGateway {
    * placeholders in request headers also authorizes that loopback route.
    */
   replaceTokens?: Readonly<Record<string, string>> | undefined;
-  /** Optional HTTP method allowlist for this gateway route (case-insensitive). */
+  /**
+   * Optional HTTP method allowlist for this gateway route (case-insensitive).
+   */
   allowedMethods?: readonly string[] | undefined;
   /** Optional custom CA bundle when `target` uses `https:`. */
   ca?: string | Buffer | ReadonlyArray<string | Buffer> | undefined;
@@ -56,12 +64,16 @@ export interface FilterProxyOptions {
   portRange?: ProxyPortRange | undefined;
   /**
    * Global HTTP method allowlist (case-insensitive, e.g. `['GET', 'HEAD']`).
-   * Rejects `CONNECT` with `405 Method Not Allowed` unless `'CONNECT'` is listed.
+   * Rejects `CONNECT` with `405 Method Not Allowed` unless `'CONNECT'` is
+   * listed.
    */
   allowedMethods?: readonly string[] | undefined;
   /** Host-scoped header/token injection and HTTPS-upgrade rules. */
   headerRules?: readonly ProxyHeaderInjectionRule[] | undefined;
-  /** Loopback path-prefix gateway routes (`{ '/openai': { target: 'https://api.openai.com' } }`). */
+  /**
+   * Loopback path-prefix gateway routes
+   * (`{ '/openai': { target: 'https://api.openai.com' } }`).
+   */
   upstreams?: Readonly<Record<string, ProxyUpstreamGateway>> | undefined;
 }
 
@@ -70,7 +82,9 @@ export interface FilterProxyHandle {
   stop(): Promise<void>;
 }
 
-export function startFilterProxy(options: FilterProxyOptions): Promise<FilterProxyHandle>;
+export function startFilterProxy(
+  options: FilterProxyOptions,
+): Promise<FilterProxyHandle>;
 
 export const PROXY_ENVIRONMENT_VARIABLES: readonly [
   'HTTP_PROXY',
@@ -81,7 +95,8 @@ export const PROXY_ENVIRONMENT_VARIABLES: readonly [
   'all_proxy',
 ];
 
-export type ProxyEnvironmentVariable = (typeof PROXY_ENVIRONMENT_VARIABLES)[number];
+export type ProxyEnvironmentVariable =
+  (typeof PROXY_ENVIRONMENT_VARIABLES)[number];
 
 export interface ProxyCredentials {
   token: string;
@@ -90,7 +105,11 @@ export interface ProxyCredentials {
 
 export function createProxyCredentials(token?: string): ProxyCredentials;
 
-export function createProxyUrl(port: number, token?: string | null, host?: string): string;
+export function createProxyUrl(
+  port: number,
+  token?: string | null,
+  host?: string,
+): string;
 
 export interface CreateProxyEnvironmentOptions {
   token?: string | null | undefined;

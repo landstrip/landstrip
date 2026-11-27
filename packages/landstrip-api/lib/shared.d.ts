@@ -33,8 +33,13 @@ import type {
   ShellReadAccess,
 } from './index.js';
 
-export type LandstripDenialTrap = LandstripFilesystemTrap | LandstripNetworkTrap;
-export type LandstripQueryTrap = LandstripDenialTrap & { state: 'query'; query_id: string };
+export type LandstripDenialTrap =
+  | LandstripFilesystemTrap
+  | LandstripNetworkTrap;
+export type LandstripQueryTrap = LandstripDenialTrap & {
+  state: 'query';
+  query_id: string;
+};
 
 export type {
   DoctorReport,
@@ -67,9 +72,15 @@ export function expandHomePath(path: string): string;
 
 export function expandPath(filePath: string, baseDirectory: string): string;
 
-export function canonicalizePath(filePath: string, baseDirectory: string): string;
+export function canonicalizePath(
+  filePath: string,
+  baseDirectory: string,
+): string;
 
-export function canonicalizeGlobPattern(pattern: string, baseDirectory: string): string;
+export function canonicalizeGlobPattern(
+  pattern: string,
+  baseDirectory: string,
+): string;
 
 export function normalizePathSeparators(path: string): string;
 
@@ -79,7 +90,10 @@ export function pathUnderDirectory(filePath: string, dir: string): boolean;
 
 export function sessionAllows(prefixes: Set<string>, filePath: string): boolean;
 
-export function sessionScopeFor(filePath: string, baseDirectory: string): string;
+export function sessionScopeFor(
+  filePath: string,
+  baseDirectory: string,
+): string;
 
 export function canonicalizeHost(host: string): string | null;
 
@@ -97,7 +111,9 @@ export function parseLandstripTraps(output: string): LandstripTrap[];
 
 export function serializeTrapStanza(trap: LandstripTrap): string;
 
-export function isFilesystemTrap(trap: LandstripTrap): trap is LandstripFilesystemTrap;
+export function isFilesystemTrap(
+  trap: LandstripTrap,
+): trap is LandstripFilesystemTrap;
 
 export function isDenialTrap(trap: LandstripTrap): trap is LandstripDenialTrap;
 
@@ -126,12 +142,16 @@ export function resolveFilesystemPatterns(
   patterns: LandstripPathSelector[] | undefined,
   baseDirectory?: string,
 ): LandstripPathSelector[];
+
 export function resolveFilesystemPolicy(
   filesystem?: LandstripFilesystemPolicy,
   baseDirectory?: string,
 ): LandstripFilesystemPolicy;
 
-/** Forwards macos.logTag; throws if it is empty, non-string, or contains a double quote, backslash, ASCII control or DEL. */
+/**
+ * Forwards macos.logTag; throws if it is empty, non-string, or contains a
+ * double quote, backslash, ASCII control or DEL.
+ */
 export function buildLandstripPolicy(
   options: BuildLandstripPolicyOptions,
 ): LandstripPolicy;
@@ -144,10 +164,17 @@ export function writeLandstripPolicyFile(
 ): { dir: string; path: string };
 
 export function mergeArray<T = string>(base: T[], override?: T[]): T[];
-/** Parses sandbox settings, validating macos.logTag with the same rules as buildLandstripPolicy (null is invalid). */
+
+/**
+ * Parses sandbox settings, validating macos.logTag with the same rules as
+ * buildLandstripPolicy (null is invalid).
+ */
 export function parseSandboxConfig(value: unknown): SandboxConfigFile;
 
-/** Merges arrays and applies override scalar precedence, including macos.logTag. */
+/**
+ * Merges arrays and applies override scalar precedence, including
+ * macos.logTag.
+ */
 export function deepMergeSandboxConfig<T extends SandboxConfig = SandboxConfig>(
   base: T,
   overrides?: SandboxConfigFile,
@@ -178,7 +205,10 @@ export function matchesPathPattern(
   baseDirectory?: string,
 ): boolean;
 
-// Relative write denies apply at the policy base and every effective write root.
+/**
+ * Relative write denies apply at the policy base and every effective write
+ * root.
+ */
 export function matchesWriteDenyPattern(
   filePath: string,
   patterns: LandstripPathSelector[],
@@ -229,11 +259,13 @@ export function readGrantScopesFor(
   baseDirectory?: string,
   scope?: string,
 ): string[];
+
 export function evaluateReadAccess(
   filePath: string,
   filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile,
   options?: EvaluateReadOptions,
 ): PathAccessDecision;
+
 export function evaluateWriteAccess(
   filePath: string,
   filesystem: SandboxFilesystemConfig | SandboxFilesystemConfigFile,
@@ -259,11 +291,15 @@ export function extractTrapBlockedPath(
   cwd?: string,
   operation?: 'read' | 'write',
 ): string | null;
+
 export function extractDomainsFromCommand(command: string): string[];
 
 export function extractCandidatePaths(command: string): string[];
 
-export function extractNativeDeniedPath(output: string, cwd?: string): string | null;
+export function extractNativeDeniedPath(
+  output: string,
+  cwd?: string,
+): string | null;
 
 export function extractNativeWriteDeniedPath(
   output: string,
@@ -316,16 +352,24 @@ export interface QuerySeatbeltDenialsOptions {
   runLogShow?: ((args: readonly string[]) => Promise<string>) | undefined;
 }
 
-/** Creates a valid per-run `macos.logTag`, preserving an optional base tag prefix. */
+/**
+ * Creates a valid per-run `macos.logTag`, preserving an optional base tag
+ * prefix.
+ */
 export function createDarwinLogTag(prefix?: string, baseTag?: string): string;
 
-/** Parses macOS Seatbelt unified-log JSON or text output into normalized denials. */
+/**
+ * Parses macOS Seatbelt unified-log JSON or text output into normalized
+ * denials.
+ */
 export function parseSeatbeltDenials(
   logOutput: string,
   options?: ParseSeatbeltDenialsOptions,
 ): SeatbeltDenial[];
 
-/** Queries `/usr/bin/log show` on macOS for Seatbelt denials matching `logTag`. */
+/**
+ * Queries `/usr/bin/log show` on macOS for Seatbelt denials matching `logTag`.
+ */
 export function querySeatbeltDenials(
   logTag: string,
   options?: QuerySeatbeltDenialsOptions,

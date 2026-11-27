@@ -12,8 +12,8 @@ export type LandstripMechanism =
 
 /**
  * `query` holds the syscall until the launcher answers with a
- * {@link LandstripControlResponse}; `info` is terminal. Queries need a socket on
- * `--trap`, and only the Linux broker raises them.
+ * {@link LandstripControlResponse}; `info` is terminal. Queries need a socket
+ * on `--trap`, and only the Linux broker raises them.
  */
 export type LandstripTrapState = 'query' | 'info';
 
@@ -95,6 +95,7 @@ export type LandstripPolicyErrorCode =
   | 'POLICY_TRAVERSAL_DEPTH'
   | 'POLICY_GLOB_TOO_LONG'
   | 'POLICY_SELECTOR_LIMIT';
+
 /** The stage that failed before the tool ran. */
 export type LandstripInternalCode =
   | LandstripPolicyErrorCode
@@ -169,7 +170,10 @@ export interface LandstripNetworkPolicy {
 }
 
 export interface LandstripDarwinPolicy {
-  /** Seatbelt log correlation tag: nonempty, without double quotes, backslashes, ASCII controls or DEL; not null. */
+  /**
+   * Seatbelt log correlation tag: nonempty, without double quotes, backslashes,
+   * ASCII controls or DEL; not null.
+   */
   logTag?: string;
   allowTrustd?: boolean;
   allowMachLookup?: string[];
@@ -182,7 +186,10 @@ export type LandstripWindowsAppContainerMode = 'lpac' | 'standard';
 export interface LandstripWindowsPolicy {
   appContainerMode?: LandstripWindowsAppContainerMode;
   allowLoopback?: boolean;
-  /** Accept the additive grants the restricted-user backend applies on top of the sandbox account's own rights. */
+  /**
+   * Accept the additive grants the restricted-user backend applies on top of
+   * the sandbox account's own rights.
+   */
   allowAdditiveGrants?: boolean;
 }
 
@@ -240,8 +247,12 @@ export type LandstripLinuxBackend = 'auto' | 'container' | 'machine';
 export interface SandboxLinuxConfig {
   backend: LandstripLinuxBackend;
 }
+
 export interface SandboxDarwinConfig {
-  /** Optional Seatbelt log correlation tag; same restrictions as LandstripDarwinPolicy.logTag. */
+  /**
+   * Optional Seatbelt log correlation tag; same restrictions as
+   * LandstripDarwinPolicy.logTag.
+   */
   logTag?: string;
   allowTrustd: boolean;
   allowMachLookup: string[];
@@ -252,7 +263,10 @@ export interface SandboxDarwinConfig {
 export interface SandboxWindowsConfig {
   appContainerMode: LandstripWindowsAppContainerMode;
   allowLoopback: boolean;
-  /** Accept the additive grants the restricted-user backend applies on top of the sandbox account's own rights. */
+  /**
+   * Accept the additive grants the restricted-user backend applies on top of
+   * the sandbox account's own rights.
+   */
   allowAdditiveGrants?: boolean;
 }
 
@@ -293,10 +307,13 @@ export type {
   EvaluateDomainOptions,
   ExtractDeniedPathOptions,
 } from './shared.js';
+
 /**
- * Canonical path to the native landstrip binary in an official Landstrip package.
+ * Canonical path to the native landstrip binary in an official Landstrip
+ * package.
  *
- * @throws if the target is unsupported, the binary is missing, or ownership cannot be verified.
+ * @throws if the target is unsupported, the binary is missing, or ownership
+ * cannot be verified.
  */
 export function binaryPath(platform?: string, arch?: string): string;
 
