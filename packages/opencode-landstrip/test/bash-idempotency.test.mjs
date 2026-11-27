@@ -859,7 +859,12 @@ test(
       {
         enabled: true,
         linux: { backend: 'container' },
-        filesystem: { allowRead: ['.'], allowWrite: ['.'], denyRead: ['secret.txt'], denyWrite: [] },
+        filesystem: {
+          allowRead: ['.'],
+          allowWrite: ['.'],
+          denyRead: ['secret.txt'],
+          denyWrite: [],
+        },
         network: { allowNetwork: true, allowedDomains: ['*'], deniedDomains: [] },
       },
       async ({ handlers, tempDir }) => {
