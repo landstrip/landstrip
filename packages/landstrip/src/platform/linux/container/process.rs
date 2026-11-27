@@ -294,6 +294,92 @@ impl ResolvedPath {
     }
 }
 
+struct DirStack {
+    dirs: Vec<OwnedFd>,
+    rooted: bool,
+    scoped: bool,
+}
+
+impl DirStack {
+    fn rooted(root: OwnedFd) -> Self {
+        Self {
+            dirs: vec![root],
+            rooted: true,
+            scoped: false,
+        }
+    }
+
+    fn rooted_vec(dirs: Vec<OwnedFd>) -> Self {
+        Self {
+            dirs,
+            rooted: true,
+            scoped: false,
+        }
+    }
+
+    fn unrooted(base: OwnedFd, scoped: bool) -> Self {
+        Self {
+            dirs: vec![base],
+            rooted: false,
+            scoped,
+        }
+    }
+
+    fn top(&self) -> SysResult<BorrowedFd<'_>> {
+        self.dirs
+            .last()
+            .map(AsFd::as_fd)
+            .ok_or_else(|| BrokerError::syscall(libc::EIO))
+    }
+
+    fn into_top(mut self) -> SysResult<OwnedFd> {
+        self.dirs
+            .pop()
+            .ok_or_else(|| BrokerError::syscall(libc::EIO))
+    }
+
+    fn push(&mut self, dir: OwnedFd) {
+        self.dirs.push(dir);
+    }
+
+    fn pop_parent(&mut self, fs: &TargetFilesystem<'_>, beneath: bool) -> SysResult<()> {
+        if self.dirs.len() > 1 {
+            self.dirs.pop();
+            return Ok(());
+        }
+        if self.scoped {
+            if beneath {
+                return Err(BrokerError::syscall(libc::EXDEV));
+            }
+            return Ok(());
+        }
+        if !self.rooted {
+            let base = self.top()?;
+            self.dirs = fs.directory_stack(base)?;
+            self.rooted = true;
+            if self.dirs.len() > 1 {
+                self.dirs.pop();
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_to_floor(&mut self, fs: &TargetFilesystem<'_>, beneath: bool) -> SysResult<()> {
+        if beneath {
+            return Err(BrokerError::syscall(libc::EXDEV));
+        }
+        if self.scoped || self.rooted {
+            self.dirs.truncate(1);
+            return Ok(());
+        }
+        let root = fs.root.try_clone()?;
+        self.dirs.clear();
+        self.dirs.push(root);
+        self.rooted = true;
+        Ok(())
+    }
+}
+
 pub(super) struct TargetFilesystem<'a> {
     process: &'a TargetProcess,
     pub(super) root: OwnedFd,
@@ -476,31 +562,26 @@ impl TargetFilesystem<'_> {
             return Err(BrokerError::syscall(libc::EXDEV));
         }
         let scoped = resolve & (IN_ROOT | BENEATH) != 0;
-        let base = if !path.is_absolute() || scoped {
-            self.process.open_dirfd(dirfd)?
+        let (lexical, mut dirs) = if path.is_absolute() && !scoped {
+            (
+                path.clean_lexically(),
+                DirStack::rooted(self.root.try_clone()?),
+            )
         } else {
-            self.root.try_clone()?
+            let base = self.process.open_dirfd(dirfd)?;
+            let base_label = self.label(base.as_fd())?;
+            let lexical = base_label
+                .join(path.strip_prefix("/").unwrap_or(path))
+                .clean_lexically();
+            (lexical, DirStack::unrooted(base, scoped))
         };
-        let base_label = self.label(base.as_fd())?;
-        let lexical = if path.is_absolute() && !scoped {
-            path.to_path_buf()
-        } else {
-            base_label.join(path.strip_prefix("/").unwrap_or(path))
-        }
-        .clean_lexically();
-        let mut dirs = self.directory_stack(base.as_fd())?;
-        let floor = if scoped { dirs.len() } else { 1 };
         let mut pending = Self::path_components(path.as_os_str().as_bytes());
         let trailing_slash = path.as_os_str().as_bytes().ends_with(b"/");
         let mut links = 0;
         loop {
             let component = pending.pop_front().unwrap_or_else(|| b".".to_vec());
             if component == b".." {
-                if dirs.len() > floor {
-                    dirs.pop();
-                } else if resolve & BENEATH != 0 {
-                    return Err(BrokerError::syscall(libc::EXDEV));
-                }
+                dirs.pop_parent(self, resolve & BENEATH != 0)?;
                 if !pending.is_empty() {
                     continue;
                 }
@@ -512,7 +593,7 @@ impl TargetFilesystem<'_> {
             } else {
                 &component
             })?;
-            let parent = dirs.last().ok_or_else(|| BrokerError::syscall(libc::EIO))?;
+            let parent = dirs.top()?;
             let how = OpenHow {
                 flags: (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
                 mode: 0,
@@ -526,9 +607,7 @@ impl TargetFilesystem<'_> {
                     if !pending.is_empty()
                         || (trailing_slash && missing != MissingTarget::Directory)
                     {
-                        let mut label = self
-                            .label(parent.as_fd())?
-                            .join(OsStr::from_bytes(&component));
+                        let mut label = self.label(parent)?.join(OsStr::from_bytes(&component));
                         for part in pending {
                             label.push(OsStr::from_bytes(&part));
                         }
@@ -562,7 +641,7 @@ impl TargetFilesystem<'_> {
                     let procfs = filesystem.f_type == 0x9fa0;
                     let target = if procfs && (component == b"self" || component == b"thread-self")
                     {
-                        if !Self::same_object(parent.as_fd(), self.proc_root()?.as_fd())? {
+                        if !Self::same_object(parent, self.proc_root()?.as_fd())? {
                             return Err(BrokerError::syscall(libc::ELOOP));
                         }
                         self.proc_alias(&component)?
@@ -571,12 +650,13 @@ impl TargetFilesystem<'_> {
                             if resolve & (0x02 | BENEATH | IN_ROOT) != 0 {
                                 return Err(BrokerError::syscall(libc::ELOOP));
                             }
-                            if let Some(target) = self.proc_magic(parent.as_fd(), &component)? {
+                            if let Some(target) = self.proc_magic(parent, &component)? {
                                 if !pending.is_empty() {
                                     if fstat(&target)?.st_mode & libc::S_IFMT != libc::S_IFDIR {
                                         return Err(BrokerError::syscall(libc::ENOTDIR));
                                     }
-                                    dirs = self.directory_stack(target.as_fd())?;
+                                    dirs =
+                                        DirStack::rooted_vec(self.directory_stack(target.as_fd())?);
                                     continue;
                                 }
                                 if trailing_slash
@@ -588,7 +668,7 @@ impl TargetFilesystem<'_> {
                                 let (label, anonymous) = match self.label_opt(target.as_fd())? {
                                     Some(label) => (label, false),
                                     None => (
-                                        self.label(parent.as_fd())?
+                                        self.label(parent)?
                                             .join(OsStr::from_bytes(name.as_bytes())),
                                         true,
                                     ),
@@ -599,7 +679,7 @@ impl TargetFilesystem<'_> {
                                     trailing_slash,
                                     anonymous,
                                     anchor: Some(Anchor {
-                                        dir: parent.try_clone()?,
+                                        dir: dirs.into_top()?,
                                         name,
                                         target: Some(target),
                                     }),
@@ -625,10 +705,7 @@ impl TargetFilesystem<'_> {
                         bytes
                     };
                     if target.starts_with(b"/") {
-                        if resolve & BENEATH != 0 {
-                            return Err(BrokerError::syscall(libc::EXDEV));
-                        }
-                        dirs.truncate(floor);
+                        dirs.reset_to_floor(self, resolve & BENEATH != 0)?;
                     }
                     let mut expanded = Self::path_components(&target);
                     if target.ends_with(b"/") && pending.is_empty() {
@@ -654,9 +731,7 @@ impl TargetFilesystem<'_> {
             }
             let label = match &object {
                 Some(fd) => self.label(fd.as_fd())?,
-                None => self
-                    .label(parent.as_fd())?
-                    .join(OsStr::from_bytes(name.as_bytes())),
+                None => self.label(parent)?.join(OsStr::from_bytes(name.as_bytes())),
             };
             return Ok(ResolvedPath {
                 lexical,
@@ -664,7 +739,7 @@ impl TargetFilesystem<'_> {
                 trailing_slash,
                 anonymous: false,
                 anchor: Some(Anchor {
-                    dir: parent.try_clone()?,
+                    dir: dirs.into_top()?,
                     name,
                     target: object.take(),
                 }),
