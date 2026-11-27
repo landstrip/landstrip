@@ -137,7 +137,8 @@ pub(crate) fn check(policy: &crate::policy::AccessPolicy) -> crate::error::Resul
 ))]
 #[allow(clippy::unnecessary_wraps, reason = "uniform platform doctor API")]
 pub(crate) fn doctor(backend: LinuxBackend) -> anyhow::Result<DoctorReport> {
-    Ok(doctor_report(SandboxPlatform::Linux, backend.doctor()))
+    let (resolved, result) = backend.doctor();
+    Ok(doctor_report(SandboxPlatform::Linux, result).with_backend(resolved))
 }
 
 #[cfg(target_os = "macos")]

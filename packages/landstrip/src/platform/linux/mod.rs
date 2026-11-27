@@ -11,6 +11,7 @@ use crate::trap_fd::TrapFd;
 use anyhow::Result;
 use clap::ValueEnum;
 use clap::builder::PossibleValue;
+use serde::Serialize;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::os::fd::RawFd;
@@ -24,10 +25,33 @@ pub(crate) enum Backend {
     Machine,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum ResolvedBackend {
     Container,
     Machine,
+}
+
+impl ResolvedBackend {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::Machine => "machine",
+        }
+    }
+
+    pub(crate) fn doctor(self) -> Result<()> {
+        match self {
+            Self::Container => {
+                container::Sandbox::probe()?;
+                namespace::probe()
+            }
+            Self::Machine => {
+                kvm::Sandbox::probe()?;
+                namespace::probe()
+            }
+        }
+    }
 }
 
 impl fmt::Display for Backend {
@@ -54,17 +78,9 @@ impl Backend {
         }
     }
 
-    pub(crate) fn doctor(self) -> Result<()> {
-        match self.resolve() {
-            ResolvedBackend::Container => {
-                container::Sandbox::probe()?;
-                namespace::probe()
-            }
-            ResolvedBackend::Machine => {
-                kvm::Sandbox::probe()?;
-                namespace::probe()
-            }
-        }
+    pub(crate) fn doctor(self) -> (ResolvedBackend, Result<()>) {
+        let resolved = self.resolve();
+        (resolved, resolved.doctor())
     }
 
     pub(crate) fn check_host(self) -> crate::error::Result<()> {

@@ -110,6 +110,12 @@ impl TryFrom<Result<()>> for PolicyValidationReport {
 pub(crate) struct DoctorReport {
     pub(crate) ok: bool,
     pub(crate) platform: SandboxPlatform,
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) backend: Option<crate::platform::ResolvedLinuxBackend>,
     pub(crate) supported: FeatureCapabilities,
     pub(crate) available: FeatureCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,10 +142,24 @@ impl DoctorReport {
         Self {
             ok,
             platform,
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))]
+            backend: None,
             supported,
             available,
             error,
         }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn with_backend(mut self, backend: crate::platform::ResolvedLinuxBackend) -> Self {
+        self.backend = Some(backend);
+        self
     }
 }
 

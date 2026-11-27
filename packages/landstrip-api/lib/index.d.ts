@@ -205,6 +205,7 @@ export interface FeatureCapabilities {
 export interface DoctorReport {
   ok: boolean;
   platform: SandboxPlatform;
+  backend?: 'container' | 'machine';
   supported: FeatureCapabilities;
   available: FeatureCapabilities;
   error?: string;

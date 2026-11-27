@@ -34,6 +34,14 @@ impl Step for DoctorContractCmd {
         prop_assert!(res.success(), "landstrip doctor failed: {}", res.stderr);
         let doc: Value = serde_json::from_slice(&res.stdout).require("doctor JSON output")?;
         prop_assert_eq!(doc.get("ok").and_then(Value::as_bool), Some(true));
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        prop_assert_eq!(
+            doc.get("backend").and_then(Value::as_str),
+            Some(state.ctx.backend.resolve().as_str())
+        );
         let tiers = doc
             .pointer("/supported/filesystemTiers")
             .and_then(Value::as_array)
