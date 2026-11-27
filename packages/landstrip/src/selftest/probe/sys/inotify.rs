@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 // Copyright (c) 2026 Jarkko Sakkinen
 
+use super::super::proc::Mapping;
 use super::{CPath, OsResult, Probe, ProbeError, ProbeResult, SysCheck, SysProbe};
 use nix::sys::inotify::{InitFlags, Inotify};
 use std::fs::{self, File};
@@ -341,6 +342,16 @@ fn errors(dir: &Path) -> ProbeResult<()> {
     expect_errno(
         unsafe { libc::inotify_add_watch(fd, std::ptr::without_provenance(1), libc::IN_CREATE) }
             .into(),
+        libc::EFAULT,
+    )?;
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.os_result()?)
+        .map_err(io::Error::other)?;
+    let pages = Mapping::new(2 * page, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1)?;
+    unsafe { libc::mprotect(pages.ptr.byte_add(page), page, libc::PROT_NONE) }.os_result()?;
+    let tail = unsafe { pages.ptr.byte_add(page - 6).cast::<u8>() };
+    unsafe { std::ptr::copy_nonoverlapping(b"abcdef".as_ptr(), tail, 6) };
+    expect_errno(
+        unsafe { libc::inotify_add_watch(fd, tail.cast(), libc::IN_CREATE) }.into(),
         libc::EFAULT,
     )?;
     expect_errno(

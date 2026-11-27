@@ -71,23 +71,46 @@ impl TargetProcess {
     }
 
     pub(super) fn read_string(&self, addr: usize, max_len: usize) -> SysResult<Vec<u8>> {
-        let mut buf = vec![0_u8; max_len];
-        let mut local = [IoSliceMut::new(&mut buf)];
-        let target = [RemoteIoVec {
-            base: addr,
-            len: max_len,
-        }];
-        let n = process_vm_readv(self.pid, &mut local, &target)?;
-        if n == 0 {
+        if addr == 0 {
             return Err(BrokerError::BadAddress);
         }
-        let slice = &buf[..n];
-        let end = slice
-            .iter()
-            .position(|byte| *byte == 0)
-            .ok_or(BrokerError::NameTooLong)?;
-        buf.truncate(end);
-        Ok(buf)
+        let mut page = [0_u8; 4096];
+        let mut out = Vec::new();
+        let mut cursor = addr;
+        let mut remaining = max_len;
+        while remaining > 0 {
+            let step = remaining.min(4096 - (cursor & 4095));
+            let chunk = &mut page[..step];
+            let mut local = [IoSliceMut::new(chunk)];
+            let target = [RemoteIoVec {
+                base: cursor,
+                len: step,
+            }];
+            let n = process_vm_readv(self.pid, &mut local, &target).map_err(|errno| {
+                if errno == Errno::EFAULT {
+                    BrokerError::BadAddress
+                } else {
+                    BrokerError::from(errno)
+                }
+            })?;
+            if let Some(end) = chunk[..n].iter().position(|byte| *byte == 0) {
+                if out.is_empty() {
+                    return Ok(chunk[..end].to_vec());
+                }
+                out.reserve_exact(end);
+                out.extend_from_slice(&chunk[..end]);
+                return Ok(out);
+            }
+            if n < step {
+                return Err(BrokerError::BadAddress);
+            }
+            out.extend_from_slice(chunk);
+            remaining -= step;
+            if remaining > 0 {
+                cursor = cursor.checked_add(step).ok_or(BrokerError::BadAddress)?;
+            }
+        }
+        Err(BrokerError::NameTooLong)
     }
 
     pub(super) fn read_path(&self, path_ptr: usize) -> SysResult<PathBuf> {
