@@ -15,7 +15,7 @@ use crate::platform::LinuxBackend;
 use proptest::test_runner::TestCaseError;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -539,13 +539,28 @@ impl SandboxContext {
             };
         };
         drop(cmd);
+        let stdout = Self::drain_pipe(child.stdout.take());
+        let stderr = Self::drain_pipe(child.stderr.take());
         if let Some(payload) = stdin_payload
             && let Some(mut stdin) = child.stdin.take()
         {
             let _ = stdin.write_all(&payload);
         }
         let deadline = Instant::now() + timeout;
-        while let Ok(None) = child.try_wait() {
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(_) => {
+                    return RunResult {
+                        code: -1,
+                        signal: None,
+                        stdout: Vec::new(),
+                        stderr: "try_wait failed".to_owned(),
+                        traps: Vec::new(),
+                    };
+                }
+            }
             if Instant::now() >= deadline {
                 #[cfg(target_os = "linux")]
                 if let Ok(pid) = i32::try_from(child.id()) {
@@ -564,28 +579,31 @@ impl SandboxContext {
                 };
             }
             std::thread::sleep(Duration::from_millis(10));
-        }
-        let Ok(output) = child.wait_with_output() else {
-            return RunResult {
-                code: -1,
-                signal: None,
-                stdout: Vec::new(),
-                stderr: "wait_with_output failed".to_owned(),
-                traps: Vec::new(),
-            };
         };
+        let stdout = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
         let traps = trap_collector.map_or_else(Vec::new, TrapCollector::finish);
         #[cfg(unix)]
-        let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
+        let signal = std::os::unix::process::ExitStatusExt::signal(&status);
         #[cfg(not(unix))]
         let signal = None;
         RunResult {
-            code: output.status.code().unwrap_or(-1),
+            code: status.code().unwrap_or(-1),
             signal,
-            stdout: output.stdout,
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout,
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
             traps,
         }
+    }
+
+    fn drain_pipe(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
     }
 }
 
