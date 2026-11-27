@@ -251,7 +251,14 @@ npm run ci:extensions:local
   cd packages/landstrip
   cargo fmt --all --check
   cargo build --locked
-  target/debug/landstrip selftest
+  if [[ "$(uname -s)" == Linux ]]; then
+    target/debug/landstrip selftest --backend container
+    if target/debug/landstrip doctor --backend machine >/dev/null 2>&1; then
+      target/debug/landstrip selftest --backend machine
+    fi
+  else
+    target/debug/landstrip selftest
+  fi
   cargo clippy --all-targets --locked -- -D warnings
 )
 

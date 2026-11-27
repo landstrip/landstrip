@@ -47,8 +47,17 @@ binary_name=landstrip
   printf '==> cargo build\n'
   $CARGO build
 
-  printf '==> landstrip selftest\n'
-  "target/debug/$binary_name" selftest
+  if [[ "$host_platform" == linux-* ]]; then
+    printf '==> landstrip selftest --backend container\n'
+    "target/debug/$binary_name" selftest --backend container
+    if "target/debug/$binary_name" doctor --backend machine >/dev/null 2>&1; then
+      printf '==> landstrip selftest --backend machine\n'
+      "target/debug/$binary_name" selftest --backend machine
+    fi
+  else
+    printf '==> landstrip selftest\n'
+    "target/debug/$binary_name" selftest
+  fi
 
   printf '==> cargo clippy\n'
   $CARGO clippy --all-targets

@@ -1,7 +1,7 @@
 # landstrip
 
-Landstrip runs commands in an OS-level sandbox using KVM on Linux, Seatbelt on
-macOS, and AppContainer on Windows.
+Landstrip runs commands in an OS-level sandbox using KVM or Landlock/seccomp on
+Linux, Seatbelt on macOS, and AppContainer on Windows.
 
 ## Install
 
